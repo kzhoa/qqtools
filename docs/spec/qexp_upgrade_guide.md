@@ -1,7 +1,7 @@
 ---
 doc_type: spec
 status: active
-updated_at: 2026-09-28
+updated_at: 2026-09-29
 archived_at:
 ---
 
@@ -189,6 +189,156 @@ recovery authority. Do not copy `diagnostics/scheduler-v1` between machine
 runtimes, edit its JSON to clear a scheduling blocker, or treat its loss as proof
 that a fault resolved.
 
+### Blocking Project I/O isolation
+
+Project I/O isolation is an L1 machine-rolling change. Upgrade the package and restart one
+Machine's global agent at a time; do not stop or drain running training:
+
+```bash
+python -m pip install --upgrade qqtools
+qexp agent restart
+qexp agent status --format json
+```
+
+The restarted agent reconstructs reservations and existing-Attempt supervision before new
+admission. Old and new machines may operate against the same Projects during the rollout because
+the executor adds no shared Project schema or writer capability. Its permanent atomic-JSON state is
+machine-local under `project-io-executor-v1/`; old packages ignore it. There is no SQLite database,
+Project migration, legacy reader, dual writer, or temporary compatibility shim.
+
+If restart finds an interrupted registration CLI journal, recovery admission
+automatically restores its captured shared records and local registry under the
+existing machine exclusions, durably retires the journal, and reloads the registry
+before continuing enrollment. A malformed journal or an uncertain partial replay
+keeps that Machine fail-closed and visible as worker failure or ambiguity. Do not
+delete `registration-transaction.json` or edit the registry to bypass recovery;
+preserve both for exact replay and diagnosis.
+
+Primary-demand scan and verification continuations are disposable controller
+state. Restart obtains new proofs before admitting borrow work; ordinary ready
+cursors and previously created reservations are not deleted or repurposed as
+absence evidence. CPU and GPU reservations preserve `admission.admitted_as_borrow`
+using the existing reservation record. This adds no shared migration or CLI
+compatibility mode.
+
+Borrow proof consumption may allocate one bounded local provisional offer before
+the shared claim wins its fair request grant. If the agent restarts in that gap,
+it releases only an exact offer with no request/process/result evidence; existing
+or unreadable evidence still requires ordinary ambiguous-claim reconciliation.
+Do not delete offers to make this recovery appear complete.
+
+Submission-control repair now uses bounded isolated slices instead of a direct
+shared-I/O maintenance thread. Its traversal continuation is disposable, while
+source witnesses, parser checkpoints and proof receipts remain in the shared
+Project. Restart resumes those proofs without a format migration or payload
+copy into MachineRuntime.
+
+Application progress keeps its existing shared and local formats. The restarted
+agent may give one captured observation/publication pair two bounded background
+opportunities, then requires another background family to run before repeating
+that preference. This is disposable admission state: restart neither migrates
+progress records nor treats the lost preference as publication evidence.
+
+Retained recovery keeps its existing target capture, source hold and pending
+backfill records. Source-hold publication/replay and pending source-record reads
+use isolated transactions; local process capture consumes only exact retained
+identities. A missing worker result after source retention is unknown until the
+worker's exit is positively verified, after which exact hold replay recovers it.
+Do not delete holds, regenerate a responsibility ledger or discard pending
+capture batches to clear this state. These transactions introduce no shared
+format migration and do not by themselves certify recovery readiness or source
+release.
+
+Retained evidence discovery resumes from a bounded directory cursor in the
+existing machine-local capture-backfill checkpoint. It does not require a
+source-format migration or a persistent worker. Discovery paths are journaled
+before source record reads; restart replays pending identities before advancing
+the cursor. A replaced source directory invalidates the advisory cursor and
+requires rediscovery, not manual journal removal or assumed empty history.
+
+Re-registration preserves the existing capture-generation journal and source
+holds. The agent first isolates the source's generation-pending fence, applies
+the local reset, isolates source normalization, then clears the local intent.
+Each phase replays after interruption without advancing the census twice or
+discarding captured responsibilities. Group namespace activation and source
+retirement are independent transactions: active Group truth does not mean that
+legacy source responsibilities have retired. Source hold removal requires the
+existing exact local release receipt; missing or ambiguous executor results are
+not permission to delete recovery files manually.
+
+Progress v1/v2 retain their producer channels, local accepted observations and
+shared snapshot formats. The agent samples locally and uses isolated shared
+identity/publication transactions; cadence advances only after exact result
+consumption. Restart conservatively restores cadence and preserves observation
+timestamps. Existing training, producers and viewers need no migration. Do not
+remove progress caches or executor records to clear an ambiguous publication.
+
+Upgrade discovery and one-phase advancement now use the same four-slot Project
+I/O executor as other shared services. The existing Project upgrade journal
+remains the migration and replay authority. Machine-local pending, admission,
+idle and retry summaries are disposable and rebuilt on restart; missing evidence
+blocks that Project until observed rather than being treated as no upgrade work.
+
+Legacy notification reconciliation also runs as isolated Project work. Existing
+private policy revisions, credential files and conflict resolution are retained;
+no new credential migration or compatibility period is introduced. Executor
+records contain no webhook contents. Restart safely repeats unfinished imports
+against the same private policy; do not delete that policy or its credentials to
+clear ambiguous executor work. Private aged-credential cleanup does not wait for
+another notification transaction.
+
+In status, inspect `project_io_isolation`. Capacity is four workers and the supported hang limit is
+two. `degraded` means isolation is active but at least one request is overdue or otherwise impaired;
+`exceeded` means the supported two-hang peer-service envelope has been exceeded; `unknown` means the
+agent cannot establish safe executor state. Preserve the MachineRuntime and investigate the listed
+blocking Project IDs and scheduler diagnostic reason. Do not delete request, result, process, epoch,
+or resolved records to clear status. Those files can be the only local evidence that a shared
+mutation or provisional resource offer remains ambiguous.
+
+Isolation does not provide a load-independent 15-second response guarantee. The 15-second
+qualification covers two blocked bindings and one recovered healthy peer completing primary
+admission and a due renewal under the workload defined in the
+[product specification](qexp_product_spec.md#blocking-project-io-isolation). More healthy demand or
+startup/recovery work can increase latency without exceeding the hung-worker envelope. Inspect
+worker state and existing scheduling diagnostics; do not delete executor records, disable Projects,
+or interpret queued renewal as successful renewal to reduce the apparent delay. The approved
+2026-09-29 latency-contract correction introduces no migration, compatibility shim, tuning option,
+or change to the L1 rollout and downgrade prerequisites.
+
+The local activation/idle fence uses an optional, atomically replaced
+`agent/activation-wake.json` record in MachineRuntime. No backfill is required:
+absence is the initial generation, and the first activation creates the record.
+It contains only a runtime identity and fresh UUID, not experiment history or
+shared scheduling authority. Malformed or foreign-runtime evidence inhibits
+idle exit; do not delete it while the agent is running to bypass that check.
+An unchanged generation alone is never an idle proof. Local CLI activation
+participates even for an already-running agent; `--no-activate` and the rule
+that remote submissions do not wake stopped machines remain unchanged.
+
+Agent stop fences the executor epoch, gives workers two seconds to return, sends `SIGTERM`, waits
+another two seconds, then sends `SIGKILL`. A signal delivery is not proof that a worker in blocked
+kernel I/O exited. The controller may stop successfully while status retains a nonzero
+`unreaped_worker_count`; do not reuse, move, copy, or remove that MachineRuntime until each recorded
+PID plus process start time is proven absent and shared transaction/reservation evidence is
+reconciled. When a container hides the host process boundary, restoring that certainty may require
+the container or cluster operator to terminate the owning container/host process namespace.
+
+After the ordinary epoch is shut down, final eligible Project snapshots run through a fresh
+two-second stop-publication epoch rather than controller threads. Retained ambiguous requests keep
+their slots and can prevent their own stop snapshot. Responsive peers still use remaining slots;
+an incomplete publication is recorded as cleanup failure while local stopped status and final
+diagnostics continue. Do not delete retained requests to make the stop snapshot appear successful.
+
+The executor-specific downgrade precondition is a fully quiescent executor after stopping the new
+agent: live and exit-unverified worker counts are zero, every request/result is resolved, and no
+provisional offer or possible shared mutation remains ambiguous. This condition is necessary, not
+sufficient; it does not override the stricter no-downgrade rules of scheduler diagnostics,
+registry-authoritative enablement, or another MachineRuntime protocol used by the source and target
+versions. If an uninterruptible worker cannot be proven absent, do not start the older agent on that
+MachineRuntime. Restore process certainty at the container or host boundary first, restart the new
+version, and allow reconciliation to complete. Deleting the executor directory is not a downgrade
+procedure and does not prove that a worker or shared mutation ended.
+
 ### Registry-authoritative Project enablement
 
 The Project enable/disable correction keeps the existing registry and inventory
@@ -233,6 +383,15 @@ generations. A missing or corrupt record causes conservative resident replay; it
 does not require a Project schema migration. The shared
 `operations/project-activation-v1/checkpoint.json` is preserved with the Project
 and must not be reset as a way to clear work.
+
+Binding removal now records an `activation-consumer-retirements-v2` intent in
+the owning MachineRuntime and returns without synchronously accessing the shared
+Project root. Preserve that directory across ordinary agent restarts until the
+isolated worker clears each exact intent. Do not copy it to another
+MachineRuntime or delete it to unblock re-registration; a pending intent safely
+forces a fresh consumer generation. This is disposable machine-local
+coordination and introduces no shared Project schema migration or mixed-writer
+compatibility mode.
 
 Preserve the complete `operations/project-activation-v1/` directory, including
 events, snapshots, membership, and consumer records. Do not delete an activation
@@ -402,6 +561,19 @@ projects automatically prepare their Task observation indexes. Existing projects
 first satisfy the canonical Group/recovery writer boundary; running training
 continues. There is no mandatory per-project activation command. New projects
 initialize their empty index during `qexp init`.
+
+With Project-I/O isolation, the agent advances index builds and obsolete-generation
+cleanup using bounded isolated requests instead of a separate shared-I/O thread.
+Existing shared build checkpoints and pagination formats remain unchanged.
+Restart resumes unfinished work automatically; do not delete the projection or
+copy MachineRuntime files to recover a build.
+
+An ordinary agent restart also resumes an expired registration when the exact
+same runtime still owns its generation. No re-registration or `--adopt-existing`
+is required merely because the agent was offline past its eligibility lease.
+If a successor runtime has acquired the logical machine name, the old binding
+remains fenced; restart never overwrites that successor or relaunches an orphaned
+Attempt.
 
 Use `qexp task list --page-size 50 --format json` for indexed pages. Preserve
 `--phase` and `--group` when following `next_cursor`. `index_not_ready` means the

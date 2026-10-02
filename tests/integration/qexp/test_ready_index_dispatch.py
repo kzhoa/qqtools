@@ -10,8 +10,11 @@ import pytest
 
 from qqtools.plugins.qexp import init_shared_root, submit
 from qqtools.plugins.qexp.agent import dispatch_loop as machine_agent
+from qqtools.plugins.qexp.agent import primary_demand
 from qqtools.plugins.qexp.agent.context import MachineRuntime
 from qqtools.plugins.qexp.agent.lifecycle import dispatch_machine_cycle_locked
+from qqtools.plugins.qexp.agent.project_io_controller import ProjectIOController
+from qqtools.plugins.qexp.agent.project_io_executor import ProjectIOExecutor
 from qqtools.plugins.qexp.agent.working_set import SERVICE_LANES
 from qqtools.plugins.qexp.commands import group as group_commands
 from qqtools.plugins.qexp.commands.group import change_worker, create_group
@@ -119,6 +122,35 @@ def test_machine_agent_admits_borrow_only_after_no_primary_demand(
     assert executor.launched == [task.task_id]
 
 
+def _retire_bindings(runtime: MachineRuntime, bindings) -> None:
+    """Build dormant residency through the real asynchronous consumer protocol."""
+    executor = ProjectIOExecutor(runtime)
+    executor.begin_epoch()
+    controller = ProjectIOController(runtime, executor)
+    deadline = time.monotonic() + 30
+    acknowledged = set()
+    try:
+        while time.monotonic() < deadline:
+            revision, registered = runtime.load_registry_snapshot()
+            machine_agent._advance_activation_working_set(runtime, controller, revision, registered)
+            for binding in bindings:
+                state = runtime.working_set._states[runtime.working_set._identity(binding)]
+                if state.activation_observed and binding not in acknowledged:
+                    for lane in SERVICE_LANES:
+                        turn = runtime.working_set.begin_turn(binding, lane)
+                        assert not runtime.working_set.acknowledge(turn, quiescent=True)
+                    acknowledged.add(binding)
+            if all(
+                runtime.working_set._states[runtime.working_set._identity(binding)].state == "dormant"
+                for binding in bindings
+            ):
+                return
+            time.sleep(0.02)
+        raise AssertionError("activation consumer acknowledgements did not retire bindings")
+    finally:
+        executor.shutdown()
+
+
 def test_machine_agent_denies_borrow_while_enabled_bindings_are_dormant(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -141,10 +173,7 @@ def test_machine_agent_denies_borrow_while_enabled_bindings_are_dormant(
     _, bindings = runtime.load_registry()
     registry_revision, registry_snapshot = runtime.load_registry_snapshot()
     runtime.working_set.reconcile(registry_snapshot, revision=registry_revision)
-    for binding in dormant:
-        for lane in SERVICE_LANES:
-            turn = runtime.working_set.begin_turn(binding, lane)
-            assert runtime.working_set.acknowledge(turn, quiescent=True)
+    _retire_bindings(runtime, dormant)
 
     def make_budget(policy: WorkBudgetPolicy | None = None) -> SliceBudget:
         return SliceBudget(policy or WorkBudgetPolicy(), clock_ns=lambda: 0)
@@ -189,10 +218,7 @@ def test_dormant_population_does_not_drive_dispatch_truth_reads(
         bindings.append(runtime.add_binding(cfg.shared_root, cfg.machine_name))
     registry_revision, registry_snapshot = runtime.load_registry_snapshot()
     runtime.working_set.reconcile(registry_snapshot, revision=registry_revision)
-    for binding in bindings:
-        for lane in SERVICE_LANES:
-            turn = runtime.working_set.begin_turn(binding, lane)
-            assert runtime.working_set.acknowledge(turn, quiescent=True)
+    _retire_bindings(runtime, bindings)
 
     original_status = runtime.registration_status
     original_eligible = runtime.binding_write_eligible
@@ -246,7 +272,7 @@ def test_temporary_primary_dependency_gate_is_rechecked_before_borrowing(
     binding = runtime.add_binding(cfg.shared_root, cfg.machine_name)
     temporary = ReadyClassificationResult("temporarily_unavailable", "dependency_waiting")
 
-    monkeypatch.setattr(machine_agent, "classify_ready_marker", lambda *_args: temporary)
+    monkeypatch.setattr(primary_demand, "classify_ready_marker", lambda *_args: temporary)
     first = machine_agent._probe_primary_demand(
         runtime,
         {binding.project_id: cfg},
@@ -264,7 +290,7 @@ def test_temporary_primary_dependency_gate_is_rechecked_before_borrowing(
     )
 
     claimable = ReadyClassificationResult("claimable", "eligible_truth", task)
-    monkeypatch.setattr(machine_agent, "classify_ready_marker", lambda *_args: claimable)
+    monkeypatch.setattr(primary_demand, "classify_ready_marker", lambda *_args: claimable)
     second = machine_agent._probe_primary_demand(
         runtime,
         {binding.project_id: cfg},
@@ -291,7 +317,7 @@ def test_primary_probe_retains_dependency_recheck_across_budgeted_batches(
     temporary = ReadyClassificationResult("temporarily_unavailable", "dependency_waiting")
     route_key = (binding.project_id, "home", "gpu")
 
-    monkeypatch.setattr(machine_agent, "classify_ready_marker", lambda *_args: temporary)
+    monkeypatch.setattr(primary_demand, "classify_ready_marker", lambda *_args: temporary)
     limited = SliceBudget(
         WorkBudgetPolicy(record_hard_limit=1, operation_hard_limit=32, initial_batch_size=1),
         clock_ns=lambda: 0,
@@ -314,7 +340,7 @@ def test_primary_probe_retains_dependency_recheck_across_budgeted_batches(
     assert runtime.primary_probe.route(route_key).is_complete
 
     claimable = ReadyClassificationResult("claimable", "eligible_truth", first_task)
-    monkeypatch.setattr(machine_agent, "classify_ready_marker", lambda *_args: claimable)
+    monkeypatch.setattr(primary_demand, "classify_ready_marker", lambda *_args: claimable)
     rechecked = machine_agent._probe_primary_demand(
         runtime,
         {binding.project_id: cfg},
@@ -767,7 +793,7 @@ def test_primary_probe_uses_primary_projection_without_scanning_borrow_markers(
     def fail_if_marker_is_classified(*_args, **_kwargs):
         raise AssertionError("borrow markers must not be classified by primary probe")
 
-    monkeypatch.setattr(machine_agent, "classify_ready_marker", fail_if_marker_is_classified)
+    monkeypatch.setattr(primary_demand, "classify_ready_marker", fail_if_marker_is_classified)
     probe = machine_agent._probe_primary_demand(
         runtime,
         {binding.project_id: cfg},
@@ -1035,7 +1061,7 @@ def test_primary_probe_rechecks_completed_shared_scope_before_borrow(
     attach(runtime.root, occupied["reservation"]["reservation_id"], "occupied-attempt", 1)
     executor = _RecordingExecutor()
 
-    original_peek = machine_agent.peek_primary_ready_marker
+    original_peek = primary_demand.peek_primary_ready_marker
     should_force_shared_complete = True
     should_force_home_incomplete = True
 
@@ -1054,7 +1080,7 @@ def test_primary_probe_rechecks_completed_shared_scope_before_borrow(
             return ReadyPeek(None, peek.cursor, exhausted=True)
         return peek
 
-    monkeypatch.setattr(machine_agent, "peek_primary_ready_marker", control_probe_progress)
+    monkeypatch.setattr(primary_demand, "peek_primary_ready_marker", control_probe_progress)
 
     first_results = dispatch_machine_cycle_locked(
         runtime,
@@ -1324,6 +1350,31 @@ def test_ready_cursor_advances_past_temporarily_unavailable_candidate(tmp_path: 
     assert cursor.after_name == f"{ready.task_id}.{ready.ready_generation}.json"
     assert cursor.revision >= 2
     assert paused.task_id not in launched
+
+
+def test_damaged_ready_cursor_retains_legacy_conservative_fallback(tmp_path: Path) -> None:
+    cfg = init_shared_root(tmp_path / "project" / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime")
+    cursor_path = shared_paths(cfg.shared_root)["ready_cursors"] / "project-a.gpu-1.home.json"
+    atomic_replace(
+        cursor_path,
+        {
+            "cursor": {
+                "schema_version": True,
+                "project_id": "project-a",
+                "machine_name": "gpu-1",
+                "queue_scope": "home",
+                "catalog_page": "-1",
+                "partition": None,
+                "after_name": None,
+                "revision": 0,
+            }
+        },
+    )
+
+    assert load_ready_cursor(cfg, "project-a", "home").catalog_page == -1
+
+    cursor_path.write_text("{", encoding="utf-8")
+    assert load_ready_cursor(cfg, "project-a", "home").catalog_page == 0
 
 
 def test_candidate_cursor_wraps_without_repeating_a_marker_in_one_slice(tmp_path: Path) -> None:

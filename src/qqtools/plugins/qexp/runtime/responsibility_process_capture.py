@@ -5,14 +5,14 @@ from __future__ import annotations
 import os
 import stat
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
 from ..config_types import RootConfig
 from ..infrastructure.host import host_instance_id
 from .records import validate_identifier
-from .responsibility_capture import CAPTURE_BATCH_SIZE, WriterCaptureCheckpoint, capture_admission
+from .responsibility_capture import CAPTURE_BATCH_SIZE, SourceHold, WriterCaptureCheckpoint, capture_admission
 from .responsibility_import import recovery_locator
 from .responsibility_store import Ledger, Unavailable, validate_captured_writer
 
@@ -82,12 +82,31 @@ class RunnerProcessCapture:
     No Task history is read and no process is launched, killed or signalled.
     """
 
-    def __init__(self, cfg: RootConfig, ledger: Ledger, *, legacy_source: Path | None = None) -> None:
+    def __init__(
+        self,
+        cfg: RootConfig,
+        ledger: Ledger,
+        *,
+        legacy_source: Path | None = None,
+        source_hold: SourceHold | None = None,
+    ) -> None:
         self.cfg = cfg
+        if source_hold is not None:
+            if source_hold.target_root != cfg.runtime_root or (
+                legacy_source is not None and legacy_source != source_hold.source_root
+            ):
+                raise ValueError("process capture source hold belongs to another runtime")
+            legacy_source = source_hold.source_root
         self.checkpoint = WriterCaptureCheckpoint(ledger, cfg.runtime_root, legacy_source=legacy_source)
+        self._source_hold = source_hold
         self._entries = None
         self._iterator_scope: dict | None = None
         self._admission: dict | None = None
+
+    def _checkpoint_observation(self) -> AbstractContextManager[WriterCaptureCheckpoint]:
+        if self._source_hold is not None:
+            return self.checkpoint.observe_local(self._source_hold)
+        return self.checkpoint.observe()
 
     def _check_admission(self, checkpoint: WriterCaptureCheckpoint) -> None:
         if checkpoint.admission != self._admission:
@@ -99,6 +118,11 @@ class RunnerProcessCapture:
         self._entries = None
         self._iterator_scope = None
 
+    @property
+    def has_open_scan(self) -> bool:
+        """Whether eviction would discard an unfinished process iterator."""
+        return self._entries is not None
+
     def restart_after_reboot(self) -> bool:
         """Replay retained writers and restart only on a new boot of the same host.
 
@@ -107,7 +131,7 @@ class RunnerProcessCapture:
         Retention and enrollment identity survive; evidence must be swept again.
         """
         self.close()
-        with self.checkpoint.observe() as checkpoint:
+        with self._checkpoint_observation() as checkpoint:
             self._check_admission(checkpoint)
             scope = _process_scope()
             validate_captured_writer({**scope, "pid": 1, "start_time_ticks": 0})
@@ -136,7 +160,7 @@ class RunnerProcessCapture:
     def prepare_admission(self, owner: dict) -> None:
         """Start a fresh post-fence census once, retaining prior durable writers."""
         self.close()
-        with self.checkpoint.observe() as checkpoint:
+        with self._checkpoint_observation() as checkpoint:
             scope = _process_scope()
             previous = checkpoint.progress
             revision = 0
@@ -162,7 +186,7 @@ class RunnerProcessCapture:
         This verifies process-sweep ordering and context, not an admission fence
         or complete discovery. Target and source retention remain pending.
         """
-        with self.checkpoint.observe() as checkpoint:
+        with self._checkpoint_observation() as checkpoint:
             self._check_admission(checkpoint)
             state = self._progress(checkpoint.progress, _process_scope())
             if not state["is_sweep_complete"]:
@@ -172,7 +196,7 @@ class RunnerProcessCapture:
     def _progress(self, previous: dict | None, scope: dict) -> dict:
         context = {
             "format": SCAN_FORMAT,
-            "shared_root": str(self.cfg.shared_root.resolve()),
+            "shared_root": str(self.cfg.shared_root),
             "machine_name": self.cfg.machine_name,
             **scope,
         }
@@ -203,12 +227,15 @@ class RunnerProcessCapture:
         shared = fields.get("--shared-root")
         if not shared or not Path(shared).is_absolute():
             raise Unavailable("runner command has no absolute shared root")
-        if Path(shared).resolve() != self.cfg.shared_root.resolve():
+        # Supported runner launches already carry canonical absolute paths.
+        # Resolving a command belonging to another Project here would cross
+        # shared storage while the local capture checkpoint is held.
+        if Path(shared) != self.cfg.shared_root:
             return None
         root = fields.get("--runtime-root")
         if not root or not Path(root).is_absolute():
             raise Unavailable("runner command has no absolute runtime root")
-        runtime = Path(root).resolve()
+        runtime = Path(root)
         if runtime not in {self.checkpoint.runtime_root, self.checkpoint.legacy_source}:
             return None
         if set(fields) != RUNNER_OPTIONS:
@@ -277,7 +304,7 @@ class RunnerProcessCapture:
         if type(limit) is not int or not 1 <= limit <= CAPTURE_BATCH_SIZE:
             raise ValueError("process capture limit must be in 1..64")
         try:
-            with self.checkpoint.observe() as checkpoint:
+            with self._checkpoint_observation() as checkpoint:
                 self._check_admission(checkpoint)
                 scope = _process_scope()
                 state = self._progress(checkpoint.progress, scope)

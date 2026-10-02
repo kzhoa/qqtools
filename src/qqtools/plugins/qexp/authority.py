@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import copy
 import uuid
 from collections.abc import Generator, Iterable
 from contextlib import nullcontext
@@ -15,6 +14,7 @@ from .lease import AuthorityResolutionOutcome, LeasePolicy, LeaseRenewalOutcome,
 from .lifecycle import TerminalTransition, commit_terminal_transition_locked, dispatch_task_lifecycle_hooks_noexcept
 from .runtime.authority_scan import EvidenceScan, is_path_present
 from .runtime.claims import archive_claim, reconcile_claim_archives
+from .runtime.local_exit_reconciliation import LocalExitReconciler
 from .runtime.locks import exclusive
 from .runtime.paths import attempt_path, local_paths
 from .runtime.process_evidence import inspect_group_identity, inspect_local_group_identity, inspect_wrapper_identity
@@ -36,8 +36,10 @@ from .runtime.responsibility_cleanup import (
 )
 from .runtime.responsibility_import import recovery_locator
 from .runtime.responsibility_store import Ledger, ServiceTraversal
+from .runtime.running_publication import publish_running_registration
 from .runtime.store import atomic_replace, iter_json, read_json
-from .runtime.tasks import load_task, save_task
+from .runtime.tasks import load_task
+from .runtime.terminal_evidence import canonical_attempt_number, load_settled_terminal_attempt
 from .runtime.termination import (
     advance_signals,
     attempt_control_lock,
@@ -70,7 +72,11 @@ class AuthoritySupervisor:
         self.metrics: dict[str, int | float] = {}
         self.cfg = cfg
         self.reservation_runtime_root = reservation_runtime_root or cfg.runtime_root
-        self._allows_projectless_reservations = self.reservation_runtime_root.resolve() == cfg.runtime_root.resolve()
+        self._local_exit_reconciler = LocalExitReconciler(
+            cfg.runtime_root,
+            reservation_runtime_root=self.reservation_runtime_root,
+            project_id=cfg.runtime_root.name,
+        )
         self._last_renewal: dict[str, float] = {}
         self._termination_deadlines: dict[tuple[str, str], float] = {}
         self._failures: dict[str, int] = {}
@@ -81,9 +87,6 @@ class AuthoritySupervisor:
         self._refresh_policy()
         self._work = None
         self._cleanup_traversal: ServiceTraversal | None = None
-        capacity_paths = local_paths(self.reservation_runtime_root)
-        self._capacity_scans = (EvidenceScan(capacity_paths["active"]), EvidenceScan(capacity_paths["cpu_active"]))
-        self._capacity_turn = 0
 
     def tick_bounded(self, limit: int = 64) -> dict[str, object]:
         """Advance resumable discovery and supervision without a full inventory pass."""
@@ -102,8 +105,7 @@ class AuthoritySupervisor:
         """Release advisory cursors after this supervisor is no longer scheduled."""
         if self._work is not None:
             self._work.close()
-        for scan in self._capacity_scans:
-            scan.close()
+        self._local_exit_reconciler.close()
 
     def recover_startup(self) -> None:
         if self.work_limit is not None:
@@ -196,23 +198,8 @@ class AuthoritySupervisor:
         return None
 
     def reconcile_local_exit_evidence(self, *, limit: int | None = None) -> None:
-        """Release verified finished local occupancy without reading shared Task truth."""
-        paths = local_paths(self.cfg.runtime_root)
-        if limit is None:
-            for observation in iter_json(paths["observations"]):
-                self._reconcile_local_exit_observation(observation)
-            return
-        if type(limit) is not int or limit <= 0:
-            raise ValueError("local capacity discovery limit must be a positive integer")
-        for identity in self._local_capacity_page("local-capacity", limit=limit):
-            if not self._owns_local_reservation(identity):
-                continue
-            attempt_id = identity.attempt_id
-            if not attempt_id or attempt_id in {".", ".."} or "/" in attempt_id or "\\" in attempt_id:
-                continue
-            self._reconcile_local_exit_observation(
-                paths["observations"] / f"{attempt_id}.json", reservation_identity=identity
-            )
+        """Release verified finished local occupancy without reading shared task truth."""
+        self._local_exit_reconciler.reconcile(limit=limit, bounded=self._work is not None)
 
     def _reconcile_local_exit_observation(
         self,
@@ -220,20 +207,11 @@ class AuthoritySupervisor:
         *,
         reservation_identity: ReservationIdentity | None = None,
     ) -> None:
-        paths = local_paths(self.cfg.runtime_root)
-        attempt_id = observation.stem
-        try:
-            manifest = paths["processes"] / observation.name
-            if manifest.exists():
-                process = read_json(manifest)["process"]
-            else:
-                process = read_json(paths["registrations"] / observation.name)["process_registration"]
-            if not isinstance(process, dict):
-                raise ValueError("local process evidence must be an object")
-            if process.get("attempt_id") == attempt_id:
-                self._release_finished_local_capacity(process, reservation_identity=reservation_identity)
-        except (OSError, KeyError, TypeError, ValueError):
-            self._record_diagnostic({"attempt_id": attempt_id}, "local_capacity_reconciliation_unavailable")
+        self._local_exit_reconciler.reconcile_observation(
+            observation,
+            reservation_identity=reservation_identity,
+            bounded=self._work is not None,
+        )
 
     def _release_finished_local_capacity(
         self,
@@ -241,78 +219,17 @@ class AuthoritySupervisor:
         *,
         reservation_identity: ReservationIdentity | None = None,
     ) -> None:
-        """Retain recovery evidence while releasing an identity-verified absent process."""
-        task_id, attempt_id = process.get("task_id"), process.get("attempt_id")
-        if not isinstance(task_id, str) or not isinstance(attempt_id, str):
-            return
-        paths = local_paths(self.cfg.runtime_root)
-        try:
-            registration = read_json(paths["registrations"] / f"{attempt_id}.json")["process_registration"]
-            if not isinstance(registration, dict):
-                raise ValueError("local process registration must be an object")
-            for key in ("task_id", "attempt_id", "process_group_id", "process_group_start_time_ticks"):
-                if registration.get(key) is None or registration.get(key) != process.get(key):
-                    return
-            group = registration["process_group_id"]
-            if not isinstance(group, int) or group <= 0:
-                return
-            if inspect_group_identity(registration, process).state != "absent":
-                return
-            is_valid, _code = self._read_exit_observation(
-                paths["observations"] / f"{attempt_id}.json", task_id, attempt_id, process
-            )
-            if not is_valid:
-                return
-            if reservation_identity is None and self._work is not None:
-                self.reconcile_local_exit_evidence(limit=8)
-                return
-            identities = (
-                (reservation_identity,)
-                if reservation_identity is not None
-                else (
-                    ReservationIdentity.from_record(record)
-                    for record in reservation_snapshot(self.reservation_runtime_root).reservations
-                )
-            )
-            for identity in identities:
-                if not self._owns_local_reservation(identity):
-                    continue
-                if (
-                    identity.task_id == task_id
-                    and identity.attempt_id == attempt_id
-                    and identity.fencing_token == process.get("fencing_token")
-                ):
-                    release_if_matches(self.reservation_runtime_root, identity, "local_process_exited")
-        except (OSError, KeyError, TypeError, ValueError):
-            self._record_diagnostic(process, "local_capacity_reconciliation_unavailable")
-
-    def _owns_local_reservation(self, identity: ReservationIdentity) -> bool:
-        return identity.project_id == self.cfg.runtime_root.name or (
-            identity.project_id is None and self._allows_projectless_reservations
+        self._local_exit_reconciler.release_finished(
+            process,
+            reservation_identity=reservation_identity,
+            bounded=self._work is not None,
         )
 
+    def _owns_local_reservation(self, identity: ReservationIdentity) -> bool:
+        return self._local_exit_reconciler.owns_reservation(identity)
+
     def _local_capacity_page(self, attempt_id: str, *, limit: int = 8) -> Iterable[ReservationIdentity]:
-        turn = self._capacity_turn
-        self._capacity_turn = (turn + 1) % len(self._capacity_scans)
-        quota, remainder = divmod(limit, len(self._capacity_scans))
-        for offset in range(len(self._capacity_scans)):
-            budget = quota + (offset < remainder)
-            if not budget:
-                continue
-            scan = self._capacity_scans[(turn + offset) % len(self._capacity_scans)]
-            try:
-                page = scan.take(budget)
-            except OSError:
-                self._record_diagnostic({"attempt_id": attempt_id}, "local_reservation_unreadable")
-                continue
-            for path in page.paths:
-                try:
-                    reservation = read_json(path)["reservation"]
-                    if not isinstance(reservation, dict):
-                        raise ValueError("local reservation must be an object")
-                    yield ReservationIdentity.from_record(reservation)
-                except (OSError, KeyError, TypeError, ValueError):
-                    self._record_diagnostic({"attempt_id": attempt_id}, "local_reservation_unreadable")
+        return self._local_exit_reconciler.capacity_page(attempt_id, limit=limit)
 
     @property
     def renewal_interval_seconds(self) -> float:
@@ -367,20 +284,7 @@ class AuthoritySupervisor:
         return self._policy
 
     def _record_diagnostic(self, process: dict[str, object], reason: str, error: Exception | None = None) -> None:
-        attempt_id = process.get("attempt_id")
-        if not isinstance(attempt_id, str):
-            return
-        value: dict[str, object] = {"attempt_id": attempt_id, "reason": reason, "at": utc_now()}
-        if error is not None:
-            value["error_type"] = type(error).__name__
-            value["error"] = str(error)
-        try:
-            atomic_replace(
-                local_paths(self.cfg.runtime_root)["authority_diagnostics"] / f"{attempt_id}.json",
-                {"authority_diagnostic": value},
-            )
-        except OSError:
-            pass
+        self._local_exit_reconciler.record_diagnostic(process, reason, error)
 
     def _set_authority_state(self, process: dict[str, object], state: str) -> None:
         attempt_id = process.get("attempt_id")
@@ -422,69 +326,8 @@ class AuthoritySupervisor:
         token = registration.get("fencing_token")
         if not isinstance(task_id, str) or not isinstance(attempt_id, str) or not isinstance(token, int):
             return
-        with attempt_control_lock(self.cfg, attempt_id):
-            task = load_task(self.cfg, task_id)
-            with authority_locks(self.cfg, task):
-                task = load_task(self.cfg, task_id)
-                claim = task.claim_control.get("active_claim") or {}
-                number = task.attempt_control.get("current_attempt_number")
-                if not isinstance(number, int):
-                    return
-                try:
-                    attempt_file = attempt_path(self.cfg.shared_root, task_id, number)
-                    stored_attempt = read_json(attempt_file)
-                    attempt = AttemptRecord.from_dict(stored_attempt)
-                    original_attempt_value = copy.deepcopy(stored_attempt)
-                except (FileNotFoundError, KeyError, ValueError):
-                    return
-                if (
-                    claim.get("attempt_id") != attempt_id
-                    or claim.get("fencing_token") != token
-                    or claim.get("machine_name") != self.cfg.machine_name
-                    or attempt.attempt_id != attempt_id
-                    or attempt.current_fencing_token != token
-                    or attempt.machine_name != self.cfg.machine_name
-                ):
-                    return
-                if claim.get("launch_state") not in {"starting", "running"} or attempt.phase not in {
-                    "starting",
-                    "running",
-                }:
-                    return
-                for key in (
-                    "wrapper_pid",
-                    "wrapper_start_time_ticks",
-                    "process_group_id",
-                    "process_group_start_time_ticks",
-                ):
-                    value = registration.get(key)
-                    if value is not None:
-                        existing = attempt.process.get(key)
-                        if existing is not None and existing != value:
-                            return
-                        attempt.process[key] = value
-                attempt.process["local_process_manifest"] = str(manifest)
-                created_at = registration.get("process_created_at")
-                if not isinstance(created_at, str):
-                    return
-                existing_created = attempt.timestamps.get("process_created_at")
-                if existing_created is not None and existing_created != created_at:
-                    return
-                attempt.timestamps["process_created_at"] = created_at
-                if attempt.timestamps.get("running_at") is None:
-                    attempt.timestamps["running_at"] = utc_now()
-                was_running = attempt.phase == "running"
-                attempt.phase = "running"
-                attempt_value = attempt.to_dict()
-                if attempt_value != original_attempt_value:
-                    atomic_replace(attempt_file, attempt_value)
-                if not was_running:
-                    self._observe_latency("registration_to_running", registration.get("process_created_at"))
-                if claim.get("launch_state") != "running":
-                    claim["launch_state"] = "running"
-                    task.meta["revision"] += 1
-                    task.meta["updated_at"] = utc_now()
-                    save_task(self.cfg, task)
+        if publish_running_registration(self.cfg, registration, manifest):
+            self._observe_latency("registration_to_running", registration.get("process_created_at"))
 
     def _materialize_registrations(
         self,
@@ -503,21 +346,24 @@ class AuthoritySupervisor:
     def _materialize_registration(self, path: Path) -> None:
         if self._work is None and self._remove_terminal_attempt_evidence(path.stem):
             return
+        publication: tuple[dict[str, object], Path] | None = None
         with evidence_write_guard(self.cfg.runtime_root, path.stem) as acquired:
             if acquired:
-                self._materialize_registration_locked(path)
+                publication = self._materialize_registration_locked(path)
+        if publication is not None:
+            self._publish_running(*publication)
 
-    def _materialize_registration_locked(self, path: Path) -> None:
+    def _materialize_registration_locked(self, path: Path) -> tuple[dict[str, object], Path] | None:
         registration = read_json(path).get("process_registration", {})
         if not isinstance(registration, dict):
             raise ValueError("local process registration must be an object")
         if registration.get("protocol_version") != 1:
-            return
+            return None
         attempt_id = registration.get("attempt_id")
         if not isinstance(attempt_id, str):
-            return
+            return None
         if self._work is not None and self._work.is_control_pending(attempt_id):
-            return
+            return None
         manifest = local_paths(self.cfg.runtime_root)["processes"] / f"{attempt_id}.json"
         if not manifest.exists():
             value = dict(registration)
@@ -531,7 +377,7 @@ class AuthoritySupervisor:
             )
             atomic_replace(manifest, {"process": value})
             self._observe_latency("registration_to_manifest", registration.get("process_created_at"))
-        self._publish_running(registration, manifest)
+        return registration, manifest
 
     def _materialize_unverified_intents(self) -> None:
         for path in iter_json(local_paths(self.cfg.runtime_root)["launch_intents"]):
@@ -540,31 +386,34 @@ class AuthoritySupervisor:
     def _materialize_unverified_intent(self, path: Path) -> None:
         if self._work is None and self._remove_terminal_attempt_evidence(path.stem):
             return
+        publication: tuple[dict[str, object], Path] | None = None
         with evidence_write_guard(self.cfg.runtime_root, path.stem) as acquired:
             if acquired:
-                self._materialize_unverified_intent_locked(path)
+                publication = self._materialize_unverified_intent_locked(path)
+        if publication is not None:
+            self._publish_running(*publication)
 
-    def _materialize_unverified_intent_locked(self, path: Path) -> None:
+    def _materialize_unverified_intent_locked(self, path: Path) -> tuple[dict[str, object], Path] | None:
         intent = read_json(path).get("launch_intent", {})
         if not isinstance(intent, dict):
             raise ValueError("local launch intent must be an object")
         if intent.get("protocol_version") != 1:
-            return
+            return None
         attempt_id = intent.get("attempt_id")
         if not isinstance(attempt_id, str):
-            return
+            return None
         if self._work is not None and self._work.is_control_pending(attempt_id):
-            return
+            return None
         registration = local_paths(self.cfg.runtime_root)["registrations"] / f"{attempt_id}.json"
         manifest = local_paths(self.cfg.runtime_root)["processes"] / f"{attempt_id}.json"
         if manifest.exists():
-            return
+            return None
         if registration.exists():
             if self._work is not None:
-                self._materialize_registration_locked(registration)
-            return
+                return self._materialize_registration_locked(registration)
+            return None
         if self._wrapper_matches(intent):
-            return
+            return None
         value = dict(intent)
         value.update(
             {
@@ -576,6 +425,7 @@ class AuthoritySupervisor:
         )
         atomic_replace(manifest, {"process": value})
         self._record_diagnostic(value, "launch_registration_missing")
+        return None
 
     @staticmethod
     def _wrapper_matches(intent: dict[str, object]) -> bool:
@@ -746,30 +596,7 @@ class AuthoritySupervisor:
     def _read_exit_observation(
         self, path: Path, task_id: str, attempt_id: str, process: dict[str, object]
     ) -> tuple[bool, int | None]:
-        """Validate immutable exit identity before publishing terminal Task truth."""
-        try:
-            record = read_json(path)
-            observation = record.get("exit_observation") if isinstance(record, dict) else None
-        except (OSError, ValueError, TypeError):
-            self._record_diagnostic(process, "exit_observation_unreadable")
-            return False, None
-        if not isinstance(observation, dict):
-            self._record_diagnostic(process, "exit_observation_unreadable")
-            return False, None
-        if observation.get("protocol_version", 1) != 1:
-            self._record_diagnostic(process, "exit_observation_protocol_unsupported")
-            return False, None
-        if observation.get("attempt_id") != attempt_id or observation.get("task_id") not in {
-            None,
-            task_id,
-        }:
-            self._record_diagnostic(process, "exit_observation_identity_mismatch")
-            return False, None
-        code = observation.get("observed_exit_code")
-        if type(code) is not int:
-            self._record_diagnostic(process, "exit_observation_code_invalid")
-            return False, None
-        return True, code
+        return self._local_exit_reconciler.read_exit_observation(path, task_id, attempt_id, process)
 
     def _reconcile_orphaned_process(self, process: dict[str, object], task: object) -> None:
         """Recover or finalize one process whose lease was archived while offline."""
@@ -914,58 +741,16 @@ class AuthoritySupervisor:
     def _terminal_attempt_for_cleanup(
         self, task_id: str, attempt_id: str, *, attempt_number: int | None = None
     ) -> AttemptRecord | None:
-        """Resolve settled current or historical truth without scanning Attempts."""
-        task = load_task(self.cfg, task_id)
-        claim = task.claim_control.get("active_claim") or {}
-        if not isinstance(claim, dict) or claim.get("attempt_id") == attempt_id:
-            return None
-        current_id = task.attempt_control.get("current_attempt_id")
-        current_number = task.attempt_control.get("current_attempt_number")
-        number = current_number if attempt_number is None else attempt_number
-        # Scheduler identities encode their immutable number. An opaque historical
-        # identity may instead have a captured direct locator. Either hint must
-        # still match authoritative Task/Attempt truth below before it is used.
-        prefix = f"{task_id}-attempt-"
-        has_canonical_number = False
-        if attempt_id.startswith(prefix):
-            suffix = attempt_id[len(prefix) :]
-            if suffix.isascii() and suffix.isdecimal() and suffix == str(int(suffix)):
-                has_canonical_number = True
-                number = int(suffix)
-                if attempt_number is not None and number != attempt_number:
-                    return None
-        if not has_canonical_number and attempt_number is None:
-            locator = self._recorded_recovery_locator(attempt_id)
-            if locator is not None:
-                if locator["task_id"] not in (None, task_id):
-                    return None
-                if locator["attempt_number"] is not None:
-                    number = locator["attempt_number"]
-        if type(number) is not int or type(current_number) is not int or not 1 <= number <= current_number:
-            return None
-        if number == current_number:
-            # A terminal Attempt can precede its Task commit after a crash. Only
-            # committed Task terminal truth or a completed retry transition proves
-            # that this Attempt no longer owns the Task's terminal publication.
-            if claim or task.state.get("projection") not in {"succeeded", "failed", "cancelled", "queued"}:
-                return None
-            if current_id not in {None, attempt_id}:
-                return None
-            if task.state.get("projection") == "queued" and current_id is not None:
-                return None
-        next_number = task.attempt_control.get("next_attempt_number")
-        if type(next_number) is not int or number >= next_number:
-            return None
-        attempt = AttemptRecord.from_dict(read_json(attempt_path(self.cfg.shared_root, task_id, number)))
-        if (
-            attempt.task_id != task_id
-            or attempt.attempt_id != attempt_id
-            or attempt.attempt_number != number
-            or attempt.machine_name != self.cfg.machine_name
-            or attempt.phase not in {"succeeded", "failed", "cancelled"}
-        ):
-            return None
-        return attempt
+        recovery = None
+        if attempt_number is None and canonical_attempt_number(task_id, attempt_id) is None:
+            recovery = self._recorded_recovery_locator(attempt_id)
+        return load_settled_terminal_attempt(
+            self.cfg,
+            task_id,
+            attempt_id,
+            attempt_number=attempt_number,
+            recovery_locator=recovery,
+        )
 
     def _has_terminal_attempt(self, task_id: str, attempt_id: str, *, attempt_number: int | None = None) -> bool:
         try:

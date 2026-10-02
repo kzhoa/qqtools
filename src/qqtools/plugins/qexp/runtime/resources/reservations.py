@@ -5,12 +5,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from ...gpu_policy import GpuReservationPolicy, validate_gpu_reservation
 from ..locks import exclusive
 from ..paths import local_paths
-from ..records import new_id, utc_now
+from ..records import new_id, utc_now, validate_identifier
 from ..store import atomic_replace, iter_json, read_json
 from ..work_budget import diagnostic_increment, diagnostic_span
 
@@ -29,6 +29,10 @@ class ReservationIdentity:
     fencing_token: int | None
     gpu_ids: tuple[int, ...]
     cpu_slots: int | None
+    shared_root: str | None = None
+    registration_generation: str | None = None
+    executor_epoch: str | None = None
+    executor_request_id: str | None = None
 
     @classmethod
     def from_record(cls, reservation: dict[str, Any]) -> "ReservationIdentity":
@@ -40,6 +44,8 @@ class ReservationIdentity:
         if (
             not isinstance(reservation_id, str)
             or not reservation_id
+            or reservation_id in {".", ".."}
+            or Path(reservation_id).name != reservation_id
             or not isinstance(acquisition_id, str)
             or not acquisition_id
             or not isinstance(task_id, str)
@@ -61,6 +67,24 @@ class ReservationIdentity:
             raise ValueError("active reservation attempt_id must be a string or null.")
         if fencing_token is not None and type(fencing_token) is not int:
             raise ValueError("active reservation fencing_token must be an integer or null.")
+        shared_root = reservation.get("shared_root")
+        if shared_root is not None and not isinstance(shared_root, str):
+            raise ValueError("active reservation shared_root must be a string or null.")
+        executor_owner = reservation.get("executor_owner")
+        if executor_owner is None:
+            registration_generation = executor_epoch = executor_request_id = None
+        else:
+            if not isinstance(executor_owner, dict) or set(executor_owner) != {
+                "executor_epoch",
+                "request_id",
+                "registration_generation",
+            }:
+                raise ValueError("active reservation executor owner is malformed.")
+            executor_epoch = _require_bounded_id(executor_owner["executor_epoch"], "executor_epoch")
+            executor_request_id = _require_bounded_id(executor_owner["request_id"], "executor_request_id")
+            registration_generation = _require_bounded_id(
+                executor_owner["registration_generation"], "registration_generation"
+            )
         return cls(
             reservation_id,
             acquisition_id,
@@ -70,13 +94,109 @@ class ReservationIdentity:
             fencing_token,
             tuple(gpu_ids or ()),
             cpu_slots,
+            shared_root,
+            registration_generation,
+            executor_epoch,
+            executor_request_id,
         )
 
     def matches(self, reservation: dict[str, Any]) -> bool:
         try:
-            return self == type(self).from_record(reservation)
+            observed = type(self).from_record(reservation)
         except ValueError:
             return False
+        base_fields = (
+            "reservation_id",
+            "acquisition_id",
+            "project_id",
+            "task_id",
+            "attempt_id",
+            "fencing_token",
+            "gpu_ids",
+            "cpu_slots",
+        )
+        if any(getattr(self, field) != getattr(observed, field) for field in base_fields):
+            return False
+        if not _identity_has_executor_owner(self):
+            return True
+        executor_fields = (
+            "shared_root",
+            "registration_generation",
+            "executor_epoch",
+            "executor_request_id",
+        )
+        return all(getattr(self, field) == getattr(observed, field) for field in executor_fields)
+
+    def exactly_matches(self, reservation: dict[str, Any]) -> bool:
+        """Return whether every identity field, including absent ownership, matches."""
+        try:
+            observed = type(self).from_record(reservation)
+        except ValueError:
+            return False
+        return self == observed
+
+
+def _require_bounded_id(value: object, label: str) -> str:
+    if not isinstance(value, str) or not value or len(value) > 128 or "\x00" in value:
+        raise ValueError(f"{label} must be a bounded nonempty identifier.")
+    try:
+        validate_identifier(value, label)
+    except ValueError as exc:
+        raise ValueError(f"{label} must be a bounded nonempty identifier.") from exc
+    return value
+
+
+def _executor_owner(
+    executor_epoch: str | None,
+    executor_request_id: str | None,
+    registration_generation: str | None,
+    *,
+    project_id: str | None,
+    shared_root: str | None,
+    task_id: str,
+    attempt_id: str | None,
+    fencing_token: int | None,
+) -> dict[str, str] | None:
+    values = (executor_epoch, executor_request_id, registration_generation)
+    if all(value is None for value in values):
+        return None
+    if any(value is None for value in values):
+        raise ValueError("executor_epoch, executor_request_id, and registration_generation must be provided together.")
+    epoch = _require_bounded_id(executor_epoch, "executor_epoch")
+    request_id = _require_bounded_id(executor_request_id, "executor_request_id")
+    generation = _require_bounded_id(registration_generation, "registration_generation")
+    if not project_id or not shared_root or not attempt_id or type(fencing_token) is not int or fencing_token <= 0:
+        raise ValueError("executor-owned reservations require exact Project and Attempt identity.")
+    _require_bounded_id(project_id, "project_id")
+    _require_bounded_id(task_id, "task_id")
+    _require_bounded_id(attempt_id, "attempt_id")
+    if (
+        not isinstance(shared_root, str)
+        or len(shared_root) > 4096
+        or "\x00" in shared_root
+        or not Path(shared_root).is_absolute()
+        or str(Path(shared_root)) != shared_root
+    ):
+        raise ValueError("executor-owned reservations require an absolute bounded shared_root.")
+    return {
+        "executor_epoch": epoch,
+        "request_id": request_id,
+        "registration_generation": generation,
+    }
+
+
+def _matches_executor_owner(reservation: dict[str, Any], identity: ReservationIdentity) -> bool:
+    if not _identity_has_executor_owner(identity):
+        return False
+    return reservation.get("executor_owner") == {
+        "executor_epoch": identity.executor_epoch,
+        "request_id": identity.executor_request_id,
+        "registration_generation": identity.registration_generation,
+    }
+
+
+def _identity_has_executor_owner(identity: ReservationIdentity) -> bool:
+    return bool(identity.executor_epoch and identity.executor_request_id and identity.registration_generation)
 
 
 @dataclass(frozen=True, slots=True)
@@ -106,7 +226,10 @@ def _reservation_values(directory: Path) -> list[dict[str, Any]]:
 
 
 def _is_expired(value: dict[str, Any]) -> bool:
-    expires_at = value["reservation"].get("expires_at")
+    reservation = value["reservation"]
+    if reservation.get("state") == "provisional" and "executor_owner" in reservation:
+        return False
+    expires_at = reservation.get("expires_at")
     if not expires_at:
         return False
     return datetime.fromisoformat(expires_at.replace("Z", "+00:00")) <= datetime.now(timezone.utc)
@@ -145,6 +268,7 @@ def _reserve_locked(
     admitted_as_borrow: bool,
     enforce_gpu_limit: bool,
     gpu_policy: GpuReservationPolicy | None = None,
+    executor_owner: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     _expire_provisionals(paths)
     if gpu_policy is not None:
@@ -167,34 +291,41 @@ def _reserve_locked(
         if usage + len(gpu_ids) > gpu_limit_gpus:
             raise ValueError(f"Group {group_name!r} GPU limit on machine {machine_name!r} would be exceeded.")
     reservation_id = new_id()
-    value = {
-        "reservation": {
-            "reservation_id": reservation_id,
-            "acquisition_id": new_id(),
-            "project_id": project_id,
-            "shared_root": shared_root,
-            "group_name": group_name,
-            "machine_name": machine_name,
-            "task_id": task_id,
-            "attempt_id": attempt_id,
-            "fencing_token": fencing_token,
-            "gpu_ids": list(gpu_ids),
-            "admission": {
-                "worker_scheduling_role": worker_scheduling_role,
-                "gpu_limit_gpus": gpu_limit_gpus,
-                "group_worker_set_epoch": group_worker_set_epoch,
-                "worker_state_epoch": worker_state_epoch,
-                "admitted_as_borrow": admitted_as_borrow,
-            },
-            "state": "provisional",
-            "created_at": utc_now(),
-            "expires_at": (datetime.now(timezone.utc) + timedelta(seconds=PROVISIONAL_TTL_SECONDS))
+    reservation = {
+        "reservation_id": reservation_id,
+        "acquisition_id": new_id(),
+        "project_id": project_id,
+        "shared_root": shared_root,
+        "group_name": group_name,
+        "machine_name": machine_name,
+        "task_id": task_id,
+        "attempt_id": attempt_id,
+        "fencing_token": fencing_token,
+        "gpu_ids": list(gpu_ids),
+        "admission": {
+            "worker_scheduling_role": worker_scheduling_role,
+            "gpu_limit_gpus": gpu_limit_gpus,
+            "group_worker_set_epoch": group_worker_set_epoch,
+            "worker_state_epoch": worker_state_epoch,
+            "admitted_as_borrow": admitted_as_borrow,
+        },
+        "state": "provisional",
+        "created_at": utc_now(),
+        "expires_at": (
+            None
+            if executor_owner is not None
+            else (datetime.now(timezone.utc) + timedelta(seconds=PROVISIONAL_TTL_SECONDS))
             .replace(microsecond=0)
             .isoformat()
-            .replace("+00:00", "Z"),
-            "released_at": None,
-            "release_reason": None,
-        }
+            .replace("+00:00", "Z")
+        ),
+        "released_at": None,
+        "release_reason": None,
+    }
+    if executor_owner is not None:
+        reservation["executor_owner"] = executor_owner
+    value = {
+        "reservation": reservation,
     }
     atomic_replace(paths["provisional"] / f"{reservation_id}.json", value)
     return value
@@ -217,7 +348,20 @@ def reserve(
     worker_state_epoch: int | None = None,
     admitted_as_borrow: bool = False,
     gpu_policy: GpuReservationPolicy | None = None,
+    executor_epoch: str | None = None,
+    executor_request_id: str | None = None,
+    registration_generation: str | None = None,
 ) -> dict[str, Any]:
+    owner = _executor_owner(
+        executor_epoch,
+        executor_request_id,
+        registration_generation,
+        project_id=project_id,
+        shared_root=shared_root,
+        task_id=task_id,
+        attempt_id=attempt_id,
+        fencing_token=fencing_token,
+    )
     paths = local_paths(runtime_root)
     with exclusive(paths["locks"] / "gpu-reservations.lock"):
         return _reserve_locked(
@@ -237,6 +381,7 @@ def reserve(
             admitted_as_borrow=admitted_as_borrow,
             enforce_gpu_limit=False,
             gpu_policy=gpu_policy,
+            executor_owner=owner,
         )
 
 
@@ -257,8 +402,21 @@ def reserve_admitted(
     shared_root: str | None = None,
     admitted_as_borrow: bool = True,
     gpu_policy: GpuReservationPolicy | None = None,
+    executor_epoch: str | None = None,
+    executor_request_id: str | None = None,
+    registration_generation: str | None = None,
 ) -> dict[str, Any]:
     """Atomically reserve GPUs after Group/Task admission authorization."""
+    owner = _executor_owner(
+        executor_epoch,
+        executor_request_id,
+        registration_generation,
+        project_id=project_id,
+        shared_root=shared_root,
+        task_id=task_id,
+        attempt_id=attempt_id,
+        fencing_token=fencing_token,
+    )
     paths = local_paths(runtime_root)
     with exclusive(paths["locks"] / "gpu-reservations.lock"):
         return _reserve_locked(
@@ -278,6 +436,7 @@ def reserve_admitted(
             admitted_as_borrow=admitted_as_borrow,
             enforce_gpu_limit=True,
             gpu_policy=gpu_policy,
+            executor_owner=owner,
         )
 
 
@@ -290,9 +449,202 @@ def attach(runtime_root: Path, reservation_id: str, attempt_id: str, fencing_tok
                 return
             raise FileNotFoundError(source)
         value = read_json(source)
+        if "executor_owner" in value.get("reservation", {}):
+            raise RuntimeError("executor-owned reservations require exact offer attachment.")
         value["reservation"].update({"state": "active", "attempt_id": attempt_id, "fencing_token": fencing_token})
         atomic_replace(paths["active"] / source.name, value)
         source.unlink(missing_ok=True)
+
+
+def attach_executor_offer(
+    runtime_root: Path,
+    identity: ReservationIdentity,
+    attempt_id: str,
+    fencing_token: int,
+) -> bool:
+    """Attach one exact executor-owned provisional offer, idempotently."""
+    if identity.cpu_slots is not None:
+        from .cpu_lane import attach_executor_offer as attach_cpu_executor_offer
+
+        return attach_cpu_executor_offer(runtime_root, identity, attempt_id, fencing_token)
+    if not _identity_has_executor_owner(identity):
+        raise ValueError("executor offer identity is incomplete.")
+    if identity.attempt_id != attempt_id or identity.fencing_token != fencing_token:
+        return False
+    paths = local_paths(runtime_root)
+    with exclusive(paths["locks"] / "gpu-reservations.lock"):
+        name = f"{identity.reservation_id}.json"
+        provisional = paths["provisional"] / name
+        active = paths["active"] / name
+        released = paths["released"] / name
+        if active.exists():
+            if released.exists():
+                return False
+            current = read_json(active).get("reservation", {})
+            active_matches = (
+                current.get("state") == "active"
+                and identity.matches(current)
+                and _matches_executor_owner(current, identity)
+            )
+            if not active_matches:
+                return False
+            if provisional.exists():
+                source = read_json(provisional).get("reservation", {})
+                if (
+                    source.get("state") != "provisional"
+                    or not identity.matches(source)
+                    or not _matches_executor_owner(source, identity)
+                ):
+                    return False
+                # Destination publication precedes source retirement. An exact
+                # pair is the durable crash image of this same transition.
+                provisional.unlink(missing_ok=True)
+            return True
+        if not provisional.exists() or released.exists():
+            return False
+        value = read_json(provisional)
+        reservation = value.get("reservation", {})
+        if (
+            reservation.get("state") != "provisional"
+            or not identity.matches(reservation)
+            or not _matches_executor_owner(reservation, identity)
+        ):
+            return False
+        if _is_expired(value):
+            return False
+        reservation["state"] = "active"
+        atomic_replace(active, value)
+        provisional.unlink(missing_ok=True)
+        return True
+
+
+def release_executor_offer(
+    runtime_root: Path,
+    identity: ReservationIdentity,
+    reason: str = "claim_not_committed",
+) -> bool:
+    """Release only an exact executor-owned provisional offer."""
+    if identity.cpu_slots is not None:
+        from .cpu_lane import release_executor_offer as release_cpu_executor_offer
+
+        return release_cpu_executor_offer(runtime_root, identity, reason)
+    if not _identity_has_executor_owner(identity):
+        raise ValueError("executor offer identity is incomplete.")
+    paths = local_paths(runtime_root)
+    with exclusive(paths["locks"] / "gpu-reservations.lock"):
+        source = paths["provisional"] / f"{identity.reservation_id}.json"
+        active = paths["active"] / source.name
+        released = paths["released"] / source.name
+        if released.exists():
+            if active.exists():
+                return False
+            current = read_json(released).get("reservation", {})
+            if (
+                current.get("state") != "released"
+                or not identity.matches(current)
+                or not _matches_executor_owner(current, identity)
+            ):
+                return False
+            if source.exists():
+                provisional = read_json(source).get("reservation", {})
+                if (
+                    provisional.get("state") != "provisional"
+                    or not identity.matches(provisional)
+                    or not _matches_executor_owner(provisional, identity)
+                ):
+                    return False
+                source.unlink(missing_ok=True)
+            return True
+        if not source.exists() or active.exists():
+            return False
+        value = read_json(source)
+        reservation = value.get("reservation", {})
+        if (
+            reservation.get("state") != "provisional"
+            or not identity.matches(reservation)
+            or not _matches_executor_owner(reservation, identity)
+        ):
+            return False
+        reservation.update({"state": "released", "released_at": utc_now(), "release_reason": reason})
+        atomic_replace(paths["released"] / source.name, value)
+        source.unlink(missing_ok=True)
+        return True
+
+
+def classify_executor_offer(
+    runtime_root: Path,
+    identity: ReservationIdentity,
+) -> Literal["absent", "matching_provisional", "matching_active", "matching_released", "conflict"]:
+    """Read one offer identity without expiring, attaching, or releasing it."""
+    if identity.cpu_slots is not None:
+        from .cpu_lane import classify_executor_offer as classify_cpu_executor_offer
+
+        return classify_cpu_executor_offer(runtime_root, identity)
+    if not _identity_has_executor_owner(identity):
+        raise ValueError("executor offer identity is incomplete.")
+    paths = local_paths(runtime_root)
+    with exclusive(paths["locks"] / "gpu-reservations.lock"):
+        name = f"{identity.reservation_id}.json"
+        found: list[tuple[str, Path]] = [
+            (state, paths[state] / name)
+            for state in ("provisional", "active", "released")
+            if (paths[state] / name).exists()
+        ]
+        if not found:
+            return "absent"
+        if len(found) != 1:
+            return "conflict"
+        state, path = found[0]
+        value = read_json(path)
+        reservation = value.get("reservation", {})
+        if (
+            reservation.get("state") != state
+            or not identity.matches(reservation)
+            or not _matches_executor_owner(reservation, identity)
+        ):
+            return "conflict"
+        if state == "provisional":
+            return "matching_provisional"
+        if state == "active":
+            return "matching_active"
+        return "matching_released"
+
+
+def classify_exact_reservation(
+    runtime_root: Path,
+    identity: ReservationIdentity,
+) -> Literal["absent", "matching_active", "matching_released", "matching_release_pair", "conflict"]:
+    """Read one active/released reservation using its complete local identity."""
+    if identity.cpu_slots is not None:
+        from .cpu_lane import classify_exact_reservation as classify_exact_cpu_reservation
+
+        return classify_exact_cpu_reservation(runtime_root, identity)
+    paths = local_paths(runtime_root)
+    with exclusive(paths["locks"] / "gpu-reservations.lock"):
+        name = f"{identity.reservation_id}.json"
+        found = [
+            (state, paths[state] / name)
+            for state in ("provisional", "active", "released")
+            if (paths[state] / name).exists()
+        ]
+        if not found:
+            return "absent"
+        states = {state for state, _path in found}
+        if states == {"active", "released"}:
+            if all(
+                reservation.get("state") == state and identity.exactly_matches(reservation)
+                for state, path in found
+                for reservation in (read_json(path).get("reservation", {}),)
+            ):
+                return "matching_release_pair"
+            return "conflict"
+        if len(found) != 1 or "provisional" in states:
+            return "conflict"
+        state, path = found[0]
+        reservation = read_json(path).get("reservation", {})
+        if reservation.get("state") != state or not identity.exactly_matches(reservation):
+            return "conflict"
+        return "matching_active" if state == "active" else "matching_released"
 
 
 def retag(runtime_root: Path, reservation_id: str, attempt_id: str, fencing_token: int) -> bool:
@@ -323,12 +675,15 @@ def retag_if_matches(
     """Retag an active reservation only if its full identity is unchanged."""
     paths = local_paths(runtime_root)
     with exclusive(paths["locks"] / "gpu-reservations.lock"):
-        path = paths["active"] / f"{identity.reservation_id}.json"
-        if not path.exists():
+        filename = f"{identity.reservation_id}.json"
+        matches = [paths[name] / filename for name in ("active", "provisional", "released")]
+        present = [path for path in matches if path.exists()]
+        path = paths["active"] / filename
+        if present != [path]:
             return False
         value = read_json(path)
         reservation = value.get("reservation", {})
-        if not identity.matches(reservation) or reservation.get("attempt_id") != attempt_id:
+        if not identity.exactly_matches(reservation) or reservation.get("attempt_id") != attempt_id:
             return False
         if reservation.get("fencing_token") == fencing_token:
             return True
@@ -348,6 +703,8 @@ def release(runtime_root: Path, reservation_id: str, reason: str = "completed") 
         if source is not None:
             source_file = source / f"{reservation_id}.json"
             value = read_json(source_file)
+            if source == paths["provisional"] and "executor_owner" in value.get("reservation", {}):
+                return
             value["reservation"].update({"state": "released", "released_at": utc_now(), "release_reason": reason})
             atomic_replace(paths["released"] / source_file.name, value)
             source_file.unlink(missing_ok=True)
@@ -370,12 +727,18 @@ def release_if_matches(
     paths = local_paths(runtime_root)
     with exclusive(paths["locks"] / "gpu-reservations.lock"):
         source = paths["active"] / f"{identity.reservation_id}.json"
-        if not source.exists():
+        provisional = paths["provisional"] / source.name
+        released = paths["released"] / source.name
+        if not source.exists() or provisional.exists():
             return False
         value = read_json(source)
         reservation = value.get("reservation", {})
-        if not identity.matches(reservation):
+        if not identity.exactly_matches(reservation):
             return False
+        if released.exists():
+            released_reservation = read_json(released).get("reservation", {})
+            if released_reservation.get("state") != "released" or not identity.exactly_matches(released_reservation):
+                return False
         reservation.update(
             {
                 "state": "released",
@@ -383,7 +746,7 @@ def release_if_matches(
                 "release_reason": reason,
             }
         )
-        atomic_replace(paths["released"] / source.name, value)
+        atomic_replace(released, value)
         source.unlink(missing_ok=True)
         return True
 

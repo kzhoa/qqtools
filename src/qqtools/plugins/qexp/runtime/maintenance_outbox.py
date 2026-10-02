@@ -15,7 +15,7 @@ from .directory_capture import read_directory_entry
 from .locks import exclusive
 from .project_activation import project_activation_transaction
 from .records import new_id, utc_now, validate_identifier
-from .store import atomic_replace, read_json_limited, require_json_size
+from .store import atomic_replace, check_mutation_fence, read_json_limited, require_json_size
 
 DESCRIPTOR_SCHEMA_VERSION = 1
 DESCRIPTOR_MAX_BYTES = 64 * 1024
@@ -198,6 +198,7 @@ def _write_slot(cfg: object, record: dict[str, Any], filename: str) -> None:
         if slot is None or slot["identity"] != record["identity"] or slot["filename"] != filename:
             raise ValueError("maintenance queue position is already owned by another descriptor.")
         return
+    check_mutation_fence(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     slot = {
         "maintenance_queue_slot": {
@@ -218,8 +219,10 @@ def _write_record(path: Path, record: dict[str, Any]) -> None:
 
 
 def _fsync_directory(path: Path) -> None:
+    check_mutation_fence(path)
     fd = os.open(path, os.O_DIRECTORY)
     try:
+        check_mutation_fence(path)
         os.fsync(fd)
     finally:
         os.close(fd)
@@ -227,6 +230,7 @@ def _fsync_directory(path: Path) -> None:
 
 def _unlink_durable(path: Path) -> None:
     try:
+        check_mutation_fence(path)
         path.unlink()
     except FileNotFoundError:
         return
@@ -255,6 +259,22 @@ def _queue_state(cfg: object) -> dict[str, int]:
     }
 
 
+class _FencedQueueConnection(sqlite3.Connection):
+    """Carry a scoped Project mutation fence through derived SQL index writes."""
+
+    def __init__(self, database, *args, **kwargs):
+        self._mutation_path = Path(database)
+        check_mutation_fence(self._mutation_path)
+        super().__init__(database, *args, **kwargs)
+
+    def execute(self, sql, parameters=(), /):
+        # Rollback must remain available after revocation to abandon uncommitted
+        # index changes and release SQLite locks.
+        if sql.lstrip().split(None, 1)[0].upper() not in {"SELECT", "ROLLBACK"}:
+            check_mutation_fence(self._mutation_path)
+        return super().execute(sql, parameters)
+
+
 def _queue_connection(cfg: object) -> sqlite3.Connection:
     """Open the durable active-slot index while the outbox lock is held.
 
@@ -263,9 +283,10 @@ def _queue_connection(cfg: object) -> sqlite3.Connection:
     not revisit queue positions that were retired long ago.
     """
     path = _queue_index_path(cfg)
+    check_mutation_fence(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     try:
-        connection = sqlite3.connect(path, timeout=30, isolation_level=None)
+        connection = sqlite3.connect(path, timeout=30, isolation_level=None, factory=_FencedQueueConnection)
         connection.execute("PRAGMA journal_mode=DELETE")
         connection.execute("PRAGMA synchronous=FULL")
         connection.execute(
@@ -332,6 +353,12 @@ def _queue_connection(cfg: object) -> sqlite3.Connection:
         except (UnboundLocalError, sqlite3.Error):
             pass
         raise RuntimeError("maintenance active-slot index is corrupt; explicit recovery is required.") from exc
+    except BaseException:
+        try:
+            connection.close()
+        except UnboundLocalError:
+            pass
+        raise
 
 
 def _queue_register(
@@ -592,11 +619,13 @@ def _prepare_with_queue(
         active_path = _active_root(cfg) / filename
         if not active_path.exists():
             _write_record(active_path, record)
+        check_mutation_fence(_index_root(cfg))
         _index_root(cfg).mkdir(parents=True, exist_ok=True)
         atomic_replace(index_path, {"identity": identity, "location": "active", "filename": filename})
         return _read_record(active_path, identity)
     record, filename, restore_migration = _queue_allocate(connection, identity, now, phase, cursor)
     path = _active_root(cfg) / filename
+    check_mutation_fence(_index_root(cfg))
     _index_root(cfg).mkdir(parents=True, exist_ok=True)
     queue_meta = connection.execute("SELECT next_position, revision FROM queue_meta WHERE singleton = 1").fetchone()
     atomic_replace(
@@ -694,6 +723,7 @@ def prepare_target_work(
                     return _prepare_locked(cfg, identity, phase=phase, cursor=cursor)
         generation = new_id()
         identity = {**target_identity, "work_generation": generation}
+        check_mutation_fence(target_path)
         target_path.parent.mkdir(parents=True, exist_ok=True)
         atomic_replace(target_path, {"work_generation": generation})
         record = _prepare_locked(cfg, identity, phase=phase, cursor=cursor)
@@ -773,6 +803,7 @@ def _change_work(
     current_base = _active_root(cfg) if index.get("location") == "active" else _retired_root(cfg)
     old_path = current_base / index["filename"]
     if record["state"] in _TERMINAL_STATES:
+        check_mutation_fence(_retired_root(cfg))
         _retired_root(cfg).mkdir(parents=True, exist_ok=True)
         new_path = _retired_root(cfg) / f"{key}.json"
         _write_record(new_path, record)
@@ -829,16 +860,35 @@ def _publish_revision_change(cfg: object, identity: dict[str, str], **changes: A
             return result
 
 
-def activate_work(cfg: object, record: dict[str, Any]) -> dict[str, Any]:
-    """Mark prepared work pending and publish its exact revision through activation."""
-    return _publish_revision_change(
+def activate_work(
+    cfg: object,
+    record: dict[str, Any],
+    *,
+    publish_activation: bool = True,
+) -> dict[str, Any]:
+    """Mark prepared work pending, optionally reusing an enclosing business wake."""
+    identity = record["identity"]
+    if publish_activation:
+        return _publish_revision_change(
+            cfg,
+            identity,
+            state="pending",
+            due_at=utc_now(),
+            retry_count=0,
+            failure=None,
+            meaningful_progress=True,
+        )
+    return update_work(
         cfg,
-        record["identity"],
+        kind=identity["kind"],
+        target_id=identity["target_id"],
+        work_generation=identity["work_generation"],
         state="pending",
         due_at=utc_now(),
         retry_count=0,
         failure=None,
         meaningful_progress=True,
+        publish_activation=False,
     )
 
 
@@ -911,6 +961,7 @@ def _migrate_slot_entry(cfg: object, connection: sqlite3.Connection, name: str) 
         _write_record(active_path, record)
     if record["queue_position"] != position:
         raise ValueError("maintenance descriptor queue position is invalid during reconstruction.")
+    check_mutation_fence(_index_root(cfg))
     _index_root(cfg).mkdir(parents=True, exist_ok=True)
     atomic_replace(index_path, {"identity": identity, "location": "active", "filename": filename})
     _write_slot(cfg, slot["initial_record"], filename)
@@ -941,6 +992,7 @@ def _migrate_active_entry(cfg: object, connection: sqlite3.Connection, name: str
         _unlink_durable(path)
         return
     if index is None:
+        check_mutation_fence(_index_root(cfg))
         _index_root(cfg).mkdir(parents=True, exist_ok=True)
         atomic_replace(index_path, {"identity": identity, "location": "active", "filename": name})
     _write_slot(cfg, record, name)
@@ -1014,6 +1066,7 @@ def _candidate_record(
         if adopted is not None:
             return None, position
     else:
+        check_mutation_fence(_index_root(cfg))
         _index_root(cfg).mkdir(parents=True, exist_ok=True)
         atomic_replace(index_path, {"identity": identity, "location": "active", "filename": filename})
     slot = _read_slot(cfg, position)

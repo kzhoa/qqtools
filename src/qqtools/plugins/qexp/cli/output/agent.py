@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping, Sequence
+from datetime import datetime
 from typing import Any
 
 from .admin import _validate_upgrade_registry
@@ -98,6 +100,25 @@ def _render_agent_status(result: Mapping[str, Any], _presentation: Mapping[str, 
     rendered = _render_agent_operation(result, _presentation)
     if result.get("stop_reason") is not None:
         rendered = f"{rendered}\n\nStop reason: {result.get('stop_reason')}"
+    project_io = result.get("project_io_isolation")
+    if isinstance(project_io, Mapping) and project_io.get("envelope") != "healthy":
+        project_io_details = _details(
+            (
+                ("Project I/O isolation", project_io.get("envelope")),
+                ("Executor epoch", project_io.get("executor_epoch")),
+                (
+                    "Workers active / overdue / exit-unverified",
+                    f"{project_io.get('active_worker_count')} / {project_io.get('overdue_worker_count')} / "
+                    f"{project_io.get('exit_unverified_worker_count')}",
+                ),
+                ("Unreaped workers", project_io.get("unreaped_worker_count")),
+                ("Free executor slots", project_io.get("free_slot_count")),
+                ("Oldest overdue request", project_io.get("oldest_overdue_at")),
+                ("Blocking Projects", project_io.get("blocking_project_ids")),
+            )
+        )
+        if project_io_details:
+            rendered = f"{rendered}\n\n{project_io_details}" if rendered else project_io_details
     diagnostics = result.get("diagnostics")
     if isinstance(diagnostics, Mapping):
         diagnostic_details = _details(
@@ -372,6 +393,67 @@ def _validate_agent_status(result: Any) -> None:
         )
         for key in ("schema_version", "status", "coverage", "truncated", "reason"):
             _required(scheduler, key, "agent-status payload.scheduler_diagnostics")
+    if "project_io_isolation" in value:
+        _validate_project_io_isolation(value["project_io_isolation"])
+
+
+def _validate_project_io_isolation(value: Any) -> None:
+    label = "agent-status payload.project_io_isolation"
+    isolation = _mapping(value, label)
+    expected_keys = {
+        "protocol_version",
+        "executor_epoch",
+        "capacity",
+        "active_worker_count",
+        "overdue_worker_count",
+        "exit_unverified_worker_count",
+        "unreaped_worker_count",
+        "free_slot_count",
+        "supported_hang_limit",
+        "envelope",
+        "oldest_overdue_at",
+        "blocking_project_ids",
+    }
+    if set(isolation) != expected_keys:
+        raise ValueError(f"{label} has missing or unknown fields")
+    if type(isolation["protocol_version"]) is not int or isolation["protocol_version"] != 1:
+        raise ValueError(f"{label}.protocol_version is unsupported")
+    epoch = isolation["executor_epoch"]
+    if epoch is not None and (not isinstance(epoch, str) or not re.fullmatch(r"[0-9a-f]{32}", epoch)):
+        raise TypeError(f"{label}.executor_epoch must be a lowercase hexadecimal ID or null")
+    if type(isolation["capacity"]) is not int or isolation["capacity"] != 4:
+        raise ValueError(f"{label}.capacity must be 4")
+    if type(isolation["supported_hang_limit"]) is not int or isolation["supported_hang_limit"] != 2:
+        raise ValueError(f"{label}.supported_hang_limit must be 2")
+    for key in (
+        "active_worker_count",
+        "overdue_worker_count",
+        "exit_unverified_worker_count",
+        "unreaped_worker_count",
+        "free_slot_count",
+    ):
+        count = isolation[key]
+        if type(count) is not int or count < 0 or count > 4:
+            raise TypeError(f"{label}.{key} must be an integer from 0 through 4")
+    if isolation["envelope"] not in {"healthy", "degraded", "exceeded", "unknown"}:
+        raise ValueError(f"{label}.envelope is invalid")
+    oldest = isolation["oldest_overdue_at"]
+    if oldest is not None:
+        if not isinstance(oldest, str) or not oldest:
+            raise TypeError(f"{label}.oldest_overdue_at must be a non-empty string or null")
+        try:
+            timestamp = datetime.fromisoformat(oldest[:-1] + "+00:00" if oldest.endswith("Z") else oldest)
+        except ValueError as exc:
+            raise ValueError(f"{label}.oldest_overdue_at must be an ISO-8601 timestamp") from exc
+        if timestamp.tzinfo is None or timestamp.utcoffset() is None:
+            raise ValueError(f"{label}.oldest_overdue_at must include a timezone")
+    projects = isolation["blocking_project_ids"]
+    if not isinstance(projects, list) or len(projects) > 4:
+        raise TypeError(f"{label}.blocking_project_ids must be a list of at most four IDs")
+    if any(not isinstance(project_id, str) or not project_id or len(project_id) > 128 for project_id in projects):
+        raise TypeError(f"{label}.blocking_project_ids contains an invalid ID")
+    if len(set(projects)) != len(projects):
+        raise ValueError(f"{label}.blocking_project_ids must not contain duplicates")
 
 
 def _validate_scheduler_diagnostics(result: Any) -> None:

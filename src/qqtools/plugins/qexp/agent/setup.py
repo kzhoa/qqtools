@@ -19,6 +19,7 @@ from ..runtime.authority_scan import iter_evidence_files
 from ..runtime.paths import shared_paths
 from ..runtime.process_evidence import inspect_local_group_identity, inspect_wrapper_identity
 from ..runtime.store import AtomicReplaceError, atomic_replace, read_json
+from .bindings import ProjectBinding
 from .config import (
     DEFAULT_AGENT_MODE,
     AgentConfig,
@@ -32,6 +33,7 @@ from .config import (
 from .context import MachineRuntime
 from .identity import load_identity_record, require_fresh_runtime
 from .inventory import (
+    InventoryReconciliation,
     ProjectInventoryEntry,
     canonical_shared_root,
     exact_binding_for_entry,
@@ -927,6 +929,10 @@ def register_projects(
 
 def list_projects(runtime: MachineRuntime | str | Path | None) -> dict[str, Any]:
     machine_runtime = _runtime(runtime)
+    # Preserve identity as the first trust boundary. Inventory reconciliation
+    # must not replace a missing/corrupt MachineRuntime identity with a generic
+    # registry-availability error.
+    machine_runtime.require_initialized()
     try:
         return inventory_status(machine_runtime)
     except (OSError, RuntimeError, ValueError, KeyError, TypeError) as exc:
@@ -985,6 +991,59 @@ def remove_project(runtime: MachineRuntime | str | Path | None, selector: str | 
             }
 
 
+def _prepare_project_enablement(
+    machine_runtime: MachineRuntime,
+    selector: str | Path,
+    enabled: bool,
+) -> tuple[InventoryReconciliation, ProjectInventoryEntry, ProjectBinding, dict[str, Any] | None]:
+    """Prepare local enablement state while lifecycle, inventory, and registry guards are held."""
+    _selected_entry(machine_runtime, selector)
+    reconciliation = _reconcile_inventory_for_intent(machine_runtime)
+    entries = list(reconciliation.entries)
+    matches = find_inventory_entries(entries, selector)
+    if len(matches) != 1:
+        if not matches:
+            raise SetupUsageError(f"machine Project inventory has no entry for {selector!r}.")
+        raise SetupUsageError(f"machine Project inventory selector {selector!r} is ambiguous.")
+    entry = matches[0]
+    binding, binding_conflict = exact_binding_for_entry(entry, reconciliation.bindings)
+    if binding_conflict:
+        raise SetupOperationalError("Project registry identity and shared path conflict.")
+    if binding is None:
+        raise SetupUsageError(f"Project {entry.project_id!r} is not registered.")
+    if (
+        binding.runtime_instance_id != machine_runtime.instance_id
+        or binding.runtime_root not in {None, str(machine_runtime.root)}
+        or not isinstance(binding.registration_generation, str)
+        or not binding.registration_generation
+    ):
+        raise SetupOperationalError("Project binding belongs to a different runtime generation.")
+    structural_blockers = [blocker for blocker in reconciliation.blockers if blocker != "inventory_mirror_incomplete"]
+    if structural_blockers:
+        raise SetupOperationalError(
+            "Project inventory reconciliation is blocked: " + ", ".join(structural_blockers) + "."
+        )
+
+    early_result = None
+    if "inventory_mirror_incomplete" in reconciliation.blockers:
+        if binding.enabled == enabled:
+            early_result = _enablement_result(
+                entry,
+                binding,
+                requested_enabled=enabled,
+                status="partially_committed",
+                registry_revision=reconciliation.registry_revision,
+                inventory_revision=reconciliation.inventory_revision,
+                inventory_converged=False,
+                reason="inventory_mirror_incomplete",
+            )
+        else:
+            raise SetupOperationalError(
+                "Project inventory mirror repair is incomplete; retry before changing enablement."
+            )
+    return reconciliation, entry, binding, early_result
+
+
 def set_project_enablement(
     runtime: MachineRuntime | str | Path | None,
     selector: str | Path,
@@ -994,62 +1053,47 @@ def set_project_enablement(
         raise SetupUsageError("project enablement must be a bool.")
     machine_runtime = _runtime(runtime)
     machine_runtime.require_initialized()
+
+    if enabled:
+        with machine_runtime.agent_lifecycle_guard():
+            with machine_runtime.inventory_guard():
+                with machine_runtime.registry_guard():
+                    reconciliation, entry, binding, early_result = _prepare_project_enablement(
+                        machine_runtime,
+                        selector,
+                        enabled,
+                    )
+                    if early_result is not None:
+                        return early_result
+        observed_binding = binding
+        observed_registry_revision = reconciliation.registry_revision
+        is_eligible = machine_runtime.binding_write_eligible(observed_binding, renew=True)
+        authority = None if is_eligible else machine_runtime.registration_status(observed_binding)
+
     with machine_runtime.agent_lifecycle_guard():
         with machine_runtime.inventory_guard():
             with machine_runtime.registry_guard():
-                _selected_entry(machine_runtime, selector)
-                reconciliation = _reconcile_inventory_for_intent(machine_runtime)
-                entries = list(reconciliation.entries)
-                matches = find_inventory_entries(entries, selector)
-                if len(matches) != 1:
-                    if not matches:
-                        raise SetupUsageError(f"machine Project inventory has no entry for {selector!r}.")
-                    raise SetupUsageError(f"machine Project inventory selector {selector!r} is ambiguous.")
-                entry = matches[0]
-                binding, binding_conflict = exact_binding_for_entry(entry, reconciliation.bindings)
-                if binding_conflict:
-                    raise SetupOperationalError("Project registry identity and shared path conflict.")
-                if binding is None:
-                    raise SetupUsageError(f"Project {entry.project_id!r} is not registered.")
-                if (
-                    binding.runtime_instance_id != machine_runtime.instance_id
-                    or binding.runtime_root not in {None, str(machine_runtime.root)}
-                    or not isinstance(binding.registration_generation, str)
-                    or not binding.registration_generation
-                ):
-                    raise SetupOperationalError("Project binding belongs to a different runtime generation.")
-                structural_blockers = [
-                    blocker for blocker in reconciliation.blockers if blocker != "inventory_mirror_incomplete"
-                ]
-                if structural_blockers:
-                    raise SetupOperationalError(
-                        "Project inventory reconciliation is blocked: " + ", ".join(structural_blockers) + "."
-                    )
-                if "inventory_mirror_incomplete" in reconciliation.blockers:
-                    if binding.enabled == enabled:
-                        return _enablement_result(
-                            entry,
-                            binding,
-                            requested_enabled=enabled,
-                            status="partially_committed",
-                            registry_revision=reconciliation.registry_revision,
-                            inventory_revision=reconciliation.inventory_revision,
-                            inventory_converged=False,
-                            reason="inventory_mirror_incomplete",
+                if enabled:
+                    current_revision, current_bindings = machine_runtime.load_registry_uncached()
+                    if current_revision != observed_registry_revision or observed_binding not in current_bindings:
+                        raise SetupOperationalError("Project registry changed during enablement validation; retry.")
+                    if not is_eligible:
+                        raise SetupOperationalError(
+                            f"cannot enable project {observed_binding.project_id!r}: registration is "
+                            f"{authority.get('state', 'unavailable')}; resolve registration authority first."
                         )
-                    raise SetupOperationalError(
-                        "Project inventory mirror repair is incomplete; retry before changing enablement."
-                    )
-                if enabled and not machine_runtime.binding_write_eligible(binding, renew=True):
-                    authority = machine_runtime.registration_status(binding)
-                    raise SetupOperationalError(
-                        f"cannot enable project {binding.project_id!r}: registration is "
-                        f"{authority.get('state', 'unavailable')}; resolve registration authority first."
-                    )
+                reconciliation, entry, binding, early_result = _prepare_project_enablement(
+                    machine_runtime,
+                    selector,
+                    enabled,
+                )
+                if early_result is not None:
+                    return early_result
 
+                entries = list(reconciliation.entries)
                 registry_revision = reconciliation.registry_revision
                 inventory_revision = reconciliation.inventory_revision
-                updated_binding = replace(binding, enabled=enabled)
+                updated_binding = replace(binding, enabled=enabled, _canonical_paths=True)
                 updated_bindings = [updated_binding if item == binding else item for item in reconciliation.bindings]
                 try:
                     persisted_registry = machine_runtime.registration.save_registry_locked(
@@ -1132,6 +1176,7 @@ def set_project_enablement(
                     enabled,
                     entry.name_source,
                     entry.name_override,
+                    _canonical_paths=True,
                 )
                 updated_entries = [updated_entry if item == entry else item for item in entries]
                 try:

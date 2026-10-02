@@ -89,6 +89,7 @@ from .state import (
 from .traversal import (
     ReadyCursor,
     ReadyPeek,
+    compare_and_commit_ready_cursor,
     iter_ready_marker_refs,
     load_ready_cursor,
     next_ready_marker,
@@ -136,6 +137,7 @@ __all__ = [
     "classification_diagnostic",
     "complete_primary_ready_index_rebuild",
     "commit_publication",
+    "compare_and_commit_ready_cursor",
     "delete_ready_marker",
     "delete_stale_ready_marker",
     "diagnostic",

@@ -12,7 +12,7 @@ import re
 import stat
 import tempfile
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 PROTOCOL_VERSION = 1
 MAX_PAYLOAD_BYTES = 8192
@@ -100,7 +100,13 @@ def read_advisory_snapshot(path: Path, *, max_bytes: int = MAX_SNAPSHOT_BYTES) -
     return value
 
 
-def replace_advisory_snapshot(path: Path, value: dict[str, Any], *, max_bytes: int = MAX_SNAPSHOT_BYTES) -> None:
+def replace_advisory_snapshot(
+    path: Path,
+    value: dict[str, Any],
+    *,
+    max_bytes: int = MAX_SNAPSHOT_BYTES,
+    before_replace: Callable[[], None] | None = None,
+) -> None:
     """Atomically replace a disposable snapshot, without fsync or parent creation.
 
     The channel owner provisions directories. A stale writer must not recreate
@@ -111,6 +117,8 @@ def replace_advisory_snapshot(path: Path, value: dict[str, Any], *, max_bytes: i
     try:
         with os.fdopen(fd, "wb") as handle:
             handle.write(encoded)
+        if before_replace is not None:
+            before_replace()
         os.replace(temporary, path)
     finally:
         try:

@@ -130,6 +130,7 @@ def attempt_control_lock_path(root: Path, attempt_id: str) -> Path:
 
 def machine_runtime_paths(root: Path) -> dict[str, Path]:
     root = Path(root).expanduser().resolve()
+    project_io_root = root / "project-io-executor-v1"
     return {
         "root": root,
         "locks": root / "locks",
@@ -189,6 +190,13 @@ def machine_runtime_paths(root: Path) -> dict[str, Path]:
         "gpu_policy": root / "gpu-policy.json",
         "gpu_policy_observation": root / "agent" / "gpu-policy-observation.json",
         "gpu_policy_warnings": root / "agent" / "gpu-policy-warnings.json",
+        "project_io_root": project_io_root,
+        "project_io_epoch": project_io_root / "epoch.json",
+        "project_io_requests": project_io_root / "requests",
+        "project_io_results": project_io_root / "results",
+        "project_io_processes": project_io_root / "processes",
+        "project_io_resolved": project_io_root / "resolved",
+        "project_io_lock": project_io_root / "locks" / "executor.lock",
     }
 
 

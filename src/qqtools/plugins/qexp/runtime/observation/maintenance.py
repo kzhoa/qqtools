@@ -7,7 +7,7 @@ import os
 import stat
 import threading
 import time
-from dataclasses import dataclass
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -20,7 +20,7 @@ from ..paths import shared_paths, task_path
 from ..project_activation import project_activation_transaction
 from ..protocol_compatibility import OBSERVATION_CAPABILITY
 from ..records import TaskRecord, validate_identifier
-from ..store import atomic_replace, read_json
+from ..store import atomic_replace, check_mutation_fence, read_json
 from ..tasks import load_task
 from . import projection
 
@@ -29,6 +29,8 @@ _MAX_GC_DEPTH = 5
 _WORKER_WAIT_SECONDS = 0.05
 _WORKER_IDLE_SECONDS = 0.25
 _ACTIVE_POLL_SECONDS = 1.0
+_GcAncestors = list[tuple[int, str, int, int]]
+_GcFence = Callable[[Path, _GcAncestors], None]
 
 
 def _observation_lock_path(cfg: RootConfig) -> Path:
@@ -126,32 +128,11 @@ def _regular_task_path(path: Path) -> bool:
     return True
 
 
-@dataclass
-class _DirectoryFrame:
-    """One bounded, symlink-safe directory enumeration frame."""
-
-    path: Path
-    depth: int
-    iterator: os.ScandirIterator[str]
-    descriptor: int
-    remove_after: bool
-
-    def close(self) -> None:
-        self.iterator.close()
-        try:
-            os.close(self.descriptor)
-        except OSError:
-            pass
-
-
 class _GenerationGarbageCollector:
-    """Reclaim one obsolete generation entry or node per maintenance slice."""
+    """Reclaim one obsolete node, retaining no directory stream between slices."""
 
     def __init__(self, generations: Path) -> None:
         self._generations = generations
-        self._keep_generation: str | None | object = _UNSET
-        self._frames: list[_DirectoryFrame] = []
-        self._complete = False
         self._blocked_reason: str | None = None
 
     @property
@@ -159,105 +140,96 @@ class _GenerationGarbageCollector:
         return self._blocked_reason
 
     def reset(self, keep_generation: str | None) -> None:
-        self.close()
-        self._keep_generation = keep_generation
-        self._complete = False
         self._blocked_reason = None
 
     def close(self) -> None:
-        while self._frames:
-            self._frames.pop().close()
+        """No process resources survive an advance call."""
 
     def advance(self, keep_generation: str | None) -> bool:
         """Perform one GC selection or unlink/rmdir and report completion."""
 
-        if self._keep_generation is _UNSET or self._keep_generation != keep_generation:
-            self.reset(keep_generation)
-        if self._complete:
-            return True
-        if self._blocked_reason is not None:
-            return False
-        if not self._frames:
-            try:
-                generations_info = self._generations.lstat()
-            except FileNotFoundError:
-                self._complete = True
-                return True
-            if stat.S_ISLNK(generations_info.st_mode) or not stat.S_ISDIR(generations_info.st_mode):
-                self._blocked_reason = f"generation_cleanup:invalid_root:{self._generations}"
-                return False
-            self._frames.append(self._open_frame(self._generations, 0, False))
-            return False
-
-        frame = self._frames[-1]
+        self._blocked_reason = None
         try:
-            entry = next(frame.iterator)
-        except StopIteration:
-            frame.close()
-            self._frames.pop()
-            if frame.remove_after:
-                try:
-                    parent_frame = self._frames[-1]
-                    os.rmdir(frame.path.name, dir_fd=parent_frame.descriptor)
-                    os.fsync(parent_frame.descriptor)
-                except FileNotFoundError:
-                    pass
-                except OSError as exc:
-                    if exc.errno == errno.ENOTEMPTY:
-                        try:
-                            self._frames.append(
-                                self._open_frame(frame.path, frame.depth, True, dir_fd=parent_frame.descriptor)
-                            )
-                        except FileNotFoundError:
-                            pass
-                    elif exc.errno not in {errno.ENOENT, errno.ENOTDIR}:
-                        self._blocked_reason = f"generation_cleanup:{type(exc).__name__}:{exc}"
-                return False
-            self._complete = not self._frames
-            return self._complete
-
-        name = entry.name
-        child = frame.path / name
-        if frame.depth == 0 and self._keep_generation is not None and name == self._keep_generation:
-            return False
-        try:
-            info = entry.stat(follow_symlinks=False)
+            descriptor = os.open(self._generations, self._directory_flags())
         except FileNotFoundError:
-            return False
-        if stat.S_ISDIR(info.st_mode) and not stat.S_ISLNK(info.st_mode):
-            depth = frame.depth + 1
-            if depth > _MAX_GC_DEPTH:
-                self._blocked_reason = f"generation_cleanup:depth_exceeded:{child}"
-                return False
-            try:
-                self._frames.append(self._open_frame(child, depth, True, dir_fd=frame.descriptor))
-            except FileNotFoundError:
-                pass
+            return True
+        except OSError as exc:
+            self._blocked_reason = f"generation_cleanup:{type(exc).__name__}:{exc}"
             return False
         try:
-            os.unlink(name, dir_fd=frame.descriptor)
-            os.fsync(frame.descriptor)
+            root_identity = os.fstat(descriptor)
+
+            def fence(path: Path, ancestors: _GcAncestors) -> None:
+                check_mutation_fence(path)
+                current_root = self._generations.lstat()
+                if (current_root.st_dev, current_root.st_ino) != (root_identity.st_dev, root_identity.st_ino):
+                    raise RuntimeError("generation cleanup root changed")
+                for parent, name, device, inode in ancestors:
+                    current = os.stat(name, dir_fd=parent, follow_symlinks=False)
+                    if (current.st_dev, current.st_ino) != (device, inode):
+                        raise RuntimeError("generation cleanup ancestor changed")
+
+            return self._advance_directory(descriptor, self._generations, 0, keep_generation, [], fence)
+        finally:
+            os.close(descriptor)
+
+    def _advance_directory(
+        self,
+        descriptor: int,
+        path: Path,
+        depth: int,
+        keep_generation: str | None,
+        ancestors: _GcAncestors,
+        fence: _GcFence,
+    ) -> bool:
+        # Only the root may skip an entry: the one current generation. No scan
+        # or cursor survives the slice, and at most one namespace mutation occurs.
+        name = None
+        with os.scandir(descriptor) as entries:
+            for _ in range(2 if depth == 0 else 1):
+                entry = next(entries, None)
+                if entry is None:
+                    return True
+                if depth == 0 and entry.name == keep_generation:
+                    continue
+                name = entry.name
+                break
+        if name is None:
+            return True
+        child = path / name
+        try:
+            info = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+            if stat.S_ISDIR(info.st_mode):
+                if depth >= _MAX_GC_DEPTH:
+                    self._blocked_reason = f"generation_cleanup:depth_exceeded:{child}"
+                    return False
+                child_fd = os.open(name, self._directory_flags(), dir_fd=descriptor)
+                try:
+                    opened = os.fstat(child_fd)
+                    if (opened.st_dev, opened.st_ino) != (info.st_dev, info.st_ino):
+                        return False
+                    lineage = [*ancestors, (descriptor, name, info.st_dev, info.st_ino)]
+                    is_empty = self._advance_directory(child_fd, child, depth + 1, keep_generation, lineage, fence)
+                finally:
+                    os.close(child_fd)
+                if is_empty:
+                    fence(child, lineage)
+                    os.rmdir(name, dir_fd=descriptor)
+                    os.fsync(descriptor)
+                return False
+            fence(child, ancestors)
+            os.unlink(name, dir_fd=descriptor)
+            os.fsync(descriptor)
         except FileNotFoundError:
             pass
-        except IsADirectoryError:
-            # A concurrent replacement can turn a selected non-directory into
-            # a directory.  Revisit it on a later bounded slice.
-            return False
+        except OSError as exc:
+            if exc.errno not in {errno.ENOTEMPTY, errno.ENOTDIR, errno.EISDIR}:
+                self._blocked_reason = f"generation_cleanup:{type(exc).__name__}:{exc}"
         return False
 
     @staticmethod
-    def _open_frame(path: Path, depth: int, remove_after: bool, *, dir_fd: int | None = None) -> _DirectoryFrame:
-        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
-        descriptor = os.open(path if dir_fd is None else path.name, flags, dir_fd=dir_fd)
-        try:
-            iterator = os.scandir(descriptor)
-        except BaseException:
-            os.close(descriptor)
-            raise
-        return _DirectoryFrame(path, depth, iterator, descriptor, remove_after)
-
-
-_UNSET = object()
+    def _directory_flags() -> int:
+        return os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
 
 
 def _initialize_generation(cfg: RootConfig, state: dict[str, Any]) -> None:
@@ -316,7 +288,7 @@ class ObservationMaintenance:
 
     @property
     def is_closed(self) -> bool:
-        """Return whether this maintenance owner has released its iterators."""
+        """Return whether this maintenance owner has been closed."""
 
         return self._closed
 
@@ -356,7 +328,7 @@ class ObservationMaintenance:
             return {"state": "degraded", "reason": f"observation_maintenance:{type(exc).__name__}:{exc}"}
 
     def close(self) -> None:
-        """Release the persistent generation scanner owned by this instance."""
+        """Prevent further slices; no directory scanner survives a slice."""
 
         if self._closed:
             return
@@ -604,7 +576,7 @@ def request_rebuild(cfg: RootConfig) -> dict[str, Any]:
                 state = projection.new_state(cfg, state="degraded")
             if state is None:
                 return {"state": "waiting", "reason": "observation_activation_deferred"}
-            from ..maintenance_outbox import activate_work, prepare_target_work
+            from ..maintenance_outbox import activate_work, prepare_target_work, update_work
 
             descriptor = prepare_target_work(
                 cfg,
@@ -614,9 +586,21 @@ def request_rebuild(cfg: RootConfig) -> dict[str, Any]:
                 cursor={"projection_generation": state["generation"]},
             )
             with project_activation_transaction(cfg, "observation_rebuild_request"):
+                descriptor = update_work(
+                    cfg,
+                    kind="task_observation",
+                    target_id="project",
+                    work_generation=descriptor["identity"]["work_generation"],
+                    state="prepared",
+                    cursor={
+                        "projection_generation": state["generation"],
+                        "activation_mode": "business",
+                    },
+                    publish_activation=False,
+                )
                 updated = _revisioned(state, state="degraded", dirty=True, build=None)
                 projection.write_state(cfg, updated)
-            activate_work(cfg, descriptor)
+            activate_work(cfg, descriptor, publish_activation=False)
             return {"state": "degraded", "reason": "rebuild_requested", "revision": updated["revision"]}
 
 

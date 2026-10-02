@@ -9,12 +9,13 @@ from qqtools.plugins.qexp.notification_config import (
     update_notifications,
     write_shared_feishu_webhook,
 )
-from qqtools.plugins.qexp.notifications import NotificationHook, notification_runtime
+from qqtools.plugins.qexp.notifications import NotificationHook, notification_delivery_fence, notification_runtime
 
 pytestmark = [pytest.mark.integration, pytest.mark.qexp_fast_io]
 
 
-def test_legacy_shared_file_imports_into_owner_private_webhook(tmp_path):
+@pytest.mark.parametrize("is_fenced", [False, True])
+def test_legacy_shared_file_imports_into_owner_private_webhook(tmp_path, is_fenced):
     cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime")
     runtime = MachineRuntime(tmp_path / "machine-runtime")
     runtime.ensure_binding(cfg.shared_root, cfg.machine_name)
@@ -37,11 +38,18 @@ def test_legacy_shared_file_imports_into_owner_private_webhook(tmp_path):
     webhook = "https://open.feishu.cn/open-apis/bot/v2/hook/shared-webhook"
     write_shared_feishu_webhook(cfg, webhook)
     calls = []
+    order = []
+
+    def check_delivery():
+        order.append("fence")
+        if is_fenced:
+            raise RuntimeError("executor epoch revoked")
 
     class Notifier:
         name = "feishu"
 
         def send(self, event, *, webhook, secret, timeout_seconds):
+            order.append("send")
             calls.append((webhook, secret, timeout_seconds))
             return {"http_status": 200, "business_code": "0"}
 
@@ -57,8 +65,12 @@ def test_legacy_shared_file_imports_into_owner_private_webhook(tmp_path):
         execution_started_at=None,
         duration_ms=None,
     )
-    with notification_runtime(runtime.root):
+    with notification_runtime(runtime.root), notification_delivery_fence(check_delivery):
+        NotificationHook(registry={"feishu": Notifier()}).handle(cfg, event)
+        # Exact terminal replay must retain the existing at-most-once claim,
+        # including when authority was revoked immediately before delivery.
         NotificationHook(registry={"feishu": Notifier()}).handle(cfg, event)
 
-    assert calls == [(webhook, None, 5)]
+    assert calls == ([] if is_fenced else [(webhook, None, 5)])
+    assert order == (["fence"] if is_fenced else ["fence", "send"])
     assert shared_feishu_webhook_path(cfg).exists()

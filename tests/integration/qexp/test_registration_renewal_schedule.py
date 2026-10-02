@@ -1,13 +1,14 @@
 """Registration write scheduling must retain fresh fenced authorization."""
 
+import time
 from datetime import datetime, timedelta, timezone
 
 import pytest
 
 from qqtools.plugins.qexp import init_shared_root
-from qqtools.plugins.qexp.agent import registration as registration_owner
 from qqtools.plugins.qexp.agent.context import MachineRuntime
 from qqtools.plugins.qexp.lease import LeasePolicy, save_lease_policy
+from qqtools.plugins.qexp.runtime import registration_authority
 from qqtools.plugins.qexp.runtime.store import atomic_replace, read_json
 
 pytestmark = [pytest.mark.integration, pytest.mark.qexp_fast_io]
@@ -26,9 +27,9 @@ def registration(tmp_path, monkeypatch):
         def now(cls, tz=None):
             return now[0]
 
-    monkeypatch.setattr(registration_owner, "datetime", FixedDateTime)
+    monkeypatch.setattr(registration_authority, "datetime", FixedDateTime)
     monkeypatch.setattr(
-        registration_owner,
+        registration_authority,
         "lease_expiry",
         lambda policy: (now[0] + timedelta(seconds=policy.ttl_seconds)).replace(microsecond=0).isoformat(),
     )
@@ -36,13 +37,13 @@ def registration(tmp_path, monkeypatch):
     value["registration"]["eligibility_expires_at"] = (now[0] + timedelta(seconds=120)).isoformat()
     atomic_replace(path, value)
     publications = []
-    save = registration_owner.save_machine_registration
+    save = registration_authority.save_machine_registration
 
     def record_save(cfg, value):
         publications.append(value)
         save(cfg, value)
 
-    monkeypatch.setattr(registration_owner, "save_machine_registration", record_save)
+    monkeypatch.setattr(registration_authority, "save_machine_registration", record_save)
     return cfg, runtime, binding, path, now, publications
 
 
@@ -132,24 +133,95 @@ def test_subsecond_due_guard_does_not_republish_identical_expiry(registration):
     assert len(publications) == 1
 
 
+def test_registration_guard_calls_write_fence_immediately_before_renewal(registration, monkeypatch):
+    _cfg, runtime, binding, path, now, _publications = registration
+    value = read_json(path)
+    value["registration"]["eligibility_expires_at"] = (now[0] + timedelta(seconds=1)).isoformat()
+    atomic_replace(path, value)
+    fenced = False
+    real_save = registration_authority.save_machine_registration
+
+    def before_shared_write() -> None:
+        nonlocal fenced
+        fenced = True
+
+    def require_fence_before_save(cfg, record) -> None:
+        assert fenced
+        real_save(cfg, record)
+
+    monkeypatch.setattr(registration_authority, "save_machine_registration", require_fence_before_save)
+    with runtime.binding_write_guard(binding, before_shared_write=before_shared_write) as eligible:
+        assert eligible
+    assert fenced
+
+
+def test_registration_guard_callback_failure_prevents_shared_save(registration, monkeypatch):
+    _cfg, runtime, binding, path, now, publications = registration
+    value = read_json(path)
+    value["registration"]["eligibility_expires_at"] = (now[0] + timedelta(seconds=1)).isoformat()
+    atomic_replace(path, value)
+    before = path.read_bytes()
+
+    def reject_shared_write() -> None:
+        raise RuntimeError("injected write fence")
+
+    with pytest.raises(RuntimeError, match="write fence"):
+        with runtime.binding_write_guard(binding, before_shared_write=reject_shared_write):
+            raise AssertionError("an unsuccessful guard must not enter its protected body")
+
+    assert path.read_bytes() == before
+    assert publications == []
+
+
 def test_idle_heartbeat_keeps_registration_alive_with_near_ttl_renewal_interval(registration):
     from qqtools.plugins.qexp.agent.control_plane import _MachineControlPlane
+    from qqtools.plugins.qexp.agent.dispatch_loop import dispatch_machine_cycle_locked
+    from qqtools.plugins.qexp.agent.project_io_executor import ProjectIOExecutor
 
-    cfg, runtime, binding, path, now, publications = registration
-    save_lease_policy(cfg, LeasePolicy(ttl_seconds=120, renew_interval_seconds=119))
+    cfg, runtime, binding, path, _now, _publications = registration
+    # The subprocess uses the system clock, so this integration slice replaces
+    # the fixture's parent-only clock with a short real-time policy.  A 13-second
+    # TTL retains the full clock/retry safety budget while a 0.2-second renewal
+    # interval keeps the test bounded.
+    registration_authority.datetime = datetime
+    registration_authority.lease_expiry = lambda policy: (
+        (datetime.now(timezone.utc) + timedelta(seconds=policy.ttl_seconds)).replace(microsecond=0).isoformat()
+    )
+    value = read_json(path)
+    value["registration"]["eligibility_expires_at"] = (datetime.now(timezone.utc) + timedelta(seconds=120)).isoformat()
+    atomic_replace(path, value)
+    save_lease_policy(cfg, LeasePolicy(ttl_seconds=13, renew_interval_seconds=0.2))
+    executor = ProjectIOExecutor(runtime)
+    executor.begin_epoch()
+    runtime.project_io_executor = executor
+    runtime.authority_ready_generations = {}
     plane = _MachineControlPlane(
         runtime,
         instance_id="test",
-        loop_interval=5,
-        started_at=now[0].isoformat(),
+        loop_interval=0.2,
+        started_at=datetime.now(timezone.utc).isoformat(),
         available_gpus=[],
     )
-    for _ in range(61):
-        plane._publish_heartbeat()
-        assert plane._heartbeat_snapshot["observation_status"] == "returned"
-        assert runtime.registration_status(binding)["write_eligible"]
-        now[0] += timedelta(seconds=5)
-    assert len(publications) == 5
+    expiries = []
+    try:
+        for _ in range(6):
+            previous = read_json(path)["registration"]["eligibility_expires_at"]
+            plane._publish_heartbeat()
+            assert plane._heartbeat_snapshot["observation_status"] == "queued"
+            deadline = time.monotonic() + 5.0
+            current = previous
+            while current == previous and time.monotonic() < deadline:
+                dispatch_machine_cycle_locked(runtime, available_gpus=[], supervise=False, publish_snapshots=False)
+                current = read_json(path)["registration"]["eligibility_expires_at"]
+                if current == previous:
+                    time.sleep(0.02)
+            assert current != previous
+            assert runtime.registration_status(binding)["write_eligible"]
+            expiries.append(current)
+            time.sleep(0.21)
+        assert len(set(expiries)) == len(expiries)
+    finally:
+        executor.shutdown()
 
 
 def test_slow_configured_loop_still_services_idle_registration_before_expiry(registration):

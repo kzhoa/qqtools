@@ -3,15 +3,23 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from ..agent.registration import RECOVERY_REGISTRATION_VERSION
 from ..config_types import RootConfig
 from ..layout import LOCAL_RECOVERY_CAPABILITY, load_machine_record, load_machine_registration, validate_root_contract
 from .locks import schema_lock
 from .paths import machine_registration_path, shared_paths
+from .registration_authority import (
+    RECOVERY_REGISTRATION_VERSION,
+    RegistrationIdentity,
+    publish_recovery_registration_locked,
+    registration_state,
+    registration_write_guard,
+    validate_registration_record,
+)
 from .responsibility_store import DurableIO
 from .store import atomic_replace, read_json
 from .upgrade.framework import UpgradeCoordinator, pending_upgrade_requires_completion
@@ -28,6 +36,12 @@ class RecoveryAdmission:
     blockers: tuple[str, ...] = ()
 
 
+@dataclass(frozen=True)
+class RecoveryPreparation:
+    is_registration_prepared: bool
+    admission: RecoveryAdmission
+
+
 def _upgrade_blocker(cfg: RootConfig) -> str | None:
     if UpgradeJournalMigration().is_applicable(cfg):
         return "upgrade_manifest_not_ready"
@@ -37,7 +51,7 @@ def _upgrade_blocker(cfg: RootConfig) -> str | None:
     return None
 
 
-def _participants(runtime: MachineRuntime, binding: ProjectBinding, cfg: RootConfig) -> tuple[list[Path], list[str]]:
+def _participants(project_id: str, cfg: RootConfig) -> tuple[list[Path], list[str]]:
     directories = []
     blockers = []
     with os.scandir(shared_paths(cfg.shared_root)["machines"]) as entries:
@@ -52,7 +66,7 @@ def _participants(runtime: MachineRuntime, binding: ProjectBinding, cfg: RootCon
                 machine.get(key) != value
                 for key, value in {
                     "machine_name": entry.name,
-                    "project_id": binding.project_id,
+                    "project_id": project_id,
                     "shared_root": str(cfg.shared_root),
                     "agent_runtime": "machine",
                 }.items()
@@ -77,7 +91,7 @@ def _participants(runtime: MachineRuntime, binding: ProjectBinding, cfg: RootCon
             try:
                 if not isinstance(record, dict):
                     raise ValueError("missing registration")
-                runtime.registration.validate_registration_record(record, binding.project_id, peer)
+                validate_registration_record(record, project_id, peer)
             except (RuntimeError, ValueError):
                 blockers.append(f"invalid_registration:{entry.name}")
                 continue
@@ -95,6 +109,105 @@ def _participants(runtime: MachineRuntime, binding: ProjectBinding, cfg: RootCon
                 continue
             directories.append(machine_registration_path(cfg.shared_root, entry.name).parent)
     return directories, blockers
+
+
+def _fence_recovery_capability_locked(
+    cfg: RootConfig,
+    project_id: str,
+    *,
+    registration_is_current: Callable[[], bool],
+    before_shared_write: Callable[[], None] | None = None,
+) -> RecoveryAdmission:
+    """Publish the existing capability while shared registration ownership is held."""
+    with schema_lock(cfg.shared_root, blocking=False) as acquired:
+        if not acquired:
+            return RecoveryAdmission(False, ("schema_busy",))
+        validate_root_contract(cfg)
+        path = shared_paths(cfg.shared_root)["schema"] / "version.json"
+        schema = read_json(path)
+        capabilities = schema["schema"]["required_capabilities"]
+        io = DurableIO()
+        if not registration_is_current():
+            return RecoveryAdmission(False, ("registration_ineligible",))
+        if LOCAL_RECOVERY_CAPABILITY in capabilities:
+            if before_shared_write is not None:
+                before_shared_write()
+            io.sync_directory(path.parent, "recovery_admission")
+            return RecoveryAdmission(True)
+        if (upgrade_blocker := _upgrade_blocker(cfg)) is not None:
+            return RecoveryAdmission(False, (upgrade_blocker,))
+        directories, blockers = _participants(project_id, cfg)
+        if blockers:
+            return RecoveryAdmission(False, tuple(sorted(blockers)))
+        for directory in directories:
+            if before_shared_write is not None:
+                before_shared_write()
+            io.sync_directory(directory, "recovery_participant")
+        if not registration_is_current():
+            return RecoveryAdmission(False, ("registration_ineligible",))
+        schema["schema"]["required_capabilities"] = [*capabilities, LOCAL_RECOVERY_CAPABILITY]
+        if before_shared_write is not None:
+            before_shared_write()
+        atomic_replace(path, schema)
+        return RecoveryAdmission(True)
+
+
+def prepare_shared_recovery_admission(
+    cfg: RootConfig,
+    identity: RegistrationIdentity,
+    *,
+    is_current: Callable[[], bool],
+    before_registration_conversion: Callable[[], None],
+    before_shared_write: Callable[[], None] | None = None,
+) -> RecoveryPreparation:
+    """Prepare registration and root admission under one shared ownership scope.
+
+    The caller owns local rollback absence/durability and migration eligibility.
+    This transaction creates no capture proof or local ledger/registry record.
+    """
+    with registration_write_guard(
+        cfg, identity, is_current=is_current, before_shared_write=before_shared_write
+    ) as registration:
+        if registration is None:
+            return RecoveryPreparation(False, RecoveryAdmission(False, ("registration_ineligible",)))
+        if registration["version"] != RECOVERY_REGISTRATION_VERSION:
+            before_registration_conversion()
+        publish_recovery_registration_locked(cfg, registration, before_shared_write=before_shared_write)
+        admission = _fence_recovery_capability_locked(
+            cfg,
+            identity.project_id,
+            registration_is_current=lambda: is_current() and registration_state(registration) == "eligible",
+            before_shared_write=before_shared_write,
+        )
+        return RecoveryPreparation(True, admission)
+
+
+def fence_shared_recovery_admission(
+    cfg: RootConfig,
+    identity: RegistrationIdentity,
+    *,
+    is_current: Callable[[], bool],
+    before_shared_write: Callable[[], None] | None = None,
+) -> RecoveryAdmission:
+    """Fence shared admission with no MachineRuntime locks or capture effects.
+
+    Shared registration ownership precedes the nonblocking schema lock. Local
+    preparation/capture belongs to the caller; this transaction inventories
+    only shared participants and publishes the existing root capability.
+    """
+    with registration_write_guard(
+        cfg, identity, is_current=is_current, before_shared_write=before_shared_write
+    ) as registration:
+        if registration is None:
+            return RecoveryAdmission(False, ("registration_ineligible",))
+        if registration["version"] != RECOVERY_REGISTRATION_VERSION:
+            return RecoveryAdmission(False, ("local_registration_not_prepared",))
+        return _fence_recovery_capability_locked(
+            cfg,
+            identity.project_id,
+            registration_is_current=lambda: is_current() and registration_state(registration) == "eligible",
+            before_shared_write=before_shared_write,
+        )
 
 
 def fence_recovery_admission(runtime: MachineRuntime, binding: ProjectBinding) -> RecoveryAdmission:
@@ -116,37 +229,17 @@ def fence_recovery_admission(runtime: MachineRuntime, binding: ProjectBinding) -
             if binding not in runtime.load_registry()[1]:
                 return RecoveryAdmission(False, ("binding_changed",))
             cfg = binding.root_config()
-            with runtime.binding_write_guard(binding) as eligible:
-                if not eligible:
-                    return RecoveryAdmission(False, ("registration_ineligible",))
-                if runtime.registration_status(binding)["registration_version"] != RECOVERY_REGISTRATION_VERSION:
-                    return RecoveryAdmission(False, ("local_registration_not_prepared",))
-                with schema_lock(cfg.shared_root, blocking=False) as acquired:
-                    if not acquired:
-                        return RecoveryAdmission(False, ("schema_busy",))
-                    validate_root_contract(cfg)
-                    path = shared_paths(cfg.shared_root)["schema"] / "version.json"
-                    schema = read_json(path)
-                    capabilities = schema["schema"]["required_capabilities"]
-                    io = DurableIO()
-                    if LOCAL_RECOVERY_CAPABILITY in capabilities:
-                        # Finish an uncertain previous rename barrier before the
-                        # caller treats a visible capability as durable admission.
-                        io.sync_directory(path.parent, "recovery_admission")
-                        return RecoveryAdmission(True)
-                    upgrade_blocker = _upgrade_blocker(cfg)
-                    if upgrade_blocker is not None:
-                        return RecoveryAdmission(False, (upgrade_blocker,))
-                    directories, blockers = _participants(runtime, binding, cfg)
-                    if blockers:
-                        return RecoveryAdmission(False, tuple(sorted(blockers)))
-                    for directory in directories:
-                        io.sync_directory(directory, "recovery_participant")
-                    if not runtime.registration_status(binding)["write_eligible"]:
-                        return RecoveryAdmission(False, ("registration_ineligible",))
-                    schema["schema"]["required_capabilities"] = [*capabilities, LOCAL_RECOVERY_CAPABILITY]
-                    atomic_replace(path, schema)
-                    return RecoveryAdmission(True)
+            identity = RegistrationIdentity(
+                binding.project_id, binding.registration_generation, binding.runtime_instance_id, str(runtime.root)
+            )
+            return fence_shared_recovery_admission(
+                cfg,
+                identity,
+                is_current=lambda: (
+                    binding.runtime_instance_id == runtime.instance_id
+                    and binding.runtime_root in {None, str(runtime.root)}
+                ),
+            )
 
 
 def inspect_recovery_admission(runtime: MachineRuntime, binding: ProjectBinding) -> dict:
@@ -166,7 +259,7 @@ def inspect_recovery_admission(runtime: MachineRuntime, binding: ProjectBinding)
         elif (upgrade_blocker := _upgrade_blocker(cfg)) is not None:
             blockers = [upgrade_blocker]
         else:
-            _directories, blockers = _participants(runtime, binding, cfg)
+            _directories, blockers = _participants(binding.project_id, cfg)
             if not blockers:
                 blockers = ["admission_fence_pending"]
         return {"state": "waiting", "blockers": sorted(blockers), "diagnostic_only": True}

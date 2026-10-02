@@ -1003,6 +1003,8 @@ def test_qualified_idle_requires_matching_release_receipt_after_source_hold_remo
 
 
 def test_group_isolation_activates_while_captured_source_remains_owned(project):
+    from qqtools.plugins.qexp.agent.project_io_controller import ProjectIOController
+    from qqtools.plugins.qexp.agent.project_io_executor import ProjectIOExecutor
     from qqtools.plugins.qexp.agent.recovery_enrollment import RecoveryEnrollment
     from qqtools.plugins.qexp.runtime.group_namespace import is_group_authority_isolated
 
@@ -1013,14 +1015,21 @@ def test_group_isolation_activates_while_captured_source_remains_owned(project):
     assert not finish(capture)
     assert completion.read_capture_completion(root) is not None
     enrollment = RecoveryEnrollment(runtime)
-    enrollment._captures[binding] = capture
+    executor = ProjectIOExecutor(runtime)
+    executor.begin_epoch()
+    controller = ProjectIOController(runtime, executor)
     try:
         from tests.helpers.qexp.lifecycle import wait_until
 
-        enrollment.poll()
+        def group_isolated():
+            revision, bindings = runtime.load_registry_snapshot()
+            with controller.admission_turn():
+                enrollment.advance(controller, bindings, revision)
+            return is_group_authority_isolated(cfg.shared_root)
+
         wait_until(
             "group-authority-isolated",
-            lambda: is_group_authority_isolated(cfg.shared_root),
+            group_isolated,
             stage="recovery-enrollment:source-retained",
         )
         enrollment.poll()
@@ -1030,6 +1039,7 @@ def test_group_isolation_activates_while_captured_source_remains_owned(project):
         assert Ledger(responsibility_root(root)).has_members()
     finally:
         enrollment.stop()
+        executor.shutdown()
 
 
 def test_capture_completion_does_not_release_source_without_explicit_cleanup(project):

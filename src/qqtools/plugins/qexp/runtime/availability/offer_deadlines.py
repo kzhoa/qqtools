@@ -16,7 +16,7 @@ from ..locks import schema_lock
 from ..paths import local_paths, shared_paths
 from ..project_activation import project_activation_transaction
 from ..records import TaskRecord
-from ..store import atomic_replace, iter_json, read_json, read_json_limited
+from ..store import atomic_replace, check_mutation_fence, iter_json, read_json, read_json_limited
 
 _MAX_REBUILD_TASK_BYTES = 1_048_576
 
@@ -95,8 +95,10 @@ def _iter_bucket_paths(buckets: list[Path]) -> Iterator[Path]:
 
 
 def _sync_directory(path: Path) -> None:
+    check_mutation_fence(path)
     descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW)
     try:
+        check_mutation_fence(path)
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
@@ -117,7 +119,7 @@ def remove_deadline_index(cfg: RootConfig, task_id: str, *, _publish_activation:
     if stable.exists() or stable.is_symlink():
         descriptor = None
         if _publish_activation:
-            from ..maintenance_outbox import activate_work, prepare_target_work, retire_work
+            from ..maintenance_outbox import activate_work, prepare_target_work, retire_work, update_work
 
             descriptor = prepare_target_work(
                 cfg,
@@ -129,29 +131,43 @@ def remove_deadline_index(cfg: RootConfig, task_id: str, *, _publish_activation:
             project_activation_transaction(cfg, "offer_deadline_update") if _publish_activation else nullcontext()
         )
         with activation:
+            if descriptor is not None:
+                descriptor = update_work(
+                    cfg,
+                    kind="deadline_index",
+                    target_id=task_id,
+                    work_generation=descriptor["identity"]["work_generation"],
+                    state="prepared",
+                    cursor={"activation_mode": "business"},
+                    publish_activation=False,
+                )
             try:
                 target = stable.resolve(strict=True)
             except FileNotFoundError:
                 target = None
+            check_mutation_fence(stable)
             stable.unlink(missing_ok=True)
             if target is not None:
+                check_mutation_fence(target)
                 target.unlink(missing_ok=True)
                 bucket = target.parent
                 home = bucket.parent
                 _sync_directory(bucket)
                 try:
+                    check_mutation_fence(bucket)
                     bucket.rmdir()
                 except OSError:
                     pass
                 _sync_directory(home)
                 try:
+                    check_mutation_fence(home)
                     home.rmdir()
                 except OSError:
                     pass
                 _sync_directory(home.parent)
             _sync_directory_chain(stable.parent, cfg.shared_root)
         if descriptor is not None:
-            handoff = activate_work(cfg, descriptor)
+            handoff = activate_work(cfg, descriptor, publish_activation=False)
             retire_work(
                 cfg,
                 kind="deadline_index",
@@ -186,7 +202,7 @@ def sync_deadline_index(cfg: RootConfig, task: TaskRecord) -> None:
                     return
             except (KeyError, TypeError, ValueError):
                 pass
-        from ..maintenance_outbox import activate_work, prepare_target_work, retire_work
+        from ..maintenance_outbox import activate_work, prepare_target_work, retire_work, update_work
 
         descriptor = prepare_target_work(
             cfg,
@@ -195,15 +211,25 @@ def sync_deadline_index(cfg: RootConfig, task: TaskRecord) -> None:
             phase="sync",
         )
         with project_activation_transaction(cfg, "offer_deadline_update"):
+            descriptor = update_work(
+                cfg,
+                kind="deadline_index",
+                target_id=task.task_id,
+                work_generation=descriptor["identity"]["work_generation"],
+                state="prepared",
+                cursor={"activation_mode": "business"},
+                publish_activation=False,
+            )
             remove_deadline_index(cfg, task.task_id, _publish_activation=False)
             atomic_replace(active, desired)
             try:
+                check_mutation_fence(path)
                 path.symlink_to(active.relative_to(path.parent))
             except FileExistsError:
                 pass
             _sync_directory_chain(active.parent, cfg.shared_root)
             _sync_directory_chain(path.parent, cfg.shared_root)
-        handoff = activate_work(cfg, descriptor)
+        handoff = activate_work(cfg, descriptor, publish_activation=False)
         retire_work(
             cfg,
             kind="deadline_index",

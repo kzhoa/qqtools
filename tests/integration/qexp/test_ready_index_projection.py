@@ -457,13 +457,20 @@ def test_offer_due_tasks_never_enumerates_task_truth(
     from qqtools.plugins.qexp.runtime.availability import offer_deadlines
 
     original_scandir = offer_deadlines.os.scandir
+    original_read_entry = offer_deadlines.read_directory_entry
 
     def record_directory(directory):
         seen.append(directory)
         assert directory != shared_paths(cfg.shared_root)["tasks"]
         return original_scandir(directory)
 
+    def record_entry(directory, offset):
+        seen.append(directory)
+        assert directory != shared_paths(cfg.shared_root)["tasks"]
+        return original_read_entry(directory, offset)
+
     monkeypatch.setattr(offer_deadlines.os, "scandir", record_directory)
+    monkeypatch.setattr(offer_deadlines, "read_directory_entry", record_entry)
     set_offer_evaluation_time(monkeypatch, cfg, task.task_id)
 
     offer_due_tasks(cfg)

@@ -15,6 +15,32 @@ from .work_budget import diagnostic_increment, diagnostic_span
 T = TypeVar("T")
 _migration_json_io_guard: ContextVar[bool] = ContextVar("migration_json_io_guard", default=False)
 _migration_json_io_authorized: ContextVar[bool] = ContextVar("migration_json_io_authorized", default=False)
+_mutation_fences: ContextVar[tuple[tuple[Path, Callable[[], None]], ...]] = ContextVar("mutation_fences", default=())
+
+
+@contextmanager
+def fenced_mutations(root: Path, before_write: Callable[[], None] | None) -> Iterator[None]:
+    """Fence nested writes beneath an already selected root in this execution context.
+
+    JSON primitives check automatically. Non-JSON mutators must call
+    ``check_mutation_fence`` immediately before their publication or removal.
+    Paths are compared lexically so checking the fence cannot block on Project I/O.
+    """
+    if before_write is None:
+        yield
+        return
+    token = _mutation_fences.set((*_mutation_fences.get(), (root.absolute(), before_write)))
+    try:
+        yield
+    finally:
+        _mutation_fences.reset(token)
+
+
+def check_mutation_fence(path: Path) -> None:
+    """Revalidate every enclosing mutation fence applicable to this path."""
+    for root, before_write in _mutation_fences.get():
+        if path.absolute().is_relative_to(root):
+            before_write()
 
 
 class CASConflict(RuntimeError):
@@ -91,6 +117,7 @@ def atomic_replace(
     failure: BaseException | None = None
     failure_traceback = None
     try:
+        check_mutation_fence(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         encoded = json.dumps(value, ensure_ascii=False, sort_keys=True, indent=2).encode("utf-8")
         fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
@@ -108,6 +135,7 @@ def atomic_replace(
             before_replace(temporary_stat)
         if io_step_observer is not None:
             io_step_observer("replace")
+        check_mutation_fence(path)
         replace_started = True
         os.replace(temporary, path)
         replace_completed = True
@@ -244,9 +272,11 @@ def require_json_size(value: dict[str, Any], *, max_bytes: int, record_type: str
 @diagnostic_span("store.create_if_absent")
 def create_if_absent(path: Path, value: dict[str, Any]) -> None:
     _require_migration_json_io_authorization()
+    check_mutation_fence(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
     try:
+        check_mutation_fence(path)
         fd = os.open(path, flags, 0o644)
     except FileExistsError as exc:
         raise CASConflict(f"Record already exists: {path}") from exc

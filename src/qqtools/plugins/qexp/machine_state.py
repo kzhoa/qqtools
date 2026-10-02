@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from typing import Iterable, Mapping
+from collections.abc import Callable
+from typing import Any, ContextManager, Iterable, Mapping
 
 from .config_types import RootConfig
 from .layout import machine_state_path
@@ -30,10 +31,12 @@ def publish_machine_snapshots(
     stop_reason: str | None = None,
     reservation_summaries: Iterable[dict[str, object]] | None = None,
     gpu_policy: Mapping[str, object] | None = None,
-) -> None:
+    observed_at: str | None = None,
+    shared_write_guard: Callable[[], ContextManager[bool]] | None = None,
+) -> bool | None:
     """Publish machine-owned advisory state without affecting scheduling authority."""
     with exclusive(local_paths(cfg.runtime_root)["locks"] / "machine-snapshot.lock"):
-        _write_machine_snapshots(
+        published = _write_machine_snapshots(
             cfg,
             instance_id=instance_id,
             pid=pid,
@@ -48,7 +51,10 @@ def publish_machine_snapshots(
             stop_reason=stop_reason,
             reservation_summaries=reservation_summaries,
             gpu_policy=gpu_policy,
+            observed_at=observed_at,
+            shared_write_guard=shared_write_guard,
         )
+    return published if shared_write_guard is not None else None
 
 
 def _write_machine_snapshots(
@@ -67,9 +73,11 @@ def _write_machine_snapshots(
     stop_reason: str | None = None,
     reservation_summaries: Iterable[dict[str, object]] | None = None,
     gpu_policy: Mapping[str, object] | None = None,
-) -> None:
+    observed_at: str | None = None,
+    shared_write_guard: Callable[[], ContextManager[bool]] | None = None,
+) -> bool:
     """Write snapshots while the local machine-snapshot lock is held."""
-    now = utc_now()
+    now = observed_at or utc_now()
     attempts = sorted(set(active_attempt_ids))
     visible = sorted(set(visible_gpu_ids))
     reserved = sorted(set(reserved_gpu_ids))
@@ -151,9 +159,74 @@ def _write_machine_snapshots(
             "warnings": list(policy.get("warnings", [])),
         }
     }
-    replace_snapshot_if_changed(machine_state_path(cfg, "agent.json"), agent)
-    replace_snapshot_if_changed(machine_state_path(cfg, "gpu.json"), gpu)
-    replace_snapshot_if_changed(machine_state_path(cfg, "summary.json"), summary)
+    for filename, value in (("agent.json", agent), ("gpu.json", gpu), ("summary.json", summary)):
+        if shared_write_guard is None:
+            replace_snapshot_if_changed(machine_state_path(cfg, filename), value)
+            continue
+        with shared_write_guard() as can_write:
+            if not can_write:
+                return False
+            replace_snapshot_if_changed(machine_state_path(cfg, filename), value)
+    return True
+
+
+def publish_shared_machine_snapshots(
+    cfg: RootConfig,
+    *,
+    shared_write_guard: Callable[[], ContextManager[bool]],
+    **snapshot: Any,
+) -> bool:
+    """Publish captured advisory state without acquiring a MachineRuntime lock.
+
+    The isolated executor owns one request per binding. The shared guard and
+    mutation fence must recheck each publication; they never grant local capacity.
+    """
+    return _write_machine_snapshots(cfg, shared_write_guard=shared_write_guard, **snapshot)
+
+
+def publish_shared_machine_stop_snapshot(
+    cfg: RootConfig,
+    *,
+    shared_write_guard: Callable[[], ContextManager[bool]],
+    instance_id: str,
+    pid: int | None,
+    agent_mode: str,
+    visible_gpu_ids: Iterable[int],
+    reserved_gpu_ids: Iterable[int],
+    heartbeat_interval_seconds: float,
+    started_at: str,
+    idle_since_at: str | None,
+    stop_reason: str,
+    gpu_policy: Mapping[str, object] | None = None,
+) -> bool:
+    """Publish a fenced stop snapshot without a controller-side shared write."""
+    path = machine_state_path(cfg, "agent.json")
+    with shared_write_guard() as can_write:
+        if not can_write:
+            return False
+        if path.exists():
+            try:
+                current_instance_id = read_json(path).get("agent", {}).get("instance_id")
+            except (OSError, ValueError):
+                return False
+            if current_instance_id != instance_id:
+                return False
+    return _write_machine_snapshots(
+        cfg,
+        instance_id=instance_id,
+        pid=pid,
+        agent_mode=agent_mode,
+        observed_state="stopped",
+        active_attempt_ids=[],
+        visible_gpu_ids=visible_gpu_ids,
+        reserved_gpu_ids=reserved_gpu_ids,
+        heartbeat_interval_seconds=heartbeat_interval_seconds,
+        started_at=started_at,
+        idle_since_at=idle_since_at,
+        stop_reason=stop_reason,
+        gpu_policy=gpu_policy,
+        shared_write_guard=shared_write_guard,
+    )
 
 
 def publish_machine_stop_snapshot(

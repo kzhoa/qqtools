@@ -126,3 +126,27 @@ def test_missing_state_is_not_dormant_and_reinitialization_revokes_old_proof(tmp
     new = journal.snapshot(initialize=True)
     assert new.generation != old.generation
     assert new.tail == 0
+
+
+def test_mutation_fence_runs_before_each_recheck_journal_write(tmp_path):
+    cfg = isolated_group(tmp_path)
+    journal = GroupRechecks(cfg.shared_root, "experiment")
+    journal.snapshot(initialize=True)
+    checks: list[str] = []
+
+    ticket = journal.begin(
+        "task-a",
+        "submission-a",
+        1,
+        "retry",
+        {"task_revision_before": 3},
+        before_write=lambda: checks.append("begin"),
+    )
+    assert ticket is not None
+    assert checks == ["begin", "begin"]
+
+    journal.resolve(ticket, before_write=lambda: checks.append("resolve"))
+    assert checks[-1] == "resolve"
+
+    journal.invalidate(before_write=lambda: checks.append("invalidate"))
+    assert checks[-2:] == ["invalidate", "invalidate"]

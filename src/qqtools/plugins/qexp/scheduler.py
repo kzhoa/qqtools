@@ -2,13 +2,18 @@
 
 from __future__ import annotations
 
+import copy
+import hashlib
+import json
+import math
+import re
 import time
 import uuid
 from contextlib import contextmanager, nullcontext
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable, ContextManager, Iterator
+from typing import Any, Callable, ContextManager, Iterator, Mapping
 
 from .config_types import RootConfig
 from .domain.policies import group_allows, task_machine_matches
@@ -17,6 +22,8 @@ from .executor import Executor, append_launch_failure_diagnostic, launch_failure
 from .gpu_policy import GpuReservationPolicy
 from .infrastructure.clock import clock_evidence as _clock_evidence
 from .infrastructure.process import terminate_process_group as _terminate_process_group
+from .launch_policy import validate_launch_handoff_timeout_seconds
+from .layout import load_machine_registration
 from .lease import (
     AuthorityResolution,
     AuthorityResolutionOutcome,
@@ -40,7 +47,7 @@ from .runtime.group_discovery.changes import record_task_change
 from .runtime.group_namespace import read_group
 from .runtime.locks import group_lock, schema_writer_lock, task_lock
 from .runtime.operation_store import operation_exists
-from .runtime.paths import attempt_path, group_path, local_paths, shared_paths
+from .runtime.paths import attempt_path, group_path, local_paths, shared_paths, task_path
 from .runtime.process_evidence import inspect_group_identity, inspect_wrapper_identity
 from .runtime.ready import (
     ReadyMarkerRef,
@@ -53,24 +60,65 @@ from .runtime.ready import (
     next_ready_marker,
     prepare_ready_transition,
     read_ready_index_state,
+    read_ready_index_status,
     retire_current_ready_generation,
     retire_previous_ready_generation,
 )
-from .runtime.records import AttemptRecord, TaskRecord, TaskSpec, normalize_group_record, utc_now
+from .runtime.ready import routes as ready_routes
+from .runtime.records import AttemptRecord, TaskRecord, TaskSpec, normalize_group_record, utc_now, validate_identifier
 from .runtime.resources.cpu_lane import attach_cpu, has_active_cpu_reservation, release_cpu, reserve_cpu
 from .runtime.resources.reservations import ReservationIdentity, attach, release, reserve, reserve_admitted
 from .runtime.store import atomic_replace, iter_json, read_json
 from .runtime.submission_control import SubmissionControlUnavailable, read_submission_state
 from .runtime.tasks import load_task, save_task
+from .runtime.terminal_evidence import load_settled_terminal_attempt
 from .runtime.work_budget import AdaptiveBatchSizer, SliceBudget, diagnostic_increment, diagnostic_span
 
 LEASE_SECONDS = 120
 TERMINATION_GRACE_SECONDS = 5.0
 TERMINATION_POLL_SECONDS = 0.05
+_LAUNCH_ID = re.compile(r"[0-9a-f]{32}")
+
+
+def _valid_utc_timestamp(value: object) -> bool:
+    if not isinstance(value, str) or not value or len(value) > 40:
+        return False
+    try:
+        parsed = datetime.fromisoformat(value[:-1] + "+00:00" if value.endswith("Z") else value)
+    except ValueError:
+        return False
+    return parsed.tzinfo is not None and parsed.utcoffset() == timedelta(0)
+
+
+def _bounded_lease_is_current(claim: Mapping[str, Any], attempt: AttemptRecord) -> bool:
+    claim_expiry = claim.get("lease_expires_at")
+    attempt_expiry = attempt.lease.get("expires_at")
+    if claim_expiry != attempt_expiry or not _valid_utc_timestamp(claim_expiry):
+        return False
+    holder_bound = claim.get("clock_error_bound_seconds")
+    if type(holder_bound) not in {int, float} or holder_bound < 0 or not float(holder_bound) < float("inf"):
+        return False
+    try:
+        expires_at = datetime.fromisoformat(
+            claim_expiry[:-1] + "+00:00" if claim_expiry.endswith("Z") else claim_expiry
+        )
+    except ValueError:
+        return False
+    return expires_at - timedelta(seconds=float(holder_bound)) > datetime.now(timezone.utc)
 
 
 class BorrowAdmissionRequired(RuntimeError):
     """Raised when a borrow claim is attempted without machine-wide admission."""
+
+
+def _registration_is_current(record: object) -> bool:
+    if not isinstance(record, dict) or record.get("state") != "eligible":
+        return False
+    try:
+        expires_at = datetime.fromisoformat(record["eligibility_expires_at"].replace("Z", "+00:00"))
+    except (AttributeError, KeyError, TypeError, ValueError):
+        return False
+    return expires_at > datetime.now(timezone.utc)
 
 
 @dataclass(frozen=True, slots=True)
@@ -437,6 +485,340 @@ def claim_task(
     )
 
 
+def claim_project_io_candidate(
+    cfg: RootConfig,
+    candidate: dict[str, Any],
+    offer: dict[str, Any],
+    *,
+    project_id: str,
+    registration_generation: str,
+    admission_role: str,
+    source_revisions: dict[str, int],
+    mutation_fence: Callable[[], None],
+) -> dict[str, Any]:
+    """Commit one observed candidate using its already-owned local resource offer.
+
+    This path writes only Project Task and Attempt truth.  In particular, it
+    never consults or changes either machine-local reservation backend.
+    """
+    no_claim = lambda reason: {"outcome": "no_claim", "reason": reason}
+    task_id = candidate.get("task_id")
+    if not isinstance(task_id, str) or not task_id:
+        return no_claim("offer_mismatch")
+    if admission_role not in {"primary", "borrow"}:
+        return no_claim("admission_role_changed")
+    if candidate.get("admission_role") != admission_role or (
+        candidate.get("group_name") is not None and offer.get("worker_scheduling_role") != admission_role
+    ):
+        return no_claim("admission_role_changed")
+    if admission_role == "borrow" and (candidate.get("group_name") is None or offer.get("group_name") is None):
+        return no_claim("admission_role_changed")
+    expected_source_revisions = {
+        "ready_index": source_revisions.get("ready_index"),
+        "task": candidate.get("task_revision"),
+        "ready_catalog": candidate.get("catalog_revision"),
+        "ready_partition": candidate.get("ready_revision"),
+    }
+    if candidate.get("group_revision") is not None:
+        expected_source_revisions["group"] = candidate.get("group_revision")
+    if source_revisions != expected_source_revisions:
+        return no_claim("ready_changed")
+    ready_status = read_ready_index_status(cfg)
+    if ready_status.get("state") != "active" or ready_status.get("revision") != source_revisions["ready_index"]:
+        return no_claim("ready_changed")
+    if (
+        offer.get("project_id") != project_id
+        or offer.get("shared_root") != str(cfg.shared_root)
+        or offer.get("registration_generation") != registration_generation
+        or offer.get("task_id") != task_id
+        or offer.get("lane") != candidate.get("lane")
+        or offer.get("attempt_id") != candidate.get("attempt_id")
+        or offer.get("attempt_number") != candidate.get("attempt_number")
+        or offer.get("fencing_token") != candidate.get("fencing_token")
+        or offer.get("group_name") != candidate.get("group_name")
+        or offer.get("admitted_as_borrow") is not (admission_role == "borrow")
+        or any(
+            offer.get(field) != candidate.get(field)
+            for field in (
+                "group_dispatch_epoch",
+                "group_worker_set_epoch",
+                "worker_state_epoch",
+                "worker_scheduling_role",
+                "gpu_limit_gpus",
+            )
+        )
+        or not isinstance(offer.get("reservation_id"), str)
+    ):
+        return no_claim("offer_mismatch")
+
+    policy = load_lease_policy(cfg)
+    capability = clock_capability(cfg, policy)
+    authority_mode = "bounded_lease" if capability.is_healthy else "holder_bound"
+    clock_evidence = None
+    if capability.observation:
+        mutation_fence()
+        persist_clock_observation(cfg, capability.observation)
+        clock_evidence = _clock_evidence(capability.observation)
+
+    initial = load_task(cfg, task_id)
+    if initial.group_name != candidate.get("group_name"):
+        return no_claim("group_changed")
+    with authority_locks(cfg, initial):
+        registration_envelope = load_machine_registration(cfg) or {}
+        registration = registration_envelope.get("registration")
+        if (
+            not isinstance(registration, dict)
+            or registration.get("project_id") != project_id
+            or registration.get("shared_root") != str(cfg.shared_root)
+            or registration.get("machine_name") != cfg.machine_name
+            or registration.get("generation") != registration_generation
+            or not _registration_is_current(registration)
+        ):
+            return no_claim("candidate_stale")
+        task = load_task(cfg, task_id)
+        if task.group_name != initial.group_name:
+            return no_claim("group_changed")
+        if task.meta.get("revision") != candidate.get("task_revision"):
+            return no_claim("task_changed")
+        if task.ready_generation != candidate.get("ready_generation"):
+            return no_claim("ready_changed")
+        if (
+            task.attempt_control.get("next_attempt_number") != candidate.get("attempt_number")
+            or task.claim_control.get("fencing_epoch", -1) + 1 != candidate.get("fencing_token")
+            or candidate.get("attempt_id") != f"{task_id}-attempt-{candidate.get('attempt_number')}"
+        ):
+            return no_claim("task_changed")
+        if (
+            (candidate.get("lane") == "cpu") != task.spec.is_cpu_only
+            or (candidate.get("lane") == "gpu" and task.spec.requested_gpus != candidate.get("requested_gpus"))
+            or (candidate.get("lane") == "cpu" and (task.spec.requested_cpus or 0) != candidate.get("requested_cpus"))
+        ):
+            return no_claim("task_changed")
+        if not _eligible(cfg, task):
+            return no_claim("candidate_stale")
+        if not dependency_gate(cfg, task).is_ready:
+            return no_claim("dependency_not_ready")
+
+        reference = ReadyMarkerRef(
+            task_id=task_id,
+            generation=candidate["ready_generation"],
+            queue_scope=candidate["ready_scope"],
+            home_machine=candidate["home_machine"],
+            partition=candidate["partition"],
+            catalog_page=candidate["catalog_page"],
+            marker_name=candidate["marker_name"],
+        )
+        if (
+            reference.identity != candidate.get("ready_identity")
+            or reference.marker_name != f"{task_id}.{reference.generation}.json"
+            or reference.queue_scope != task.placement_runtime.get("queue_scope")
+            or reference.home_machine != task.placement_policy.get("home_machine")
+        ):
+            return no_claim("ready_changed")
+        classification = classify_ready_marker(cfg, reference, read_only=True)
+        if classification.classification != "claimable" or classification.task is None:
+            return no_claim(
+                "dependency_not_ready" if classification.reason.startswith("dependency_") else "ready_changed"
+            )
+        if classification.task.meta.get("revision") != candidate.get("task_revision"):
+            return no_claim("task_changed")
+        route = ready_routes.route_key(reference.queue_scope, cfg.machine_name)
+        catalog = read_json(ready_routes.catalog_path(cfg.shared_root, route, reference.catalog_page))["ready_catalog"]
+        partition = read_json(
+            ready_routes.partition_record_path(
+                cfg.shared_root,
+                reference.queue_scope,
+                cfg.machine_name,
+                reference.partition,
+            )
+        )["ready_partition"]
+        if (
+            catalog.get("route") != route
+            or catalog.get("page") != reference.catalog_page
+            or reference.partition not in catalog.get("partitions", [])
+            or partition.get("route") != route
+            or partition.get("partition") != reference.partition
+            or partition.get("catalog_page") != reference.catalog_page
+            or reference.marker_name not in partition.get("slots", [])
+        ):
+            return no_claim("ready_changed")
+        if catalog.get("revision") != candidate.get("catalog_revision") or partition.get("revision") != candidate.get(
+            "ready_revision"
+        ):
+            return no_claim("ready_changed")
+
+        group: dict[str, Any] | None = None
+        worker: dict[str, Any] | None = None
+        if task.group_name:
+            try:
+                group_value = normalize_group_record(read_group(cfg.shared_root, task.group_name))
+            except FileNotFoundError:
+                return no_claim("group_changed")
+            group = group_value["group"]
+            group_meta = group_value.get("meta")
+            worker = group["worker_set"].get(cfg.machine_name)
+            if (
+                not isinstance(group_meta, dict)
+                or group_meta.get("revision") != candidate.get("group_revision")
+                or group.get("dispatch_epoch") != candidate.get("group_dispatch_epoch")
+                or group.get("worker_set_epoch") != candidate.get("group_worker_set_epoch")
+            ):
+                return no_claim("group_changed")
+            if worker is None or worker.get("state") != "active" or worker.get("scheduling_role") != admission_role:
+                return no_claim("admission_role_changed")
+            if (
+                worker.get("state_epoch", 0) != candidate.get("worker_state_epoch")
+                or worker.get("scheduling_role") != candidate.get("worker_scheduling_role")
+                or worker.get("gpu_limit_gpus") != candidate.get("gpu_limit_gpus")
+            ):
+                return no_claim("group_changed")
+            if task.spec.is_cpu_only is False and worker.get("gpu_limit_gpus") is not None:
+                if task.spec.requested_gpus > worker["gpu_limit_gpus"]:
+                    return no_claim("group_changed")
+        elif admission_role != "primary" or candidate.get("admission_role") != "primary":
+            return no_claim("admission_role_changed")
+        if not task_machine_matches(task, cfg.machine_name):
+            return no_claim("candidate_stale")
+        if task.group_name and group is not None and has_active_cancellation(cfg, task, group_value):
+            return no_claim("candidate_stale")
+
+        gpu_ids = list(offer["gpu_ids"])
+        if (task.spec.is_cpu_only and (gpu_ids or offer.get("cpu_slots") != (task.spec.requested_cpus or 0))) or (
+            not task.spec.is_cpu_only and (len(gpu_ids) != task.spec.requested_gpus or offer.get("cpu_slots") != 0)
+        ):
+            return no_claim("offer_mismatch")
+        attempt_number = candidate["attempt_number"]
+        attempt_file = attempt_path(cfg.shared_root, task_id, attempt_number)
+        if attempt_file.exists():
+            return no_claim("task_changed")
+        token = candidate["fencing_token"]
+        attempt = AttemptRecord.claimed(
+            task,
+            cfg.machine_name,
+            gpu_ids,
+            offer["reservation_id"],
+            token,
+            authority_mode=authority_mode,
+            clock_evidence=clock_evidence,
+            lease_seconds=policy.ttl_seconds,
+            attempt_id=candidate["attempt_id"],
+        )
+        claim = {
+            "claim_id": attempt.attempt_id,
+            "attempt_id": attempt.attempt_id,
+            "attempt_number": attempt_number,
+            "machine_name": cfg.machine_name,
+            "reservation_id": offer["reservation_id"],
+            "queue_origin": task.placement_runtime["queue_scope"],
+            "fencing_token": token,
+            "claimed_at": utc_now(),
+            "authority_mode": authority_mode,
+            "clock_error_bound_seconds": (clock_evidence or {}).get("clock_error_bound_seconds"),
+            "clock_provider": (clock_evidence or {}).get("provider"),
+            "clock_observation_id": (clock_evidence or {}).get("observation_id"),
+            "lease_expires_at": attempt.lease["expires_at"],
+            "launch_state": "claimed",
+            "launch_authorized_at": None,
+            "group_dispatch_epoch": None,
+            "group_worker_set_epoch": None,
+        }
+        if task.group_name and group is not None and worker is not None:
+            claim.update(
+                {
+                    "group_dispatch_epoch": group["dispatch_epoch"],
+                    "group_worker_set_epoch": group["worker_set_epoch"],
+                    "worker_state_epoch": worker["state_epoch"],
+                    "worker_scheduling_role": worker["scheduling_role"],
+                    "gpu_limit_gpus": worker["gpu_limit_gpus"],
+                    "admitted_as_borrow": admission_role == "borrow",
+                }
+            )
+            attempt.authorization.update(
+                {
+                    "group_dispatch_epoch": group["dispatch_epoch"],
+                    "group_worker_set_epoch": group["worker_set_epoch"],
+                    "worker_state_epoch": worker["state_epoch"],
+                    "worker_scheduling_role": worker["scheduling_role"],
+                    "gpu_limit_gpus": worker["gpu_limit_gpus"],
+                    "admitted_as_borrow": admission_role == "borrow",
+                }
+            )
+        attempt_persisted = False
+        mutation_fence()
+        with record_task_change(
+            cfg,
+            task,
+            "claim",
+            details={"attempt_id": attempt.attempt_id, "attempt_number": attempt_number, "fencing_token": token},
+        ):
+            mutation_fence()
+            task.claim_control.update({"fencing_epoch": token, "active_claim": claim})
+            task.attempt_control.update(
+                {
+                    "current_attempt_id": attempt.attempt_id,
+                    "current_attempt_number": attempt_number,
+                    "next_attempt_number": attempt_number + 1,
+                }
+            )
+            task.state["projection"] = "running"
+            task.meta["revision"] += 1
+            task.meta["updated_at"] = utc_now()
+            save_task(cfg, task)
+            try:
+                atomic_replace(attempt_file, attempt.to_dict())
+                attempt_persisted = True
+            except Exception:
+                _rollback_project_io_claim_locked(cfg, task, token, attempt_file, attempt_persisted)
+                raise
+        mutation_fence()
+        retire_current_ready_generation(cfg, task)
+        return {
+            "outcome": "claimed",
+            "attempt_id": attempt.attempt_id,
+            "attempt_number": attempt_number,
+            "fencing_token": token,
+            "reservation_id": offer["reservation_id"],
+            "gpu_ids": gpu_ids,
+            "cpu_slots": offer["cpu_slots"],
+        }
+
+
+def _rollback_project_io_claim_locked(
+    cfg: RootConfig,
+    task: TaskRecord,
+    token: int,
+    attempt_file: Path,
+    attempt_persisted: bool,
+) -> None:
+    """Undo only the shared claim artifacts; the executor retains its offer."""
+    claim = task.claim_control.get("active_claim") or {}
+    if claim.get("fencing_token") != token:
+        return
+    with record_task_change(
+        cfg,
+        task,
+        "claim_loss",
+        details={
+            "expected_attempt_id": claim.get("attempt_id"),
+            "expected_fencing_token": token,
+            "transition": "claim_materialization_failed",
+            "reason": "attempt_materialization_failed",
+        },
+    ):
+        archive_claim(cfg, task.task_id, claim, "attempt_materialization_failed")
+        task.claim_control["active_claim"] = None
+        task.attempt_control["current_attempt_id"] = None
+        task.state.update({"projection": "queued", "reason": "attempt_materialization_failed"})
+        task.meta["revision"] += 1
+        task.meta["updated_at"] = utc_now()
+        save_task(cfg, task)
+    if attempt_persisted:
+        try:
+            attempt_file.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
 def _has_local_launch_evidence(cfg: RootConfig, attempt_id: str) -> bool:
     paths = local_paths(cfg.runtime_root)
     return any(
@@ -587,6 +969,189 @@ def resume_starting_attempt(
         if cancel_result.event:
             dispatch_task_lifecycle_hooks_noexcept(cfg, cancel_result.event)
     return None
+
+
+def authorize_project_io_launch(
+    cfg: RootConfig,
+    claim_identity: Mapping[str, Any],
+    *,
+    launch_handoff_timeout_seconds: int | float,
+    mutation_fence: Callable[[], None],
+) -> dict[str, Any]:
+    """Authorize one exact claim without touching local resource reservations or launching work."""
+    fields = {"task_id", "attempt_id", "attempt_number", "fencing_token", "reservation_id"}
+    if not isinstance(claim_identity, Mapping) or set(claim_identity) != fields:
+        raise ValueError("launch authorization identity has missing or unknown fields.")
+    identity = dict(claim_identity)
+    for field in ("task_id", "attempt_id", "reservation_id"):
+        validate_identifier(identity[field], f"claim_identity.{field}")
+    for field in ("attempt_number", "fencing_token"):
+        if type(identity[field]) is not int or identity[field] < 1:
+            raise ValueError(f"claim_identity.{field} must be a positive integer.")
+    task_id = identity["task_id"]
+    attempt_number = identity["attempt_number"]
+    attempt_id = identity["attempt_id"]
+    fencing_token = identity["fencing_token"]
+    reservation_id = identity["reservation_id"]
+    if attempt_id != f"{task_id}-attempt-{attempt_number}":
+        raise ValueError("launch authorization attempt identity is inconsistent.")
+    timeout_seconds = validate_launch_handoff_timeout_seconds(launch_handoff_timeout_seconds)
+
+    def denied(reason: str) -> dict[str, Any]:
+        return {"outcome": "denied", "claim_identity": identity, "reason": reason}
+
+    def authorized(launch_id: str, resolved_timeout: int | float) -> dict[str, Any]:
+        return {
+            "outcome": "authorized",
+            "claim_identity": identity,
+            "launch_id": launch_id,
+            "launch_handoff_timeout_seconds": validate_launch_handoff_timeout_seconds(resolved_timeout),
+        }
+
+    try:
+        initial = load_task(cfg, task_id)
+    except (FileNotFoundError, KeyError, ValueError):
+        return denied("claim_not_current")
+    if initial.task_id != task_id:
+        return denied("claim_not_current")
+
+    with authority_locks(cfg, initial):
+        try:
+            task = load_task(cfg, task_id)
+        except (FileNotFoundError, KeyError, ValueError):
+            return denied("claim_not_current")
+        claim = task.claim_control.get("active_claim") or {}
+        if (
+            task.state.get("projection") != "running"
+            or task.attempt_control.get("current_attempt_id") != attempt_id
+            or task.attempt_control.get("current_attempt_number") != attempt_number
+            or claim.get("attempt_id") != attempt_id
+            or claim.get("attempt_number") != attempt_number
+            or claim.get("fencing_token") != fencing_token
+            or claim.get("reservation_id") != reservation_id
+            or claim.get("machine_name") != cfg.machine_name
+            or claim.get("launch_state") not in {"claimed", "starting"}
+        ):
+            return denied("claim_not_current")
+
+        try:
+            attempt = AttemptRecord.from_dict(read_json(attempt_path(cfg.shared_root, task_id, attempt_number)))
+        except (FileNotFoundError, KeyError, TypeError, ValueError):
+            return denied("attempt_not_current")
+        if (
+            attempt.task_id != task_id
+            or attempt.attempt_number != attempt_number
+            or attempt.attempt_id != attempt_id
+            or attempt.current_fencing_token != fencing_token
+            or attempt.reservation_id != reservation_id
+            or attempt.machine_name != cfg.machine_name
+            or attempt.authority_mode != claim.get("authority_mode")
+            or attempt.phase not in {"claimed", "starting"}
+        ):
+            return denied("attempt_not_current")
+
+        authority_mode = claim.get("authority_mode")
+        if authority_mode not in {"bounded_lease", "holder_bound"}:
+            return denied("authority_unavailable")
+        if attempt.authority_mode != authority_mode:
+            return denied("authority_unavailable")
+
+        # Once the Task-side launch gate commits, later pause, cancellation,
+        # membership, or clock changes cannot revoke it. Exact replay either
+        # returns the durable identity or repairs only its matching Attempt.
+        if claim.get("launch_state") == "starting":
+            launch_id = claim.get("launch_id")
+            authorized_at = claim.get("launch_authorized_at")
+            if not isinstance(launch_id, str) or not _LAUNCH_ID.fullmatch(launch_id):
+                return denied("attempt_not_current")
+            if not _valid_utc_timestamp(authorized_at):
+                return denied("attempt_not_current")
+            stored_timeout = claim.get(
+                "launch_handoff_timeout_seconds",
+                attempt.authorization.get("launch_handoff_timeout_seconds", timeout_seconds),
+            )
+            try:
+                stored_timeout = validate_launch_handoff_timeout_seconds(stored_timeout)
+            except (TypeError, ValueError):
+                return denied("attempt_not_current")
+            if attempt.phase == "claimed" and attempt.authorization.get("launch_id") is None:
+                attempt.phase = "starting"
+                attempt.authorization["launch_id"] = launch_id
+                attempt.authorization["launch_handoff_timeout_seconds"] = stored_timeout
+                attempt.timestamps["launch_authorized_at"] = authorized_at
+                mutation_fence()
+                atomic_replace(attempt_path(cfg.shared_root, task_id, attempt_number), attempt.to_dict())
+            elif (
+                attempt.phase != "starting"
+                or attempt.authorization.get("launch_id") != launch_id
+                or attempt.authorization.get("launch_handoff_timeout_seconds") != stored_timeout
+                or attempt.timestamps.get("launch_authorized_at") != authorized_at
+            ):
+                return denied("attempt_not_current")
+            return authorized(launch_id, stored_timeout)
+        if claim.get("launch_state") != "claimed" or attempt.phase != "claimed":
+            return denied("attempt_not_current")
+
+        if task.control.get("cleanup_operation_id") or task.control.get("cleanup_state"):
+            return denied("cleanup_pending")
+        try:
+            if operation_exists(cfg, "cleanup", task_id):
+                return denied("cleanup_pending")
+        except (OSError, RuntimeError, ValueError, KeyError, TypeError):
+            return denied("cleanup_pending")
+        if task.control.get("cancellation_requested_at"):
+            return denied("cancellation_pending")
+
+        group: dict[str, Any] | None = None
+        if task.group_name:
+            try:
+                group = read_group(cfg.shared_root, task.group_name)
+                if has_active_cancellation(cfg, task, group):
+                    return denied("cancellation_pending")
+                if not group_allows(group, task, cfg.machine_name):
+                    return denied("group_gate_closed")
+            except (FileNotFoundError, OSError, RuntimeError, ValueError, KeyError, TypeError):
+                return denied("group_gate_closed")
+
+        if authority_mode == "bounded_lease":
+            if not _bounded_lease_is_current(claim, attempt):
+                return denied("authority_unavailable")
+            try:
+                if not clock_capability(cfg).is_healthy:
+                    return denied("clock_unhealthy")
+            except (OSError, RuntimeError, ValueError, KeyError, TypeError):
+                return denied("clock_unhealthy")
+
+        authorized_at = utc_now()
+        launch_id = uuid.uuid4().hex
+        details = {
+            "attempt_id": attempt_id,
+            "attempt_number": attempt_number,
+            "fencing_token": fencing_token,
+            "launch_id": launch_id,
+        }
+        # Group change journaling can make its own shared writes. Fence before
+        # entering it, then fence immediately before the Task and Attempt writes.
+        mutation_fence()
+        with record_task_change(cfg, task, "launch", details=details, mutation_fence=mutation_fence):
+            claim["launch_state"] = "starting"
+            claim["launch_id"] = launch_id
+            claim["launch_authorized_at"] = authorized_at
+            claim["launch_handoff_timeout_seconds"] = timeout_seconds
+            if group is not None:
+                claim["group_dispatch_epoch"] = group["group"]["dispatch_epoch"]
+                claim["group_worker_set_epoch"] = group["group"]["worker_set_epoch"]
+            task.meta["revision"] += 1
+            task.meta["updated_at"] = authorized_at
+            mutation_fence()
+            save_task(cfg, task)
+            attempt.phase = "starting"
+            attempt.authorization["launch_id"] = launch_id
+            attempt.authorization["launch_handoff_timeout_seconds"] = timeout_seconds
+            attempt.timestamps["launch_authorized_at"] = authorized_at
+            mutation_fence()
+            atomic_replace(attempt_path(cfg.shared_root, task_id, attempt_number), attempt.to_dict())
+        return authorized(launch_id, timeout_seconds)
 
 
 def authorize_launch(
@@ -1349,6 +1914,339 @@ def renew_attempt_lease(
         )
 
 
+def renew_project_io_attempt_lease(
+    cfg: RootConfig,
+    *,
+    request_id: str,
+    task_id: str,
+    attempt_id: str,
+    attempt_number: int,
+    fencing_token: int,
+    reservation_id: str | None,
+    process_identity: Mapping[str, Any],
+    expected_task_revision: int,
+    expected_attempt_digest: str,
+    mutation_fence: Callable[[], None],
+    replay_only: bool = False,
+) -> dict[str, Any]:
+    """Renew one exact observed Attempt with replayable per-write fencing.
+
+    ``request_id`` becomes the immutable clock-observation identity.  That
+    marker lets an exact request resume after the clock-plan or Task write and
+    recognize a fully committed Task/Attempt pair without adding shared-schema
+    fields.  The Task write is deliberately metadata-only: renewal cannot
+    change observation routes, so it bypasses ``save_task`` and its unrelated
+    projection/outbox transaction.  ``replay_only`` is for stale executor
+    requests and may only finish a Task commit already marked by this request.
+    """
+
+    def stale(reason: str, *, task_revision: int | None, attempt_digest: str | None) -> dict[str, Any]:
+        return {
+            "outcome": "observed_stale",
+            "reason": reason,
+            "lease_expires_at": None,
+            "renew_after_seconds": None,
+            "committed_revisions": {"task": task_revision, "attempt_digest": attempt_digest},
+        }
+
+    def read_attempt() -> tuple[AttemptRecord | None, str | None]:
+        path = attempt_path(cfg.shared_root, task_id, attempt_number)
+        try:
+            raw = path.read_bytes()
+        except FileNotFoundError:
+            return None, None
+        value = json.loads(raw.decode("utf-8"))
+        if not isinstance(value, dict):
+            raise ValueError("Attempt record must contain a JSON object.")
+        return AttemptRecord.from_dict(value), hashlib.sha256(raw).hexdigest()
+
+    def observation_id(record: Mapping[str, Any] | None) -> object:
+        return None if not isinstance(record, Mapping) else record.get("observation_id")
+
+    def validate_clock_observation(observation: ClockObservation) -> None:
+        if observation.observation_id != request_id:
+            raise ValueError("renewal clock observation identity is inconsistent.")
+        if (
+            not isinstance(observation.provider, str)
+            or not observation.provider
+            or len(observation.provider) > 128
+            or not _valid_utc_timestamp(observation.observed_at)
+            or not isinstance(observation.boot_id, str)
+            or not observation.boot_id
+            or len(observation.boot_id) > 128
+        ):
+            raise ValueError("renewal clock observation identity is malformed.")
+        numeric = (
+            observation.monotonic_observed_at,
+            observation.lower_error_seconds,
+            observation.upper_error_seconds,
+            observation.max_drift_rate,
+            observation.provider_margin_seconds,
+        )
+        if any(type(value) not in {int, float} or not math.isfinite(value) for value in numeric):
+            raise ValueError("renewal clock observation contains a non-finite value.")
+        if (
+            observation.monotonic_observed_at < 0
+            or observation.lower_error_seconds > observation.upper_error_seconds
+            or observation.max_drift_rate < 0
+            or observation.provider_margin_seconds < 0
+        ):
+            raise ValueError("renewal clock observation bounds are invalid.")
+
+    def validate_plan(value: object) -> tuple[str, str, float]:
+        if not isinstance(value, Mapping) or set(value) != {
+            "renewed_at",
+            "lease_expires_at",
+            "renew_after_seconds",
+        }:
+            raise ValueError("renewal clock record has no immutable plan.")
+        renewed_at = value["renewed_at"]
+        expires = value["lease_expires_at"]
+        if not _valid_utc_timestamp(renewed_at) or not _valid_utc_timestamp(expires):
+            raise ValueError("renewal plan timestamps are malformed.")
+        renewed_time = datetime.fromisoformat(renewed_at.replace("Z", "+00:00"))
+        expiry_time = datetime.fromisoformat(expires.replace("Z", "+00:00"))
+        if expiry_time <= renewed_time:
+            raise ValueError("renewal plan expiry must follow renewal time.")
+        renew_after = value["renew_after_seconds"]
+        if type(renew_after) not in {int, float} or not math.isfinite(renew_after) or not 0 < renew_after <= 86_400:
+            raise ValueError("renewal plan cadence is invalid.")
+        return renewed_at, expires, float(renew_after)
+
+    initial = load_task(cfg, task_id)
+    with authority_locks(cfg, initial):
+        task = load_task(cfg, task_id)
+        attempt, attempt_digest = read_attempt()
+        task_revision = task.meta.get("revision")
+        if type(task_revision) is not int or task_revision < 0:
+            raise ValueError("Task revision is malformed.")
+        claim = task.claim_control.get("active_claim") or {}
+        if (
+            task.attempt_control.get("current_attempt_id") != attempt_id
+            or task.attempt_control.get("current_attempt_number") != attempt_number
+            or claim.get("attempt_id") != attempt_id
+            or claim.get("attempt_number") != attempt_number
+            or claim.get("fencing_token") != fencing_token
+            or claim.get("machine_name") != cfg.machine_name
+        ):
+            return stale("task_changed", task_revision=task_revision, attempt_digest=attempt_digest)
+        if (
+            attempt is None
+            or attempt.task_id != task_id
+            or attempt.attempt_id != attempt_id
+            or attempt.attempt_number != attempt_number
+            or attempt.current_fencing_token != fencing_token
+            or attempt.machine_name != cfg.machine_name
+        ):
+            return stale("attempt_changed", task_revision=task_revision, attempt_digest=attempt_digest)
+        if claim.get("reservation_id") != reservation_id or attempt.reservation_id != reservation_id:
+            return stale("reservation_changed", task_revision=task_revision, attempt_digest=attempt_digest)
+        if any(
+            attempt.process.get(field) != process_identity.get(field)
+            for field in (
+                "wrapper_pid",
+                "wrapper_start_time_ticks",
+                "process_group_id",
+                "process_group_start_time_ticks",
+            )
+        ):
+            return stale("process_changed", task_revision=task_revision, attempt_digest=attempt_digest)
+        if attempt.phase != "running":
+            return stale("attempt_not_running", task_revision=task_revision, attempt_digest=attempt_digest)
+
+        attempt_clock = attempt.lease.get("clock_evidence")
+        task_applied = claim.get("clock_observation_id") == request_id
+        attempt_applied = observation_id(attempt_clock) == request_id
+        if attempt_applied and not task_applied:
+            raise RuntimeError("Attempt renewal marker exists without authoritative Task evidence.")
+        if replay_only and not task_applied:
+            return stale("task_changed", task_revision=task_revision, attempt_digest=attempt_digest)
+        if not task_applied and (task_revision != expected_task_revision or attempt_digest != expected_attempt_digest):
+            return stale("attempt_changed", task_revision=task_revision, attempt_digest=attempt_digest)
+        if not task_applied and (
+            task.control.get("terminate_running") is True
+            or task.control.get("cancellation_requested_at") is not None
+            or claim.get("termination_decision_id") is not None
+            or attempt.termination.get("requested_at") is not None
+            or attempt.termination.get("requested_by_operation_id") is not None
+        ):
+            return {
+                "outcome": "termination_requested",
+                "reason": "termination_pending",
+                "lease_expires_at": None,
+                "renew_after_seconds": None,
+                "committed_revisions": {"task": task_revision, "attempt_digest": attempt_digest},
+            }
+        if claim.get("authority_mode") != attempt.authority_mode:
+            return stale("attempt_changed", task_revision=task_revision, attempt_digest=attempt_digest)
+        if attempt.authority_mode == "holder_bound":
+            return {
+                "outcome": "not_required",
+                "reason": None,
+                "lease_expires_at": None,
+                "renew_after_seconds": None,
+                "committed_revisions": {"task": task_revision, "attempt_digest": attempt_digest},
+            }
+
+        observation_path = shared_paths(cfg.shared_root)["clock_observations"] / cfg.machine_name / f"{request_id}.json"
+        try:
+            clock_record = read_json(observation_path)
+            if set(clock_record) != {"clock_observation", "renewal_plan"}:
+                raise ValueError("renewal clock record fields are invalid.")
+            stored_observation = ClockObservation.from_dict(clock_record["clock_observation"])
+            validate_clock_observation(stored_observation)
+            renewed_at, expires, renew_after_seconds = validate_plan(clock_record["renewal_plan"])
+        except FileNotFoundError:
+            if task_applied:
+                raise RuntimeError("Authoritative Task renewal is missing its clock observation.")
+            policy = load_lease_policy(cfg)
+            capability = clock_capability(cfg, policy)
+            if not capability.is_healthy or capability.observation is None:
+                raise RuntimeError(f"clock capability is unavailable: {capability.reason}")
+            source = capability.observation
+            stored_observation = ClockObservation(
+                observation_id=request_id,
+                provider=source.provider,
+                observed_at=source.observed_at,
+                monotonic_observed_at=source.monotonic_observed_at,
+                boot_id=source.boot_id,
+                lower_error_seconds=source.lower_error_seconds,
+                upper_error_seconds=source.upper_error_seconds,
+                max_drift_rate=source.max_drift_rate,
+                provider_margin_seconds=source.provider_margin_seconds,
+            )
+            validate_clock_observation(stored_observation)
+            renewed_at = utc_now()
+            expires = lease_expiry(policy)
+            renew_after_seconds = policy.renew_interval_seconds
+            validate_plan(
+                {
+                    "renewed_at": renewed_at,
+                    "lease_expires_at": expires,
+                    "renew_after_seconds": renew_after_seconds,
+                }
+            )
+            mutation_fence()
+            atomic_replace(
+                observation_path,
+                {
+                    "clock_observation": stored_observation.to_dict(),
+                    "renewal_plan": {
+                        "renewed_at": renewed_at,
+                        "lease_expires_at": expires,
+                        "renew_after_seconds": renew_after_seconds,
+                    },
+                },
+            )
+        else:
+            if not task_applied:
+                policy = load_lease_policy(cfg)
+                capability = clock_capability(cfg, policy)
+                now_mono = time.monotonic()
+                age = now_mono - stored_observation.monotonic_observed_at
+                if (
+                    not capability.is_healthy
+                    or capability.observation is None
+                    or capability.observation.boot_id != stored_observation.boot_id
+                    or age < 0
+                    or age > policy.clock_observation_max_age_seconds
+                    or stored_observation.bound_at(now_mono) > policy.max_clock_skew_seconds
+                ):
+                    raise RuntimeError("renewal clock observation is no longer current.")
+
+        if not task_applied:
+            remaining_deadline = datetime.fromisoformat(expires.replace("Z", "+00:00"))
+            conservative_commit_time = datetime.now(timezone.utc) + timedelta(
+                seconds=stored_observation.bound_at(time.monotonic()) + policy.renewal_commit_margin_seconds
+            )
+            if remaining_deadline <= conservative_commit_time:
+                return stale(
+                    "renewal_plan_expired",
+                    task_revision=task_revision,
+                    attempt_digest=attempt_digest,
+                )
+
+        if task_applied:
+            evidence = {
+                "clock_error_bound_seconds": claim.get("clock_error_bound_seconds"),
+                "provider": claim.get("clock_provider"),
+                "observation_id": claim.get("clock_observation_id"),
+            }
+            if (
+                claim.get("lease_expires_at") != expires
+                or evidence["observation_id"] != request_id
+                or evidence["provider"] != stored_observation.provider
+                or type(evidence["clock_error_bound_seconds"]) not in {int, float}
+                or not math.isfinite(evidence["clock_error_bound_seconds"])
+                or evidence["clock_error_bound_seconds"] < 0
+            ):
+                raise RuntimeError("Authoritative Task renewal evidence is inconsistent.")
+            if attempt_applied:
+                if (
+                    attempt.lease.get("expires_at") != expires
+                    or attempt.lease.get("renewed_at") != renewed_at
+                    or attempt_clock != evidence
+                ):
+                    raise RuntimeError("Committed renewal evidence is inconsistent.")
+                return {
+                    "outcome": "renewed",
+                    "reason": None,
+                    "lease_expires_at": expires,
+                    "renew_after_seconds": renew_after_seconds,
+                    "committed_revisions": {"task": task_revision, "attempt_digest": attempt_digest},
+                }
+        else:
+            evidence = _clock_evidence(stored_observation)
+            if (
+                type(evidence.get("clock_error_bound_seconds")) not in {int, float}
+                or not math.isfinite(evidence["clock_error_bound_seconds"])
+                or evidence["clock_error_bound_seconds"] < 0
+            ):
+                raise ValueError("renewal clock evidence bound is invalid.")
+
+            before = copy.deepcopy(task.to_dict())
+            claim["lease_expires_at"] = expires
+            claim.update(
+                {
+                    "clock_error_bound_seconds": evidence["clock_error_bound_seconds"],
+                    "clock_provider": evidence["provider"],
+                    "clock_observation_id": evidence["observation_id"],
+                }
+            )
+            task.meta["revision"] = task_revision + 1
+            task.meta["updated_at"] = renewed_at
+            after = copy.deepcopy(task.to_dict())
+            for value in (before, after):
+                value["meta"].pop("revision", None)
+                value["meta"].pop("updated_at", None)
+                active_claim = value["task"]["claim_control"].get("active_claim") or {}
+                for field in (
+                    "lease_expires_at",
+                    "clock_error_bound_seconds",
+                    "clock_provider",
+                    "clock_observation_id",
+                ):
+                    active_claim.pop(field, None)
+            if before != after:
+                raise RuntimeError("renewal attempted an observation-visible Task mutation.")
+            mutation_fence()
+            atomic_replace(task_path(cfg.shared_root, task_id), task.to_dict())
+            task_revision += 1
+
+        attempt.lease.update({"renewed_at": renewed_at, "expires_at": expires, "clock_evidence": evidence})
+        mutation_fence()
+        attempt_file = attempt_path(cfg.shared_root, task_id, attempt_number)
+        atomic_replace(attempt_file, attempt.to_dict())
+        attempt_digest = hashlib.sha256(attempt_file.read_bytes()).hexdigest()
+        return {
+            "outcome": "renewed",
+            "reason": None,
+            "lease_expires_at": expires,
+            "renew_after_seconds": renew_after_seconds,
+            "committed_revisions": {"task": task_revision, "attempt_digest": attempt_digest},
+        }
+
+
 def resolve_execution_authority(
     cfg: RootConfig,
     task_id: str,
@@ -1449,6 +2347,238 @@ def commit_shared_termination(
         task.meta["updated_at"] = utc_now()
         save_task(cfg, task)
         return True
+
+
+def commit_project_io_shared_termination(
+    cfg: RootConfig,
+    *,
+    machine_name: str,
+    task_id: str,
+    attempt_id: str,
+    attempt_number: int,
+    fencing_token: int,
+    reservation_id: str | None,
+    decision_id: str,
+    decision_token: int,
+    authority_outcome: str,
+    reason: str,
+    process_identity: Mapping[str, Any],
+    expected_task_revision: int,
+    expected_attempt_digest: str,
+    mutation_fence: Callable[[], None],
+) -> dict[str, Any]:
+    """Commit one exact Project-I/O termination marker under shared authority locks."""
+
+    def evidence(
+        outcome: str,
+        stale_reason: str | None,
+        task: TaskRecord | None,
+        attempt: AttemptRecord | None,
+        attempt_digest: str | None,
+        shared_commitment: str | None,
+    ) -> dict[str, Any]:
+        return {
+            "outcome": outcome,
+            "reason": stale_reason,
+            "machine_name": machine_name,
+            "task_id": task_id,
+            "attempt_id": attempt_id,
+            "attempt_number": attempt_number,
+            "fencing_token": fencing_token,
+            "reservation_id": reservation_id,
+            "decision_id": decision_id,
+            "decision_token": decision_token,
+            "authority_outcome": authority_outcome,
+            "decision_reason": reason,
+            "process_identity": dict(process_identity),
+            "source_revisions": {"task": expected_task_revision, "attempt_digest": expected_attempt_digest},
+            "committed_revisions": {
+                "task": None if task is None else task.meta.get("revision"),
+                "attempt_digest": attempt_digest,
+            },
+            "shared_commitment": shared_commitment,
+            "authority_granted": False,
+            "local_effects": [],
+        }
+
+    def read_attempt() -> tuple[AttemptRecord | None, str | None]:
+        path = attempt_path(cfg.shared_root, task_id, attempt_number)
+        try:
+            raw = path.read_bytes()
+        except FileNotFoundError:
+            return None, None
+        value = json.loads(raw.decode("utf-8"))
+        if not isinstance(value, dict):
+            raise ValueError("Attempt record must contain a JSON object.")
+        return AttemptRecord.from_dict(value), hashlib.sha256(raw).hexdigest()
+
+    commitment_identity = {
+        "machine_name": machine_name,
+        "task_id": task_id,
+        "attempt_id": attempt_id,
+        "attempt_number": attempt_number,
+        "fencing_token": fencing_token,
+        "reservation_id": reservation_id,
+        "decision_id": decision_id,
+        "decision_token": decision_token,
+        "authority_outcome": authority_outcome,
+        "reason": reason,
+        "process_identity": dict(process_identity),
+        "source_revisions": {"task": expected_task_revision, "attempt_digest": expected_attempt_digest},
+    }
+    commitment_digest = hashlib.sha256(
+        json.dumps(
+            commitment_identity,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
+    ).hexdigest()
+
+    try:
+        initial = load_task(cfg, task_id)
+    except FileNotFoundError:
+        attempt, attempt_digest = read_attempt()
+        return evidence("stale", "task_missing", None, attempt, attempt_digest, None)
+    with authority_locks(cfg, initial):
+        task = load_task(cfg, task_id)
+        if task.depends_on_task_ids != initial.depends_on_task_ids:
+            raise RuntimeError("Task dependency identity changed while Project-I/O locks were acquired.")
+        attempt, attempt_digest = read_attempt()
+        if attempt is None:
+            return evidence("stale", "attempt_missing", task, None, None, None)
+        claim = task.claim_control.get("active_claim") or {}
+        attempt_identity_matches = (
+            task.task_id == task_id
+            and attempt.task_id == task_id
+            and attempt.attempt_id == attempt_id
+            and attempt.attempt_number == attempt_number
+            and attempt.current_fencing_token == fencing_token
+            and attempt.machine_name == machine_name
+        )
+        if not attempt_identity_matches:
+            return evidence("stale", "claim_not_current", task, attempt, attempt_digest, None)
+        attempt_process_matches = all(
+            attempt.process.get(field) == process_identity.get(field) for field in process_identity
+        )
+        claim_identity_matches = (
+            task.attempt_control.get("current_attempt_id") == attempt_id
+            and task.attempt_control.get("current_attempt_number") == attempt_number
+            and claim.get("attempt_id") == attempt_id
+            and claim.get("attempt_number") == attempt_number
+            and claim.get("fencing_token") == fencing_token
+            and claim.get("machine_name") == machine_name
+        )
+        if not claim_identity_matches and not claim:
+            terminal_pair = (
+                task.attempt_control.get("current_attempt_id") is None
+                and task.attempt_control.get("current_attempt_number") == attempt_number
+                and task.state.get("projection") in {"succeeded", "failed", "cancelled"}
+                and task.state.get("projection") == attempt.phase
+                and task.state.get("reason") == attempt.result.get("reason")
+            )
+            if terminal_pair and attempt_process_matches and attempt.reservation_id == reservation_id:
+                claim_paths = shared_paths(cfg.shared_root)
+                for archive_dir in ("claim_archive", "claim_pending"):
+                    path = claim_paths[archive_dir] / task_id / f"{fencing_token}.json"
+                    try:
+                        archived = read_json(path).get("claim_archive", {}).get("claim", {})
+                    except FileNotFoundError:
+                        continue
+                    if (
+                        archived.get("attempt_id") == attempt_id
+                        and archived.get("attempt_number") == attempt_number
+                        and archived.get("fencing_token") == fencing_token
+                    ):
+                        existing_decision_id = archived.get("termination_decision_id")
+                        existing_decision_token = archived.get("termination_decision_token")
+                        if (
+                            existing_decision_id == decision_id
+                            and existing_decision_token == decision_token
+                            and archived.get("termination_commitment_digest") == commitment_digest
+                        ):
+                            return evidence("already_committed", None, task, attempt, attempt_digest, "committed")
+                        if existing_decision_id is not None or existing_decision_token is not None:
+                            return evidence("stale", "decision_conflict", task, attempt, attempt_digest, None)
+            return evidence("stale", "claim_not_current", task, attempt, attempt_digest, None)
+        if not claim_identity_matches:
+            return evidence("stale", "claim_not_current", task, attempt, attempt_digest, None)
+        existing_decision_id = claim.get("termination_decision_id")
+        existing_decision_token = claim.get("termination_decision_token")
+        if existing_decision_id is not None or existing_decision_token is not None:
+            if (
+                existing_decision_id == decision_id
+                and existing_decision_token == decision_token
+                and claim.get("termination_commitment_digest") == commitment_digest
+            ):
+                if (
+                    claim.get("reservation_id") != reservation_id
+                    or attempt.reservation_id != reservation_id
+                    or not attempt_process_matches
+                ):
+                    return evidence("stale", "process_identity_mismatch", task, attempt, attempt_digest, None)
+                return evidence("already_committed", None, task, attempt, attempt_digest, "committed")
+            return evidence("stale", "decision_conflict", task, attempt, attempt_digest, None)
+        if task.meta.get("revision") != expected_task_revision or attempt_digest != expected_attempt_digest:
+            return evidence("stale", "source_revision_mismatch", task, attempt, attempt_digest, None)
+        if task.state.get("projection") != "running":
+            return evidence("stale", "task_phase_mismatch", task, attempt, attempt_digest, None)
+        if claim.get("reservation_id") != reservation_id or attempt.reservation_id != reservation_id:
+            return evidence("stale", "reservation_mismatch", task, attempt, attempt_digest, None)
+        if attempt.phase != "running":
+            return evidence("stale", "attempt_phase_mismatch", task, attempt, attempt_digest, None)
+        if any(attempt.process.get(field) != process_identity.get(field) for field in process_identity):
+            return evidence("stale", "process_identity_mismatch", task, attempt, attempt_digest, None)
+        claim.update(
+            {
+                "termination_decision_id": decision_id,
+                "termination_decision_token": decision_token,
+                "termination_committed_at": utc_now(),
+                "termination_commitment_digest": commitment_digest,
+            }
+        )
+        task.meta["revision"] += 1
+        task.meta["updated_at"] = utc_now()
+        mutation_fence()
+        save_task(cfg, task, mutation_fence=mutation_fence)
+        return evidence("committed", None, task, attempt, attempt_digest, "committed")
+
+
+def recover_project_io_orphaned_attempt(
+    cfg: RootConfig,
+    *,
+    machine_name: str,
+    task_id: str,
+    attempt_id: str,
+    attempt_number: int,
+    fencing_token: int,
+    reservation_id: str | None,
+    process_identity: Mapping[str, Any],
+    binding_signature: list[str] | tuple[str, ...],
+    expected_task_revision: int | None,
+    expected_attempt_digest: str | None,
+    mutation_fence: Callable[[], None],
+    replay_only: bool = False,
+) -> dict[str, Any]:
+    """Run the shared-only orphan recovery transaction for Project I/O."""
+    from .runtime.attempt_recovery import recover_orphaned_attempt_shared
+
+    return recover_orphaned_attempt_shared(
+        cfg,
+        machine_name=machine_name,
+        task_id=task_id,
+        attempt_id=attempt_id,
+        attempt_number=attempt_number,
+        expired_token=fencing_token,
+        reservation_id=reservation_id,
+        process_identity=process_identity,
+        binding_signature=binding_signature,
+        expected_task_revision=expected_task_revision,
+        expected_attempt_digest=expected_attempt_digest,
+        mutation_fence=mutation_fence,
+        replay_only=replay_only,
+    )
 
 
 def _continue_committed_termination(cfg: RootConfig, task_id: str, attempt_id: str, fencing_token: int) -> bool:
@@ -1798,6 +2928,402 @@ def finalize_orphaned_attempt(
     if result.event:
         dispatch_task_lifecycle_hooks_noexcept(cfg, result.event)
     return True
+
+
+def observe_project_io_terminal_state(
+    cfg: RootConfig,
+    *,
+    machine_name: str,
+    task_id: str,
+    attempt_id: str,
+    attempt_number: int,
+    fencing_token: int,
+    reservation_id: str | None,
+    process_identity: Mapping[str, Any],
+    mode: str,
+) -> dict[str, Any]:
+    """Read one exact active or detached Attempt snapshot under authority locks."""
+
+    def read_attempt() -> tuple[AttemptRecord | None, str | None]:
+        try:
+            raw = attempt_path(cfg.shared_root, task_id, attempt_number).read_bytes()
+        except FileNotFoundError:
+            return None, None
+        value = json.loads(raw.decode("utf-8"))
+        if not isinstance(value, dict):
+            raise ValueError("Attempt record must contain a JSON object.")
+        return AttemptRecord.from_dict(value), hashlib.sha256(raw).hexdigest()
+
+    def evidence(
+        outcome: str,
+        reason: str | None,
+        task: TaskRecord | None,
+        attempt: AttemptRecord | None,
+        attempt_digest: str | None,
+    ) -> dict[str, Any]:
+        return {
+            "outcome": outcome,
+            "reason": reason,
+            "machine_name": machine_name,
+            "task_id": task_id,
+            "attempt_id": attempt_id,
+            "attempt_number": attempt_number,
+            "fencing_token": fencing_token,
+            "reservation_id": None if attempt is None else attempt.reservation_id,
+            "process_identity": dict(process_identity),
+            "mode": mode,
+            "task_phase": None if task is None else task.state.get("projection"),
+            "attempt_phase": None if attempt is None else attempt.phase,
+            "attempt_result_reason": None if attempt is None else attempt.result.get("reason"),
+            "attempt_exit_code": None if attempt is None else attempt.result.get("exit_code"),
+            "execution_machine_name": None if attempt is None else attempt.machine_name,
+            "reservation_machine_name": None if attempt is None else attempt.machine_name,
+            "termination_result": None if attempt is None else attempt.termination.get("result"),
+            "cancel_requested": False if task is None else bool(task.control.get("terminate_running")),
+            "source_revisions": {
+                "task": None if task is None else task.meta.get("revision"),
+                "attempt_digest": attempt_digest,
+            },
+            "authority_granted": False,
+            "local_effects": [],
+        }
+
+    try:
+        initial = load_task(cfg, task_id)
+    except FileNotFoundError:
+        attempt, attempt_digest = read_attempt()
+        return evidence("stale", "task_missing", None, attempt, attempt_digest)
+    with authority_locks(cfg, initial):
+        task = load_task(cfg, task_id)
+        if task.depends_on_task_ids != initial.depends_on_task_ids:
+            raise RuntimeError("Task dependency identity changed while Project-I/O locks were acquired.")
+        attempt, attempt_digest = read_attempt()
+        if attempt is None:
+            return evidence("stale", "attempt_missing", task, None, None)
+        if (
+            attempt.task_id != task_id
+            or attempt.attempt_id != attempt_id
+            or attempt.attempt_number != attempt_number
+            or attempt.current_fencing_token != fencing_token
+        ):
+            return evidence("stale", "attempt_identity_mismatch", task, attempt, attempt_digest)
+        if attempt.machine_name != machine_name:
+            return evidence("stale", "task_identity_mismatch", task, attempt, attempt_digest)
+        if attempt.reservation_id != reservation_id:
+            return evidence("stale", "reservation_mismatch", task, attempt, attempt_digest)
+        if any(attempt.process.get(field) != process_identity.get(field) for field in process_identity):
+            return evidence("stale", "process_identity_mismatch", task, attempt, attempt_digest)
+
+        task_phase = task.state.get("projection")
+        attempt_phase = attempt.phase
+        terminal_pair = (
+            task_phase in {"succeeded", "failed", "cancelled"}
+            and attempt_phase == task_phase
+            and task.state.get("reason") == attempt.result.get("reason")
+            and task.control.get("termination_result") == attempt.termination.get("result")
+            and task.attempt_control.get("current_attempt_number") == attempt_number
+            and task.attempt_control.get("current_attempt_id") is None
+            and not task.claim_control.get("active_claim")
+        )
+        if terminal_pair:
+            return evidence("already_terminal", None, task, attempt, attempt_digest)
+
+        if attempt_phase in {"succeeded", "failed", "cancelled"}:
+            settled_attempt = load_settled_terminal_attempt(
+                cfg,
+                task_id,
+                attempt_id,
+                attempt_number=attempt_number,
+            )
+            if settled_attempt is not None:
+                return evidence("settled_terminal", None, task, attempt, attempt_digest)
+
+        if mode == "active":
+            if (
+                task.attempt_control.get("current_attempt_id") != attempt_id
+                or task.attempt_control.get("current_attempt_number") != attempt_number
+            ):
+                return evidence("stale", "task_identity_mismatch", task, attempt, attempt_digest)
+            claim = task.claim_control.get("active_claim") or {}
+            if (
+                task_phase != "running"
+                or claim.get("attempt_id") != attempt_id
+                or claim.get("attempt_number") != attempt_number
+                or claim.get("fencing_token") != fencing_token
+                or claim.get("machine_name") != machine_name
+                or claim.get("reservation_id") != reservation_id
+            ):
+                return evidence("stale", "claim_not_current", task, attempt, attempt_digest)
+            if attempt_phase != "running":
+                return evidence("stale", "attempt_phase_mismatch", task, attempt, attempt_digest)
+        elif mode == "detached_orphan":
+            if task_phase != "blocked" or task.claim_control.get("active_claim"):
+                return evidence("stale", "task_phase_mismatch", task, attempt, attempt_digest)
+            if (
+                task.attempt_control.get("current_attempt_id") is not None
+                or task.attempt_control.get("current_attempt_number") != attempt_number
+            ):
+                return evidence("stale", "task_identity_mismatch", task, attempt, attempt_digest)
+            if task.attempt_control.get("next_attempt_number") != attempt_number + 1:
+                return evidence("stale", "task_identity_mismatch", task, attempt, attempt_digest)
+            if attempt_phase != "orphaned":
+                return evidence("stale", "attempt_phase_mismatch", task, attempt, attempt_digest)
+        else:
+            return evidence("stale", "task_identity_mismatch", task, attempt, attempt_digest)
+        return evidence("current", None, task, attempt, attempt_digest)
+
+
+def publish_project_io_terminal_transition(
+    cfg: RootConfig,
+    *,
+    request_id: str,
+    machine_name: str,
+    task_id: str,
+    attempt_id: str,
+    attempt_number: int,
+    fencing_token: int,
+    reservation_id: str | None,
+    process_identity: Mapping[str, Any],
+    mode: str,
+    phase: str,
+    reason: str,
+    exit_code: int | None,
+    termination_result: str | None,
+    expected_task_revision: int,
+    expected_attempt_digest: str,
+    transition_digest: str,
+    mutation_fence: Callable[[], None],
+) -> dict[str, Any]:
+    """Publish one digest-bound terminal transition and its shared lifecycle evidence."""
+
+    def read_attempt() -> tuple[AttemptRecord | None, str | None]:
+        try:
+            raw = attempt_path(cfg.shared_root, task_id, attempt_number).read_bytes()
+        except FileNotFoundError:
+            return None, None
+        value = json.loads(raw.decode("utf-8"))
+        if not isinstance(value, dict):
+            raise ValueError("Attempt record must contain a JSON object.")
+        return AttemptRecord.from_dict(value), hashlib.sha256(raw).hexdigest()
+
+    def evidence(
+        outcome: str,
+        stale_reason: str | None,
+        task: TaskRecord | None,
+        attempt: AttemptRecord | None,
+        attempt_digest: str | None,
+        result: object | None = None,
+    ) -> dict[str, Any]:
+        event = getattr(result, "event", None)
+        event_value = None if event is None else asdict(event)
+        if event_value is not None and event_value["task_name"] is not None:
+            # Bound the wire projection, including JSON escaping, while keeping
+            # the full user name in shared truth and ordinary lifecycle events.
+            name = event_value["task_name"]
+            low, high = 0, min(len(name), 16_384)
+            while low < high:
+                middle = (low + high + 1) // 2
+                if len(json.dumps(name[:middle], ensure_ascii=False).encode("utf-8")) <= 16_384:
+                    low = middle
+                else:
+                    high = middle - 1
+            event_value["task_name"] = name[:low]
+        reservation = getattr(result, "reservation_id", None)
+        reservation_machine = getattr(result, "reservation_machine_name", None)
+        return {
+            "outcome": outcome,
+            "reason": stale_reason,
+            "machine_name": machine_name,
+            "task_id": task_id,
+            "attempt_id": attempt_id,
+            "attempt_number": attempt_number,
+            "fencing_token": fencing_token,
+            "reservation_id": reservation
+            if result is not None
+            else (None if attempt is None else attempt.reservation_id),
+            "reservation_machine_name": reservation_machine
+            if result is not None
+            else (None if attempt is None else attempt.machine_name),
+            "process_identity": dict(process_identity),
+            "mode": mode,
+            "phase": phase,
+            "transition_reason": reason,
+            "exit_code": exit_code,
+            "termination_result": termination_result,
+            "source_revisions": {"task": expected_task_revision, "attempt_digest": expected_attempt_digest},
+            "committed_revisions": {
+                "task": None if task is None else task.meta.get("revision"),
+                "attempt_digest": attempt_digest,
+            },
+            "lifecycle_event": event_value,
+            "transition_digest": transition_digest,
+            "authority_granted": False,
+            "local_effects": [],
+        }
+
+    try:
+        initial = load_task(cfg, task_id)
+    except FileNotFoundError:
+        attempt, attempt_digest = read_attempt()
+        return evidence("stale", "task_missing", None, attempt, attempt_digest)
+    with authority_locks(cfg, initial):
+        task = load_task(cfg, task_id)
+        if task.depends_on_task_ids != initial.depends_on_task_ids:
+            raise RuntimeError("Task dependency identity changed while Project-I/O locks were acquired.")
+        attempt, attempt_digest = read_attempt()
+        if attempt is None:
+            return evidence("stale", "attempt_missing", task, None, None)
+        if (
+            attempt.task_id != task_id
+            or attempt.attempt_id != attempt_id
+            or attempt.attempt_number != attempt_number
+            or attempt.current_fencing_token != fencing_token
+            or attempt.machine_name != machine_name
+        ):
+            return evidence("stale", "attempt_identity_mismatch", task, attempt, attempt_digest)
+        if attempt.reservation_id != reservation_id:
+            return evidence("stale", "reservation_mismatch", task, attempt, attempt_digest)
+        if any(attempt.process.get(field) != process_identity.get(field) for field in process_identity):
+            return evidence("stale", "process_identity_mismatch", task, attempt, attempt_digest)
+
+        task_phase = task.state.get("projection")
+        active_claim = task.claim_control.get("active_claim") or {}
+        target_attempt_matches = (
+            attempt.phase == phase
+            and attempt.result.get("reason") == reason
+            and attempt.result.get("exit_code") == exit_code
+            and attempt.termination.get("result") == termination_result
+            and attempt.termination.get("project_io_publication_id") == request_id
+        )
+        target_task_matches = (
+            task_phase == phase
+            and task.state.get("reason") == reason
+            and task.attempt_control.get("current_attempt_id") is None
+            and task.attempt_control.get("current_attempt_number") == attempt_number
+            and not active_claim
+            and task.control.get("termination_result") == termination_result
+            and task.control.get("project_io_publication_id") == request_id
+        )
+        if target_attempt_matches and target_task_matches:
+            replay_transition = TerminalTransition(
+                task_id,
+                attempt_id,
+                attempt_number,
+                fencing_token,
+                phase,
+                reason,
+                exit_code,
+                frozenset({phase}),
+                frozenset({phase}),
+                "active" if mode == "active" else "detached",
+                termination_result,
+                project_io_publication_id=request_id,
+            )
+            committed = commit_terminal_transition_locked(
+                cfg,
+                task,
+                replay_transition,
+                mutation_fence=mutation_fence,
+            )
+            if committed.outcome == "already_committed":
+                _attempt, current_digest = read_attempt()
+                task = load_task(cfg, task_id)
+                return evidence("already_committed", None, task, _attempt, current_digest, committed)
+            return evidence("stale", "terminal_conflict", task, attempt, attempt_digest)
+        if (attempt.phase == phase and not target_attempt_matches) or (task_phase == phase and not target_task_matches):
+            return evidence("stale", "terminal_conflict", task, attempt, attempt_digest)
+
+        if mode == "active":
+            current_identity = (
+                task.attempt_control.get("current_attempt_id") == attempt_id
+                and task.attempt_control.get("current_attempt_number") == attempt_number
+            )
+        elif mode == "detached_orphan":
+            current_identity = (
+                task_phase == "blocked"
+                and not active_claim
+                and task.attempt_control.get("current_attempt_id") is None
+                and task.attempt_control.get("current_attempt_number") == attempt_number
+                and task.attempt_control.get("next_attempt_number") == attempt_number + 1
+            )
+        else:
+            current_identity = False
+        if not current_identity:
+            return evidence("stale", "task_identity_mismatch", task, attempt, attempt_digest)
+        if mode == "active":
+            if (
+                task_phase != "running"
+                or active_claim.get("attempt_id") != attempt_id
+                or active_claim.get("attempt_number") != attempt_number
+                or active_claim.get("fencing_token") != fencing_token
+                or active_claim.get("machine_name") != machine_name
+                or active_claim.get("reservation_id") != reservation_id
+            ):
+                return evidence("stale", "claim_not_current", task, attempt, attempt_digest)
+            allowed_attempt_phases = frozenset({"running"})
+        elif mode == "detached_orphan":
+            if task_phase != "blocked" or task.claim_control.get("active_claim"):
+                return evidence("stale", "task_phase_mismatch", task, attempt, attempt_digest)
+            if task.attempt_control.get("next_attempt_number") != attempt_number + 1:
+                return evidence("stale", "task_identity_mismatch", task, attempt, attempt_digest)
+            allowed_attempt_phases = frozenset({"orphaned"})
+        else:
+            return evidence("stale", "task_phase_mismatch", task, attempt, attempt_digest)
+
+        partial_attempt_matches = target_attempt_matches and (
+            task_phase in ({"running"} if mode == "active" else {"blocked"})
+        )
+        if not partial_attempt_matches and (
+            task.meta.get("revision") != expected_task_revision or attempt_digest != expected_attempt_digest
+        ):
+            return evidence("stale", "source_revision_mismatch", task, attempt, attempt_digest)
+        if attempt.phase not in allowed_attempt_phases and not partial_attempt_matches:
+            return evidence("stale", "attempt_phase_mismatch", task, attempt, attempt_digest)
+        if task_phase not in ({"running"} if mode == "active" else {"blocked"}):
+            return evidence("stale", "task_phase_mismatch", task, attempt, attempt_digest)
+
+        transition = TerminalTransition(
+            task_id,
+            attempt_id,
+            attempt_number,
+            fencing_token,
+            phase,
+            reason,
+            exit_code,
+            frozenset({"running"} if mode == "active" else {"blocked"}),
+            allowed_attempt_phases,
+            "active" if mode == "active" else "detached",
+            termination_result,
+            project_io_publication_id=request_id,
+        )
+        committed = commit_terminal_transition_locked(
+            cfg,
+            task,
+            transition,
+            mutation_fence=mutation_fence,
+        )
+        if committed.outcome not in {"committed", "already_committed"}:
+            stale_reason = {
+                "attempt_missing": "attempt_missing",
+                "stale_claim": "claim_not_current",
+                "active_claim_present": "claim_not_current",
+                "invalid_attempt_identity_or_phase": "attempt_identity_mismatch",
+                "invalid_attempt_source_phase": "attempt_phase_mismatch",
+                "invalid_task_source_phase": "task_phase_mismatch",
+            }.get(committed.reason, "terminal_conflict")
+            _attempt, current_digest = read_attempt()
+            current_task = load_task(cfg, task_id)
+            return evidence("stale", stale_reason, current_task, _attempt, current_digest)
+        current_task = load_task(cfg, task_id)
+        current_attempt, current_digest = read_attempt()
+        return evidence(
+            committed.outcome,
+            None,
+            current_task,
+            current_attempt,
+            current_digest,
+            committed,
+        )
 
 
 def reconcile_running_tasks(

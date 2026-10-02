@@ -517,6 +517,7 @@ def cleanup_credentials(
     *,
     now: float | None = None,
     limit: int = 32,
+    blocking: bool = True,
 ) -> dict[str, int | str | None]:
     """Retain reachable credentials and delete only aged private orphans.
 
@@ -524,6 +525,7 @@ def cleanup_credentials(
         runtime_root: Machine runtime root containing private notification storage.
         now: Optional Unix timestamp for deterministic maintenance decisions.
         limit: Maximum number of credential records inspected in this pass.
+        blocking: Whether to wait for another private policy transaction.
 
     Returns:
         Per-pass retained, eligible, and deleted counts plus a sanitized diagnostic.
@@ -533,9 +535,9 @@ def cleanup_credentials(
         raise ValueError(f"limit must be an integer from 1 to {_MAX_CLEANUP_LIMIT}.")
     current_time = _timestamp(time.time() if now is None else now)
     try:
-        with policy_guard(root):
+        with policy_guard(root, blocking=blocking):
             return _cleanup_locked(root, current_time, limit)
-    except (OSError, TypeError, ValueError, RecursionError):
+    except (OSError, RuntimeError, TypeError, ValueError, RecursionError):
         return _result(0, 0, 0, "private notification storage is unsafe or unavailable; cleanup deferred.")
 
 

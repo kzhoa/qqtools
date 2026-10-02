@@ -67,10 +67,10 @@ def plane_factory(monkeypatch, tmp_path):
                 assert isinstance(quiescent, bool)
                 return True
 
-            def renew_dormant_registrations(self, *, limit, heartbeat_interval_seconds):
+            def select_registration_renewals(self, *, limit, heartbeat_interval_seconds):
                 assert limit == 64
                 assert heartbeat_interval_seconds == interval
-                return 0, 0
+                return tuple(bindings), heartbeat_interval_seconds * 2
 
         runtime = SimpleNamespace(
             root=tmp_path / "machine",
@@ -82,6 +82,24 @@ def plane_factory(monkeypatch, tmp_path):
             reactivate_binding=lambda binding: True,
             project_paths=lambda project_id: {"root": tmp_path / project_id},
         )
+        runtime.machine_snapshot_intents = []
+        runtime.publish_machine_snapshot_intent = lambda **intent: runtime.machine_snapshot_intents.append(intent)
+        runtime.registration_renewal_intents = []
+        runtime._registration_renewal_intent = None
+
+        def publish_registration_renewal_intent(**intent):
+            runtime.registration_renewal_intents.append(intent)
+            runtime._registration_renewal_intent = SimpleNamespace(**intent)
+
+        def complete_registration_renewal_intent(intent):
+            if runtime._registration_renewal_intent is not intent:
+                return False
+            runtime._registration_renewal_intent = None
+            return True
+
+        runtime.publish_registration_renewal_intent = publish_registration_renewal_intent
+        runtime.registration_renewal_intent = lambda: runtime._registration_renewal_intent
+        runtime.complete_registration_renewal_intent = complete_registration_renewal_intent
 
         class Supervisor:
             renewal_interval_seconds = 0.25
@@ -107,14 +125,24 @@ def plane_factory(monkeypatch, tmp_path):
             def reconcile_local_exit_evidence(self, **kwargs):
                 calls.append((self.cfg.runtime_root.name, "local_exit"))
 
+        class Reconciler:
+            def __init__(self, runtime_root, **_kwargs):
+                self.runtime_root = Path(runtime_root)
+
+            def reconcile(self, **_kwargs):
+                calls.append((self.runtime_root.name, "local_exit"))
+
+            def close(self):
+                pass
+
         monkeypatch.setattr(control_plane, "time", SimpleNamespace(monotonic=clock.monotonic))
-        monkeypatch.setattr(control_plane, "ProgressObservationLoop", lambda runtime: None)
         monkeypatch.setattr(
             control_plane,
             "load_lease_policy",
             lambda cfg: SimpleNamespace(ttl_seconds=120, renew_interval_seconds=10),
         )
         monkeypatch.setattr(control_plane, "_AuthoritySupervisor", Supervisor)
+        monkeypatch.setattr(control_plane, "LocalExitReconciler", Reconciler)
         monkeypatch.setattr(
             control_plane._helpers,
             "_binding_config",
@@ -343,7 +371,7 @@ def test_failed_local_reconciliation_keeps_supervising_other_projects(plane_fact
         raise OSError("local evidence unavailable")
 
     monkeypatch.setattr(control_plane._helpers, "_binding_config", config)
-    monkeypatch.setattr(control_plane._AuthoritySupervisor, "reconcile_local_exit_evidence", unavailable)
+    monkeypatch.setattr(control_plane.LocalExitReconciler, "reconcile", unavailable)
     case.plane._run_authority_cycle()
     assert case.plane._authority_snapshot["projects"][0]["local_reconciliation"] == "unavailable"
     assert ("b", "tick") in case.calls and ("c", "tick") in case.calls
@@ -572,51 +600,46 @@ def test_eligibility_diagnostics_are_exposed_per_project(plane_factory):
         assert diagnostics["timings"]["registration.renewal_lateness"]["maximum_ns"] == expected
 
 
-@pytest.mark.parametrize("publication_fails", [False, True])
-def test_heartbeat_collects_both_renewal_boundaries_and_replaces_failed_samples(
-    plane_factory, monkeypatch, publication_fails
-):
-    from contextlib import contextmanager
-
-    from qqtools.plugins.qexp.runtime.work_budget import diagnostic_increment, diagnostic_observe_ns
-
+def test_heartbeat_queues_snapshot_without_resident_project_io(plane_factory, monkeypatch):
     case = plane_factory(("a", "b"))
     case.plane._run_authority_cycle()
+    case.plane._registry_revision = 1
     authority_sample = copy.deepcopy(case.plane._authority_snapshot)
     writes = []
     monkeypatch.setattr(control_plane, "atomic_replace", lambda path, value: writes.append(copy.deepcopy(value)))
     monkeypatch.setattr(control_plane, "_read_pid", lambda _runtime: 123)
     monkeypatch.setattr(control_plane, "reservation_snapshot", lambda _root: SimpleNamespace(reservations=[]))
-
-    def renew(binding, **_kwargs):
-        diagnostic_increment("registration.renewal")
-        diagnostic_observe_ns("registration.renewal_lateness", 100)
-        return True
-
-    @contextmanager
-    def guard(binding):
-        diagnostic_increment("registration.renewal")
-        diagnostic_observe_ns("registration.renewal_lateness", 200)
-        yield True
-
-    def publish(configs, *, write_guard, **_kwargs):
-        for project_id in configs:
-            with write_guard(project_id) as is_eligible:
-                assert is_eligible
-        if publication_fails:
-            raise OSError("heartbeat publication failed")
-
-    case.runtime.binding_write_eligible = renew
-    case.runtime.binding_write_guard = guard
-    monkeypatch.setattr(control_plane, "_publish_project_snapshots", publish)
+    policy = SimpleNamespace(visible_gpu_ids=(0, 1), to_dict=lambda: {"mode": "auto"})
+    monkeypatch.setattr(case.plane, "_gpu_policy_view", lambda _reserved: policy)
+    case.runtime.binding_write_eligible = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+        AssertionError("resident eligibility must be isolated")
+    )
+    monkeypatch.setattr(
+        control_plane._helpers,
+        "_binding_config",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("resident config must be isolated")),
+    )
     case.plane._publish_heartbeat()
     heartbeat = writes[0]["authority_control_plane"]["heartbeat"]
     assert heartbeat["sequence"] == 1
-    assert heartbeat["observation_status"] == ("publication_unavailable" if publication_fails else "returned")
-    operations = heartbeat["operations"]
-    assert operations["counters"]["registration.renewal"] == 4
-    assert operations["counters"]["registration.renewal_lateness.observations"] == 4
-    assert operations["timings"]["registration.renewal_lateness"] == {"total_ns": 600, "maximum_ns": 200}
+    assert heartbeat["observation_status"] == "queued"
+    assert len(case.runtime.machine_snapshot_intents) == 1
+    assert len(case.runtime.registration_renewal_intents) == 1
+    renewal = case.runtime.registration_renewal_intents[0]
+    assert renewal == {
+        "bindings": tuple(case.bindings),
+        "registry_revision": 1,
+        "renewal_horizon_seconds": 0.5,
+        "heartbeat_interval_seconds": 0.25,
+    }
+    intent = case.runtime.machine_snapshot_intents[0]
+    assert intent["bindings"] == case.bindings
+    assert intent["registry_revision"] == 1
+    assert intent["instance_id"] == "test-instance"
+    assert intent["pid"] == 123
+    assert intent["visible_gpu_ids"] == (0, 1)
+    assert intent["reservations"] == []
+    assert intent["gpu_policy"] == {"mode": "auto"}
     assert case.plane._authority_snapshot == authority_sample
 
     def unavailable():
@@ -629,7 +652,29 @@ def test_heartbeat_collects_both_renewal_boundaries_and_replaces_failed_samples(
     assert failed["sequence"] == 2
     assert failed["observation_status"] == "registry_unavailable"
     assert failed["operations"]["counters"] == {}
-    assert heartbeat["operations"]["counters"]["registration.renewal"] == 4
+    assert len(case.runtime.machine_snapshot_intents) == 1
+    assert len(case.runtime.registration_renewal_intents) == 1
+
+
+def test_heartbeat_does_not_advance_dormant_renewal_batch_until_completion(plane_factory, monkeypatch):
+    case = plane_factory(("a", "b"))
+    case.plane._run_authority_cycle()
+    case.plane._registry_revision = 1
+    monkeypatch.setattr(control_plane, "reservation_snapshot", lambda _root: SimpleNamespace(reservations=[]))
+    monkeypatch.setattr(control_plane, "_read_pid", lambda _runtime: 123)
+    policy = SimpleNamespace(visible_gpu_ids=(), to_dict=lambda: {"mode": "auto"})
+    monkeypatch.setattr(case.plane, "_gpu_policy_view", lambda _reserved: policy)
+
+    case.plane._publish_heartbeat()
+    retained = case.runtime.registration_renewal_intent()
+    case.plane._publish_heartbeat()
+
+    assert retained is case.runtime.registration_renewal_intent()
+    assert len(case.runtime.registration_renewal_intents) == 1
+
+    assert case.runtime.complete_registration_renewal_intent(retained)
+    case.plane._publish_heartbeat()
+    assert len(case.runtime.registration_renewal_intents) == 2
 
 
 @pytest.mark.parametrize("failure", ["configuration", "eligibility", "registry"])

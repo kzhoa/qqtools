@@ -1,6 +1,6 @@
 import time
 from pathlib import Path
-from threading import Timer
+from threading import Event, Timer
 from types import SimpleNamespace
 
 import pytest
@@ -368,6 +368,73 @@ def test_executor_rejects_runner_without_launch_handoff(tmp_path: Path):
         executor._wait_for_launch_intent(_cfg(tmp_path), "task-1-attempt-1", timeout_seconds=0.01)
 
 
+def test_authorized_launch_uses_only_ticket_and_machine_runtime(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = RootConfig(
+        tmp_path / "unavailable-shared" / ".qexp",
+        tmp_path / "unavailable-shared",
+        "gpu-1",
+        tmp_path / "machine" / "projects" / "project-a",
+    )
+    spawned: list[tuple[list[str], dict[str, object]]] = []
+
+    def spawn(argv, **kwargs):
+        spawned.append((argv, kwargs))
+        return _FakeProcess(4321)
+
+    def reject_project_io(*_args, **_kwargs):
+        raise AssertionError("authorized launch must not inspect Project state")
+
+    monkeypatch.setattr(executor_module, "shared_attempt_log_path", reject_project_io)
+    monkeypatch.setattr(executor_module, "resolve_launch_handoff_policy", reject_project_io)
+    executor = Executor(spawn_runner=spawn)
+
+    handle, handoff = executor.initiate_authorized_attempt(
+        cfg,
+        claim_identity={
+            "task_id": "task-1",
+            "attempt_id": "task-1-attempt-1",
+            "attempt_number": 1,
+            "fencing_token": 7,
+            "reservation_id": "reservation-1",
+        },
+        launch_id="a" * 32,
+        launch_handoff_timeout_seconds=17,
+    )
+
+    assert handle.display_reference == "pid:4321"
+    assert handoff.attempt_id == "task-1-attempt-1"
+    assert handoff.intent_path == cfg.runtime_root / "launch-intents" / "task-1-attempt-1.json"
+    argv, kwargs = spawned.pop()
+    assert argv == executor.build_runner_argv(cfg, "task-1", "task-1-attempt-1", 7, "a" * 32)
+    assert kwargs["cwd"] == str(cfg.runtime_root)
+    assert kwargs["stdin"] == executor_module.subprocess.DEVNULL
+    assert kwargs["stdout"] == executor_module.subprocess.DEVNULL
+    assert kwargs["stderr"] == executor_module.subprocess.DEVNULL
+    assert kwargs["start_new_session"] is True
+
+
+def test_authorized_launch_rejects_path_like_ticket_identity(tmp_path: Path) -> None:
+    cfg = RootConfig(tmp_path / ".qexp", tmp_path, "gpu-1", tmp_path / "runtime")
+    executor = Executor(spawn_runner=lambda *_args, **_kwargs: pytest.fail("invalid ticket must not launch"))
+
+    with pytest.raises(ValueError):
+        executor.initiate_authorized_attempt(
+            cfg,
+            claim_identity={
+                "task_id": "../task",
+                "attempt_id": "../task-attempt-1",
+                "attempt_number": 1,
+                "fencing_token": 7,
+                "reservation_id": "reservation-1",
+            },
+            launch_id="a" * 32,
+            launch_handoff_timeout_seconds=17,
+        )
+
+
 def test_executor_reports_only_failed_handoffs_with_duplicate_attempt_ids(tmp_path: Path):
     published = tmp_path / "project-a" / "published.json"
     published.parent.mkdir()
@@ -508,6 +575,195 @@ def test_machine_launch_batch_retries_compensation_errors(tmp_path: Path, monkey
     batch.finish()
     assert runtime.pending_launch_handoffs == {}
     assert len(calls) == 2
+
+
+def test_isolated_launch_handoff_retries_only_after_exact_runner_exit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from qqtools.plugins.qexp.agent import dispatch_loop
+
+    runtime = MachineRuntime(tmp_path / "machine")
+    cfg = RootConfig(tmp_path / ".qexp", tmp_path, "gpu-1", tmp_path / "runtime")
+    process = SimpleNamespace(pid=4321, returncode=-15)
+    process.poll = lambda: process.returncode
+    handle = LaunchHandle("detached", process, runner_process=process)
+    handoff = LaunchHandoff("task-attempt-1", tmp_path / "missing.json", 0.0, handle)
+    pending = dispatch_loop._PendingLaunchHandoff(
+        cfg,
+        "task",
+        "task-attempt-1",
+        7,
+        "project-a",
+        handoff,
+        handle,
+        reservation_id="reservation-1",
+    )
+    runtime.pending_launch_handoffs[("project-a", "task-attempt-1")] = pending
+    retried = []
+    runtime.project_io_controller = SimpleNamespace(
+        retry_scheduler_launch_authorization=lambda identity: retried.append(identity)
+    )
+    record = {
+        "reservation_id": "reservation-1",
+        "acquisition_id": "acquisition-1",
+        "project_id": "project-a",
+        "shared_root": str(cfg.shared_root),
+        "task_id": "task",
+        "attempt_id": "task-attempt-1",
+        "fencing_token": 7,
+        "gpu_ids": [0],
+        "executor_owner": {
+            "executor_epoch": "a" * 32,
+            "request_id": "b" * 32,
+            "registration_generation": "generation-1",
+        },
+    }
+    monkeypatch.setattr(
+        dispatch_loop,
+        "reservation_snapshot",
+        lambda _root: SimpleNamespace(active=(record,)),
+    )
+
+    class LocalExecutor:
+        @staticmethod
+        def cleanup_launch(_candidate):
+            raise AssertionError("isolated timeout must not terminate an ambiguous live runner")
+
+    dispatch_loop._LaunchHandoffBatch(LocalExecutor(), runtime).poll(isolated=True)
+
+    assert len(retried) == 1
+    assert retried[0].reservation_id == "reservation-1"
+    assert runtime.pending_launch_handoffs == {}
+    assert runtime.pending_launch_wait_seconds(5.0) == 5.0
+
+
+def test_isolated_launch_handoff_retains_live_runner_across_timeout_race(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from qqtools.plugins.qexp.agent import dispatch_loop
+
+    now = [10.0]
+    monkeypatch.setattr(dispatch_loop.time, "monotonic", lambda: now[0])
+    runtime = MachineRuntime(tmp_path / "machine")
+    cfg = RootConfig(tmp_path / ".qexp", tmp_path, "gpu-1", tmp_path / "runtime")
+    intent = tmp_path / "intent.json"
+    process = SimpleNamespace(pid=4321, poll=lambda: None)
+    handle = LaunchHandle("detached", process, runner_process=process)
+    pending = dispatch_loop._PendingLaunchHandoff(
+        cfg,
+        "task",
+        "task-attempt-1",
+        7,
+        "project-a",
+        LaunchHandoff("task-attempt-1", intent, 9.0, handle),
+        handle,
+        reservation_id="reservation-1",
+    )
+    runtime.pending_launch_handoffs[("project-a", "task-attempt-1")] = pending
+    observed = []
+    observed_event = Event()
+
+    class LocalExecutor:
+        @staticmethod
+        def cleanup_launch(_candidate):
+            raise AssertionError("deadline is not authority to terminate a live runner")
+
+        @staticmethod
+        def attach_observer(*args):
+            observed.append(args)
+            observed_event.set()
+
+    batch = dispatch_loop._LaunchHandoffBatch(LocalExecutor(), runtime)
+    batch.poll(isolated=True)
+    assert runtime.pending_launch_handoffs
+    retry_at = runtime.pending_launch_handoffs[("project-a", "task-attempt-1")].retry_not_before
+    assert retry_at > now[0]
+
+    intent.touch()
+    now[0] = retry_at + 0.01
+    batch.poll(isolated=True)
+    assert observed_event.wait(1.0)
+    assert runtime.pending_launch_handoffs == {}
+    assert len(observed) == 1
+
+
+def test_authorized_launch_reaper_failure_retains_live_handle_without_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from qqtools.plugins.qexp.agent import dispatch_loop
+
+    runtime = MachineRuntime(tmp_path / "machine")
+    cfg = RootConfig(tmp_path / ".qexp", tmp_path, "gpu-1", tmp_path / "runtime")
+    process = SimpleNamespace(pid=4321, poll=lambda: None)
+    spawn_count = 0
+
+    def spawn(*_args, **_kwargs):
+        nonlocal spawn_count
+        spawn_count += 1
+        return process
+
+    monkeypatch.setattr(
+        executor_module,
+        "_start_runner_reaper",
+        lambda _process: (_ for _ in ()).throw(RuntimeError("reaper unavailable")),
+    )
+    executor = Executor(spawn_runner=spawn)
+    batch = dispatch_loop._LaunchHandoffBatch(executor, runtime)
+    evidence = {
+        "outcome": "authorized",
+        "claim_identity": {
+            "task_id": "task",
+            "attempt_id": "task-attempt-1",
+            "attempt_number": 1,
+            "fencing_token": 7,
+            "reservation_id": "reservation-1",
+        },
+        "launch_id": "a" * 32,
+        "launch_handoff_timeout_seconds": 1,
+    }
+
+    with pytest.raises(RuntimeError, match="reaper failed"):
+        batch.launch_authorized(cfg, evidence, "project-a")
+
+    assert spawn_count == 1
+    assert batch.has_pending("project-a", "task-attempt-1")
+    batch.poll(isolated=True)
+    assert spawn_count == 1
+
+
+def test_isolated_launch_handoff_queues_observer_after_intent(tmp_path: Path) -> None:
+    from qqtools.plugins.qexp.agent import dispatch_loop
+
+    runtime = MachineRuntime(tmp_path / "machine")
+    cfg = RootConfig(tmp_path / ".qexp", tmp_path, "gpu-1", tmp_path / "runtime")
+    intent = tmp_path / "intent.json"
+    intent.touch()
+    process = SimpleNamespace(pid=4321)
+    handle = LaunchHandle("detached", process, runner_process=process)
+    handoff = LaunchHandoff("task-attempt-1", intent, time.monotonic() + 60, handle)
+    pending = dispatch_loop._PendingLaunchHandoff(
+        cfg,
+        "task",
+        "task-attempt-1",
+        7,
+        "project-a",
+        handoff,
+        handle,
+    )
+    runtime.pending_launch_handoffs[("project-a", "task-attempt-1")] = pending
+    observed = []
+    executor = SimpleNamespace(attach_observer=lambda *args: observed.append(args))
+
+    dispatch_loop._LaunchHandoffBatch(executor, runtime).poll(isolated=True)
+
+    deadline = time.monotonic() + 1.0
+    while not observed and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert len(observed) == 1
+    assert runtime.pending_launch_handoffs == {}
 
 
 def test_starting_recovery_skips_attempt_with_pending_handoff(tmp_path: Path, monkeypatch):

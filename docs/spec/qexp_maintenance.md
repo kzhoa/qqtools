@@ -105,6 +105,16 @@ activation is recovered from kind-specific truth evidence; a descriptor with
 no such proof remains prepared and retries rather than applying an uncommitted
 intent.
 
+When the authoritative mutation itself publishes the business wake, its activation
+transaction first persists the pending wake and then marks the prepared descriptor
+with `cursor.activation_mode=business` before changing authoritative truth. The
+producer and prepared-descriptor recovery then advance the descriptor silently:
+they must not publish a second `mw:*` wake that overwrites the business reason.
+Crashing before the activation transaction leaves no marker and recovery publishes
+the ordinary `mw:*` wake. Crashing after the marker therefore keeps
+both the committed wake and enough durable provenance to recover the descriptor.
+Later meaningful maintenance progress may publish its ordinary descriptor wake.
+
 Agent and CLI advancement use the existing authority locks plus current-work
 and projection/build fences. Effects and replay evidence commit before cursor
 advancement. If an indexed active descriptor loses its latest JSON progress,

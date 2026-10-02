@@ -6,6 +6,7 @@ import pytest
 
 from qqtools.plugins.qexp import init_shared_root, submit
 from qqtools.plugins.qexp.authority import AuthoritySupervisor
+from qqtools.plugins.qexp.runtime import local_exit_reconciliation
 from qqtools.plugins.qexp.runtime.paths import attempt_path, local_paths
 from qqtools.plugins.qexp.runtime.process_evidence import ProcessEvidence
 from qqtools.plugins.qexp.runtime.records import utc_now
@@ -28,6 +29,7 @@ def _registration(cfg):
         "task_id": task.task_id,
         "attempt_id": attempt.attempt_id,
         "fencing_token": attempt.current_fencing_token,
+        "reservation_id": attempt.reservation_id,
         "machine_name": cfg.machine_name,
         "authority_mode": attempt.authority_mode,
         "wrapper_pid": 99999991,
@@ -125,6 +127,7 @@ def test_bounded_materialization_and_offline_completion_survive_restart(tmp_path
     _finish(cfg, attempt)
     unknown = ProcessEvidence(state="unknown", reason="read_failed")
     monkeypatch.setattr("qqtools.plugins.qexp.authority.inspect_group_identity", lambda *_args: unknown)
+    monkeypatch.setattr(local_exit_reconciliation, "inspect_group_identity", lambda *_args: unknown)
     monkeypatch.setattr("qqtools.plugins.qexp.authority.inspect_local_group_identity", lambda *_args: unknown)
     restarted = AuthoritySupervisor(cfg, work_limit=1)
     try:
@@ -473,8 +476,8 @@ def test_active_service_remains_fair_during_arrivals_and_failed_cleanup(tmp_path
         work.close()
 
 
-def test_outage_capacity_discovery_is_bounded_and_retains_evidence(tmp_path, monkeypatch):
-    from qqtools.plugins.qexp import authority
+@pytest.mark.parametrize("entry_point", ["release", "observation"])
+def test_outage_capacity_discovery_is_bounded_and_retains_evidence(tmp_path, monkeypatch, entry_point):
     from qqtools.plugins.qexp.runtime.work_budget import RuntimeDiagnostics, activate_diagnostics
 
     cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime")
@@ -487,7 +490,7 @@ def test_outage_capacity_discovery_is_bounded_and_retains_evidence(tmp_path, mon
         atomic_replace(paths["active"] / f"unrelated-{number}.json", {"reservation": {}})
     supervisor = AuthoritySupervisor(cfg, work_limit=64)
     supervisor.recover_startup()
-    original_read = authority.read_json
+    original_read = local_exit_reconciliation.read_json
     reservation_reads = []
 
     def measured_read(path):
@@ -495,13 +498,16 @@ def test_outage_capacity_discovery_is_bounded_and_retains_evidence(tmp_path, mon
             reservation_reads.append(path)
         return original_read(path)
 
-    monkeypatch.setattr(authority, "read_json", measured_read)
+    monkeypatch.setattr(local_exit_reconciliation, "read_json", measured_read)
     try:
         for _ in range(40):
             before = len(reservation_reads)
             diagnostics = RuntimeDiagnostics()
             with activate_diagnostics(diagnostics):
-                supervisor._release_finished_local_capacity(process)
+                if entry_point == "release":
+                    supervisor._release_finished_local_capacity(process)
+                else:
+                    supervisor._reconcile_local_exit_observation(observation)
             assert len(reservation_reads) - before <= 8
             assert diagnostics.counters["store.iter_json.calls"] == 0
         assert not (paths["active"] / f"{attempt.reservation_id}.json").exists()
@@ -618,7 +624,7 @@ def test_capacity_discovery_progresses_across_more_than_256_attempts(tmp_path, m
 
     supervisor = AuthoritySupervisor(cfg, work_limit=64)
     supervisor.recover_startup()
-    original_read = authority.read_json
+    original_read = local_exit_reconciliation.read_json
     reservation_reads = []
 
     def measured_read(path):
@@ -626,7 +632,7 @@ def test_capacity_discovery_progresses_across_more_than_256_attempts(tmp_path, m
             reservation_reads.append(path)
         return original_read(path)
 
-    monkeypatch.setattr(authority, "read_json", measured_read)
+    monkeypatch.setattr(local_exit_reconciliation, "read_json", measured_read)
     monkeypatch.setattr(authority, "load_task", lambda *_args: pytest.fail("local release read shared Task truth"))
     try:
         for process in processes:
@@ -634,7 +640,7 @@ def test_capacity_discovery_progresses_across_more_than_256_attempts(tmp_path, m
             supervisor._release_finished_local_capacity(process)
             assert len(reservation_reads) - before <= 8
         assert {path.stem for path in paths["active"].glob("*.json")} == retained
-        assert len(supervisor._capacity_scans) == 2
+        assert len(supervisor._local_exit_reconciler._capacity_scans) == 2
         assert load_task(cfg, task.task_id).to_dict() == original_task
         assert all((paths["registrations"] / f"{process['attempt_id']}.json").exists() for process in processes)
     finally:
@@ -772,6 +778,164 @@ def test_launch_intent_materializes_registration_without_waiting_for_inventory(t
         supervisor.close()
 
 
+@pytest.fixture
+def running_publication_case(tmp_path):
+    cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime")
+    task, attempt = _registration(cfg)
+    paths = local_paths(cfg.runtime_root)
+    registration = paths["registrations"] / f"{attempt.attempt_id}.json"
+    intent = paths["launch_intents"] / registration.name
+    atomic_replace(intent, {"launch_intent": read_json(registration)["process_registration"]})
+    supervisor = AuthoritySupervisor(cfg, work_limit=64)
+    supervisor.recover_startup()
+    try:
+        yield cfg, task, attempt, paths, supervisor
+    finally:
+        supervisor.close()
+
+
+def _materialize_publication_source(supervisor, paths, attempt_id, source):
+    if source == "registration":
+        supervisor._materialize_registration(paths["registrations"] / f"{attempt_id}.json")
+    else:
+        supervisor._materialize_unverified_intent(paths["launch_intents"] / f"{attempt_id}.json")
+
+
+@pytest.mark.parametrize("source", ["registration", "intent"])
+def test_running_publication_releases_local_guards(running_publication_case, monkeypatch, source):
+    from qqtools.plugins.qexp import authority
+    from qqtools.plugins.qexp.runtime.responsibility_cleanup import evidence_write_guard
+    from qqtools.plugins.qexp.runtime.termination import attempt_control_lock
+
+    cfg, task, attempt, paths, supervisor = running_publication_case
+    manifest = paths["processes"] / f"{attempt.attempt_id}.json"
+    real_replace = authority.atomic_replace
+    real_publish = authority.publish_running_registration
+    publications = []
+
+    def guarded_manifest_write(path, value):
+        if path == manifest:
+            with evidence_write_guard(cfg.runtime_root, attempt.attempt_id) as acquired:
+                assert not acquired, "manifest creation lost its cleanup exclusion"
+        real_replace(path, value)
+
+    def publish_without_local_guards(config, registration, locator):
+        with evidence_write_guard(cfg.runtime_root, attempt.attempt_id) as acquired:
+            assert acquired, "shared publication retained the local evidence lock"
+        with attempt_control_lock(cfg, attempt.attempt_id, blocking=False) as acquired:
+            assert acquired, "shared publication retained the local process-control lock"
+        publications.append(locator)
+        return real_publish(config, registration, locator)
+
+    monkeypatch.setattr(authority, "atomic_replace", guarded_manifest_write)
+    monkeypatch.setattr(authority, "publish_running_registration", publish_without_local_guards)
+    _materialize_publication_source(supervisor, paths, attempt.attempt_id, source)
+
+    assert publications == [manifest]
+    assert read_json(manifest)["process"]["attempt_id"] == attempt.attempt_id
+    assert read_json(attempt_path(cfg.shared_root, task.task_id, 1))["attempt"]["phase"] == "running"
+    assert load_task(cfg, task.task_id).claim_control["active_claim"]["launch_state"] == "running"
+
+
+@pytest.mark.parametrize("source", ["registration", "intent"])
+@pytest.mark.parametrize("with_cleanup", [False, True])
+def test_late_running_publication_cannot_resurrect_terminal_attempt(
+    running_publication_case, monkeypatch, source, with_cleanup
+):
+    from qqtools.plugins.qexp import authority
+    from qqtools.plugins.qexp.runtime.paths import task_path
+    from qqtools.plugins.qexp.scheduler import fail_attempt
+
+    cfg, task, attempt, paths, supervisor = running_publication_case
+    real_publish = authority.publish_running_registration
+    terminal_bytes = []
+    attempt_file = attempt_path(cfg.shared_root, task.task_id, 1)
+    task_file = task_path(cfg.shared_root, task.task_id)
+
+    def terminate_between_local_and_shared(config, registration, locator):
+        assert fail_attempt(config, task.task_id, attempt.attempt_id, attempt.current_fencing_token, "test_exit")
+        if with_cleanup:
+            cleaner = AuthoritySupervisor(cfg)
+            try:
+                assert cleaner._remove_terminal_attempt_evidence(attempt.attempt_id)
+            finally:
+                cleaner.close()
+            assert not locator.exists()
+        terminal_bytes.extend((attempt_file.read_bytes(), task_file.read_bytes()))
+        assert real_publish(config, registration, locator) is False
+        return False
+
+    monkeypatch.setattr(authority, "publish_running_registration", terminate_between_local_and_shared)
+    _materialize_publication_source(supervisor, paths, attempt.attempt_id, source)
+
+    assert [attempt_file.read_bytes(), task_file.read_bytes()] == terminal_bytes
+    assert read_json(attempt_file)["attempt"]["phase"] == "failed"
+    assert load_task(cfg, task.task_id).state["projection"] == "failed"
+    manifest = paths["processes"] / f"{attempt.attempt_id}.json"
+    if with_cleanup:
+        assert not manifest.exists()
+        assert not (paths["registrations"] / manifest.name).exists()
+    else:
+        assert read_json(manifest)["process"]["attempt_id"] == attempt.attempt_id
+
+
+@pytest.mark.parametrize("source", ["registration", "intent"])
+def test_failed_running_publication_retains_replay_evidence(running_publication_case, monkeypatch, source):
+    from qqtools.plugins.qexp import authority
+
+    cfg, task, attempt, paths, supervisor = running_publication_case
+    registration = paths["registrations"] / f"{attempt.attempt_id}.json"
+    manifest = paths["processes"] / registration.name
+    registration_before = registration.read_bytes()
+
+    def unavailable(*_args):
+        raise OSError("shared storage unavailable")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(authority, "publish_running_registration", unavailable)
+        with pytest.raises(OSError, match="shared storage unavailable"):
+            _materialize_publication_source(supervisor, paths, attempt.attempt_id, source)
+    manifest_before = manifest.read_bytes()
+    assert registration.read_bytes() == registration_before
+    assert read_json(attempt_path(cfg.shared_root, task.task_id, 1))["attempt"]["phase"] == "starting"
+
+    # Registrations remain the replay source even when the launch-intent lane
+    # already materialized a manifest and will skip it on the next sweep.
+    supervisor._materialize_registration(registration)
+
+    assert manifest.read_bytes() == manifest_before
+    assert registration.read_bytes() == registration_before
+    assert read_json(attempt_path(cfg.shared_root, task.task_id, 1))["attempt"]["phase"] == "running"
+    assert load_task(cfg, task.task_id).claim_control["active_claim"]["launch_state"] == "running"
+
+
+@pytest.mark.parametrize("source", ["registration", "intent"])
+@pytest.mark.parametrize("blocked_by", ["cleanup_guard", "pending_control"])
+def test_blocked_materialization_does_not_publish_running(running_publication_case, monkeypatch, source, blocked_by):
+    from qqtools.plugins.qexp import authority
+    from qqtools.plugins.qexp.runtime.responsibility_cleanup import evidence_write_guard
+
+    cfg, task, attempt, paths, supervisor = running_publication_case
+
+    def reject_publication(*_args):
+        raise AssertionError("blocked local materialization published shared running truth")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(authority, "publish_running_registration", reject_publication)
+        if blocked_by == "cleanup_guard":
+            with evidence_write_guard(cfg.runtime_root, attempt.attempt_id) as acquired:
+                assert acquired
+                _materialize_publication_source(supervisor, paths, attempt.attempt_id, source)
+        else:
+            patch.setattr(supervisor._work, "is_control_pending", lambda _attempt_id: True)
+            _materialize_publication_source(supervisor, paths, attempt.attempt_id, source)
+    assert not (paths["processes"] / f"{attempt.attempt_id}.json").exists()
+    assert read_json(attempt_path(cfg.shared_root, task.task_id, 1))["attempt"]["phase"] == "starting"
+
+    _materialize_publication_source(supervisor, paths, attempt.attempt_id, source)
+    assert read_json(attempt_path(cfg.shared_root, task.task_id, 1))["attempt"]["phase"] == "running"
+
+
 def test_uncertain_wrapper_does_not_suppress_unverified_launch_materialization(tmp_path, monkeypatch):
     cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime")
     _task, attempt = _registration(cfg)
@@ -877,12 +1041,12 @@ def test_outage_capacity_discovery_preserves_unverified_occupancy(tmp_path, monk
         observation.unlink()
     elif blocker == "live_process":
         monkeypatch.setattr(
-            "qqtools.plugins.qexp.authority.inspect_group_identity",
+            "qqtools.plugins.qexp.runtime.local_exit_reconciliation.inspect_group_identity",
             lambda *_args: ProcessEvidence(state="alive"),
         )
     elif blocker == "unknown_process":
         monkeypatch.setattr(
-            "qqtools.plugins.qexp.authority.inspect_group_identity",
+            "qqtools.plugins.qexp.runtime.local_exit_reconciliation.inspect_group_identity",
             lambda *_args: ProcessEvidence(state="unknown", reason="read_failed"),
         )
     atomic_replace(reservation_path, reservation)

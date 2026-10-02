@@ -11,7 +11,7 @@ from ..group_namespace import read_group
 from ..locks import exclusive
 from ..paths import group_path, shared_paths
 from ..records import TaskRecord, normalize_group_record, utc_now, validate_identifier
-from ..store import atomic_replace, read_json
+from ..store import atomic_replace, check_mutation_fence, read_json
 from .protocol import PRIMARY_READY_PROTOCOL_VERSION, projection_state_path
 from .records import ReadyMarkerRef, ReadyScope
 
@@ -106,7 +106,9 @@ def remove_candidate_from_all_routes_under_lock(cfg: object, identity: str) -> N
         return
     for route in os.scandir(routes):
         if route.is_dir():
-            candidate_path(cfg, route.name, identity).unlink(missing_ok=True)
+            path = candidate_path(cfg, route.name, identity)
+            check_mutation_fence(path)
+            path.unlink(missing_ok=True)
 
 
 def remove_candidate_from_all_routes(cfg: object, identity: str) -> None:
@@ -121,7 +123,9 @@ def _remove_candidate_from_machines_under_lock(
 ) -> None:
     for machine in sorted(machines):
         candidate_route = route_key(reference.queue_scope, machine)
-        candidate_path(cfg, candidate_route, reference.identity).unlink(missing_ok=True)
+        path = candidate_path(cfg, candidate_route, reference.identity)
+        check_mutation_fence(path)
+        path.unlink(missing_ok=True)
 
 
 def sync_task_candidate_under_lock(
@@ -138,7 +142,9 @@ def sync_task_candidate_under_lock(
     for machine in _primary_machines_for_task(cfg, task):
         candidate_route = route_key(reference.queue_scope, machine)
         route = route_path(cfg, candidate_route)
-        route.mkdir(parents=True, exist_ok=True)
+        if not route.exists():
+            check_mutation_fence(route)
+            route.mkdir(parents=True, exist_ok=True)
         atomic_replace(candidate_path(cfg, candidate_route, reference.identity), _serialize_candidate(reference))
 
 
@@ -172,13 +178,18 @@ def sync_member_candidate_under_lock(
     _remove_candidate_from_machines_under_lock(cfg, reference, previous_machines - current_machines)
     for machine in sorted(current_machines - previous_machines):
         candidate_route = route_key(reference.queue_scope, machine)
-        route_path(cfg, candidate_route).mkdir(parents=True, exist_ok=True)
+        route = route_path(cfg, candidate_route)
+        if not route.exists():
+            check_mutation_fence(route)
+            route.mkdir(parents=True, exist_ok=True)
         atomic_replace(candidate_path(cfg, candidate_route, reference.identity), _serialize_candidate(reference))
 
 
 def _fsync_directory(path: Path) -> None:
+    check_mutation_fence(path)
     descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
     try:
+        check_mutation_fence(path)
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
@@ -191,14 +202,22 @@ def park_projection_under_lock(cfg: object, build_id: str) -> None:
     routes = primary_root / "routes"
     replaced_root = primary_root / "replaced-routes"
     replaced = replaced_root / build_id
-    replaced_root.mkdir(parents=True, exist_ok=True)
+    if not replaced_root.exists():
+        check_mutation_fence(replaced_root)
+        replaced_root.mkdir(parents=True, exist_ok=True)
     if not replaced.exists():
         if routes.exists():
+            check_mutation_fence(routes)
             os.replace(routes, replaced)
         else:
+            check_mutation_fence(replaced)
             replaced.mkdir()
-    routes.mkdir(parents=True, exist_ok=True)
+    if not routes.exists():
+        check_mutation_fence(routes)
+        routes.mkdir(parents=True, exist_ok=True)
+    check_mutation_fence(replaced_root)
     _fsync_directory(replaced_root)
+    check_mutation_fence(primary_root)
     _fsync_directory(primary_root)
 
 
@@ -275,7 +294,10 @@ def rebuild_primary_ready_candidate(
             raise RuntimeError("primary candidate rebuild ownership is invalid.")
         for machine in _primary_machines_for_task(cfg, task):
             candidate_route = route_key(reference.queue_scope, machine)
-            route_path(cfg, candidate_route).mkdir(parents=True, exist_ok=True)
+            route = route_path(cfg, candidate_route)
+            if not route.exists():
+                check_mutation_fence(route)
+                route.mkdir(parents=True, exist_ok=True)
             atomic_replace(candidate_path(cfg, candidate_route, reference.identity), _serialize_candidate(reference))
 
 

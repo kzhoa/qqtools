@@ -14,6 +14,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from .runtime.records import utc_now
+from .runtime.store import check_mutation_fence
 
 _SCHEMA_VERSION = 1
 _CREDENTIAL_ID_RE = re.compile(r"[a-f0-9]{32}", re.ASCII)
@@ -198,6 +199,8 @@ def stage_webhook(runtime_root: Path, webhook: str) -> str:
                 raise ValueError("webhook credential record is too large.")
             flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
             flags |= getattr(os, "O_CLOEXEC", 0)
+            path = root / "notifications" / "credentials" / filename
+            check_mutation_fence(path)
             try:
                 file_fd = os.open(filename, flags, 0o600, dir_fd=credentials_fd)
             except FileExistsError:
@@ -206,6 +209,7 @@ def stage_webhook(runtime_root: Path, webhook: str) -> str:
                 os.fchmod(file_fd, 0o600)
                 file_stat = os.fstat(file_fd)
                 _private_credential_stat(file_stat)
+                check_mutation_fence(path)
                 _write_all(file_fd, encoded)
                 os.fsync(file_fd)
                 os.fsync(credentials_fd)

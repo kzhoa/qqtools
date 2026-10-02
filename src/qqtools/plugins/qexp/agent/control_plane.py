@@ -23,6 +23,7 @@ from ..gpu_policy import (
 )
 from ..lease import load_lease_policy
 from ..runtime.authority_scan import EvidenceScan, is_path_present
+from ..runtime.local_exit_reconciliation import LocalExitReconciler
 from ..runtime.paths import local_paths
 from ..runtime.records import utc_now
 from ..runtime.resources.reservations import reservation_snapshot
@@ -32,11 +33,12 @@ from ..runtime.work_budget import RuntimeDiagnostics, activate_diagnostics, diag
 from . import helpers as _helpers
 from .context import MachineRuntime, ProjectBinding
 from .deadlines import advance_deadline
-from .helpers import _publish_project_snapshots, _read_pid
-from .progress_loop import ProgressObservationLoop
+from .helpers import _read_pid
+from .project_io_controller import ProjectIOController
 from .recovery_capture import recovery_owner
 
 STARTUP_AUTHORITY_POLL_SECONDS = 1.0
+_INITIAL_CONTROL_PLANE_BINDINGS = 64
 
 
 @contextmanager
@@ -65,7 +67,6 @@ class _MachineControlPlane:
             raise ValueError("control-plane interval must be finite and positive")
         self._runtime = runtime
         self._runtime.authority_ready_generations = {}
-        self._progress_loop = ProgressObservationLoop(runtime)
         self._instance_id = instance_id
         self._loop_interval = loop_interval
         self._started_at = started_at
@@ -76,7 +77,7 @@ class _MachineControlPlane:
         self._supervisors: dict[str, AuthoritySupervisor] = {}
         self._supervisor_generations: dict[str, str | None] = {}
         self._eligibility_scans: dict[tuple[str, str], EvidenceScan] = {}
-        self._outage_supervisors: dict[str, AuthoritySupervisor] = {}
+        self._outage_supervisors: dict[str, LocalExitReconciler] = {}
         self._next_authority_project: str | None = None
         self._project_service_times: dict[tuple[str, str | None], tuple[float, float]] = {}
         self._authority_snapshot: dict[str, Any] | None = None
@@ -101,12 +102,10 @@ class _MachineControlPlane:
         self._publish_heartbeat()
         self._authority_thread.start()
         self._heartbeat_thread.start()
-        self._progress_loop.start()
 
     def stop(self) -> None:
         """Stop control loops before publishing the terminal machine snapshot."""
         self._stop_event.set()
-        self._progress_loop.stop()
         for thread in (self._authority_thread, self._heartbeat_thread):
             if thread.is_alive():
                 thread.join()
@@ -172,6 +171,8 @@ class _MachineControlPlane:
         return ordered
 
     def _run_authority_cycle(self) -> float:
+        if isinstance(getattr(self._runtime, "project_io_controller", None), ProjectIOController):
+            return self._run_isolated_authority_cycle()
         started = time.monotonic()
         self._authority_cycle_count += 1
         sample: dict[str, Any] = {
@@ -432,21 +433,62 @@ class _MachineControlPlane:
         self._finish_authority_sample(sample, started, authority_interval)
         return authority_interval
 
+    def _run_isolated_authority_cycle(self) -> float:
+        """Record local control-plane state while dispatch owns Project I/O."""
+        started = time.monotonic()
+        self._authority_cycle_count += 1
+        sample: dict[str, Any] = {
+            "protocol_version": 1,
+            "diagnostic_only": True,
+            "isolated_owner": "project_io_dispatch",
+            "instance_id": self._instance_id,
+            "sequence": self._authority_cycle_count,
+            "observation_status": "completed",
+            "project_count": None,
+            "phase_seconds": {},
+            "projects": [],
+            "schedule": None,
+        }
+        try:
+            with _measure_authority_phase(sample, "registry"):
+                bindings = self._ordered_authority_bindings(self._supervised_bindings())
+        except (OSError, RuntimeError, ValueError) as exc:
+            self._runtime.authority_ready_generations.clear()
+            sample["observation_status"] = "registry_unavailable"
+            sample["error_type"] = type(exc).__name__
+            self._finish_authority_sample(sample, started, self._loop_interval)
+            return self._loop_interval
+        sample["project_count"] = len(bindings)
+        current_generations = {binding.project_id: binding.registration_generation for binding in bindings}
+        for project_id, generation in tuple(self._runtime.authority_ready_generations.items()):
+            if current_generations.get(project_id) != generation:
+                self._runtime.authority_ready_generations.pop(project_id, None)
+        for binding in bindings[:_INITIAL_CONTROL_PLANE_BINDINGS]:
+            sample["projects"].append(
+                {
+                    "project_id": binding.project_id,
+                    "registration_generation": binding.registration_generation,
+                    "observation_status": "dispatch_owner",
+                    "ready": self._runtime.authority_ready_generations.get(binding.project_id)
+                    == binding.registration_generation,
+                }
+            )
+        self._finish_authority_sample(sample, started, self._loop_interval)
+        return self._loop_interval
+
     def _reconcile_local_exits(self, binding: Any, project_sample: dict[str, Any]) -> None:
         """Free verified finished local capacity without granting shared write eligibility."""
         try:
             with _measure_authority_phase(project_sample, "local_exit_reconciliation"):
-                local_cfg = RootConfig(
-                    binding.shared_root,
-                    binding.shared_root.parent,
-                    binding.machine_name,
-                    self._runtime.project_paths(binding.project_id)["root"],
-                )
-                local_supervisor = self._outage_supervisors.get(binding.project_id)
-                if local_supervisor is None:
-                    local_supervisor = _AuthoritySupervisor(local_cfg, reservation_runtime_root=self._runtime.root)
-                    self._outage_supervisors[binding.project_id] = local_supervisor
-                local_supervisor.reconcile_local_exit_evidence(limit=8)
+                local_reconciler = self._outage_supervisors.get(binding.project_id)
+                if local_reconciler is None:
+                    local_reconciler = LocalExitReconciler(
+                        self._runtime.project_paths(binding.project_id)["root"],
+                        reservation_runtime_root=self._runtime.root,
+                        project_id=binding.project_id,
+                    )
+                    self._outage_supervisors[binding.project_id] = local_reconciler
+                local_reconciler.reconcile(limit=8)
             project_sample["local_reconciliation"] = "returned"
         except (OSError, RuntimeError, ValueError) as local_exc:
             project_sample["local_reconciliation"] = "unavailable"
@@ -543,7 +585,7 @@ class _MachineControlPlane:
                 "operations": diagnostics.snapshot(),
             }
             # Publish liveness first. Optional local diagnostics must not sit
-            # ahead of this cycle's project heartbeat writes.
+            # ahead of this cycle's queued project heartbeat work.
             self._publish_authority_diagnostics()
 
     def _publish_project_heartbeats(self) -> str:
@@ -551,32 +593,33 @@ class _MachineControlPlane:
             bindings = self._supervised_bindings()
         except (OSError, RuntimeError, ValueError):
             return "registry_unavailable"
-        checked, renewed = self._runtime.working_set.renew_dormant_registrations(
-            limit=64,
-            heartbeat_interval_seconds=self._loop_interval,
+        registry_revision = self._registry_revision
+        if registry_revision is None:
+            return "registry_unavailable"
+        renewal_intent = self._runtime.registration_renewal_intent()
+        if renewal_intent is not None and renewal_intent.registry_revision != registry_revision:
+            self._runtime.complete_registration_renewal_intent(renewal_intent)
+            renewal_intent = None
+        selected_count = 0
+        if renewal_intent is None:
+            renewal_bindings, renewal_horizon = self._runtime.working_set.select_registration_renewals(
+                limit=64,
+                heartbeat_interval_seconds=self._loop_interval,
+            )
+            selected_count = len(renewal_bindings)
+            if renewal_bindings:
+                self._runtime.publish_registration_renewal_intent(
+                    bindings=renewal_bindings,
+                    registry_revision=registry_revision,
+                    renewal_horizon_seconds=renewal_horizon,
+                    heartbeat_interval_seconds=self._loop_interval,
+                )
+                renewal_intent = self._runtime.registration_renewal_intent()
+        diagnostic_increment("heartbeat.dormant_registration_checks", selected_count)
+        diagnostic_increment(
+            "heartbeat.dormant_registration_renewal_requests_queued",
+            len(renewal_intent.bindings) if renewal_intent is not None else 0,
         )
-        diagnostic_increment("heartbeat.dormant_registration_checks", checked)
-        diagnostic_increment("heartbeat.dormant_registration_renewals", renewed)
-        readable: dict[str, RootConfig] = {}
-        readable_bindings: dict[str, ProjectBinding] = {}
-        for binding in bindings:
-            try:
-                if not self._runtime.binding_write_eligible(binding, renew=True):
-                    diagnostic_increment("heartbeat.ineligible_projects")
-                    continue
-                readable[binding.project_id] = _helpers._binding_config(self._runtime, binding)
-                readable_bindings[binding.project_id] = binding
-            except (OSError, RuntimeError, ValueError):
-                diagnostic_increment("heartbeat.unavailable_projects")
-                continue
-
-        @contextmanager
-        def write_guard(project_id: str) -> Iterator[bool]:
-            with self._runtime.binding_write_guard(readable_bindings[project_id]) as is_eligible:
-                if not is_eligible:
-                    diagnostic_increment("heartbeat.write_guard_rejected_projects")
-                yield is_eligible
-
         try:
             reservations = list(reservation_snapshot(self._runtime.root).reservations)
         except (OSError, RuntimeError, ValueError, KeyError, TypeError, AttributeError):
@@ -588,23 +631,21 @@ class _MachineControlPlane:
         }
         try:
             gpu_policy = self._gpu_policy_view(reserved_gpu_ids)
+            gpu_policy_payload = gpu_policy.to_dict()
         except (OSError, RuntimeError, ValueError, KeyError, TypeError, AttributeError):
             return "gpu_policy_unavailable"
-        try:
-            _publish_project_snapshots(
-                readable,
-                instance_id=self._instance_id,
-                pid=_read_pid(self._runtime),
-                visible=list(gpu_policy.visible_gpu_ids or ()),
-                reservations=reservations,
-                heartbeat_interval_seconds=self._loop_interval,
-                started_at=self._started_at,
-                write_guard=write_guard,
-                gpu_policy=gpu_policy,
-            )
-        except (OSError, RuntimeError, ValueError, KeyError, TypeError, AttributeError):
-            return "publication_unavailable"
-        return "returned"
+        self._runtime.publish_machine_snapshot_intent(
+            bindings=bindings,
+            registry_revision=registry_revision,
+            instance_id=self._instance_id,
+            pid=_read_pid(self._runtime),
+            visible_gpu_ids=gpu_policy.visible_gpu_ids or (),
+            reservations=reservations,
+            heartbeat_interval_seconds=self._loop_interval,
+            started_at=self._started_at,
+            gpu_policy=gpu_policy_payload,
+        )
+        return "queued"
 
     def _run_authority_loop(self) -> None:
         deadline = time.monotonic()

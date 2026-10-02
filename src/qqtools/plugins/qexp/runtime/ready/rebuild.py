@@ -12,7 +12,7 @@ from ..directory_capture import read_directory_entry
 from ..locks import exclusive, schema_lock, schema_writer_lock
 from ..paths import ready_state_path, shared_paths, task_path
 from ..records import TaskRecord, utc_now, validate_identifier
-from ..store import atomic_replace, iter_json, read_json
+from ..store import atomic_replace, check_mutation_fence, iter_json, read_json
 from . import primary_candidates, routes, state
 from .diagnostics import (
     ReadyDiagnostic,
@@ -146,7 +146,9 @@ def _reset_ready_projection_for_repair(cfg: object, build_id: str) -> None:
     """Move the damaged advisory projection aside before a truth-based rebuild."""
     paths = shared_paths(cfg.shared_root)
     archive = _build_root(cfg, build_id) / "replaced-projection"
-    archive.mkdir(parents=True, exist_ok=True)
+    if not archive.exists():
+        check_mutation_fence(archive)
+        archive.mkdir(parents=True, exist_ok=True)
     targets = {
         "home": paths["ready_home"],
         "shared": paths["ready_shared"],
@@ -158,11 +160,16 @@ def _reset_ready_projection_for_repair(cfg: object, build_id: str) -> None:
     for name, target in targets.items():
         archived = archive / name
         if archived.exists():
-            target.mkdir(parents=True, exist_ok=True)
+            if not target.exists():
+                check_mutation_fence(target)
+                target.mkdir(parents=True, exist_ok=True)
             continue
         if target.exists():
+            check_mutation_fence(target)
             os.replace(target, archived)
-        target.mkdir(parents=True, exist_ok=True)
+        if not target.exists():
+            check_mutation_fence(target)
+            target.mkdir(parents=True, exist_ok=True)
 
 
 def begin_ready_index_build(
@@ -182,17 +189,20 @@ def begin_ready_index_build(
     from ..maintenance_outbox import activate_work, prepare_target_work
 
     if current_state == "building":
-        with schema_lock(cfg.shared_root):
-            with exclusive(state.state_lock_path(cfg)):
-                path = ready_state_path(cfg.shared_root)
-                value, record = state.read_state_record(cfg)
-                build = record.get("build") if isinstance(record.get("build"), dict) else {}
-                if record.get("state") == "building" and build.get("phase") == "reset-projection":
-                    _reset_ready_projection_for_repair(cfg, build["build_id"])
-                    build["phase"] = "inventory"
-                    state.commit_state_under_lock(path, value, record)
         existing = state.read_ready_index_status(cfg)
         build = existing.get("build") if isinstance(existing.get("build"), dict) else {}
+        if build.get("phase") == "reset-projection":
+            with schema_lock(cfg.shared_root):
+                with exclusive(state.state_lock_path(cfg)):
+                    path = ready_state_path(cfg.shared_root)
+                    value, record = state.read_state_record(cfg)
+                    build = record.get("build") if isinstance(record.get("build"), dict) else {}
+                    if record.get("state") == "building" and build.get("phase") == "reset-projection":
+                        _reset_ready_projection_for_repair(cfg, build["build_id"])
+                        build["phase"] = "inventory"
+                        state.commit_state_under_lock(path, value, record)
+            existing = state.read_ready_index_status(cfg)
+            build = existing.get("build") if isinstance(existing.get("build"), dict) else {}
         descriptor = prepare_target_work(
             cfg,
             kind="ready_index",

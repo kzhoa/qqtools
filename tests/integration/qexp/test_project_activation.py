@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -10,11 +11,14 @@ import pytest
 from qqtools.plugins.qexp import init_shared_root
 from qqtools.plugins.qexp.commands.group import create_group
 from qqtools.plugins.qexp.commands.task import submit
+from qqtools.plugins.qexp.runtime import maintenance as maintenance_module
+from qqtools.plugins.qexp.runtime import maintenance_outbox as maintenance_outbox_module
 from qqtools.plugins.qexp.runtime.availability import offer_deadlines as offer_deadline_module
 from qqtools.plugins.qexp.runtime.availability.offer_deadlines import remove_deadline_index
 from qqtools.plugins.qexp.runtime.group_discovery import locator
 from qqtools.plugins.qexp.runtime.group_discovery import service as group_service
 from qqtools.plugins.qexp.runtime.locks import group_writer_lock
+from qqtools.plugins.qexp.runtime.maintenance import advance_maintenance_work
 from qqtools.plugins.qexp.runtime.observation import maintenance as observation_maintenance
 from qqtools.plugins.qexp.runtime.observation import projection as observation_projection
 from qqtools.plugins.qexp.runtime.paths import shared_paths
@@ -342,8 +346,185 @@ def test_observation_rebuild_request_commits_wake_after_state_change(
     assert _activation(cfg)["reason"] == "observation_rebuild_request"
 
 
+@pytest.mark.parametrize("producer", ["deadline", "observation"])
+def test_business_wake_provenance_survives_crash_before_descriptor_activation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    producer: str,
+) -> None:
+    if producer == "deadline":
+        cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime")
+        create_group(cfg, "experiment")
+        task = submit(
+            cfg,
+            ["echo", "ok"],
+            group="experiment",
+            sharing_mode="spillover",
+            offer_after_seconds=60,
+        )
+        action = lambda: remove_deadline_index(cfg, task.task_id)
+        expected_reason = "offer_deadline_update"
+    else:
+        cfg = isolated_group(tmp_path, tail=0)
+        action = lambda: observation_maintenance.request_rebuild(cfg)
+        expected_reason = "observation_rebuild_request"
+
+    real_activate = maintenance_outbox_module.activate_work
+
+    def crash_after_business_wake(*_args, **_kwargs):
+        raise OSError("synthetic producer exit")
+
+    monkeypatch.setattr(maintenance_outbox_module, "activate_work", crash_after_business_wake)
+    with pytest.raises(OSError, match="synthetic producer exit"):
+        action()
+    committed = _activation(cfg)
+    assert committed["reason"] == expected_reason
+    monkeypatch.setattr(maintenance_outbox_module, "activate_work", real_activate)
+    if producer == "observation":
+        monkeypatch.setattr(
+            maintenance_module,
+            "_advance_projection_work",
+            lambda *_args, **_kwargs: {"state": "completed", "proof": {"source": "test"}},
+        )
+
+    advance_maintenance_work(cfg, reservation_runtime_root=cfg.runtime_root)
+
+    recovered = _activation(cfg)
+    assert recovered["sequence"] == committed["sequence"]
+    assert recovered["reason"] == expected_reason
+
+
+def test_business_wake_provenance_upgrades_reused_prepared_descriptor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime")
+    create_group(cfg, "experiment")
+    task = submit(
+        cfg,
+        ["echo", "ok"],
+        group="experiment",
+        sharing_mode="spillover",
+        offer_after_seconds=60,
+    )
+    prepared = maintenance_outbox_module.prepare_target_work(
+        cfg,
+        kind="deadline_index",
+        target_id=task.task_id,
+        phase="remove",
+    )
+    assert prepared["state"] == "prepared"
+    assert prepared["cursor"] == {}
+    real_activate = maintenance_outbox_module.activate_work
+
+    def crash_after_business_wake(*_args, **_kwargs):
+        raise OSError("synthetic producer exit")
+
+    monkeypatch.setattr(maintenance_outbox_module, "activate_work", crash_after_business_wake)
+    with pytest.raises(OSError, match="synthetic producer exit"):
+        remove_deadline_index(cfg, task.task_id)
+    committed = _activation(cfg)
+    assert committed["reason"] == "offer_deadline_update"
+    persisted = maintenance_outbox_module.read_work(
+        cfg,
+        kind="deadline_index",
+        target_id=task.task_id,
+        work_generation=prepared["identity"]["work_generation"],
+    )
+    assert persisted is not None
+    assert persisted["cursor"]["activation_mode"] == "business"
+
+    monkeypatch.setattr(maintenance_outbox_module, "activate_work", real_activate)
+    advance_maintenance_work(cfg, reservation_runtime_root=cfg.runtime_root)
+
+    recovered = _activation(cfg)
+    assert recovered["sequence"] == committed["sequence"]
+    assert recovered["reason"] == "offer_deadline_update"
+
+
+def test_prepared_descriptor_before_business_transaction_recovers_with_maintenance_wake(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime")
+    create_group(cfg, "experiment")
+    task = submit(
+        cfg,
+        ["echo", "ok"],
+        group="experiment",
+        sharing_mode="spillover",
+        offer_after_seconds=60,
+    )
+    before = _activation(cfg)
+
+    @contextmanager
+    def crash_before_business_transaction(*_args, **_kwargs):
+        raise OSError("synthetic pre-transaction exit")
+        yield
+
+    real_transaction = offer_deadline_module.project_activation_transaction
+    monkeypatch.setattr(
+        offer_deadline_module,
+        "project_activation_transaction",
+        crash_before_business_transaction,
+    )
+    with pytest.raises(OSError, match="synthetic pre-transaction exit"):
+        remove_deadline_index(cfg, task.task_id)
+    monkeypatch.setattr(
+        offer_deadline_module,
+        "project_activation_transaction",
+        real_transaction,
+    )
+
+    prepared = maintenance_outbox_module.prepare_target_work(
+        cfg,
+        kind="deadline_index",
+        target_id=task.task_id,
+        phase="remove",
+    )
+    assert prepared["cursor"].get("activation_mode") is None
+    for _ in range(32):
+        advance_maintenance_work(cfg, reservation_runtime_root=cfg.runtime_root)
+        current = maintenance_outbox_module.read_work(
+            cfg,
+            kind="deadline_index",
+            target_id=task.task_id,
+            work_generation=prepared["identity"]["work_generation"],
+        )
+        assert current is not None
+        if current["state"] != "prepared":
+            break
+    else:
+        raise AssertionError("prepared deadline descriptor was not recovered")
+
+    recovered = _activation(cfg)
+    assert recovered["sequence"] > before["sequence"]
+    assert recovered["reason"].startswith("mw:")
+
+
 def test_uninitialized_project_has_no_activation_checkpoint(tmp_path: Path) -> None:
     root = tmp_path / "missing"
 
     assert read_project_activation(root) is None
     assert not activation_checkpoint_path(root).exists()
+
+
+def test_activation_transaction_fences_before_recovery_or_publication(tmp_path: Path) -> None:
+    cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime")
+    before = read_project_activation(cfg.shared_root)
+    activation_root = cfg.shared_root / "operations" / "project-activation-v1"
+    before_files = {
+        path.relative_to(activation_root): path.read_bytes() for path in activation_root.rglob("*") if path.is_file()
+    }
+
+    def fenced() -> None:
+        raise RuntimeError("executor epoch fenced")
+
+    with pytest.raises(RuntimeError, match="epoch fenced"):
+        with project_activation_transaction(cfg, "group_locator_control", before_write=fenced):
+            raise AssertionError("fenced transaction entered its body")
+
+    assert read_project_activation(cfg.shared_root) == before
+    assert {
+        path.relative_to(activation_root): path.read_bytes() for path in activation_root.rglob("*") if path.is_file()
+    } == before_files

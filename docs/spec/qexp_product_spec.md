@@ -1,7 +1,7 @@
 ---
 doc_type: spec
 status: active
-updated_at: 2026-09-28
+updated_at: 2026-09-29
 archived_at:
 ---
 
@@ -216,7 +216,11 @@ handoff. The Project periodically compacts at most 256 activation events into a
 durable authoritative-index reconstruction snapshot. Offline and newly
 registered consumers below that floor must reconcile the snapshot coverage and
 replay the retained suffix before dormancy. Removing a binding retires only its
-exact consumer generation through a crash-recoverable machine-local intent.
+exact consumer generation through a crash-recoverable machine-local intent. The
+command commits registry removal without waiting on the shared Project root; the
+agent later performs retirement as bounded isolated Project I/O. A re-registration
+while that intent is pending always allocates a fresh generation, so delayed
+retirement cannot retire the replacement consumer.
 
 `agent start` is detached and idempotent. Its positive `--timeout` defaults to 30 seconds. Success
 requires a fresh response from the current runtime generation, acknowledgement of the requested
@@ -615,6 +619,115 @@ coverage but never grants scheduler authority, changes Attempt or reservation ow
 runner, or changes readiness and command exit-code semantics. Agent stop, crash, and restart retain
 the protected lifecycle-independence workflow.
 
+#### Blocking Project I/O isolation
+
+The machine agent isolates shared Project filesystem work in single-request subprocesses. Within
+the supported two-hung-worker envelope, a blocked Project must not block the controller, retain a
+transient machine-wide lock across shared I/O, or starve eligible responsive peers. With a finite
+eligible roster and returning healthy operations, primary scheduling, supervision, and background
+work receive fair service opportunities. Successful completion additionally requires a finite
+transaction chain and sufficiently stable shared revisions. The MachineRuntime filesystem and
+process table must remain responsive, at least two logical CPUs must remain available, and peers
+must be resident or discovered through the existing durable activation contract.
+
+There is no fixed service-completion bound independent of healthy workload, recovery size, or
+request count. Registration is not capped to manufacture such a bound. Local process safety and
+lease-safe-deadline actions continue independently of worker availability; queued renewal is not
+proof of renewed authority, and fairness does not guarantee every lease survives overload.
+
+The mandatory latency qualification is a real-agent scenario with two blocked bindings and one
+eligible, already recovered healthy binding B. B has one primary candidate, sufficient local
+capacity, and one running Attempt due for renewal. B may already have one responsive background
+request in flight at the measurement start. Each complete B worker invocation, including interpreter
+startup, Project-lock waits, mutation, applicable notification work, result publication, and exit,
+returns within two seconds. From the instant both foreground services are eligible and due, exact
+primary claim/admission and application of the running Attempt's renewal result must both complete
+within 15 seconds at the default five-second loop interval. At other intervals the qualification
+bound is three intervals with a 15-second floor. Queuing a request does not count as completion;
+training launch is verified separately. This is a qualification workload, not a universal latency
+guarantee. Cold startup, activation, cancellation, terminal recovery, and many-Project operation
+retain their functional and isolation requirements and require separate measured validation.
+
+This distinction was explicitly approved on 2026-09-29, replacing the feature's earlier
+load-independent 15-second wording. It does not relax readiness, claim exclusivity, capacity
+accounting, cancellation grace, running-workload continuity, or recovery safety. Acceptance still
+requires real-agent qualification; a specification update is not passing validation evidence.
+
+The supported envelope is at most two simultaneously non-returning Project I/O workers per
+MachineRuntime. The fixed worker capacity is four, with at most one live request for one exact
+`(runtime_id, project_id, registration_generation)` binding. A third or fourth overdue worker makes
+the envelope exceeded; a fifth worker is never created. At that point qexp preserves fencing,
+process evidence, and conservative resource accounting, but no longer promises peer progress
+through available worker capacity. Ordinary healthy-work queueing does not by itself mean that
+the hung-worker envelope is exceeded. A request becomes overdue after ten seconds; overdue is a
+diagnostic state, not proof of cancellation, process exit, or an uncommitted shared mutation.
+
+The controller retains machine-local policy and capacity authority. It prepares a typed request,
+releases every transient machine-local critical-section lock, and starts a fresh-interpreter worker.
+The agent retains its lifetime machine-ownership lock, but the controller never synchronously waits
+for a worker under that ownership and the worker never acquires it. The worker may use the existing
+Project transactions and Project locks required by that one operation, but it cannot allocate or
+release local GPU/CPU capacity or enqueue successor work. Claiming therefore uses a split protocol:
+isolated observation, a controller-owned provisional resource offer, an isolated fenced shared
+claim/Attempt mutation, then exact result or durable-evidence reconciliation. Timeout, missing
+output, worker exit, stale output, stop, or restart never releases an ambiguous offer by itself.
+
+Project-visible stop snapshots use the same isolated worker boundary. Agent cleanup never falls
+back to controller-side Project writes or an unbounded thread-pool join. After ordinary workers
+are fenced, a short stop-publication epoch uses only remaining executor slots; a blocked binding
+may make that cleanup step fail, but it cannot prevent responsive peers from receiving their final
+snapshot or prevent machine-local stopped status and diagnostics from being attempted.
+
+Application-progress projection remains a background service, but its already-captured observation
+and matching publication form one bounded two-request continuation. After those two opportunities,
+that binding must serve a different background family before progress can receive the continuation
+preference again. Initial progress therefore does not wait behind an entire repeating maintenance
+rotation, while a continuously updating producer cannot starve recovery or maintenance.
+
+User-relevant truth remains in the shared Project root: Tasks, Attempts, Submissions, claims,
+Groups, experiment history, execution machine, GPU assignment, and start/end facts. The
+MachineRuntime contains only disposable executor requests, process ownership, provisional capacity,
+and derived diagnostics. It uses bounded atomic JSON, not SQLite, and must not be copied between
+Machines or treated as a reconstruction source for shared truth.
+
+Task observation-index rebuilding and obsolete-generation cleanup use the same
+isolated Project-I/O admission as scheduling and other maintenance. A blocked
+Project cannot hold the controller in an index read or cleanup syscall. Existing
+shared build checkpoints survive agent restart; no new pagination format,
+user migration step, or machine-local copy of Task history is introduced.
+Automatic legacy notification reconciliation uses the same isolated background
+service. A blocked Project source does not prevent healthy Projects importing
+their settings. Existing conflict resolution and invalid-source statuses remain
+unchanged; credentials stay in private MachineRuntime storage, not executor
+requests/results. This maintenance does not send notifications itself.
+The isolated registration service retains automatic reactivation for an expired
+registration still owned by the exact same Machine/runtime and generation.
+It cannot overwrite a successor registration or revive an orphaned Attempt;
+Attempt recovery remains a separate fenced operation.
+An interrupted registration CLI transaction is also recovered automatically. The
+isolated worker restores its durable snapshot under machine-local registration and
+migration exclusion, then forces a fresh registry turn before recovery enrollment
+continues. Operators must not delete a pending or malformed registration journal:
+possible partial effects remain fail-closed and replay from that journal.
+
+`qexp agent status --format json` may include a bounded `project_io_isolation` object with protocol
+and executor epoch, capacity and free-slot counts, active/overdue/exit-unverified counts, any
+retained unreaped-worker count, the supported hang limit, `healthy | degraded | exceeded | unknown`
+envelope state, oldest overdue time, and at most four blocking Project IDs. Human status adds a
+concise section when degraded or when the existing detailed status view requests it. Stable
+diagnostic reasons are
+`project_io_overdue`, `project_io_capacity_saturated`, `project_io_envelope_exceeded`,
+`project_io_result_stale`, `project_io_worker_exit_unverified`, and
+`project_io_protocol_invalid`.
+
+Readiness keeps its existing meaning. An overdue Project captured by one `agent start` invocation
+remains not ready, so that invocation still times out and exits nonzero. If the detached process
+started, the agent remains active, reports the blocking Project/request, and continues serving
+healthy peers. Active, overdue, exit-unverified, or unreconciled executor work prevents on-demand
+idle exit. Disablement blocks new scheduling and maintenance admission for that binding but does not
+cancel a blocked syscall, discard process evidence, release ambiguous capacity, or suppress
+supervision/recovery for existing Attempts.
+
 ### 6.7 Machine GPU Admission Policy
 
 One MachineRuntime owns one persistent GPU admission policy shared by every registered Project.
@@ -971,6 +1084,20 @@ does not interrupt a synchronous syscall. Explicitly disabling the affected
 Project excludes it from later new claims and primary-demand contribution after
 the registry commit, but never removes its reservations or supervision duties.
 All remaining admission checks still apply before another Project borrows.
+
+With Project I/O isolation, borrow eligibility comes from independent bounded
+primary scans, not the ordinary dispatch cursor reaching its end. All enabled
+bindings must complete the same scan and verification round. Missing or changed
+evidence denies borrowing without stopping healthy primary work. Waiting for
+resource aggregation still counts as demand; a request exceeding machine
+capacity does not. A proof permits one new local reservation in the current
+controller turn and is discarded after restart or prerequisite changes. CPU and
+GPU borrow reservations retain their actual admission role for later inspection.
+Creating that provisional machine-local reservation is separate from selecting
+its shared claim request. A missed request grant neither extends the proof nor
+forces a full rescan for an already-created exact offer. Shared claim validation
+and existing provisional-offer recovery still determine whether it becomes an
+Attempt; no training starts merely because an offer was allocated.
 
 `gpu_limit_gpus` is `null` or a positive integer for both Worker roles. `null` removes only the
 Group-level GPU limit; visible free qexp GPUs, placement, primary demand, and machine-wide
@@ -1785,6 +1912,12 @@ Default behavior:
 - retained Group history and optional `group-service-v1` maintenance locators do not by themselves
   prevent idle exit; a later normal start resumes their durable work
 - qexp does not remotely wake other machines
+
+Local activation participates in the machine lifecycle fence even when the
+agent is already running. With Project-I/O isolation, final on-demand exit uses
+completed asynchronous service/replay proofs and a matching local activation
+generation, not a synchronous shared-root scan under the lifecycle lock.
+`--no-activate` still publishes work without requesting this local wake.
 
 Daemon mode is the default; on-demand is explicit:
 

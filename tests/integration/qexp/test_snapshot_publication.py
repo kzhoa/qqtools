@@ -1,5 +1,6 @@
 """Advisory write suppression preserves freshness, state changes, and repair."""
 
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -106,3 +107,48 @@ def test_failed_snapshot_write_is_retried(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(store, "atomic_replace", original)
     assert store.replace_snapshot_if_changed(path, {"state": "active"})
     assert store.read_json(path) == {"state": "active"}
+
+
+def test_snapshot_write_guard_is_held_through_each_atomic_replace(tmp_path: Path, monkeypatch) -> None:
+    cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")
+    guard_held = False
+    guarded_writes: list[str] = []
+    original = machine_state.replace_snapshot_if_changed
+
+    @contextmanager
+    def shared_write_guard():
+        nonlocal guard_held
+        assert not guard_held
+        guard_held = True
+        try:
+            yield True
+        finally:
+            guard_held = False
+
+    def assert_guarded(path, value):
+        assert guard_held
+        guarded_writes.append(path.name)
+        return original(path, value)
+
+    monkeypatch.setattr(machine_state, "replace_snapshot_if_changed", assert_guarded)
+
+    assert (
+        machine_state.publish_machine_snapshots(
+            cfg,
+            instance_id="agent-1",
+            pid=123,
+            agent_mode="daemon",
+            observed_state="idle",
+            active_attempt_ids=[],
+            visible_gpu_ids=[],
+            reserved_gpu_ids=[],
+            heartbeat_interval_seconds=5.0,
+            started_at="2026-09-28T00:00:00+00:00",
+            idle_since_at="2026-09-28T00:00:00+00:00",
+            observed_at="2026-09-28T00:00:01+00:00",
+            shared_write_guard=shared_write_guard,
+        )
+        is True
+    )
+    assert guarded_writes == ["agent.json", "gpu.json", "summary.json"]
+    assert not guard_held

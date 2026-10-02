@@ -6,6 +6,7 @@ import logging
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable, Literal
 
 from ..locks import exclusive
 from ..paths import shared_paths
@@ -272,6 +273,12 @@ def _cursor_path(root: Path, project_id: str, machine_name: str, scope: ReadySco
     return shared_paths(root)["ready_cursors"] / f"{project_id}.{machine_name}.{scope}.json"
 
 
+def _cursor_lock_path(root: Path, project_id: str, machine_name: str, scope: ReadyScope) -> Path:
+    validate_identifier(project_id, "project_id")
+    validate_identifier(machine_name, "machine_name")
+    return shared_paths(root)["ready_locks"] / f"cursor.{project_id}.{machine_name}.{scope}.lock"
+
+
 def _default_cursor(project_id: str, machine_name: str, scope: ReadyScope) -> ReadyCursor:
     return ReadyCursor(project_id, machine_name, scope, 0, None, None, 0)
 
@@ -323,8 +330,13 @@ def load_ready_cursor(
         return _default_cursor(project_id, cfg.machine_name, queue_scope)
 
 
-def _save_ready_cursor(cfg: object, cursor: ReadyCursor) -> None:
-    atomic_replace(
+def _write_ready_cursor_locked(
+    cfg: object,
+    cursor: ReadyCursor,
+    *,
+    before_replace: Callable[[object], None] | None = None,
+) -> None:
+    result = atomic_replace(
         _cursor_path(cfg.shared_root, cursor.project_id, cursor.machine_name, cursor.queue_scope),
         {
             "cursor": {
@@ -338,7 +350,61 @@ def _save_ready_cursor(cfg: object, cursor: ReadyCursor) -> None:
                 "revision": cursor.revision,
             }
         },
+        before_replace=before_replace,
     )
+    if result is None:
+        raise OSError("ready cursor durability could not be established.")
+
+
+def _save_ready_cursor(cfg: object, cursor: ReadyCursor) -> None:
+    lock_path = _cursor_lock_path(cfg.shared_root, cursor.project_id, cursor.machine_name, cursor.queue_scope)
+    with exclusive(lock_path):
+        _write_ready_cursor_locked(cfg, cursor)
+
+
+def compare_and_commit_ready_cursor(
+    cfg: object,
+    namespace: str,
+    queue_scope: ReadyScope,
+    observed: ReadyCursor,
+    next_cursor: ReadyCursor,
+    *,
+    mutation_guard: Callable[[], None],
+) -> Literal["committed", "already_applied", "stale"]:
+    """Commit one cursor advance only while its exact observed revision is current."""
+    validate_identifier(namespace, "cursor namespace")
+    if queue_scope not in {"home", "shared"}:
+        raise ValueError("ready cursor scope must be home or shared.")
+    for cursor in (observed, next_cursor):
+        if (
+            cursor.project_id != namespace
+            or cursor.machine_name != cfg.machine_name
+            or cursor.queue_scope != queue_scope
+            or type(cursor.revision) is not int
+            or cursor.revision < 0
+        ):
+            raise ValueError("ready cursor identity does not match its commit route.")
+    if next_cursor.revision < observed.revision:
+        raise ValueError("next ready cursor revision precedes the observed revision.")
+    position_changed = any(
+        getattr(next_cursor, field) != getattr(observed, field) for field in ("catalog_page", "partition", "after_name")
+    )
+    if position_changed and next_cursor.revision <= observed.revision:
+        raise ValueError("ready cursor position changed without advancing its revision.")
+
+    lock_path = _cursor_lock_path(cfg.shared_root, namespace, cfg.machine_name, queue_scope)
+    with exclusive(lock_path):
+        current = load_ready_cursor(cfg, namespace, queue_scope)
+        if current == next_cursor:
+            return "already_applied"
+        if current != observed:
+            return "stale"
+        _write_ready_cursor_locked(
+            cfg,
+            next_cursor,
+            before_replace=lambda _temporary_stat: mutation_guard(),
+        )
+        return "committed"
 
 
 def _reference_from_slot(
@@ -592,6 +658,8 @@ def peek_ready_marker(
     queue_scope: ReadyScope,
     cursor: ReadyCursor | None,
     budget: SliceBudget,
+    *,
+    read_only: bool = False,
 ) -> ReadyPeek:
     """Read at most one candidate through a caller-owned, bounded cursor.
 
@@ -620,16 +688,17 @@ def peek_ready_marker(
                 continue
             return ReadyPeek(None, current)
         except OSError as exc:
-            state.mark_ready_index_degraded(
-                cfg,
-                storage_diagnostic(
-                    "catalog_invalid",
-                    route=route_key,
-                    location=page_number,
-                    stage="catalog_read",
-                    exception=exc,
-                ),
-            )
+            if not read_only:
+                state.mark_ready_index_degraded(
+                    cfg,
+                    storage_diagnostic(
+                        "catalog_invalid",
+                        route=route_key,
+                        location=page_number,
+                        stage="catalog_read",
+                        exception=exc,
+                    ),
+                )
             return ReadyPeek(None, current, unresolved=True)
         if not budget.can_start_operation():
             return ReadyPeek(None, progress_cursor, exhausted=True)
@@ -637,22 +706,24 @@ def peek_ready_marker(
         try:
             partitions, successor = _read_and_validate_catalog(page_path, route_key, page_number)
         except FileNotFoundError as exc:
-            state.mark_ready_index_degraded(
-                cfg,
-                storage_diagnostic(
-                    "catalog_invalid",
-                    route=route_key,
-                    location=page_number,
-                    stage="catalog_read",
-                    exception=exc,
-                ),
-            )
+            if not read_only:
+                state.mark_ready_index_degraded(
+                    cfg,
+                    storage_diagnostic(
+                        "catalog_invalid",
+                        route=route_key,
+                        location=page_number,
+                        stage="catalog_read",
+                        exception=exc,
+                    ),
+                )
             return ReadyPeek(None, current, unresolved=True)
         except (KeyError, OSError, TypeError, ValueError) as exc:
-            state.mark_ready_index_degraded(
-                cfg,
-                _catalog_diagnostic(route_key, page_number, "catalog_schema", exc),
-            )
+            if not read_only:
+                state.mark_ready_index_degraded(
+                    cfg,
+                    _catalog_diagnostic(route_key, page_number, "catalog_schema", exc),
+                )
             return ReadyPeek(None, current, unresolved=True)
 
         if partition_name in partitions:
@@ -672,6 +743,8 @@ def peek_ready_marker(
             try:
                 names = sorted(_read_and_validate_partition(partition_path, route_key, page_number, partition_name))
             except FileNotFoundError as exc:
+                if read_only:
+                    return ReadyPeek(None, current, unresolved=True)
                 if not budget.can_start_operation():
                     return ReadyPeek(None, progress_cursor, exhausted=True)
                 budget.consume_operation()
@@ -689,7 +762,8 @@ def peek_ready_marker(
                     return ReadyPeek(None, current, unresolved=True)
                 names = []
             except (KeyError, OSError, TypeError, ValueError) as exc:
-                state.mark_ready_index_degraded(cfg, _partition_diagnostic(route_key, partition_name, exc))
+                if not read_only:
+                    state.mark_ready_index_degraded(cfg, _partition_diagnostic(route_key, partition_name, exc))
                 return ReadyPeek(None, current, unresolved=True)
             for marker_name in names:
                 if after_name is not None and marker_name <= after_name:

@@ -1,7 +1,7 @@
 ---
 doc_type: spec
 status: active
-updated_at: 2026-09-28
+updated_at: 2026-09-29
 archived_at:
 ---
 
@@ -283,6 +283,17 @@ replacement generation cannot activate between validation and commit. Runtime st
 (disabled with local blockers), or `disabled` (disabled with no blockers). A binding may be removed
 only when disabled and all associated reservations, process/launch/observation records,
 termination decisions, and pending local convergence evidence are absent.
+Before committing removal, `MachineRuntime` atomically persists an exact versioned
+retirement intent containing the runtime ID, Project ID and canonical root,
+logical machine name, and registration generation. Registry removal and later
+intent discovery perform no Project-root I/O. The common Project-I/O arbiter
+admits `activation_consumer_retire` as bounded background work; its worker proves
+the exact old binding absent under a short registry guard, releases that guard,
+and repeats the epoch-and-absence fence before every shared mutation. Missing or
+already-retired consumer state is successful. Only a completed `retired` result
+clears the exact local intent; stale, failed, ambiguous, or interrupted work is
+retained for replay. A pending exact intent forces same-runtime re-registration
+to allocate a new generation rather than reuse the generation being retired.
 After shared terminal truth commits, the agent consumes the corresponding process,
 registration, observation, launch-intent, and completed termination records. Successful removal
 deletes the binding's disposable project runtime partition before removing the registry entry.
@@ -313,6 +324,14 @@ incremented registry revision. This registry replacement is the operation commit
 point and remains under the registry guard that also fences new claims. Enable
 additionally retains shared registration-authority validation; disable does not
 require a successful shared Project read.
+
+Enable snapshots the local binding and registry revision under those guards,
+releases all three guards for shared registration validation, and reacquires
+them before committing. The exact binding and registry revision must still
+match; otherwise the command fails without enabling and requires a fresh retry.
+A non-returning registration check cannot retain machine-wide authority locks
+or prevent a peer Project's local disable operation. Persisted canonical paths
+are reconstructed lexically without shared-filesystem resolution under these guards.
 
 After commit, the caller copies only the effective registry value to the exact
 inventory entry matched by both Project ID and canonical shared root. It
@@ -1026,6 +1045,24 @@ Required write order:
 - Submission Operation state decides staged Task visibility
 - Group truth decides dispatch, membership ordering, and Worker Set eligibility
 
+Project-I/O lease renewal uses the same Task-first rule. Its request ID identifies
+one immutable clock observation and one renewal plan, including the policy's
+renewal cadence. The Task commit stores the
+expiry, clock evidence, and request marker before Attempt reconciliation; replay
+must finish a Task-only partial commit from those exact fields and must never
+derive a later expiry from an old clock marker. A clock-only partial request is
+reusable only while current clock capability has the same boot identity and the
+stored observation remains within the configured age and error bounds.
+After a definitive result, the machine-local router must not issue another
+renewal for that exact process identity before the returned cadence is due.
+
+This renewal is the sole narrow exception to ordinary Task observation-index
+publication. It may write Task truth directly only when a structural guard proves
+that the mutation changes exactly `meta.revision`, `meta.updated_at`, and the
+active claim's lease expiry and clock-evidence fields. Those fields are excluded
+from every Task observation membership and page payload. Any other Task change
+must use the normal dirty/revision/publication transaction.
+
 If a crash leaves only the first write complete, no reader may infer new execution
 authority from the second record. `doctor` reconciles the lagging record from the
 authoritative token and immutable evidence.
@@ -1435,6 +1472,753 @@ nonmatching entries. It never advances across a matching entry withheld by the
 output budget. A supplied Project filter must equal the cursor filter; omitting
 it reuses the cursor filter.
 
+### 9.7 Project I/O isolation executor
+
+The controller owns local policy, processes, capacity, readiness, and result application. Typed
+Project handlers own shared transactions and their existing recovery evidence. The executor owns
+transport persistence, subprocess limits, epochs, and exit verification, not Task/Attempt business
+decisions. Extract shared-only operations from mixed services rather than giving a worker the old
+supervisor's local capacity/process authority. The machine agent has one production orchestration
+route; executor absence must not silently select a synchronous shared-I/O fallback.
+
+The agent retains the lifetime scheduler-ownership lock that excludes a second local agent. That
+lock is an ownership fence, not a Project-work critical section: the controller never synchronously
+waits for a Project worker while holding a transient scheduler-operation, migration, lifecycle,
+inventory, registry, GPU-reservation, or CPU-reservation lock, and a worker never acquires the
+lifetime ownership lock. The controller does not perform the isolated shared Project operation on a
+worker's behalf. Startup/binding validation, scheduling observation and mutation, reservation
+reconciliation, maintenance/recovery, authority/supervision, and shared snapshot or acknowledgement
+publication use typed isolated requests. Local hardware discovery, registry and policy reads,
+process-table inspection, resource-offer allocation, result consumption, diagnostics, and worker
+lifecycle remain in the controller. Launch retains its asynchronous handoff; any shared Project
+validation before launch is isolated.
+
+Each request runs in a new subprocess started through a fresh interpreter. The agent never forks
+its multithreaded controller and does not use a thread pool for this boundary. The controller:
+
+1. captures the exact binding and source identities and, when required, persists one provisional
+   CPU/GPU offer under short machine-local locks;
+2. durably prepares one typed request, releases every transient machine-local critical-section lock,
+   then starts or non-blockingly observes its worker while retaining lifetime agent ownership;
+3. consumes a result only after revalidating every request, runtime, epoch, binding, source, and
+   offer fence; and
+4. performs only bounded machine-local effects during consumption, scheduling any later Project
+   work as a new request.
+
+The worker validates its immutable request and canonical Project root, performs only the named
+operation using existing Project transactions, checks its executor epoch immediately before every
+independent shared mutation, atomically publishes one bounded result, and exits. This protocol is a
+closed set of typed operations, not a generic RPC or Python-call interface. Requests and results
+must not contain commands, environment values, credentials, or unbounded Project records.
+
+All services use one local, work-conserving request arbiter. Rotate grant opportunities through
+`authority, primary, authority, background`, skipping empty or binding-blocked classes. Within a
+class rotate eligible bindings, moving a granted binding behind existing peers and appending new
+bindings behind them. Within a binding, resumable work cursors cover Attempts, resource lanes, and
+background families; repeated arrivals must not reset older work's position. Order the current
+finite set of due authority work by its existing safe deadlines without allowing new arrivals to
+continually displace already due work. Registration, readiness, or recovery prerequisites inherit
+the requesting service class. Skipped opportunities are immediately available to another eligible
+class; this is not permanent process-slot partitioning or a separate pool per service.
+
+The `primary` service-class name covers scheduling requests, including eligible borrow work.
+It is an arbiter weight, not an admission role or permission to borrow. Existing machine-wide
+primary-demand proofs, lane policy, revision fences, and conservative unknown-demand handling
+still determine borrow eligibility before submission and at claim. A primary-class grant cannot
+override those rules or preempt an existing borrow Attempt.
+
+Isolated borrow admission uses a dedicated primary probe, never exhaustion of the
+ordinary dispatch cursor. Its bounded slices retain the existing primary route
+baseline, completion state, and dependency recheck positions. A complete scan
+requires unchanged primary lane watermarks, including a final revalidation of
+both routes. Resource aggregation remains demand; structurally impossible work
+uses the existing primary-candidate policy. Every enabled exact binding must
+contribute a successful verification to the same admission round. Missing,
+changed, unvalidated, dormant, or upgrade-blocked participants deny admission.
+The controller binds that round to its registry revision, executor epoch and
+local capacity snapshot. Only its current one-turn capability may create a
+borrow offer; a GPU or CPU offer durably records `admission.admitted_as_borrow`.
+Resource-offer allocation is a bounded machine-local result effect: a current
+capability may allocate one provisional offer before the arbiter selects its
+shared claim request. The capability expires at turn end; it is not needed again
+to submit that exact already-allocated offer. The controller retains at most four
+pending offer preparations, with at most one per binding. Every new shared claim
+request still passes the common arbiter and executor capacity/fences. If a
+capability creates no offer, discovery progress may remain but every participant
+must contribute fresh verification before another capability is issued.
+Restart discards pending preparation payloads. An exact provisional offer with
+no request, process, or result evidence can be released under the executor's
+publication lock; any existing or invalid transport evidence prevents that
+release and retains the existing ambiguous-claim reconciliation path.
+Restart discards incomplete probe rounds and obtains fresh evidence. It retains
+already-created or ambiguous offers under the existing reconciliation rules.
+`scheduler_primary_probe` is a read-only typed operation with a closed
+continuation for the two primary routes, a scan/verify phase, round identity,
+capacity digest, lane capacity and per-Group GPU usage. It does not read or
+commit the ordinary dispatch cursor, reserve resources, or acquire process
+authority. Only an exact completed result with both unchanged primary route
+watermarks contributes absence evidence. Invalidated read-only requests may be
+reclaimed only after exact worker absence; an overdue or unverified worker
+continues to occupy its slot. Registry and local reservation identity are
+checked again before the single borrow reservation is created.
+
+`upgrade_service` performs shared journal discovery and at most one existing
+migration phase slice through background admission. Its closed result contains
+only state, pending/runnable flags, admission and idle blockers, and the next
+probe timestamp. MachineRuntime applies those summaries for the exact binding,
+registry revision, and executor epoch; it does not run shared discovery inline
+or start a separate upgrade thread. Unobserved or failed Projects block their
+own admission without withholding healthy peers. Worker absence after a possible
+journal write remains ambiguous until a fenced retry resumes the durable shared
+journal. Restart rebuilds disposable summaries; neither result archival nor a
+local summary is migration-completion authority.
+
+`submission_control_service` advances one existing shared Submission proof-repair
+or bootstrap slice through the background class. Its closed continuation carries
+only the pending/bootstrap lane choice, a disposable directory cookie/inode, and
+sweep progress. Parser checkpoints, source revision witnesses, receipts and the
+bootstrap cursor remain in the shared Project journal; no source payload or
+parser buffer crosses the transport or becomes MachineRuntime truth. Each slice
+closes its descriptors. Busy or invalid pending entries do not prevent visiting
+other entries, and directory changes cannot produce a false idle acknowledgement.
+The controller applies exact results to the local `submission` service lane and
+does not start the former shared-I/O maintenance thread. Possible partial writes
+remain `outcome_unknown` until worker absence permits a journal-backed retry;
+restarting loses only disposable traversal progress, never the canonical proof.
+
+`progress_projection` observes or publishes exactly one captured v1/v2 producer
+context through common background admission. Context discovery, payload sampling,
+local accepted observations, diagnostics, retirement, and cadence remain in the
+MachineRuntime coordinator; it never resolves shared identity inline. At most 64
+Project projector owners are retained, directory streams close on each bounded
+capture, and only local producer evidence creates shared work. The worker reads
+local frozen context without machine guards and does not write local progress
+state. It revalidates registration, Task/Attempt/process identity, context and
+executor epoch before the atomic shared replacement under the existing progress
+cleanup lock. The closed result names only state, exact identity and the bounded
+snapshot. Only consumption of the exact published projection advances the local
+shared-write cadence. An absent worker after possible publication is unknown;
+exact replay is idempotent, and an older sequence cannot overwrite newer evidence.
+Restart restores existing local/shared observations without changing either
+persisted format or fabricating freshness. Disabled bindings may finish progress
+for the same currently owned Attempt; this does not grant launch authority.
+The former shared-I/O progress thread is not started.
+
+Cold progress uses one finite two-request continuation. Its observation and, if
+that observation produces a concrete projection, corresponding publish request
+may take the next two background opportunities. The binding must then grant a
+different ordinary background family before another progress continuation can
+receive the preference. Continuously updating producers therefore cannot bypass
+background-family rotation.
+
+`legacy_capture_read` reads one evidence record already selected by the retained
+capture's durable pending batch. Requests name the exact capture, backfill
+revision, lane and relative record; they cannot supply an arbitrary source root.
+The worker derives the source from fixed local capture metadata, verifies its
+existing source hold, and rechecks the local batch, binding and executor epoch
+after reading. Each source record is limited to 8 MiB. Results contain only the
+source/lane/record and Task/Attempt locator, never command, environment or
+credential payloads. Changed capture returns non-authorizing stale evidence;
+missing, malformed or inaccessible retained evidence fails closed. The worker
+does not acquire MachineRuntime guards or mutate the target ledger. Exact local
+consumption applies the locator without reopening the source and remains
+idempotent. This read alone proves neither capture completion nor source release,
+cleanup permission, launch authority or supervision readiness.
+
+`legacy_capture_scan` discovers at most 64 source directory names for the exact
+unfinished capture lane, through the same background arbiter. It derives source
+ownership from fixed local metadata and verifies retention before and after
+enumeration. The request cursor must equal the existing local checkpoint; a
+caller cannot supply an arbitrary source or skip unvisited evidence. Closed
+results contain only relative paths, work counts, EOF and a directory cursor.
+Directory identities fence cursor reuse; replacement returns stale rather than
+certifying an empty lane. Every directory stream closes within its bounded visit.
+Local consumption first journals the returned pending batch and continuation in
+the existing capture-backfill record. Subsequent reads use `legacy_capture_read`;
+only idempotent local locator application removes a pending record. Crashes before
+journaling repeat discovery, while crashes after ledger publication replay the
+same pending identity. No progress depends on a worker's in-memory iterator, and
+neither EOF nor an archived transport result alone certifies capture completion.
+
+`recovery_source_hold` establishes or replays the existing source hold for one
+exact pending target capture through common background admission. Its request
+names only the capture and machine; the source is derived from local capture and
+the binding's completed migration record. The worker rechecks those records,
+registration and executor epoch before every source write/durability barrier and
+after the transaction. It owns source parent exclusion only, never MachineRuntime
+guards or target ledger mutation. Its exact retained-hold result is consumed
+locally before process observation. Lost or fenced results after possible source
+effects are unknown, not absence; positive worker exit permits exact idempotent
+replay. Missing holds after observation and conflicting source ownership remain
+failures, not permission to create replacement coverage.
+An unfinished capture from a prior registration generation may replay its exact
+hold only for the same persistent binding owner. This does not admit source
+reads under the old generation: the local owner must first publish fresh
+admission and restart the process sweep. Foreign owners and malformed admission
+records remain stale. Completed generations use the separate fenced generation
+transition, never this unfinished-capture replay.
+
+`recovery_admission` prepares the existing registration protocol and shared root
+capability under shared registration ownership, through common background
+admission. Requests contain only the machine name. The worker reads fixed local
+migration/journal metadata without machine guards and defers unfinished migration.
+When a durable registration rollback journal exists, the worker nonblockingly owns
+the machine migration and registry exclusions, restores every captured shared
+registration and machine record, advances the captured local registry, and durably
+retires the journal before recovery preparation can continue. It revalidates the
+executor epoch before every rollback or shared preparation effect. A lost epoch or
+write failure after a possible rollback effect is `outcome_unknown`; the journal
+remains the replay authority. A malformed journal is a retryable error and is never
+discarded or treated as readiness.
+The closed result distinguishes registration preparation from root fencing;
+only both durable outcomes produce `ready`. Pending peers, busy schema or upgrade
+ownership produce waiting, not fabricated readiness. This transaction has no
+capture, process action, or target-ledger mutation. Local registry mutation occurs
+only while replaying the existing CLI rollback journal; the worker returns
+`waiting` afterward so the controller reloads the advanced registry before issuing
+fresh recovery work.
+The closed `superseded` outcome requires a valid shared registration showing
+replacement ownership or explicit supersession under registration exclusion,
+with current local binding and epoch checks. It settles only that binding's
+enrollment obligation and grants no cleanup or execution authority. Missing,
+expired, malformed or inaccessible registration is not supersession evidence.
+
+The production recovery coordinator runs inside the dispatch admission turn;
+there is no separate enrollment thread or enrollment-worker join. Initial root
+recovery admission receives the first ordinary background-family opportunity,
+not authority/deadline priority. A waiting admission still rotates through the
+other eligible families. A completed `waiting` admission or Group-authority
+result defers only that exact binding and operation for one second before a
+fresh worker is eligible; productive local capture and healthy peers continue
+without sharing that retry deadline. Retryable failures retain their separate
+failure backoff. At most four bindings advance local capture per turn,
+with 64 process entries or evidence units per binding. The coordinator retains
+at most 64 capture owners; unfinished process iterators cannot be evicted before
+EOF. Existing target capture/backfill/generation records reconstruct evicted or
+restarted owners. Source holds, discovery, record reads, generation phases, Group
+activation and release all use common typed worker admission. Local application
+rechecks scheduler authority, registry identity and pending registration rollback
+before applying results; archived transport alone never certifies completion.
+
+`recovery_group_authority` consumes the exact current binding's local capture
+completion digest and activates the existing shared Group namespace transaction.
+It holds shared registration ownership followed by nonblocking schema exclusion;
+pending upgrades or ready-index rebuild defer activation. JSON publication,
+directory moves and durability barriers revalidate ownership, local completion
+and executor epoch. No target capture/ledger file is written by the worker.
+Group activation does not require source responsibility retirement and does not
+authorize source release. Interrupted activation replays the existing shared
+Group authority journal; a possibly committed move cannot become an empty result.
+
+`recovery_source_release` uses the existing target-local durable release receipt
+and exact capture-completion digest. Local receipt preparation owns target
+exclusion only and refuses to retire source ownership while ledger members remain.
+The worker reads fixed local metadata without writes or machine guards, then owns
+source-parent exclusion only to delete/replay the exact source hold. It rechecks
+local receipt/completion and binding before every source effect and after the
+transaction. Missing receipt, changed generation or wrong completion digest cannot
+release retention. A conflicting hold fails closed; deletion followed by lost
+result is unknown and may replay only after positive worker exit. Existing local
+receipt and source-hold formats remain unchanged.
+
+`recovery_capture_transition` separates re-registration's source and local
+effects while retaining the existing generation-transition format. Its `retain`
+phase establishes the existing `generation_pending` source hold before any local
+completion can be cleared. Exact consumption authorizes the local transition
+intent, completion/receipt retirement and one newer unfinished census revision.
+Its `normalize` phase requires that durable local reset and restores the ordinary
+pending source hold; only exact consumption permits local intent removal. Both
+phases derive source ownership from local migration and capture metadata, recheck
+binding/epoch and fail closed on phase/context changes. Worker effects never write
+target metadata; local effects never probe the source. Crash recovery finishes the
+exact retained transition before admitting a later registration generation.
+
+`observation_service` advances one Task projection build or obsolete-generation
+cleanup slice through the same background admission path. Its closed result is
+only state, quiescence, and a bounded progress/idle/blocked/closed reason code.
+Only exact active-idle evidence acknowledges the captured local `observation`
+turn as quiescent. The global agent does not start a separate shared-I/O
+observation thread. Build state and capture checkpoints retain their existing
+shared format; restarting an isolated worker does not restart the build.
+Cleanup retains no directory streams between slices: a descriptor-relative,
+no-symlink walk of at most five levels deletes at most one obsolete file or
+empty directory. Each deletion rechecks the executor/binding mutation fence
+and the attached directory identities. Every descriptor closes before return.
+An ambiguous partial write remains `outcome_unknown` until exact worker absence
+permits a fenced retry against the shared projection state.
+
+`notification_service` reconciles one registered Project's legacy notification
+configuration through background admission. Requests contain only the machine
+name; results contain only `ready`, `conflict`, `source_invalid`, or `blocked`.
+Shared source capture finishes before acquiring the private notification-policy
+lock. Within that lock, repeated executor and registry fences are local-only;
+no shared registration/configuration reads or network calls are permitted.
+Credentials remain in owner-only private storage and never enter transport
+records. Existing policy revisions and legacy fingerprints own replay, including
+mixed-writer conflicts and invalid-source recovery. Missing workers or fenced
+results after possible private publication remain ambiguous until exact absence
+allows an idempotent retry. The global agent does not start a separate shared-I/O
+notification thread. Local aged-credential cleanup is bounded and uses a
+nonblocking policy lock, so it cannot wait for an isolated worker.
+Terminal notification hooks reuse this captured-scope transaction rather than
+constructing another MachineRuntime owner or verifying a binding under local
+registry locks. Their shared-capture and pre-delivery fences remain distinct
+from the local-only private-publication fence. Existing at-most-once delivery
+claims, exact terminal replay and stale-registration suppression are unchanged.
+
+Each grant covers one typed transaction-sized request. Subsequent requests re-enter the same fair
+admission path. Completion wakes bounded local advancement without waiting an entire agent-loop
+interval per step. At most 64 candidate intents are retained per pass; roster/work cursors must
+revisit omitted work without an unbounded materialized queue. Existing backoff, enablement,
+generation, and one-request-per-binding fences remain authoritative. Local process safety runs
+independently of these grants; fairness is not proof that overload permits every renewal deadline.
+
+Scheduler candidate evidence has its own bounded discovery rotation, separate
+from the arbiter's grant roster. When all 64 retained candidate positions are
+occupied, discovery replaces one rediscoverable cached result so an omitted
+binding can be observed. A completed observation receives its same-turn claim
+opportunity before another discovery rotation may replace it. Locally
+unclaimable evidence is released back to discovery; the shared ready marker,
+not the cache entry, remains authoritative. This rotation cannot grant claim or
+borrow authority by itself.
+
+Latency accounting includes slot wait, all dependent worker invocations (including startup and
+exit), result consumption, intervening grants, and successor wakeups. The
+[product latency qualification](qexp_product_spec.md#blocking-project-io-isolation) requires both
+primary claim/admission and applied renewal for one recovered healthy peer while two other bindings
+remain blocked. Its baseline request chains are observation/local offer/shared claim/local
+application and authority observation/shared renewal/local application. Additional requests or
+background contention count toward the same measured budget. No global 15-second promise follows
+from four worker slots or two-second individual requests. Multi-Project qualification must check
+positive progress of every class and binding under finite competing demand and new arrivals,
+including rosters larger than the 64-intent pass limit.
+
+Result archival and local application are separate crash boundaries. Existing durable transaction
+and recovery evidence must support idempotent exact-identity application or fresh reconciliation
+after a crash between consumption and reservation, process-manifest, or cleanup effects. A consumed
+transport result is not proof that those local effects completed. Cleanup that accesses legacy
+shared sources remains isolated and must not execute under a local cleanup lock.
+
+Terminal-publication workers run the existing idempotent lifecycle notification hook before
+publishing their result, including on exact transaction replay. Delivery retains its existing
+shared notification claim and best-effort, at-most-once semantics. The hook may use the existing
+short local notification-policy and credential bookkeeping transactions, but no shared storage or
+network access may occur while those local locks are held. This narrow bookkeeping exception
+does not authorize local scheduling policy, capacity, process control, or successor work. Secrets
+are resolved within the worker and never enter executor records. Executor and binding fences apply
+before shared notification mutations and immediately before network delivery.
+When exact terminal recovery outlives its registration or registry revision, it skips the obsolete
+notification but still returns the proven terminal result so the old request can be resolved.
+
+Claim admission is split across authorities. An observation result names the candidate,
+Task/Group/registration revisions, resource requirement, and admission evidence. The controller
+revalidates local policy and persists an exact provisional offer. A mutation request names that
+offer while executing the existing fenced claim/Attempt transaction. The controller then consumes a
+current result or rereads exact durable evidence to activate, compensate, or retain the offer.
+Timeout, missing or malformed output, process disappearance, stale output, stop, and restart do not
+release it. The offer is marked with its executor epoch and request ID and is exempt from ordinary
+unattached-provisional TTL expiry while the outcome is ambiguous. Existing reservation
+reconciliation releases it only after proving that no matching shared claim committed, or attaches
+or compensates it after exact shared evidence identifies the committed claim.
+
+Elapsed home-queue offer maintenance uses the closed `scheduler_due_offer` operation. The
+controller admits at most one fairly rotated enabled, validated binding per advancement; the
+worker processes at most one durable offer-deadline entry and reuses the existing deadline-index
+repair and `offer(..., reason="elapsed")` transaction. It rechecks the executor epoch and exact
+current binding immediately before deadline-index mutation and again before the offer transaction.
+Its bounded `offered | noop` result names only a stable reason and nullable Task ID, grants no
+claim or local capacity authority, and requires no machine-local effect. Missing, stale, fenced,
+or outcome-unknown results are retried from durable deadline and Task truth; disabled or replaced
+bindings start no new due-offer request. The isolated production dispatch does not call the
+synchronous whole-Project maintenance entry to preserve this behavior.
+
+Initial ready-index activation uses the closed `scheduler_ready_index_build` operation. A request
+names only the exact enabled, validated binding; it carries no source revision or provisional
+resource offer. When GPU or CPU capacity is locally available, the controller fairly rotates a
+window of at most 64 bindings and admits at most one new build request per advancement. The worker
+rebases local maintenance state to that Project's MachineRuntime directory and advances one
+`max_tasks=64`, bounded-initialization slice of the existing resumable build. Executor-epoch and
+binding identity are rechecked immediately before every JSON replacement and every directory,
+rename, removal, or durability publication reachable from the slice. A failure before any possible
+shared mutation is retryable; after a mutation may have begun its outcome is unknown and recovery
+uses the durable build state. The completed result contains only the durable state and revision,
+plus build ID and closed phase while state is `building`; it grants no scheduling or local-capacity
+authority. Disabled, replaced, upgrade-blocked, and capacity-ineligible bindings start no request.
+The isolated production route never performs synchronous ready-index construction before candidate
+observation; `building` results are continued by later fair controller turns.
+
+Durable Project maintenance uses the closed `maintenance_descriptor_advance` operation. A request
+names only the exact enabled, validated binding, carries no source revision or provisional offer,
+and advances at most one descriptor selected by the existing Project outbox with `max_scan=1`.
+The Project outbox identity, cursor, retry time, transaction evidence, and retirement proof remain
+the sole authoritative recovery state; the MachineRuntime request is disposable coordination and
+does not copy descriptor payloads. The worker rebases machine-local maintenance paths to that
+Project's MachineRuntime directory and supplies the MachineRuntime root only to existing exact
+reservation reconciliation. Executor epoch and binding identity are rechecked immediately before
+every reachable shared mutation. A failure before any possible mutation is retryable; after a
+mutation may have begun it is outcome-unknown and the same request is replayed only after positive
+worker absence. The result is non-authorizing and contains only the closed maintenance state, an
+optional due timestamp for `waiting`, a bounded-more flag, and an idle-blocking bit. The controller rotates at most 64
+eligible bindings per pass and admits at most one new descriptor slice; disabled, replaced, and
+upgrade-blocked bindings start no new maintenance request. The isolated production route never
+calls `advance_maintenance_work` in the controller process. A terminal descriptor without an
+explicit outbox-wide `more=false` proof receives one bounded confirmation slice before the Project
+is settled, so one activation containing multiple descriptors cannot strand its tail. A `waiting`
+result persists its due time in the existing MachineRuntime maintenance-retry schedule. Only a
+worker-confirmed machine-owned timer obligation inhibits on-demand idle exit; a producer-handoff
+wait may be resumed by a future Project activation and does not retain the agent. A local timer
+wakes the working set when due and is cleared immediately when its binding is disabled, replaced,
+or superseded, or by a newer activation, so stale generations cannot retain the agent and newly
+due work is not delayed behind an older descriptor's retry time.
+Maintenance quiescence is acknowledged only against the local activation turn captured before
+that worker starts. A later activation or local wake invalidates the old turn, including its
+cached idle settlement. Replayed requests without a retained turn do not certify quiescence;
+the controller obtains a fresh bounded confirmation. A terminal slice with more work remains
+non-quiescent, as does a machine-owned waiting timer; a producer-handoff wait may acknowledge
+its captured turn without retaining the agent.
+An idle result captured before activation observation completes may be parked against that
+unchanged unknown turn to avoid duplicate background workers. It never acknowledges quiescence.
+Completing activation observation or changing the turn invalidates the parked proof and requires
+a new activation-bound worker result before acknowledgement.
+Service retry state is pruned against the full local registry revision and executor epoch at
+the common admission boundary, retaining exact unresolved requests. A scheduler's current
+binding subset is not a registry snapshot and cannot clear another service's waiting or failure
+backoff.
+
+Scheduler retirement uses a separate read-only `scheduler_quiescence_probe`,
+not an empty dispatch-cursor tail. Its closed request contains the machine name
+and a bounded two-route continuation. It participates in ordinary primary
+admission, alongside other scheduler
+discovery/proof families; it is not a background maintenance family. The class
+cycle and per-binding family rotation remain unchanged. Home and shared scans start at their route
+origins and cover both resource lanes and scheduling roles. Every slice checks
+the complete ready-route watermark before resuming; reaching both route ends
+also requires unchanged final watermarks. Changed revisions restart only the
+affected route. A runnable candidate is active; unresolved evidence, dependency
+waits, inactive indexes, and exhausted slices cannot certify quiescence.
+The result contains only `state` (`quiescent`, `active`, or `pending`) and the
+validated continuation. It mutates neither dispatch cursors nor Project truth
+and grants no claim, reservation, or process-control authority. The controller
+acknowledges only the activation turn captured before the independent scan;
+new activation/checkpoint or registration/epoch changes invalidate the proof.
+Known ready-index repair and retained candidate evidence defer this independent
+census until the normal scheduling prerequisite or candidate transaction has
+converged. Neither prerequisite knowledge nor a cached candidate acknowledges
+quiescence; the separate complete scan is still required afterwards.
+The independent census does not wait for simultaneous transient CPU/GPU
+dispatch receipts. A complete current census can resolve the absence of those
+receipts for idle detection, but never an unresolved or partial census. While
+its activation-bound proof remains current, speculative dispatch scans need not
+reopen the settled scheduler lane; a new wake invalidates that proof before
+service admission resumes.
+
+Authority retirement reuses the bounded MachineRuntime evidence census after
+the monotonic startup reconciliation barrier. Startup readiness is not an idle
+proof: running or identity-unknown processes remain non-quiescent. A fresh
+authority turn must cover registrations, launch intents, process manifests,
+exit observations, and nested termination decisions. Historical terminal
+records require exact settled reservations and positive local process absence;
+unfinished authority requests cannot certify retirement. Directory replacement
+or mutation during a census invalidates that census. Completed lanes retain
+their completion while other lanes resume, rather than repeatedly scanning
+their prefixes. Only the captured current activation turn may be acknowledged;
+an unchanged unknown turn may park a proof but never acknowledge it.
+
+The permanent version-1 layout is atomic JSON under the MachineRuntime:
+
+```text
+<MachineRuntime>/project-io-executor-v1/
+  epoch.json
+  requests/<request-id>.json
+  results/<request-id>.json
+  processes/<request-id>.json
+  resolved/<completion-sequence>-<request-id>.json
+  locks/executor.lock
+```
+
+The executor follows the MachineRuntime same-directory atomic-replace, directory-durability,
+bounded-read, owner, type, and symlink rules. It uses neither SQLite nor the shared Project root.
+One request ID owns its request, process, result, and resolved records: request publication precedes
+process publication; process identity is PID plus process start ticks; result publication precedes
+resolution; and a consumed result is archived before transient reclamation. Interrupted start and
+consumption are replayable in that order.
+
+Every request contains `protocol_version`, `runtime_id`, `executor_epoch`, `request_id`,
+`operation_kind`, `project_id`, `canonical_shared_root`, `registration_generation`,
+`registry_revision`, `source_revisions`, nullable `provisional_offer_id`, and `prepared_at`.
+Process evidence adds PID and start ticks. A result repeats the complete request identity and has
+status `completed`, `retryable_error`, `outcome_unknown`, or `fenced`, stable reason codes, and
+bounded typed evidence. Diagnostic error text is bounded and never replaces a stable reason.
+
+`machine_snapshot_publish` carries nullable `stop_reason`. A null value publishes the ordinary
+active/idle snapshot. A non-null lifecycle reason publishes `observed_state=stopped`, clears the
+active-Attempt projection, and still rechecks the exact registration, runtime, executor epoch and
+shared snapshot instance before every write. Stop cleanup first fences and shuts down the ordinary
+epoch, then opens one bounded stop-publication epoch. Old ambiguous requests keep their owner and
+capacity slots; responsive bindings may use the remaining slots. The stop epoch has a two-second
+publication budget and is shut down with the ordinary bounded signal/reap procedure. Any binding
+that cannot settle makes `project_stop_publications` fail, without a controller-side shared write,
+an unbounded thread join, or suppression of later local stopped-status and diagnostic steps.
+
+`authority_running_publish` projects one existing local process registration into shared
+Attempt/Task running state. Its parameters are the machine, Task, Attempt number and ID,
+fencing token, nullable wrapper/process-group identity, and process-created timestamp. The
+worker derives the manifest locator from the exact MachineRuntime/Project/Attempt identity;
+the request cannot supply an arbitrary path. The existing shared transaction rejects conflicting
+identity, timestamps or lifecycle state, and fences every Attempt and Task/index mutation.
+Its `processed` result and `transitioned_to_running` flag describe this invocation only; neither
+grants authority, proves current readiness, nor authorizes local process/capacity effects.
+Callers retain local registration evidence and obtain current authority through its separate
+observation operation. Exact replay repairs an Attempt-first partial publication without
+rewriting an already matching Attempt. After worker absence, a current request may retry;
+after epoch or binding replacement, local registration evidence remains discoverable for the
+new owner. Archiving the obsolete request never means that its shared mutation did not commit.
+
+If lease expiry precedes running publication, the same operation may fill missing process
+identity and creation evidence on an orphaned Attempt only when the exact expired launch is
+present in the claim archive or pending archive, its launch ID matches Attempt authorization,
+and no replacement claim or Attempt exists. Conflicting identity or timestamps remain stale.
+This evidence-only repair leaves the Attempt orphaned and the Task blocked; it neither renews
+the expired claim nor restores execution authority. Terminal completion or explicit orphan
+recovery subsequently uses the ordinary exact-identity authority operations.
+
+Local registration materialization holds the evidence-write guard only while creating its
+manifest. Shared running publication starts after that guard is released and holds no local
+Attempt control lock. Its captured registration and manifest locator do not authorize lifecycle
+changes: the shared transaction rechecks current identity and phase, rejecting a registration
+whose Attempt became terminal in the intervening window. A failed publication retains the
+registration and existing manifest for replay without recreating local process evidence.
+The immutable registration also records the exact reservation ID copied from the admitted
+Attempt. That local identity is carried into the agent-owned manifest so natural-exit terminal
+observation can reject a replaced reservation without querying shared truth in the controller.
+The coordinator advances terminal completion before running publication in each turn. Thus a
+restart with an existing manifest and exit observation cannot have its binding's single Project-I/O
+request slot monopolized by stale running publications, while a fast exit whose registration has
+not yet been materialized still receives one replay-safe running-publication pass before terminal
+completion takes priority on the next turn.
+At most 64 discovered running-publication intents remain eligible across unselected arbiter
+turns instead of disappearing when their directory page advances. Each subsequent offer rechecks
+the exact local registration and manifest identity. Successful processing, source replacement,
+exit or binding replacement retires the cached intent; the shared transaction still decides
+whether any lifecycle publication is current.
+
+`authority_orphan_recovery` keeps shared recovery commitment separate from exact local
+reservation retagging and process-manifest application. A process exit between these steps
+does not discard committed recovery evidence. The controller may finish that exact local
+identity change, including after restart, with its immutable exit observation still intact.
+For a manifest no longer locally live, the operation sets `replay_only` (default false):
+the shared handler may return or finish an existing exact recovery marker, but cannot create
+a new lease or recovery commitment for an exited process. Ordinary terminal supervision then
+uses the recovered token. Local liveness never substitutes for the shared commitment proof.
+Registration renewal is an authority-class service for every enabled binding, whether resident
+or dormant. Bounded fair selection and its renewal horizon do not depend on background snapshot
+publication or on a Project reaching idle; short registration leases must remain serviceable
+while the Project is active. Disabled bindings are excluded from new registration renewal.
+After a successful renewal, the isolated result returns a local-only next-renewal delay derived
+from the authoritative policy: no longer than its normal renewal interval or a quarter of the
+observed remaining eligibility lease. The exact local service identity waits for that delay before
+its next renewal request, avoiding an otherwise redundant pre-interval worker invocation.
+The local `not_due` scheduling acknowledgement retires redundant renewal intent only; it is
+not a wire result or current shared eligibility proof and grants no authority. An epoch or
+binding identity change does not inherit this cadence.
+The captured eligibility expiry also supplies a local authority-family deadline,
+with up to two seconds reserved for the qualified healthy request and intervening
+queueing. For a shorter remaining lease, the deadline is no later than the local
+quarter-lease cooldown. A due family may take one
+urgent opportunity without advancing the ordinary family cursor; the next
+authority opportunity for that binding visits other waiting families before
+repeating the override. The fixed class cycle, binding rotation, and executor
+capacity remain unchanged. This reduces short-lease queueing risk but neither
+grants authority from a deadline nor promises renewal under overload.
+Across bindings, deadline override is limited to three consecutive grants. A
+continuously due multi-owner backlog then re-enters the common class cycle so
+eligible primary or background work cannot be excluded across passes. Deadline
+preference is replenished only after every primary or background class that is
+eligible during that yield has received a grant; one primary grant cannot hide
+a continuously eligible background class by restarting the deadline burst. If
+no other class has eligible work, the normal work-conserving cycle continues to
+grant due authority rather than leaving a worker slot idle.
+
+An already prepared primary claim or exact active-reservation launch gate is a
+bounded critical chain, not speculative candidate discovery. Admission may
+defer that binding's background preparation and prefer its claim/launch family
+for at most three attempted critical grants between preference replenishments.
+Authority opportunities, other bindings' rotation, four-worker capacity and
+per-binding serialization remain unchanged. After three attempts, background
+and ordinary primary families regain their normal opportunities even if the
+chain repeatedly fails. Renewing the preference after exhausting it requires
+both a background grant and an ordinary primary grant; continuously replenished
+critical work cannot repeatedly reset its credit and hide another lane's
+discovery. Without ordinary discovery, critical work retains the normal class
+cycle rather than an unlimited preference. A blocked binding or unselected intent spends no
+critical grant. This advisory credit is local, roster-pruned, and scoped to one
+exact Attempt chain within the executor epoch. A later Attempt owned by the same
+binding starts with independent bounded credit rather than inheriting the prior
+Attempt's exhausted chain, but it does not reset an already exhausted global
+burst: ordinary primary and background grants must still consume that pending
+yield before any Attempt receives renewed preference. With no such work
+eligible, critical work remains available through the normal work-conserving
+class cycle. The credit grants no shared authority and is not durable workflow
+state.
+
+The first ordinary background family rotation visits retained-capture admission
+and upgrade service before unrelated metadata. These establish the prerequisites
+that otherwise keep scheduling and service settlement unavailable during cold
+startup. This is a finite family ordering, not urgent or repeated preference:
+the ordinary cursor visits every other waiting family before returning to a
+continuously eligible prerequisite. Class weights, binding rotation and worker
+capacity are unchanged.
+Upgrade and maintenance-descriptor producers offer every currently eligible
+binding's transient intent to this common bounded collector. They do not rotate
+a separate producer cursor or stop after offering an occupied binding. The
+collector, class/binding/family rotation and current executor occupancy decide
+actual grants; each worker still performs only one bounded domain slice.
+
+Local activation and asynchronous idle shutdown share the existing machine
+lifecycle guard. An activation request publishes a fresh runtime-bound UUID in
+`agent/activation-wake.json` before accepting an already-running agent or starting
+one; the managed-project fast path must participate in the same handshake.
+The version-1 JSON envelope is `machine_activation_wake` with exactly `version`,
+`runtime_id`, and `generation`; reads are limited to 1 KiB. Dispatch captures this
+generation before advancing any service and invalidates old binding turns when
+it changes. An absent record is the initial generation, not a service idle proof;
+unreadable, malformed, or foreign-runtime evidence inhibits idle shutdown.
+Final isolated shutdown performs only local checks under the lifecycle guard:
+the captured generation and exact registry snapshot must still match, every
+binding must have completed all service and activation-replay acknowledgements,
+and no local reservation, handoff, or unresolved worker may remain. It does not
+dispatch another asynchronous cycle or inspect shared directories under the
+guard. Hold the guard through stopped-status publication so activation arriving
+after the final check observes a stopped agent and starts its successor. Dormant
+bindings still prevent an incomplete borrow census but are not themselves demand
+after their full service and replay proofs have settled.
+Individual service-lane acknowledgements remain parked until a captured local
+wake or activation checkpoint change invalidates them. Recording one lane's
+quiescence is not binding retirement: final activation observation/acknowledgement
+still has to settle after all lanes. Producers must not clear a completed lane
+merely because asynchronous binding retirement has not returned yet.
+Registration renewal, activation consumer register/ack, and advisory snapshot
+workers use only shared registration locks. They recheck the captured local
+registry/epoch immediately before each shared mutation, never instantiate a
+MachineRuntime capacity owner, and never hold a local binding or snapshot lock
+across shared I/O. The direct library registration API uses the same shared
+eligibility transaction rather than a second renewal implementation.
+The exact registration service also preserves the previous control-plane
+reactivation behavior: an expired but nonsuperseded registration may renew only
+for the same currently enabled local binding, runtime identity, canonical root,
+and generation, under the shared registration fence. Expiry does not make that
+identity a successor generation. A replacement registration wins the fence and
+is never overwritten. Reactivation grants no Attempt lease, process authority,
+or permission to relaunch; orphaned Attempts still use their separate exact
+recovery transaction. Ordinary scheduling and Attempt mutations still require
+current registration eligibility; retirement and exact previously committed
+mutation replay retain their separate proof boundaries.
+
+Authority terminal observation, termination commitment, and terminal publication are distinct
+operations. They retain the exact nullable wrapper and process-group identities recorded for the
+Attempt; a missing wrapper does not discard a still-owned process group. Observation grants no
+reusable execution authority. Besides `already_terminal` for a matching current Task/Attempt
+terminal pair, observation may return `settled_terminal` for an exact terminal Attempt whose
+Task has completed the retry transition or advanced to a later Attempt. This reuses the existing
+terminal-cleanup settlement checks, including current/next Attempt-number fences and absence
+of an active claim for the observed Attempt. It also covers settled terminal truth accepted by
+those checks without asserting matching current Task and Attempt terminal projections.
+The result retains exact Task revision and Attempt digest, machine, token, reservation and
+process identity. It grants no execution, signal, cleanup or capacity-release authority by
+itself; consumers still require the corresponding exact local-effect proofs. A terminal Attempt
+write preceding its Task commit is not settled evidence. Its `cancel_requested` boolean reflects the observed Task's
+`terminate_running` control and is bound to the returned Task revision; natural-exit publication
+uses it to distinguish `already_exited` cancellation acknowledgement from ordinary completion.
+Termination commitments bind the decision identity, process identity,
+outcome, reason, and source revisions. Terminal publication records its request identity in Attempt
+and Task truth so a partial write can be resumed by that exact request, including after executor
+restart. Matching terminal phases alone cannot authorize a different request to replay the commit.
+Epoch checks also cover nested claim archival, projection, and maintenance mutations; revocation
+preserves existing recovery evidence instead of continuing later writes in the old request.
+
+A successful terminal publication returns a lifecycle event, including on exact replay. The event's
+Task-name display prefix is bounded to 16 KiB of encoded JSON, including escaping; the full name and
+user-relevant execution facts remain in shared Task/Attempt truth. These additive replay markers do
+not introduce a new shared schema version, writer capability, or temporary compatibility reader.
+
+The following constants are part of version 1:
+
+| Resource | Limit |
+| --- | --- |
+| Live or exit-unverified workers | 4 per MachineRuntime |
+| Live requests per exact runtime/Project/registration generation | 1 |
+| Supported non-returning workers | 2 |
+| Candidate intents retained in one controller pass | 64, deduplicated by binding and service class |
+| Resolved history | 256 records and 8 MiB; active or unreconciled records are not evicted |
+| Encoded request or result | 64 KiB |
+| Overdue threshold | 10 seconds |
+| Exited-error retry | 5 seconds, doubling to 5 minutes; current success resets it |
+| Qualification RSS | 256 MiB per worker and 1 GiB aggregate at four workers |
+
+There is no durable general-purpose request queue. Deferred intent remains discoverable from
+existing Project activation, indexes, reservations, retry state, and working-set cursors. At two
+overdue workers the remaining two slots preserve responsive peer capacity through the common
+work-conserving arbiter; eligible background work is not excluded by a foreground-only reservation.
+At four live or exit-unverified workers no new Project I/O starts. The controller continues local
+process observation, capacity protection, diagnostics, status, and explicit stop handling.
+
+A deadline changes diagnostics only. A result may grant no new authority unless runtime ID and
+executor epoch, Project ID and root, registration generation and registry revision, request ID and
+operation kind, every named Task/Attempt/Group/index/policy/source revision, and provisional offer
+identity/state still match. A stale result is recorded and ignored; any possible committed shared
+effect is recovered from shared truth and the operation's existing transaction evidence.
+Disablement fences results that would grant new work but preserves existing-Attempt
+supervision/recovery. Re-enable starts fresh observation. Registration or runtime replacement and
+agent restart fence old results. Binding removal or runtime replacement first durably fences the old
+epoch and retains its process evidence until absence is proven; moving or deleting the directory is
+not a process fence.
+
+Activation-consumer retirement is the narrow exception in which a removed
+binding remains an eligible operation owner: its exact version-2 machine-local
+retirement intent is the initiating evidence. The request has no provisional
+offer or source revisions and returns only `retired` plus whether a consumer
+record existed, or `stale` when the exact binding is present. This exception
+grants no scheduling or registration authority.
+
+Executor initialization precedes startup reconciliation. Readiness still requires current policy
+acknowledgement, authority validation, and initial scheduler reconciliation for every enabled
+inventory entry captured by that invocation. An overdue captured entry remains pending and causes
+the existing bounded start wait to return nonzero, while a successfully started detached agent may
+serve healthy peers. Active, overdue, exit-unverified, or unreconciled executor work blocks
+on-demand idle exit.
+
+Final authority-idle certification binds a bounded local evidence census to the
+exact activation turn and executor epoch. Directory metadata alone is not an
+absence proof because a local filesystem may fold multiple mutations into one
+timestamp. On Linux, the census therefore retains a nonblocking inotify witness
+for every present evidence directory and the exact name of every absent one.
+Create, move, delete, and completed-write events invalidate the census; unrelated
+siblings of an absent directory do not. Missing or failed monitoring, truncated
+events, directory replacement, activation wake, or epoch change is fail-closed
+and starts a fresh census. Every witness is closed when its census is discarded
+or the coordinator stops.
+
+Stop and restart durably fence the executor epoch before stopping the controller. Workers receive a
+two-second graceful interval, `SIGTERM`, another two-second interval, then `SIGKILL`; delivery is not
+proof of exit. Controller stop succeeds once machine scheduling authority is fenced and the
+controller exits, while status retains `unreaped_worker_count`. A new controller reconciles every
+process record before starting work: it matches PID plus start ticks, consumes a published result,
+positively records absence, or retains `exit_unverified`. Controller death alone never permits a
+replacement.
+
+The bounded `project_io_isolation` status projection contains `protocol_version`,
+`executor_epoch`, `capacity`, `active_worker_count`, `overdue_worker_count`,
+`exit_unverified_worker_count`, `unreaped_worker_count`, `free_slot_count`,
+`supported_hang_limit`, `envelope`, nullable `oldest_overdue_at`, and at most four
+`blocking_project_ids`. `unreaped_worker_count` counts stop-targeted workers whose PID/start-time
+absence is not yet proven; it may overlap active, overdue, or exit-unverified classifications and is
+not an additional capacity category. Scheduler diagnostics use
+`project_io_overdue`, `project_io_capacity_saturated`, `project_io_envelope_exceeded`,
+`project_io_result_stale`, `project_io_worker_exit_unverified`, and
+`project_io_protocol_invalid`; identity includes runtime, epoch, request, Project, registration,
+operation, and relevant source revisions. Resolution requires safe consumption, fencing plus shared
+reconciliation, or proven process absence.
+
 ## 10. Submission Protocol
 
 ### 10.1 Common Submission Pipeline
@@ -1808,6 +2592,50 @@ release is a separate maintenance transition, requiring the existing retirement
 and durable release-receipt proof. Enrollment remains pending until activation
 and source release both finish. Neither completion alone establishes supervision
 readiness, permits a duplicate launch, nor replaces the all-participant fence.
+
+Shared recovery registration publication and root admission fencing have one
+domain implementation, independent of MachineRuntime construction and capture.
+Local ownership first retires any registration rollback snapshot durably; the
+shared registration transaction then preserves its exact generation while
+publishing protocol version 2. Root admission acquires shared registration
+ownership before nonblocking schema exclusion, synchronizes participant fences,
+and rechecks current ownership and registration expiry before publishing the
+existing capability. Visible registration or capability bytes after an uncertain
+commit still require the corresponding directory durability barrier on replay.
+These shared transactions do not create capture records or mutate local ledgers;
+neither registration preparation nor root fencing proves capture completion.
+The local process census compares the canonical absolute roots carried by the
+supported runner launch protocol; it does not resolve Project or foreign runner
+paths while holding its capture checkpoint. MachineRuntime retention and legacy
+source retention remain separate ownership domains.
+
+Capture-completion validation reads only target-local fixed metadata and its
+ledger identity marker. A retained source's canonical spelling is validated
+lexically, without resolving or probing that source; source retention and release
+must obtain their own exact evidence. Completion publication therefore does not
+reintroduce source filesystem access under local capture exclusion.
+
+Registration CLIs capture shared rollback snapshots and durably publish their
+local transaction journal under the same shared registration exclusion. A
+shared-only recovery publisher checks journal absence under that exclusion and
+completes the fixed local journal-directory durability barrier before converting
+version 1. This barrier changes no local records and holds no MachineRuntime
+guard. A pending transaction defers conversion until the isolated recovery worker
+replays it under machine migration and registry exclusion; it is never ignored or
+interpreted as completed recovery. Thus a CLI either snapshots the prepared
+registration or publishes a journal that prevents concurrent preparation and is
+automatically restored by the restarted agent.
+
+Target checkpoint preparation may retain local metadata before source retention,
+but cannot observe writers or certify coverage in that interval. The source hold
+transaction owns only the source parent exclusion and source durability effects;
+it neither opens the target ledger nor writes target capture. Local process
+observation consumes an exact source/target/instance/capture identity and replays
+writer intent using target-local I/O only. Completion and generation-transition
+checks remain mandatory on every local observation. Hold replay synchronizes the
+source directory again; a missing hold after observations cannot be recreated as
+if it were an initial enrollment. These boundaries retain the existing capture
+and source-hold formats and do not grant admission, cleanup or completion authority.
 
 Compatibility interpretation for these existing protocols has one policy owner,
 `runtime/protocol_compatibility.py`. Initialization, writer admission, projection
@@ -2354,15 +3182,16 @@ diagnostic only; portable regression acceptance is based on operation counts and
 
 Before ordinary Task discovery, the machine agent forms a trustworthy capacity snapshot:
 
-1. under the machine reservation lock, expire unattached provisional records and snapshot active
-   reservation identities;
+1. under the machine reservation lock, expire ordinary unattached provisional records and snapshot
+   active reservation identities; an executor-owned offer with an unresolved request remains
+   occupied regardless of its ordinary TTL;
 2. release the machine lock and verify each active record through its stable project binding and
    exact Task and Attempt identity;
 3. reacquire the machine lock for any retag or release and apply it only when `reservation_id`,
    `acquisition_id`, `project_id`, `task_id`, `attempt_id`, `fencing_token`, and GPU IDs still match
    the original snapshot;
-4. form a second lock-consistent snapshot containing both active and unexpired provisional GPU
-   occupancy;
+4. form a second lock-consistent snapshot containing active occupancy, ordinary unexpired
+   provisional occupancy, and every unresolved executor-owned offer regardless of ordinary TTL;
 5. enter ordinary Task discovery only when that final snapshot contains visible free qexp GPUs.
 
 Shared Task or Attempt I/O is never performed while holding the machine reservation lock. A missing
@@ -2428,17 +3257,26 @@ placement allows it.
 
 ### 13.3 Provisional Reservation
 
-The agent creates a TTL-bound local provisional reservation keyed by an acquisition ID.
+The agent creates a local provisional reservation keyed by an acquisition ID.
 It must not reserve more Tasks than it can promptly launch.
 
 `reserve_admitted` is the only grouped admission API. While holding the machine reservation lock,
-it expires unattached provisionals, aggregates active and unexpired provisional GPU IDs for the
-same `(project_id, group_name, machine_name)`, checks the finite GPU limit, and writes the
-provisional record atomically. Group and Task truth are re-read under Group -> Task locks before
-this call; the reservation lock performs no shared Group/Task I/O.
+it expires ordinary unattached provisionals, aggregates active GPU IDs, ordinary unexpired
+provisional GPU IDs, and every unresolved executor-owned offer for the same
+`(project_id, group_name, machine_name)`, checks the finite GPU limit, and writes the provisional
+record atomically. Group and Task truth are re-read under Group -> Task locks before this call; the
+reservation lock performs no shared Group/Task I/O.
 
 If shared-lock acquisition is delayed beyond the provisional TTL, the agent releases and
 restarts acquisition rather than extending capacity indefinitely without ownership.
+
+An offer prepared for a Project I/O executor claim is the sole exception to ordinary TTL expiry.
+It carries the exact `executor_epoch` and `request_id` and remains occupied while worker liveness or
+the shared-mutation outcome is unknown. The controller may release it only after PID/start-time
+absence is proven and exact shared Task/Attempt/claim evidence proves the mutation did not commit.
+If the mutation committed, the existing attach or compensation protocol consumes the offer. Old
+agents must never observe this state in a supported downgrade because executor quiescence is a
+precondition.
 
 ### 13.4 Global Claim
 
@@ -2512,7 +3350,8 @@ launch intent, creates the guardian-owned training process under the assigned GP
 immutable local process registration, and later writes a separate exit observation. The agent
 materializes the mutable local process manifest from that registration and exclusively owns all
 authority transitions. The Runner records `process_created_at` in its registration immediately
-after guardian creation. The Agent validates the registration's Attempt ID, machine, fencing token
+after guardian creation and copies the admitted Attempt's reservation ID into the same immutable
+record. The Agent validates the registration's Attempt ID, machine, fencing token, reservation ID,
 and process identity, then writes the registration identity and `process_created_at` to Attempt,
 sets `Attempt.phase` and claim `launch_state` to `running`, and writes `running_at` once. Replayed
 materialization may only complete a matching partial transition; it must never refresh these
@@ -2837,6 +3676,13 @@ discovery failure reports validation unavailable without classifying every confi
 missing. Warning emission is deduplicated by policy revision and discovery fingerprint, while
 status and `agent config gpus show` retain the current warning until the mismatch clears.
 
+Initial reconciliation is a monotonic startup barrier for one exact registry revision and binding
+generation. The barrier is published only after the bounded local sweep is complete and its typed
+startup work is settled. Ordinary authority renewal, running publication, terminal completion, or
+other supervision requests created after that point do not revoke admission readiness; a registry
+revision or binding-generation change creates a new barrier and fails closed until its own sweep
+completes.
+
 The policy record is a permanent additive MachineRuntime format. The supported upgrade path is a
 machine-by-machine package upgrade and global-agent restart; running Attempts retain their existing
 runner and reservation ownership. Downgrading to a policy-unaware agent is unsafe because that
@@ -3140,6 +3986,10 @@ retention does not change the active projection gate.
 | CW-21 | Enable/disable fails during or after registry replace | Registry is old or new but never torn; uncertain durability reports `outcome_unknown` and inventory never decides authority |
 | CW-22 | Registry commits before inventory mirror | New registry value is effective; result is partial, and fresh reconciliation repairs inventory without reverting registry |
 | CW-23 | Reconciliation races newer enablement or replacement generation | Fresh registry identity/revision wins; stale work cannot modify the successor binding or replay an old desired value |
+| CW-24 | Controller stops or crashes after isolated request publication but before process publication | Replay either starts the exact request once or proves an already-started process identity; it never creates an unbounded replacement |
+| CW-25 | Isolated worker blocks or exits during a shared mutation | The provisional offer remains reserved and shared transaction evidence decides whether the mutation committed |
+| CW-26 | Isolated result is published before controller consumption | Restart consumes it only after all current fences match; stale authority is rejected and possible shared effects remain recoverable |
+| CW-27 | Executor epoch is fenced while a worker is blocked | No later independent shared mutation passes the epoch check; process evidence remains until PID/start-time absence is proven |
 
 ## 22. Verification Requirements
 
@@ -3175,6 +4025,26 @@ The runtime implementation is not releasable until tests demonstrate:
 - daemon background startup preserves daemon mode
 - unsupported Batch-era schema fails before mutation
 - indexes and summaries rebuild without changing truth
+- one or two non-returning Project workers do not starve eligible responsive peers; the product's
+  explicit two-blocked/one-healthy-peer workload completes primary claim/admission and applied
+  renewal within its qualification bound, without releasing the blocked workers first
+- finite competing healthy rosters, including more than 64 bindings and multiple Attempts per
+  binding, preserve positive scheduling, supervision, and background progress under new arrivals;
+  report workload-dependent latency separately from the single-peer qualification
+- every covered production service replaces its old direct shared-I/O entry; skipped maintenance,
+  borrow, recovery, or synchronous fallback cannot substitute for positive business outcomes
+- crashes after result consumption and before each local capacity, manifest, or cleanup effect
+  recover through exact durable evidence without duplicate release or local-lock/shared-I/O overlap
+- startup, observation, claim, reconciliation, maintenance/recovery, authority/supervision, and
+  shared-publication Project I/O all cross the subprocess boundary without a transient machine-wide
+  critical-section lock spanning synchronous worker wait; lifetime agent ownership remains held
+- three and four overdue workers report the exceeded envelope, a fifth never starts, and retries,
+  replacement, disable/re-enable, runtime replacement, stop/start, and controller crash preserve the
+  one-per-binding and four-per-runtime limits
+- malformed or oversized executor JSON fails closed; late and stale results cannot grant authority;
+  ambiguous offers and shared mutations remain conservative across every executor crash window
+- L1 mixed-version rollout preserves running workloads because the executor introduces no shared
+  Project schema or writer capability
 
 Cross-machine correctness tests must run against every supported shared-filesystem profile.
 Mock-only tests are insufficient for the coordination release gate.
@@ -3265,8 +4135,38 @@ block valid training launch. Provisioning must not wait synchronously for
 observation I/O, and viewer/window creation cannot delay heartbeat, lease, or
 dispatch. Off Tasks add no extended runtime context, callbacks, scan, or viewer.
 The existing detached runner, log descriptors, guardian, and cancellation
-authority remain unchanged. The agent projects snapshots on its independent
-observation thread; failed, stale, or missing progress is never execution truth.
+authority remain unchanged. The agent samples locally and projects snapshots
+through isolated shared transactions; failed, stale, or missing progress is
+never execution truth.
+
+The local progress coordinator keeps at most 64 cached Project owners, samples
+at most 16 bindings per pass, and counts at most eight local directory entries
+per sampled binding, alternating the v1 and v2 context directories. Names that
+are invalid, irrelevant, or have no mailbox still consume this budget. Evicting
+an idle owner parks its directory cookies, protocol alternation, and retry time
+in atomic advisory JSON at `<project-runtime>/progress-coordinator/scan.json`.
+Successful observations and consumed publications checkpoint only the Attempt's
+sampling/publication deadlines and initial/final allowances at
+`progress-coordinator/v<protocol>/<attempt-id>.json`. Projector payloads remain
+bounded in memory; existing local and freshly observed shared snapshots restore
+payload/publication facts. A reloaded owner rereads the mailbox rather than
+trusting an evicted candidate. Thus a roster larger than the cache cannot reset
+a finite context census or continually postpone a successful sampling deadline.
+
+These checkpoints are disposable MachineRuntime coordination, not shared truth
+or a transport protocol. They are bounded reads, matched to exact context and
+registration generation, and accepted only within the creating coordinator's
+clock scope. Restart never trusts a previous process's monotonic deadlines and
+uses existing snapshot recovery instead. Missing or malformed checkpoints are
+ignored. A checkpoint write failure retains the current owner rather than
+resetting its successfully advanced cadence; pending progress requests and
+unconsumed projections are never eviction candidates. Failed scan-checkpoint
+writes keep that owner, defer its parking retry for one second, and allow other
+eligible eviction candidates to proceed. Unchanged scan positions need no
+replacement write. Retiring an Attempt removes its cadence checkpoint; terminal
+Task cleanup also removes it when the context has already retired, without
+changing persisted cleanup cursor numbering. No upgrade command or shared
+schema change is required for these optional caches.
 
 Required evidence covers one-revision batch selection, set/read and identity
 replacement races, timeout with a blocked filesystem read, one worker slot and

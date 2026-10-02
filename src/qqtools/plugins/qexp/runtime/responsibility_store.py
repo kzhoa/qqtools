@@ -128,6 +128,21 @@ class DurableIO:
             self.sync_directory(path.parent, path.name)
 
 
+def read_ledger_instance(root: Path, *, io: DurableIO | None = None) -> str:
+    """Validate fixed ledger identity without locks, initialization or mutation."""
+    io = io if io is not None else DurableIO()
+    try:
+        marker = io.read(root / "marker", HEADER_BYTES)
+        if marker["format"] != FORMAT or marker["buckets"] != BUCKETS:
+            raise Unavailable("unsupported responsibility format")
+        instance = marker["instance"]
+        if not isinstance(instance, str) or re.fullmatch("[0-9a-f]{32}", instance) is None:
+            raise Unavailable("invalid responsibility identity")
+        return instance
+    except (OSError, KeyError, TypeError) as exc:
+        raise Unavailable(f"incomplete responsibility initialization: {root}") from exc
+
+
 class Ledger:
     """Paged active/maintenance membership, serialized by one flock per bucket.
 
@@ -141,15 +156,7 @@ class Ledger:
     def __init__(self, root: Path, io: DurableIO | None = None) -> None:
         self.root = root
         self.io = io if io is not None else self.io_type()
-        try:
-            marker = self.io.read(root / "marker", HEADER_BYTES)
-            if marker["format"] != FORMAT or marker["buckets"] != BUCKETS:
-                raise Unavailable("unsupported responsibility format")
-            self.instance = marker["instance"]
-            if not isinstance(self.instance, str) or re.fullmatch("[0-9a-f]{32}", self.instance) is None:
-                raise Unavailable("invalid responsibility identity")
-        except (OSError, KeyError, TypeError) as exc:
-            raise Unavailable(f"incomplete responsibility initialization: {root}") from exc
+        self.instance = read_ledger_instance(root, io=self.io)
 
     @classmethod
     def create(cls, root: Path) -> Ledger:

@@ -12,7 +12,7 @@ from ..config_types import RootConfig
 from .locks import exclusive
 from .paths import submission_path
 from .records import validate_identifier
-from .store import CASConflict, atomic_replace, create_if_absent, read_json
+from .store import CASConflict, atomic_replace, check_mutation_fence, create_if_absent, read_json
 
 CONTROL_VERSION = 1
 CONTROL_RECORD_LIMIT = 8192
@@ -151,6 +151,7 @@ def _ensure_control_directories(cfg: RootConfig) -> dict[str, Path]:
         *(paths[name] for name in ("records", "pending", "checkpoints", "locks")),
     ):
         try:
+            check_mutation_fence(directory)
             directory.mkdir()
         except FileExistsError:
             if not stat.S_ISDIR(directory.lstat().st_mode):

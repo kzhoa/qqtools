@@ -276,6 +276,10 @@ def _load_policy_at_path(path: Path, scope: str) -> dict[str, Any]:
     return _default_record() if record is None else record
 
 
+class NotificationPolicyBusyError(RuntimeError):
+    """A nonblocking private transaction has not acquired its policy lock."""
+
+
 @contextmanager
 def policy_guard(runtime_root: Path, *, blocking: bool = True) -> Iterator[None]:
     """Lock notification policy access and establish its private storage directory."""
@@ -289,7 +293,7 @@ def policy_guard(runtime_root: Path, *, blocking: bool = True) -> Iterator[None]
     _prepare_lock_file(lock_path)
     with exclusive(lock_path, blocking=blocking) as acquired:
         if not acquired:
-            raise RuntimeError("Notification policy is busy; retry after the current update.")
+            raise NotificationPolicyBusyError("Notification policy is busy; retry after the current update.")
         yield
 
 

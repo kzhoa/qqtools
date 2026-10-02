@@ -14,7 +14,7 @@ from typing import Any
 from .protocol_compatibility import GROUP_AUTHORITY_CAPABILITY, SUBMISSION_GROUP_PUBLICATION_CAPABILITY
 from .records import normalize_group_record, utc_now, validate_identifier
 from .responsibility_store import DurableIO
-from .store import atomic_replace, read_json, read_json_limited
+from .store import atomic_replace, check_mutation_fence, read_json, read_json_limited
 
 _GROUP_DIRECTORY = "groups-v2"
 _IDENTITY_FILE = ".authority-identity"
@@ -286,6 +286,11 @@ def activate_group_authority_locked(cfg: object) -> bool:
     if LOCAL_RECOVERY_CAPABILITY not in required:
         raise RuntimeError("Group authority isolation requires recovery admission")
     io = DurableIO()
+
+    def sync_directory(directory: Path, label: str) -> None:
+        check_mutation_fence(directory)
+        io.sync_directory(directory, label)
+
     journal = _read_journal(root)
     project_id = read_json(root / "project/identity.json")["project"]["project_id"]
     if journal is not None and journal["project_id"] != project_id:
@@ -301,8 +306,8 @@ def activate_group_authority_locked(cfg: object) -> bool:
         state.assert_ready_writer_compatible(cfg)
         if state.read_state_record(cfg)[1]["writer_capability"] != state.CURRENT_READY_WRITER_CAPABILITY:
             raise RuntimeError("Group authority lost its Task writer floor")
-        io.sync_directory(root, "group_authority_move")
-        io.sync_directory(root / "schema", "group_authority_completed")
+        sync_directory(root, "group_authority_move")
+        sync_directory(root / "schema", "group_authority_completed")
         return True
     if GROUP_AUTHORITY_CAPABILITY in required and journal is None:
         raise RuntimeError("Group authority capability has no migration journal")
@@ -321,7 +326,7 @@ def activate_group_authority_locked(cfg: object) -> bool:
         if ready["writer_capability"] != state.CURRENT_READY_WRITER_CAPABILITY:
             ready["writer_capability"] = state.CURRENT_READY_WRITER_CAPABILITY
             state.commit_state_under_lock(root / "indexes/ready/state.json", value, ready)
-        io.sync_directory(root / "indexes/ready", "group_authority_task_floor")
+        sync_directory(root / "indexes/ready", "group_authority_task_floor")
     source, destination = root / "groups", root / _GROUP_DIRECTORY
     if journal is None:
         if _identity(destination) is not None:
@@ -344,7 +349,7 @@ def activate_group_authority_locked(cfg: object) -> bool:
         identity = _directory_identity(source)
         if identity["project_id"] != project_id or identity["shared_root"] != str(root):
             raise RuntimeError("Group authority source belongs to another project")
-        io.sync_directory(source, "group_authority_identity")
+        sync_directory(source, "group_authority_identity")
         journal = {
             "version": 1,
             "project_id": project_id,
@@ -361,10 +366,11 @@ def activate_group_authority_locked(cfg: object) -> bool:
     if target_identity is None:
         if journal["phase"] != "prepared" or _directory_identity(source) != identity:
             raise RuntimeError("Group authority source identity changed before move")
+        check_mutation_fence(destination)
         os.rename(source, destination)
     elif target_identity != identity:
         raise RuntimeError("Group authority destination identity changed")
-    io.sync_directory(root, "group_authority_move")
+    sync_directory(root, "group_authority_move")
     journal["phase"] = "moved"
     atomic_replace(journal_path(root), {"group_authority": journal})
     # Cached released writers may recreate groups/. It is never selected again.
@@ -379,7 +385,7 @@ def activate_group_authority_locked(cfg: object) -> bool:
         capabilities_changed = True
     if capabilities_changed:
         atomic_replace(schema_path, schema)
-    io.sync_directory(root / "schema", "group_authority_capability")
+    sync_directory(root / "schema", "group_authority_capability")
     journal["phase"] = "completed"
     journal["completed_at"] = utc_now()
     atomic_replace(journal_path(root), {"group_authority": journal})

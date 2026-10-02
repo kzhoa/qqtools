@@ -8,6 +8,8 @@ import signal
 import threading
 import time
 import uuid
+from collections.abc import Collection, Mapping, Sequence
+from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -21,6 +23,7 @@ from ..executor import (
     LaunchHandle,
     LaunchHandoff,
     append_launch_failure_diagnostic,
+    launch_failure_handle,
 )
 from ..gpu_policy import (
     GpuDiscovery,
@@ -34,29 +37,17 @@ from ..legacy_agent import get_agent_status
 from ..machine_config import is_legacy_agent_project, load_machine_policy, save_machine_config
 from ..machine_dispatch_plan import (
     MachineDispatchSnapshot,
-    PrimaryCandidateObservation,
     build_machine_dispatch_plan,
-    evaluate_primary_candidate,
     order_dispatch_project_ids,
     reduce_dispatch_cursor,
 )
 from ..machine_state import publish_machine_snapshots, publish_machine_stop_snapshot
 from ..observer_provisioning import submit_observer_job
 from ..project_maintenance import maintain_project, reconcile_reservation
-from ..runtime.group_namespace import read_group
 from ..runtime.locks import exclusive
-from ..runtime.paths import local_paths, shared_paths
-from ..runtime.ready import (
-    ReadyProbeBudgetExhausted,
-    advance_ready_index_build,
-    classify_ready_marker,
-    peek_primary_ready_marker,
-    peek_ready_marker,
-    read_ready_index_state,
-    ready_index_route_revision,
-)
-from ..runtime.ready.group_members import is_group_ready_member_projection_usable
-from ..runtime.records import TaskSpec, normalize_group_record, utc_now
+from ..runtime.paths import local_paths, machine_project_paths, shared_paths
+from ..runtime.ready import advance_ready_index_build, peek_ready_marker, read_ready_index_state
+from ..runtime.records import TaskSpec, utc_now
 from ..runtime.resources.cpu_lane import cpu_reservation_snapshot
 from ..runtime.resources.reservations import (
     ReservationIdentity,
@@ -80,7 +71,6 @@ from ..runtime.work_budget import (
 from ..scheduler import (
     _BorrowAdmissionGrant,
     _BorrowAdmissionRevision,
-    _eligible,
     fail_attempt,
     resume_starting_attempt,
     run_dispatch_cycle,
@@ -96,6 +86,10 @@ from .helpers import (
     _working_directory_reason,
 )
 from .inventory import InventoryReconciliation, exact_binding_for_entry
+from .primary_demand import PrimaryDemandProbe, probe_primary_demand
+from .project_io_controller import ProjectIOController
+from .project_io_executor import ProjectIOExecutor
+from .project_io_supervision import AttemptSupervisionCoordinator
 from .scheduler_diagnostics import SchedulerDiagnosticStore
 
 _SCHEDULER_DIAGNOSTIC_PUBLISH_INTERVAL_NS = 5_000_000_000
@@ -123,12 +117,6 @@ _PRIMARY_PROBE_FAULT_REASONS = frozenset(
         "dependency_invalid",
     }
 )
-
-
-@dataclass(frozen=True, slots=True)
-class PrimaryDemandProbe:
-    state: str
-    diagnostics: tuple[dict[str, Any], ...] = ()
 
 
 def _enablement_reconciliation_probe(
@@ -381,6 +369,7 @@ class _PendingLaunchHandoff:
     compensation_committed: bool = False
     retry_not_before: float = 0.0
     retry_failures: int = 0
+    reservation_id: str | None = None
 
 
 def _queue_observer_provisioning(
@@ -422,6 +411,32 @@ def _queue_observer_provisioning(
             pending.attempt_id,
             RuntimeError("bounded observer provisioning worker is occupied"),
         )
+    return accepted
+
+
+def _queue_isolated_observer_provisioning(executor: Executor, pending: _PendingLaunchHandoff) -> bool:
+    """Queue observer work without any controller-side Project diagnostics."""
+    handle = pending.handle
+    attach = getattr(executor, "attach_observer", None)
+    if handle is None or not callable(attach):
+        return False
+    key = (str(pending.cfg.shared_root), pending.task_id, pending.attempt_id)
+
+    def attach_later() -> None:
+        try:
+            attach(pending.cfg, pending.task_id, pending.attempt_id, handle)
+        except Exception:
+            # Observer creation is optional. Its Project-side diagnostics must
+            # never fall back into the machine controller thread.
+            pass
+
+    try:
+        accepted = submit_observer_job(key, attach_later)
+    except Exception:
+        diagnostic_increment("scheduler.isolated.observer_queue_unavailable")
+        return False
+    if not accepted:
+        diagnostic_increment("scheduler.isolated.observer_queue_busy")
     return accepted
 
 
@@ -475,6 +490,13 @@ class _LaunchHandoffBatch:
             self._runtime.pending_launch_handoffs[key] = pending
         self._pending.append(pending)
 
+    def has_pending(self, project_id: str, attempt_id: str) -> bool:
+        """Return whether exact local launch ownership is already retained."""
+        key = (project_id, attempt_id)
+        return key in self._pending_store or any(
+            item.project_id == project_id and item.attempt_id == attempt_id for item in self._pending
+        )
+
     def _remove(self, pending: _PendingLaunchHandoff) -> None:
         key = (pending.project_id, pending.attempt_id)
         if self._runtime is not None and self._runtime.pending_launch_handoffs.get(key) is pending:
@@ -518,13 +540,170 @@ class _LaunchHandoffBatch:
         )
         self._remember(pending)
 
-    def poll(self, result_by_project: dict[str, dict[str, Any]] | None = None) -> None:
+    def launch_authorized(self, cfg: RootConfig, evidence: Mapping[str, Any], project_id: str) -> None:
+        """Start one runner from exact isolated authorization evidence."""
+        if not isinstance(evidence, Mapping) or set(evidence) != {
+            "outcome",
+            "claim_identity",
+            "launch_id",
+            "launch_handoff_timeout_seconds",
+        }:
+            raise ValueError("authorized launch evidence is malformed.")
+        if evidence.get("outcome") != "authorized":
+            raise ValueError("launch handoff requires an authorized completion.")
+        claim_identity = evidence.get("claim_identity")
+        claim_fields = {"task_id", "attempt_id", "attempt_number", "fencing_token", "reservation_id"}
+        if not isinstance(claim_identity, Mapping) or set(claim_identity) != claim_fields:
+            raise ValueError("authorized launch claim identity is malformed.")
+        task_id = claim_identity.get("task_id")
+        attempt_id = claim_identity.get("attempt_id")
+        fencing_token = claim_identity.get("fencing_token")
+        if not isinstance(project_id, str) or not project_id:
+            raise ValueError("authorized launch project_id must be a nonempty string.")
+        if not isinstance(task_id, str) or not task_id or not isinstance(attempt_id, str) or not attempt_id:
+            raise ValueError("authorized launch Task and Attempt identity is invalid.")
+        if type(fencing_token) is not int or fencing_token < 1:
+            raise ValueError("authorized launch fencing_token must be a positive integer.")
+
+        key = (project_id, attempt_id)
+        if key in self._pending_store or any(
+            item.project_id == project_id and item.attempt_id == attempt_id for item in self._pending
+        ):
+            raise RuntimeError(f"launch handoff is already pending for {key!r}")
+
+        initiate = getattr(self._executor, "initiate_authorized_attempt", None)
+        if not callable(initiate):
+            raise RuntimeError("executor does not support authorized launch tickets.")
+        try:
+            with diagnostic_span("executor.launch.initiate"):
+                handle, handoff = initiate(
+                    cfg,
+                    claim_identity=claim_identity,
+                    launch_id=evidence["launch_id"],
+                    launch_handoff_timeout_seconds=evidence["launch_handoff_timeout_seconds"],
+                )
+        except Exception as exc:
+            handle = launch_failure_handle(exc)
+            if handle is not None:
+                timeout = float(evidence["launch_handoff_timeout_seconds"])
+                intent_path = local_paths(cfg.runtime_root)["launch_intents"] / f"{attempt_id}.json"
+                self._remember(
+                    _PendingLaunchHandoff(
+                        cfg,
+                        task_id,
+                        attempt_id,
+                        fencing_token,
+                        project_id,
+                        LaunchHandoff(attempt_id, intent_path, time.monotonic() + timeout, handle),
+                        handle,
+                        reservation_id=claim_identity["reservation_id"],
+                    )
+                )
+            raise
+        if not isinstance(handle, LaunchHandle):
+            candidate = getattr(handoff, "handle", None)
+            handle = candidate if isinstance(candidate, LaunchHandle) else None
+        self._remember(
+            _PendingLaunchHandoff(
+                cfg,
+                task_id,
+                attempt_id,
+                fencing_token,
+                project_id,
+                handoff,
+                handle,
+                reservation_id=claim_identity["reservation_id"],
+            )
+        )
+
+    def _retry_isolated_launch_after_exit(self, pending: _PendingLaunchHandoff) -> bool:
+        """Forget an authorization only after its exact runner is proven absent."""
+        if self._runtime is None or pending.reservation_id is None:
+            return False
+        controller = getattr(self._runtime, "project_io_controller", None)
+        retry = getattr(controller, "retry_scheduler_launch_authorization", None)
+        if not callable(retry):
+            return False
+        try:
+            records = reservation_snapshot(self._runtime_root).active
+        except (OSError, RuntimeError, ValueError, KeyError, TypeError, AttributeError):
+            return False
+        for record in records:
+            if not isinstance(record, dict) or record.get("reservation_id") != pending.reservation_id:
+                continue
+            try:
+                identity = ReservationIdentity.from_record(record)
+            except (TypeError, ValueError):
+                return False
+            if (
+                identity.project_id != pending.project_id
+                or identity.task_id != pending.task_id
+                or identity.attempt_id != pending.attempt_id
+                or identity.fencing_token != pending.fencing_token
+            ):
+                return False
+            retry(identity)
+            self._remove(pending)
+            return True
+        return False
+
+    def poll(
+        self,
+        result_by_project: dict[str, dict[str, Any]] | None = None,
+        *,
+        isolated: bool = False,
+    ) -> None:
         """Poll pending handoffs once, never sleeping or waiting on a child."""
         pending_items = self._pending_items()
         if not pending_items:
             return
         for pending in pending_items:
             now = time.monotonic()
+            if isolated:
+                if now < pending.retry_not_before:
+                    continue
+                try:
+                    published = pending.handoff.intent_path.exists()
+                except Exception:
+                    continue
+                if published:
+                    _queue_isolated_observer_provisioning(self._executor, pending)
+                    self._remove(pending)
+                    continue
+                try:
+                    is_expired = now >= pending.handoff.deadline
+                except Exception:
+                    self._defer_retry(pending, now)
+                    continue
+                if not is_expired:
+                    continue
+                handle = pending.handle
+                process = None
+                if isinstance(handle, LaunchHandle):
+                    process = handle.runner_process if handle.runner_process is not None else handle.reference
+                poll = getattr(process, "poll", None)
+                if not callable(poll):
+                    self._defer_retry(pending, now)
+                    continue
+                try:
+                    has_exited = poll() is not None
+                except Exception:
+                    has_exited = False
+                if has_exited:
+                    # A dead exact child cannot publish after this point. Check
+                    # the intent once more to close the timeout observation race.
+                    try:
+                        if pending.handoff.intent_path.exists():
+                            _queue_isolated_observer_provisioning(self._executor, pending)
+                            self._remove(pending)
+                            continue
+                    except Exception:
+                        pass
+                    if self._retry_isolated_launch_after_exit(pending):
+                        continue
+                diagnostic_increment("scheduler.isolated.launch_handoff_overdue")
+                self._defer_retry(pending, now)
+                continue
             if now < pending.retry_not_before:
                 continue
             if pending.compensation_committed:
@@ -631,9 +810,14 @@ class _LaunchHandoffBatch:
         item["status"] = "error"
         item["error"] = str(failure)
 
-    def finish(self, result_by_project: dict[str, dict[str, Any]] | None = None) -> None:
+    def finish(
+        self,
+        result_by_project: dict[str, dict[str, Any]] | None = None,
+        *,
+        isolated: bool = False,
+    ) -> None:
         """Compatibility alias for one non-blocking poll."""
-        self.poll(result_by_project)
+        self.poll(result_by_project, isolated=isolated)
 
 
 @dataclass(frozen=True, slots=True)
@@ -658,7 +842,6 @@ def _probe_primary_demand(
     excluded_project_ids: set[str] | frozenset[str] = frozenset(),
 ) -> PrimaryDemandProbe:
     """Scan primary candidates through an independent bounded ready cursor."""
-    diagnostics: list[dict[str, str]] = []
     try:
         _, bindings = runtime.load_registry()
     except (OSError, RuntimeError, ValueError, KeyError, TypeError) as exc:
@@ -666,328 +849,19 @@ def _probe_primary_demand(
             "unresolved",
             ({"reason": "registry_unreadable", "exception_type": type(exc).__name__},),
         )
-    enabled_ids = {binding.project_id for binding in bindings if binding.enabled} - set(excluded_project_ids)
-    unavailable = sorted(
-        project_id for project_id in enabled_ids if project_id not in readable or project_id not in dispatchable
+    enabled_ids = {binding.project_id for binding in bindings if binding.enabled}
+    return probe_primary_demand(
+        runtime.primary_probe,
+        enabled_ids,
+        readable,
+        dispatchable,
+        visible,
+        free,
+        budget,
+        reservations,
+        lane=lane,
+        excluded_project_ids=excluded_project_ids,
     )
-    if unavailable:
-        diagnostics.extend(
-            {
-                "project_id": project_id,
-                "reason": "project_not_probeable",
-            }
-            for project_id in unavailable
-        )
-        return PrimaryDemandProbe("unresolved", tuple(diagnostics[-32:]))
-    probe_project_ids = sorted(
-        project_id for project_id in readable if project_id in dispatchable and project_id in enabled_ids
-    )
-    probe_route_keys = [(project_id, scope, lane) for project_id in probe_project_ids for scope in ("shared", "home")]
-    pending_routes = runtime.primary_probe.begin_round(lane, probe_route_keys)
-    selected_recheck_route = runtime.primary_probe.next_recheck(lane)
-    pending_route_keys = set(pending_routes)
-    if selected_recheck_route is not None:
-        pending_route_keys.add(selected_recheck_route)
-    has_completed_selected_recheck = False
-    for project_id in probe_project_ids:
-        cfg = readable[project_id]
-        try:
-            ready_state = read_ready_index_state(cfg)
-        except (OSError, RuntimeError, ValueError, KeyError, TypeError) as exc:
-            diagnostics.append(
-                {
-                    "project_id": project_id,
-                    "reason": "ready_index_unreadable",
-                    "exception_type": type(exc).__name__,
-                }
-            )
-            return PrimaryDemandProbe("unresolved", tuple(diagnostics[-32:]))
-        if ready_state != "active":
-            diagnostics.append({"project_id": project_id, "reason": "ready_index_unresolved"})
-            return PrimaryDemandProbe("unresolved", tuple(diagnostics[-32:]))
-        if not is_group_ready_member_projection_usable(cfg):
-            diagnostics.append({"project_id": project_id, "reason": "group_ready_members_unresolved"})
-            return PrimaryDemandProbe("unresolved", tuple(diagnostics[-32:]))
-        for scope in ("shared", "home"):
-            cursor_key = (project_id, scope, lane)
-            if cursor_key not in pending_route_keys:
-                continue
-            has_recheck_candidate = False
-            is_rechecking_pending_candidate = cursor_key == selected_recheck_route
-            route = runtime.primary_probe.route(cursor_key)
-            cursor = route.cursor
-            recheck_start_cursor = None
-            if is_rechecking_pending_candidate:
-                # The cached revision is checked by the borrow grant immediately
-                # before a claim.  Do not spend this slice rereading every stable
-                # route before revisiting the one dependency candidate selected
-                # for this round.
-                recheck_start_cursor = route.recheck.cursor
-                cursor = route.recheck.cursor
-            elif route.is_complete:
-                try:
-                    current_revision = ready_index_route_revision(cfg, scope, budget, primary_only=True, lane=lane)
-                except ReadyProbeBudgetExhausted:
-                    diagnostics.append({"project_id": project_id, "reason": "probe_budget_exhausted"})
-                    return PrimaryDemandProbe("unresolved", tuple(diagnostics[-32:]))
-                except (OSError, RuntimeError, ValueError, KeyError, TypeError) as exc:
-                    diagnostics.append(
-                        {
-                            "project_id": project_id,
-                            "route_scope": scope,
-                            "reason": "index_unreadable",
-                            "exception_type": type(exc).__name__,
-                        }
-                    )
-                    return PrimaryDemandProbe("unresolved", tuple(diagnostics[-32:]))
-                decision = runtime.primary_probe.begin_route(cursor_key, current_revision)
-                if decision.has_index_changed:
-                    diagnostics.append({"project_id": project_id, "reason": "ready_index_changed"})
-                    return PrimaryDemandProbe("unresolved", tuple(diagnostics[-32:]))
-                if not decision.should_scan:
-                    continue
-                route = runtime.primary_probe.route(cursor_key)
-                cursor = route.cursor
-            elif (route.cursor is None or route.revision is None) and not is_rechecking_pending_candidate:
-                try:
-                    observed_revision = ready_index_route_revision(cfg, scope, budget, primary_only=True, lane=lane)
-                except ReadyProbeBudgetExhausted:
-                    diagnostics.append({"project_id": project_id, "reason": "probe_budget_exhausted"})
-                    return PrimaryDemandProbe("unresolved", tuple(diagnostics[-32:]))
-                except (OSError, RuntimeError, ValueError, KeyError, TypeError) as exc:
-                    diagnostics.append(
-                        {
-                            "project_id": project_id,
-                            "route_scope": scope,
-                            "reason": "index_unreadable",
-                            "exception_type": type(exc).__name__,
-                        }
-                    )
-                    return PrimaryDemandProbe("unresolved", tuple(diagnostics[-32:]))
-                runtime.primary_probe.begin_route(cursor_key, observed_revision)
-                route = runtime.primary_probe.route(cursor_key)
-                cursor = route.cursor
-            while True:
-                cursor_before = cursor
-                try:
-                    peek = peek_primary_ready_marker(cfg, project_id, scope, cursor, budget)
-                except (OSError, RuntimeError, ValueError, KeyError, TypeError) as exc:
-                    runtime.primary_probe.record_progress(cursor_key, cursor_before)
-                    diagnostics.append(
-                        {
-                            "project_id": project_id,
-                            "route_scope": scope,
-                            "reason": "index_unreadable",
-                            "exception_type": type(exc).__name__,
-                        }
-                    )
-                    return PrimaryDemandProbe("unresolved", tuple(diagnostics[-32:]))
-                if peek.exhausted or peek.unresolved:
-                    runtime.primary_probe.record_progress(cursor_key, cursor_before)
-                    diagnostics.append(
-                        {
-                            "project_id": project_id,
-                            "reason": ("probe_budget_exhausted" if peek.exhausted else "ready_index_unresolved"),
-                        }
-                    )
-                    return PrimaryDemandProbe("unresolved", tuple(diagnostics[-32:]))
-                cursor = peek.cursor
-                runtime.primary_probe.record_progress(cursor_key, cursor)
-                if peek.reference is None:
-                    if is_rechecking_pending_candidate:
-                        # Recheck cursors move through every dependency candidate
-                        # in this route.  At the end, wrap to the route start so a
-                        # still-blocked first candidate cannot starve later ones.
-                        should_retain_recheck = has_recheck_candidate or recheck_start_cursor is not None
-                        if should_retain_recheck:
-                            runtime.primary_probe.record_dependency_wait(cursor_key, None)
-                        runtime.primary_probe.finish_recheck(
-                            cursor_key,
-                            has_waiting_candidate=should_retain_recheck,
-                        )
-                        has_completed_selected_recheck = True
-                        break
-                    break
-                reference = peek.reference
-                if not budget.can_start_record(operations=3):
-                    runtime.primary_probe.record_progress(cursor_key, cursor_before)
-                    diagnostics.append({"project_id": project_id, "reason": "probe_budget_exhausted"})
-                    return PrimaryDemandProbe("unresolved", tuple(diagnostics[-32:]))
-                budget.consume_record(operations=3)
-                try:
-                    result = classify_ready_marker(cfg, reference)
-                except (OSError, RuntimeError, ValueError, KeyError, TypeError) as exc:
-                    runtime.primary_probe.record_progress(cursor_key, cursor_before)
-                    diagnostics.append(
-                        {
-                            "project_id": project_id,
-                            "task_id": reference.task_id,
-                            "task_generation": reference.generation,
-                            "route_scope": scope,
-                            "reason": "marker_unreadable",
-                            "exception_type": type(exc).__name__,
-                        }
-                    )
-                    return PrimaryDemandProbe("unresolved", tuple(diagnostics[-32:]))
-                if result.classification == "corrupt":
-                    corrupt_diagnostic: dict[str, Any] = {
-                        "project_id": project_id,
-                        "task_id": reference.task_id,
-                        "task_generation": reference.generation,
-                        "route_scope": scope,
-                        "reason": result.reason,
-                    }
-                    if result.diagnostic is not None:
-                        exception_type = result.diagnostic.as_dict().get("exception_type")
-                        if isinstance(exception_type, str):
-                            corrupt_diagnostic["exception_type"] = exception_type
-                    diagnostics.append(corrupt_diagnostic)
-                    return PrimaryDemandProbe("unresolved", tuple(diagnostics[-32:]))
-                if result.classification == "temporarily_unavailable":
-                    if result.diagnostic is not None:
-                        diagnostics.append(
-                            {
-                                "project_id": project_id,
-                                "task_id": reference.task_id,
-                                "reason": result.reason,
-                                "diagnostic": result.diagnostic.as_dict(),
-                            }
-                        )
-                    if result.reason.startswith("dependency_"):
-                        # A dependency can become claimable without changing this
-                        # route's revision.  Preserve its cursor across bounded scan
-                        # batches, but do not count it as resource demand: a dependency
-                        # wait must not prevent an otherwise eligible borrow claim.
-                        has_recheck_candidate = True
-                        if is_rechecking_pending_candidate:
-                            runtime.primary_probe.record_dependency_wait(cursor_key, cursor)
-                            # The completed baseline scan already established that
-                            # this route has no runnable primary work.  Recheck only
-                            # its dependency candidate this round, then let the next
-                            # pending route consume the shared budget.
-                            runtime.primary_probe.finish_recheck(cursor_key, has_waiting_candidate=True)
-                            has_completed_selected_recheck = True
-                            break
-                        runtime.primary_probe.record_dependency_wait(cursor_key, cursor_before)
-                    continue
-                if result.classification != "claimable" or result.task is None:
-                    continue
-                task = result.task
-                if (lane == "cpu") != task.spec.is_cpu_only:
-                    continue
-                try:
-                    is_eligible = _eligible(cfg, task)
-                except (OSError, RuntimeError, ValueError, KeyError, TypeError) as exc:
-                    runtime.primary_probe.record_progress(cursor_key, cursor_before)
-                    diagnostics.append(
-                        {
-                            "project_id": project_id,
-                            "task_id": task.task_id,
-                            "task_generation": task.ready_generation,
-                            "route_scope": scope,
-                            "reason": "task_truth_unreadable",
-                            "exception_type": type(exc).__name__,
-                        }
-                    )
-                    return PrimaryDemandProbe("unresolved", tuple(diagnostics[-32:]))
-                if not is_eligible:
-                    diagnostics.append(
-                        {
-                            "project_id": project_id,
-                            "task_id": task.task_id,
-                            "reason": "placement_rejected",
-                        }
-                    )
-                    continue
-                has_primary_group_worker = True
-                if task.group_name is not None:
-                    try:
-                        group = read_group(cfg.shared_root, task.group_name)
-                        normalize_group_record(group)
-                    except (OSError, RuntimeError, ValueError, KeyError, TypeError) as exc:
-                        runtime.primary_probe.record_progress(cursor_key, cursor_before)
-                        diagnostics.append(
-                            {
-                                "project_id": project_id,
-                                "task_id": task.task_id,
-                                "task_generation": task.ready_generation,
-                                "route_scope": scope,
-                                "reason": "group_unreadable",
-                                "exception_type": type(exc).__name__,
-                            }
-                        )
-                        return PrimaryDemandProbe("unresolved", tuple(diagnostics[-32:]))
-                    worker = group["group"]["worker_set"].get(cfg.machine_name)
-                    if worker is None or worker["scheduling_role"] != "primary":
-                        has_primary_group_worker = False
-                group_gpu_limit = (
-                    worker["gpu_limit_gpus"]
-                    if lane == "gpu" and task.group_name is not None and has_primary_group_worker
-                    else None
-                )
-                group_gpu_usage = 0
-                if group_gpu_limit is not None:
-                    group_gpu_usage = sum(
-                        len(reservation.get("gpu_ids", []))
-                        for reservation in reservations
-                        if reservation.get("project_id") == project_id
-                        and reservation.get("group_name") == task.group_name
-                        and reservation.get("machine_name") == cfg.machine_name
-                    )
-                decision = evaluate_primary_candidate(
-                    PrimaryCandidateObservation(
-                        is_eligible=is_eligible,
-                        has_primary_group_worker=has_primary_group_worker,
-                        working_directory_reason=_working_directory_reason(task.spec),
-                        requested_gpus=(task.spec.requested_cpus or 0) if lane == "cpu" else task.spec.requested_gpus,
-                        # CPU primary admission needs the policy capacity here, rather than
-                        # the currently free slots.  A request that fits the machine but not
-                        # its current free capacity must retain priority over borrowing.
-                        visible_gpu_count=len(visible),
-                        free_gpu_count=len(free),
-                        group_gpu_limit=group_gpu_limit,
-                        group_gpu_usage=group_gpu_usage,
-                    )
-                )
-                if decision.reason is not None:
-                    diagnostics.append(
-                        {
-                            "project_id": project_id,
-                            "task_id": task.task_id,
-                            "reason": decision.reason,
-                        }
-                    )
-                if decision.outcome == "runnable_now":
-                    runtime.primary_probe.hold_candidate(cursor_key, cursor_before)
-                    return PrimaryDemandProbe("runnable_now", tuple(diagnostics[-32:]))
-                if decision.outcome == "waiting_for_aggregation":
-                    # Keep real primary demand at the resume position until it
-                    # disappears or can claim resources.  Later dependency-only
-                    # candidates must not turn this route into a negative cache.
-                    runtime.primary_probe.hold_candidate(cursor_key, cursor_before)
-                    return PrimaryDemandProbe("waiting_for_aggregation", tuple(diagnostics[-32:]))
-            if is_rechecking_pending_candidate and has_completed_selected_recheck:
-                continue
-            try:
-                end_revision = ready_index_route_revision(cfg, scope, budget, primary_only=True, lane=lane)
-            except ReadyProbeBudgetExhausted:
-                diagnostics.append({"project_id": project_id, "reason": "probe_budget_exhausted"})
-                return PrimaryDemandProbe("unresolved", tuple(diagnostics[-32:]))
-            except (OSError, RuntimeError, ValueError, KeyError, TypeError) as exc:
-                diagnostics.append(
-                    {
-                        "project_id": project_id,
-                        "route_scope": scope,
-                        "reason": "index_unreadable",
-                        "exception_type": type(exc).__name__,
-                    }
-                )
-                return PrimaryDemandProbe("unresolved", tuple(diagnostics[-32:]))
-            decision = runtime.primary_probe.finish_route(cursor_key, end_revision)
-            if decision.has_index_changed:
-                diagnostics.append({"project_id": project_id, "reason": "ready_index_changed"})
-                return PrimaryDemandProbe("unresolved", tuple(diagnostics[-32:]))
-    return PrimaryDemandProbe("no_primary_demand", tuple(diagnostics[-32:]))
 
 
 def _authority_recovery_has_possible_demand(readable: dict[str, RootConfig], project_ids: set[str]) -> bool:
@@ -1095,19 +969,23 @@ def dispatch_machine_cycle_locked(
     publish_snapshots: bool = True,
 ) -> list[dict[str, Any]]:
     """Supervise bindings and fill capacity in fair one-claim-per-project rounds."""
+    project_io_controller = _project_io_controller(runtime)
     diagnostics = RuntimeDiagnostics()
     with activate_diagnostics(diagnostics), diagnostic_span("dispatch_machine_cycle"):
-        results = _dispatch_machine_cycle_locked(
-            runtime,
-            available_gpus=available_gpus,
-            executor=executor,
-            instance_id=instance_id,
-            heartbeat_interval_seconds=heartbeat_interval_seconds,
-            started_at=started_at,
-            supervisors=supervisors,
-            supervise=supervise,
-            publish_snapshots=publish_snapshots,
-        )
+        with project_io_controller.admission_turn() if project_io_controller is not None else nullcontext():
+            results = _dispatch_machine_cycle_locked(
+                runtime,
+                available_gpus=available_gpus,
+                executor=executor,
+                instance_id=instance_id,
+                heartbeat_interval_seconds=heartbeat_interval_seconds,
+                started_at=started_at,
+                supervisors=supervisors,
+                supervise=supervise,
+                publish_snapshots=publish_snapshots,
+            )
+    if project_io_controller is not None and project_io_controller.has_pending_admission:
+        runtime.last_cycle_had_demand = True
     now_ns = time.monotonic_ns()
     should_publish_scheduler_diagnostics = (
         runtime.last_scheduler_diagnostics_publish_ns is None
@@ -1252,6 +1130,865 @@ def _dispatch_admission_layer(
     return free, free_cpu_slots, last_successful_binding
 
 
+def _project_io_controller(runtime: MachineRuntime) -> ProjectIOController | None:
+    executor = getattr(runtime, "project_io_executor", None)
+    if executor is None:
+        return None
+    if not isinstance(executor, ProjectIOExecutor):
+        raise TypeError("runtime.project_io_executor must be a ProjectIOExecutor.")
+    controller = getattr(runtime, "project_io_controller", None)
+    if controller is None:
+        controller = ProjectIOController(runtime, executor)
+        runtime.project_io_controller = controller
+    elif not isinstance(controller, ProjectIOController):
+        raise TypeError("runtime.project_io_controller must be a ProjectIOController.")
+    elif controller.runtime is not runtime or controller.executor is not executor:
+        raise RuntimeError("runtime.project_io_controller belongs to a different runtime or executor.")
+
+    coordinator = getattr(runtime, "attempt_supervision_coordinator", None)
+    if coordinator is None:
+        runtime.attempt_supervision_coordinator = AttemptSupervisionCoordinator(runtime, controller)
+    elif not isinstance(coordinator, AttemptSupervisionCoordinator):
+        raise TypeError("runtime.attempt_supervision_coordinator must be an AttemptSupervisionCoordinator.")
+    elif coordinator.runtime is not runtime or coordinator.controller is not controller:
+        raise RuntimeError("runtime.attempt_supervision_coordinator has a different owner.")
+    return controller
+
+
+def _advance_machine_snapshot_publications(
+    runtime: MachineRuntime,
+    controller: ProjectIOController,
+    validated_project_ids: Collection[str],
+) -> None:
+    """Advance one newest heartbeat snapshot intent on the dispatch thread."""
+    intent = runtime.machine_snapshot_intent(validated_project_ids=tuple(validated_project_ids))
+    if intent is None:
+        return
+    try:
+        controller.advance_machine_snapshot_publications(
+            intent.bindings,
+            intent.registry_revision,
+            instance_id=intent.instance_id,
+            pid=intent.pid,
+            visible_gpu_ids=intent.visible_gpu_ids,
+            reservations=intent.reservations,
+            heartbeat_interval_seconds=intent.heartbeat_interval_seconds,
+            started_at=intent.started_at,
+            gpu_policy=intent.gpu_policy,
+        )
+    except (OSError, RuntimeError, ValueError):
+        # A later heartbeat replaces this intent and retries current state.
+        return
+
+
+def _advance_registration_renewals(
+    runtime: MachineRuntime,
+    controller: ProjectIOController,
+    registry_revision: int | None = None,
+    registered_bindings: Sequence[ProjectBinding] | None = None,
+) -> None:
+    """Advance the newest heartbeat renewal intent on the dispatch thread."""
+    intent = runtime.registration_renewal_intent()
+    if intent is not None and registry_revision is not None and intent.registry_revision != registry_revision:
+        runtime.complete_registration_renewal_intent(intent)
+        intent = None
+    current_bindings = (
+        tuple(registered_bindings) if registered_bindings is not None else (() if intent is None else intent.bindings)
+    )
+    binding_by_owner = {
+        (binding.project_id, binding.registration_generation): binding
+        for binding in current_bindings
+        if binding.enabled
+    }
+    service_bindings = list(intent.bindings) if intent is not None else []
+    executor = getattr(controller, "executor", None)
+    try:
+        unresolved_before = executor.unresolved_requests() if executor is not None else ()
+    except (OSError, RuntimeError, ValueError):
+        unresolved_before = ()
+    renewal_requests = [request for request in unresolved_before if request.operation_kind == "registration_renew"]
+    for request in unresolved_before:
+        if request.operation_kind != "registration_renew" or (
+            registry_revision is not None and request.registry_revision != registry_revision
+        ):
+            continue
+        binding = binding_by_owner.get((request.project_id, request.registration_generation))
+        if binding is not None and binding not in service_bindings:
+            service_bindings.append(binding)
+    if not service_bindings and not renewal_requests:
+        return
+    if intent is not None:
+        renewal_horizon_seconds = intent.renewal_horizon_seconds
+        service_revision = intent.registry_revision
+    else:
+        matching_requests = [
+            request
+            for request in renewal_requests
+            if registry_revision is None or request.registry_revision == registry_revision
+        ]
+        horizon_requests = matching_requests or renewal_requests
+        renewal_horizon_seconds = max(request.parameters["renewal_horizon_seconds"] for request in horizon_requests)
+        service_revision = registry_revision if registry_revision is not None else horizon_requests[0].registry_revision
+    try:
+        completions = controller.advance_registration_renewals(
+            tuple(service_bindings),
+            service_revision,
+            renewal_horizon_seconds=renewal_horizon_seconds,
+        )
+    except (OSError, RuntimeError, ValueError):
+        # Retain the latest intent so a later dispatch cycle can retry it.
+        return
+    if intent is None:
+        return
+    accepted_project_ids = set(completions)
+    try:
+        unresolved_after = executor.unresolved_requests() if executor is not None else ()
+    except (OSError, RuntimeError, ValueError):
+        unresolved_after = ()
+    intent_owners = {(binding.project_id, binding.registration_generation) for binding in intent.bindings}
+    unresolved_after_owners = {
+        (request.project_id, request.registration_generation)
+        for request in unresolved_after
+        if request.operation_kind == "registration_renew"
+    }
+    occupied_after_owners = {
+        (request.project_id, request.registration_generation)
+        for request in unresolved_after
+        if request.registry_revision == intent.registry_revision
+    }
+    accepted_project_ids.update(
+        request.project_id
+        for request in unresolved_after
+        if request.operation_kind == "registration_renew"
+        and request.registry_revision == intent.registry_revision
+        and (request.project_id, request.registration_generation) in intent_owners
+    )
+    accepted_project_ids.update(
+        request.project_id
+        for request in unresolved_before
+        if request.operation_kind == "registration_renew"
+        and (request.project_id, request.registration_generation) in intent_owners
+        and (request.project_id, request.registration_generation) not in unresolved_after_owners
+    )
+    # Executor serialization prevents a renewal from being prepared while the
+    # same exact binding owns any other request. Retire that transient renewal
+    # hint from this batch so one hung claim cannot pin the other 63 renewals;
+    # the fair working-set cursor will offer the occupied owner again later.
+    accepted_project_ids.update(
+        project_id for project_id, generation in intent_owners if (project_id, generation) in occupied_after_owners
+    )
+    accepted, remaining = runtime.advance_registration_renewal_intent(intent, accepted_project_ids)
+    if not accepted or remaining is not None:
+        return
+    if intent.bindings:
+        next_bindings, next_horizon = runtime.working_set.select_registration_renewals(
+            limit=64,
+            heartbeat_interval_seconds=intent.heartbeat_interval_seconds,
+        )
+        if next_bindings:
+            runtime.publish_registration_renewal_intent(
+                bindings=next_bindings,
+                registry_revision=intent.registry_revision,
+                renewal_horizon_seconds=next_horizon,
+                heartbeat_interval_seconds=intent.heartbeat_interval_seconds,
+            )
+
+
+def _advance_activation_working_set(
+    runtime: MachineRuntime,
+    controller: ProjectIOController,
+    registry_revision: int,
+    registered_bindings: Sequence[ProjectBinding],
+) -> None:
+    """Advance activation consumer state without coordinator-side Project I/O."""
+    working_set = runtime.working_set
+    current_by_owner = {
+        (binding.project_id, binding.registration_generation): binding for binding in registered_bindings
+    }
+    try:
+        unresolved = controller.executor.unresolved_requests()
+    except (OSError, RuntimeError, ValueError):
+        unresolved = ()
+
+    retirement_bindings: list[ProjectBinding] = []
+    retirement_owners: set[tuple[str, str | None]] = set()
+    retirement_projects: set[str] = set()
+    for request in unresolved:
+        if request.operation_kind != "activation_consumer_retire":
+            continue
+        binding = runtime.activation_consumer_retirements.select_exact(
+            runtime_id=request.runtime_id,
+            project_id=request.project_id,
+            registration_generation=request.registration_generation,
+            shared_root=Path(request.canonical_shared_root),
+            machine_name=request.parameters["machine_name"],
+            snapshot=registered_bindings,
+        )
+        if binding is None:
+            continue
+        owner = (binding.project_id, binding.registration_generation)
+        if owner not in retirement_owners and binding.project_id not in retirement_projects:
+            retirement_bindings.append(binding)
+            retirement_owners.add(owner)
+            retirement_projects.add(binding.project_id)
+    for binding in runtime.activation_consumer_retirements.select_pending(
+        registered_bindings,
+        limit=max(1, 64 - len(retirement_bindings)),
+    ):
+        owner = (binding.project_id, binding.registration_generation)
+        if (
+            owner not in retirement_owners
+            and binding.project_id not in retirement_projects
+            and len(retirement_bindings) < 64
+        ):
+            retirement_bindings.append(binding)
+            retirement_owners.add(owner)
+            retirement_projects.add(binding.project_id)
+    if retirement_bindings or any(request.operation_kind == "activation_consumer_retire" for request in unresolved):
+        try:
+            completions = controller.advance_activation_consumer_retirements(retirement_bindings, registry_revision)
+        except (OSError, RuntimeError, ValueError):
+            completions = {}
+        runtime.activation_consumer_retirements.apply_completions(retirement_bindings, completions)
+
+    registration_bindings: list[ProjectBinding] = []
+    registration_owners: set[tuple[str, str | None]] = set()
+    for request in unresolved:
+        if request.operation_kind != "activation_consumer_register":
+            continue
+        binding = current_by_owner.get((request.project_id, request.registration_generation))
+        if binding is not None and (binding.project_id, binding.registration_generation) not in registration_owners:
+            registration_bindings.append(binding)
+            registration_owners.add((binding.project_id, binding.registration_generation))
+    for binding in working_set.select_activation_registrations(limit=64 - len(registration_bindings)):
+        owner = (binding.project_id, binding.registration_generation)
+        if owner not in registration_owners:
+            registration_bindings.append(binding)
+            registration_owners.add(owner)
+    if registration_bindings or any(request.operation_kind == "activation_consumer_register" for request in unresolved):
+        try:
+            completions = controller.advance_activation_consumer_registrations(
+                registration_bindings,
+                registry_revision,
+                process_fence=working_set.process_fence,
+            )
+        except (OSError, RuntimeError, ValueError):
+            completions = {}
+        working_set.apply_activation_registrations(registration_bindings, completions)
+
+    observation_intents = []
+    observation_owners: set[tuple[str, str | None]] = set()
+    for request in unresolved:
+        if request.operation_kind != "activation_observe":
+            continue
+        binding = current_by_owner.get((request.project_id, request.registration_generation))
+        if binding is None or (binding.project_id, binding.registration_generation) in observation_owners:
+            continue
+        intent = working_set.retain_activation_observation_intent(
+            binding,
+            replay_epoch=request.parameters["replay_epoch"],
+            replay_sequence=request.parameters["replay_sequence"],
+        )
+        if intent is not None:
+            observation_intents.append(intent)
+            observation_owners.add((binding.project_id, binding.registration_generation))
+    for intent in working_set.select_activation_observations(limit=64 - len(observation_intents)):
+        owner = (intent.binding.project_id, intent.binding.registration_generation)
+        if owner not in observation_owners:
+            observation_intents.append(intent)
+            observation_owners.add(owner)
+    observation_bindings = [intent.binding for intent in observation_intents]
+    replay_cursors = {
+        intent.binding.project_id: {"epoch": intent.replay_epoch, "sequence": intent.replay_sequence}
+        for intent in observation_intents
+    }
+    if observation_intents or any(request.operation_kind == "activation_observe" for request in unresolved):
+        try:
+            completions = controller.advance_activation_observations(
+                observation_bindings,
+                registry_revision,
+                replay_cursors,
+            )
+        except (OSError, RuntimeError, ValueError):
+            completions = {}
+        working_set.apply_activation_observations(observation_intents, completions)
+
+    acknowledgement_intents = []
+    acknowledgement_owners: set[tuple[str, str | None]] = set()
+    for request in unresolved:
+        if request.operation_kind != "activation_consumer_ack":
+            continue
+        binding = current_by_owner.get((request.project_id, request.registration_generation))
+        if binding is None or (binding.project_id, binding.registration_generation) in acknowledgement_owners:
+            continue
+        intent = working_set.retain_activation_acknowledgement_intent(
+            binding,
+            epoch=request.parameters["epoch"],
+            sequence=request.parameters["sequence"],
+            reconstructed_floor=request.parameters["reconstructed_floor"],
+            require_current=request.parameters["require_current"],
+        )
+        if intent is not None:
+            acknowledgement_intents.append(intent)
+            acknowledgement_owners.add((binding.project_id, binding.registration_generation))
+    for intent in working_set.select_activation_acknowledgements(limit=64 - len(acknowledgement_intents)):
+        owner = (intent.binding.project_id, intent.binding.registration_generation)
+        if owner not in acknowledgement_owners:
+            acknowledgement_intents.append(intent)
+            acknowledgement_owners.add(owner)
+    acknowledgement_bindings = [intent.binding for intent in acknowledgement_intents]
+    acknowledgements = {
+        intent.binding.project_id: {
+            "process_fence": working_set.process_fence,
+            "epoch": intent.epoch,
+            "sequence": intent.sequence,
+            "reconstructed_floor": intent.reconstructed_floor,
+            "require_current": intent.require_current,
+        }
+        for intent in acknowledgement_intents
+    }
+    if acknowledgement_intents or any(request.operation_kind == "activation_consumer_ack" for request in unresolved):
+        try:
+            completions = controller.advance_activation_consumer_acks(
+                acknowledgement_bindings,
+                registry_revision,
+                acknowledgements,
+            )
+        except (OSError, RuntimeError, ValueError):
+            completions = {}
+        working_set.apply_activation_acknowledgements(acknowledgement_intents, completions)
+
+
+def _isolated_claim_identity(reservation: ReservationIdentity) -> dict[str, Any] | None:
+    """Build the exact launch ticket key from one active local reservation."""
+    attempt_id = reservation.attempt_id
+    prefix = f"{reservation.task_id}-attempt-"
+    if (
+        reservation.project_id is None
+        or reservation.shared_root is None
+        or not isinstance(attempt_id, str)
+        or not attempt_id.startswith(prefix)
+        or type(reservation.fencing_token) is not int
+        or reservation.fencing_token < 1
+        or not reservation.reservation_id
+    ):
+        return None
+    suffix = attempt_id[len(prefix) :]
+    if not suffix.isascii() or not suffix.isdigit() or suffix.startswith("0"):
+        return None
+    attempt_number = int(suffix)
+    if attempt_id != f"{reservation.task_id}-attempt-{attempt_number}":
+        return None
+    return {
+        "task_id": reservation.task_id,
+        "attempt_id": attempt_id,
+        "attempt_number": attempt_number,
+        "fencing_token": reservation.fencing_token,
+        "reservation_id": reservation.reservation_id,
+    }
+
+
+def _isolated_active_reservations(
+    records: tuple[dict[str, Any], ...],
+    bindings_by_project: dict[str, ProjectBinding],
+    trusted: set[ReservationIdentity] | None,
+    *,
+    require_current_generation: bool,
+) -> dict[str, tuple[ReservationIdentity, ProjectBinding, dict[str, Any]]]:
+    """Convert exact binding-local active records, optionally requiring shared proof."""
+    trusted_by_id = {item.reservation_id: item for item in trusted} if trusted is not None else None
+    active: dict[str, tuple[ReservationIdentity, ProjectBinding, dict[str, Any]]] = {}
+    for record in records:
+        if not isinstance(record, dict) or record.get("state") != "active":
+            continue
+        try:
+            identity = ReservationIdentity.from_record(record)
+        except (TypeError, ValueError):
+            continue
+        binding = bindings_by_project.get(identity.project_id or "")
+        if (
+            binding is None
+            or (
+                require_current_generation
+                and identity.registration_generation not in {None, binding.registration_generation}
+            )
+            or identity.shared_root != str(binding.shared_root)
+            or record.get("machine_name") != binding.machine_name
+            or _isolated_claim_identity(identity) is None
+            or (trusted_by_id is not None and trusted_by_id.get(identity.reservation_id) != identity)
+        ):
+            continue
+        active[identity.reservation_id] = (identity, binding, record)
+    return active
+
+
+def _dispatch_isolated_machine_cycle(
+    runtime: MachineRuntime,
+    *,
+    controller: ProjectIOController,
+    bindings: list[ProjectBinding],
+    validated_configs: dict[str, RootConfig],
+    registry_revision: int,
+    launch_batch: _LaunchHandoffBatch,
+    available_gpus: list[int] | None,
+    instance_id: str,
+    omitted_dormant_enabled: bool,
+) -> list[dict[str, Any]]:
+    """Advance one bounded asynchronous scheduler pass using local snapshots."""
+    runtime.last_cycle_consumed_binding = bool(validated_configs)
+    results = [
+        {
+            "project_id": binding.project_id,
+            "launched": [],
+            "status": (
+                "binding_validation_pending"
+                if binding.enabled and binding.project_id not in validated_configs
+                else "pending"
+                if not binding.enabled
+                else "dispatched"
+            ),
+        }
+        for binding in bindings
+    ]
+    result_by_project = {item["project_id"]: item for item in results}
+    supervision_bindings = [binding for binding in bindings if binding.project_id in validated_configs]
+    reconciliation_bindings = list(supervision_bindings)
+    reconciliation_binding_by_project = {binding.project_id: binding for binding in reconciliation_bindings}
+    coordinator = getattr(runtime, "attempt_supervision_coordinator", None)
+    if not isinstance(coordinator, AttemptSupervisionCoordinator):
+        raise RuntimeError("isolated dispatch requires the runtime-owned attempt supervision coordinator.")
+    coordinator.advance_all(supervision_bindings, registry_revision)
+    ready_generations = getattr(runtime, "authority_ready_generations", None)
+    if not isinstance(ready_generations, dict):
+        ready_generations = {}
+        runtime.authority_ready_generations = ready_generations
+    current_generations = {binding.project_id: binding.registration_generation for binding in bindings}
+    for project_id, generation in tuple(ready_generations.items()):
+        if current_generations.get(project_id) != generation:
+            ready_generations.pop(project_id, None)
+    for binding in supervision_bindings:
+        if binding.enabled and coordinator.initially_reconciled(binding, registry_revision):
+            previous = ready_generations.get(binding.project_id)
+            ready_generations[binding.project_id] = binding.registration_generation
+            if previous != binding.registration_generation:
+                # A newly ready binding should wake admission immediately.
+                runtime.last_cycle_had_demand = True
+        else:
+            ready_generations.pop(binding.project_id, None)
+    enabled_bindings = [binding for binding in bindings if binding.enabled]
+    validated_bindings = [binding for binding in enabled_bindings if binding.project_id in validated_configs]
+    authority_ready = {
+        binding.project_id
+        for binding in validated_bindings
+        if ready_generations.get(binding.project_id) == binding.registration_generation
+    }
+    for binding in validated_bindings:
+        if binding.project_id not in authority_ready:
+            result_by_project[binding.project_id]["status"] = "authority_recovering"
+    validated_bindings = [binding for binding in validated_bindings if binding.project_id in authority_ready]
+    binding_by_project = {binding.project_id: binding for binding in validated_bindings}
+    blocked_projects = set(runtime.upgrade_admission_blocked_projects)
+    if runtime.upgrade_discovery_unknown:
+        blocked_projects.update(binding.project_id for binding in enabled_bindings)
+    for project_id in blocked_projects:
+        item = result_by_project.get(project_id)
+        if item is not None and item["status"] not in {"binding_validation_pending", "authority_recovering"}:
+            item["status"] = "upgrade_blocked"
+            item["upgrade"] = {"admission_blocked": True, "state": "cached"}
+
+    cursor = runtime.load_cursor()
+    ordered_project_ids = order_dispatch_project_ids(tuple(binding_by_project), cursor)
+    ordered_bindings = [binding_by_project[project_id] for project_id in ordered_project_ids]
+    primary_candidates: dict[str, Mapping[str, Any]] = {}
+    primary_unknown = False
+
+    try:
+        due_offer_completions = controller.advance_scheduler_due_offers(
+            [
+                binding
+                for binding in ordered_bindings
+                if binding.project_id not in blocked_projects
+                and not controller.scheduler_is_quiescent(binding, registry_revision)
+            ],
+            registry_revision,
+        )
+        if any(
+            evidence.get("outcome") == "offered"
+            for evidence in due_offer_completions.values()
+            if isinstance(evidence, Mapping)
+        ):
+            runtime.last_cycle_had_demand = True
+    except (OSError, RuntimeError, ValueError, KeyError, TypeError, AttributeError):
+        runtime.last_cycle_had_demand = True
+
+    def local_capacity() -> tuple[list[int], int, int, int]:
+        snapshot = reservation_snapshot(runtime.root)
+        _gpu_policy, policy_view = _observe_gpu_policy(
+            runtime,
+            available_gpus=available_gpus,
+            instance_id=instance_id,
+            reserved_gpu_ids=snapshot.reserved_gpu_ids,
+        )
+        visible = list(policy_view.visible_gpu_ids or ())
+        free_gpu_ids = [gpu_id for gpu_id in visible if gpu_id not in snapshot.reserved_gpu_ids]
+        cpu_policy, cpu_reservations = cpu_reservation_snapshot(runtime.root)
+        reserved_cpu_slots = 0
+        cpu_valid = True
+        for record in cpu_reservations:
+            slots = record.get("cpu_slots") if isinstance(record, dict) else None
+            if type(slots) is not int or slots < 0:
+                cpu_valid = False
+                break
+            reserved_cpu_slots += slots
+        free_cpu_slots = max(0, cpu_policy.capacity - reserved_cpu_slots) if cpu_valid else 0
+        return free_gpu_ids, free_cpu_slots, len(visible), cpu_policy.capacity
+
+    try:
+        initial_free_gpu_ids, initial_free_cpu_slots, _visible_gpu_count, _cpu_capacity = local_capacity()
+    except (OSError, RuntimeError, ValueError, KeyError, TypeError, AttributeError):
+        initial_free_gpu_ids, initial_free_cpu_slots = [], 0
+        primary_unknown = bool(ordered_bindings)
+    if initial_free_gpu_ids or initial_free_cpu_slots:
+        try:
+            ready_completions = controller.advance_scheduler_ready_index_builds(
+                [binding for binding in ordered_bindings if binding.project_id not in blocked_projects],
+                registry_revision,
+                observed_only=True,
+            )
+            if any(
+                evidence.get("state") == "building"
+                for evidence in ready_completions.values()
+                if isinstance(evidence, Mapping)
+            ):
+                runtime.last_cycle_had_demand = True
+        except (OSError, RuntimeError, ValueError, KeyError, TypeError, AttributeError):
+            runtime.last_cycle_had_demand = True
+
+    for lane in ("gpu", "cpu"):
+        observations: dict[str, Mapping[str, Any]] = {}
+        borrow_admission = None
+        try:
+            free_gpu_ids, free_cpu_slots, visible_gpu_count, cpu_capacity = local_capacity()
+        except (OSError, RuntimeError, ValueError, KeyError, TypeError, AttributeError):
+            free_gpu_ids, free_cpu_slots = [], 0
+            visible_gpu_count, cpu_capacity = 0, 0
+            diagnostic_increment(f"scheduler.isolated.{lane}.capacity_unavailable")
+            if ordered_bindings:
+                primary_unknown = True
+        lane_has_capacity = bool(free_gpu_ids) if lane == "gpu" else free_cpu_slots > 0
+        if lane_has_capacity and ordered_bindings:
+            try:
+                observations = dict(
+                    controller.advance_scheduler_observations(
+                        [
+                            binding
+                            for binding in ordered_bindings
+                            if binding.project_id not in blocked_projects
+                            and not controller.scheduler_is_quiescent(binding, registry_revision)
+                        ],
+                        registry_revision,
+                        lane=lane,
+                        admission_role="primary",
+                    )
+                )
+                if any(
+                    evidence.get("outcome") == "candidate"
+                    for evidence in observations.values()
+                    if isinstance(evidence, Mapping)
+                ):
+                    primary_candidates.update(
+                        {
+                            project_id: evidence
+                            for project_id, evidence in observations.items()
+                            if isinstance(evidence, Mapping) and evidence.get("outcome") == "candidate"
+                        }
+                    )
+                if any(
+                    binding.project_id not in observations
+                    and not controller.scheduler_is_quiescent(binding, registry_revision)
+                    for binding in ordered_bindings
+                ):
+                    primary_unknown = True
+            except (OSError, RuntimeError, ValueError, KeyError, TypeError, AttributeError):
+                diagnostic_increment(f"scheduler.isolated.{lane}.observation_failed")
+                primary_unknown = True
+
+        all_current_validated = len(validated_bindings) == len(enabled_bindings)
+        no_upgrade_blockers = not blocked_projects.intersection(binding_by_project)
+        try:
+            empty_scans = {
+                project_id: evidence
+                for project_id, evidence in observations.items()
+                if isinstance(evidence, Mapping) and evidence.get("outcome") == "none"
+            }
+            candidates = {
+                project_id: evidence
+                for project_id, evidence in observations.items()
+                if project_id not in blocked_projects
+                and isinstance(evidence, Mapping)
+                and evidence.get("outcome") == "candidate"
+            }
+            claim_completions = controller.advance_scheduler_claims(
+                ordered_bindings,
+                registry_revision,
+                lane=lane,
+                admission_role="primary",
+                observations=candidates,
+                available_gpu_ids=free_gpu_ids,
+                available_cpu_slots=free_cpu_slots,
+            )
+            if any(evidence.get("outcome") == "claimed" for evidence in claim_completions.values()):
+                runtime.last_cycle_had_demand = True
+
+            borrow_observations: dict[str, Mapping[str, Any]] = {}
+            if lane_has_capacity and ordered_bindings:
+                borrow_observations = dict(
+                    controller.advance_scheduler_observations(
+                        [
+                            binding
+                            for binding in ordered_bindings
+                            if binding.project_id not in blocked_projects
+                            and not controller.scheduler_is_quiescent(binding, registry_revision)
+                        ],
+                        registry_revision,
+                        lane=lane,
+                        admission_role="borrow",
+                    )
+                )
+            borrow_candidates = {
+                project_id: evidence
+                for project_id, evidence in borrow_observations.items()
+                if project_id not in blocked_projects
+                and isinstance(evidence, Mapping)
+                and evidence.get("outcome") == "candidate"
+            }
+            if (
+                borrow_candidates
+                and lane_has_capacity
+                and all_current_validated
+                and not omitted_dormant_enabled
+                and no_upgrade_blockers
+            ):
+                borrow_admission = controller.issue_borrow_admission(
+                    ordered_bindings,
+                    registry_revision,
+                    lane=lane,
+                    visible_capacity=visible_gpu_count if lane == "gpu" else cpu_capacity,
+                    free_capacity=len(free_gpu_ids) if lane == "gpu" else free_cpu_slots,
+                )
+            else:
+                controller.invalidate_borrow_admission(lane)
+            controller.advance_scheduler_cursor_commits(
+                ordered_bindings,
+                registry_revision,
+                lane=lane,
+                admission_role="borrow",
+                observations={
+                    project_id: evidence
+                    for project_id, evidence in borrow_observations.items()
+                    if isinstance(evidence, Mapping) and evidence.get("outcome") == "none"
+                },
+            )
+            borrow_completions = controller.advance_scheduler_claims(
+                ordered_bindings,
+                registry_revision,
+                lane=lane,
+                admission_role="borrow",
+                observations=borrow_candidates,
+                available_gpu_ids=free_gpu_ids,
+                available_cpu_slots=free_cpu_slots,
+                borrow_admission=borrow_admission,
+            )
+            if any(evidence.get("outcome") == "claimed" for evidence in borrow_completions.values()):
+                runtime.last_cycle_had_demand = True
+            controller.advance_scheduler_cursor_commits(
+                ordered_bindings,
+                registry_revision,
+                lane=lane,
+                admission_role="primary",
+                observations=empty_scans,
+            )
+        except (OSError, RuntimeError, ValueError, KeyError, TypeError, AttributeError):
+            diagnostic_increment(f"scheduler.isolated.{lane}.advance_failed")
+            if ordered_bindings:
+                primary_unknown = True
+
+    try:
+        final_snapshot = reservation_snapshot(runtime.root)
+    except (OSError, RuntimeError, ValueError, KeyError, TypeError, AttributeError):
+        final_snapshot = None
+
+    try:
+        executor_status = controller.executor.poll()
+        unresolved = controller.executor.unresolved_requests()
+        if unresolved or executor_status.get("envelope") == "unknown":
+            runtime.last_cycle_had_demand = True
+    except (OSError, RuntimeError, ValueError, KeyError, TypeError, AttributeError):
+        runtime.last_cycle_had_demand = True
+
+    if final_snapshot is not None:
+        if final_snapshot.active or final_snapshot.provisional:
+            runtime.last_cycle_had_demand = True
+        reconcilable_records = _isolated_active_reservations(
+            final_snapshot.active,
+            reconciliation_binding_by_project,
+            None,
+            require_current_generation=False,
+        )
+        try:
+            trusted = set(
+                controller.advance_scheduler_reservation_reconciliations(
+                    reconciliation_bindings,
+                    registry_revision,
+                    reservations=[item[0] for item in reconcilable_records.values()],
+                )
+            )
+            reconciled_snapshot = reservation_snapshot(runtime.root)
+            active_records = _isolated_active_reservations(
+                reconciled_snapshot.active,
+                binding_by_project,
+                trusted,
+                require_current_generation=True,
+            )
+            reservations = [item[0] for item in active_records.values()]
+        except (OSError, RuntimeError, ValueError, KeyError, TypeError, AttributeError):
+            active_records = {}
+            reservations = []
+            trusted = set()
+            runtime.last_cycle_had_demand = True
+    else:
+        active_records = {}
+        reservations = []
+        trusted = set()
+        runtime.last_cycle_had_demand = True
+
+    try:
+        completions = controller.advance_scheduler_launch_authorizations(
+            ordered_bindings,
+            registry_revision,
+            reservations=reservations,
+        )
+    except (OSError, RuntimeError, ValueError, KeyError, TypeError, AttributeError):
+        completions = {}
+        runtime.last_cycle_had_demand = True
+
+    if completions and final_snapshot is not None:
+        try:
+            latest_snapshot = reservation_snapshot(runtime.root)
+        except (OSError, RuntimeError, ValueError, KeyError, TypeError, AttributeError):
+            latest_snapshot = None
+            runtime.last_cycle_had_demand = True
+        latest_active = (
+            _isolated_active_reservations(
+                latest_snapshot.active,
+                binding_by_project,
+                trusted,
+                require_current_generation=True,
+            )
+            if latest_snapshot is not None
+            else {}
+        )
+        for reservation_id, evidence in completions.items():
+            if not isinstance(evidence, Mapping) or evidence.get("outcome") != "authorized":
+                continue
+            original = active_records.get(reservation_id)
+            current = latest_active.get(reservation_id)
+            if original is None or current is None:
+                continue
+            identity, binding, _record = original
+            current_identity, current_binding, current_record = current
+            claim_identity = _isolated_claim_identity(identity)
+            if (
+                claim_identity is None
+                or current_identity != identity
+                or current_binding != binding
+                or current_identity.reservation_id != reservation_id
+                or current_record.get("state") != "active"
+                or not identity.matches(current_record)
+                or evidence.get("claim_identity") != claim_identity
+            ):
+                continue
+            cfg = validated_configs.get(binding.project_id)
+            if cfg is None:
+                continue
+            try:
+                launch_batch.launch_authorized(cfg, evidence, binding.project_id)
+            except (OSError, RuntimeError, ValueError, TypeError) as exc:
+                if not launch_batch.has_pending(binding.project_id, identity.attempt_id or ""):
+                    controller.retry_scheduler_launch_authorization(identity)
+                result_by_project[binding.project_id]["status"] = "error"
+                result_by_project[binding.project_id]["error"] = str(exc)
+                runtime.last_cycle_had_demand = True
+                continue
+            result_by_project[binding.project_id]["launched"].append(identity.task_id)
+            runtime.save_cursor(binding.project_id)
+            runtime.last_cycle_had_demand = True
+
+    try:
+        descriptor_completions = controller.advance_maintenance_descriptor_work(
+            [binding for binding in ordered_bindings if binding.project_id not in blocked_projects],
+            registry_revision,
+        )
+        for project_id, evidence in descriptor_completions.items():
+            state = evidence.get("maintenance_state") if isinstance(evidence, Mapping) else None
+            if state not in {"idle", "waiting", "completed"}:
+                result_by_project[project_id]["maintenance"] = dict(evidence)
+            if state in {"pending", "running"}:
+                runtime.last_cycle_had_demand = True
+    except (OSError, RuntimeError, ValueError, KeyError, TypeError, AttributeError):
+        runtime.last_cycle_had_demand = True
+
+    try:
+        maintenance_completions = controller.advance_maintenance_event_flushes(
+            ordered_bindings,
+            registry_revision,
+        )
+        if maintenance_completions:
+            runtime.last_cycle_had_demand = True
+    except (OSError, RuntimeError, ValueError, KeyError, TypeError, AttributeError):
+        runtime.last_cycle_had_demand = True
+
+    if final_snapshot is not None:
+        occupied_projects = {
+            record.get("project_id")
+            for record in (*final_snapshot.active, *final_snapshot.provisional)
+            if isinstance(record, dict)
+        }
+        occupied_projects.update(identity[0] for identity in runtime.pending_launch_identities())
+        try:
+            # Quiescence is a per-Project proof. A candidate retained for one
+            # binding must not prevent every other binding from advancing its
+            # scheduler lane. The controller already excludes identities with
+            # retained candidate evidence, so offer closure independently for
+            # every otherwise-unoccupied Project on every pass.
+            controller.advance_scheduler_quiescence(
+                [
+                    binding
+                    for binding in ordered_bindings
+                    if binding.project_id not in blocked_projects and binding.project_id not in occupied_projects
+                ],
+                registry_revision,
+            )
+        except (OSError, RuntimeError, ValueError, KeyError, TypeError, AttributeError):
+            runtime.last_cycle_had_demand = True
+    if any(not controller.scheduler_is_quiescent(binding, registry_revision) for binding in ordered_bindings):
+        runtime.last_cycle_had_demand = True
+
+    launch_batch.poll(result_by_project, isolated=True)
+    if any(binding.enabled and binding.project_id not in validated_configs for binding in bindings):
+        runtime.last_cycle_had_demand = True
+    if primary_candidates or (
+        primary_unknown
+        and any(not controller.scheduler_is_quiescent(binding, registry_revision) for binding in ordered_bindings)
+    ):
+        runtime.last_cycle_had_demand = True
+    if getattr(runtime, "pending_launch_handoffs", {}):
+        runtime.last_cycle_had_demand = True
+    runtime.last_cycle_validated_project_ids = frozenset(validated_configs)
+    runtime.last_scheduler_diagnostic_probes = ()
+    return results
+
+
 def _dispatch_machine_cycle_locked(
     runtime: MachineRuntime,
     *,
@@ -1269,22 +2006,57 @@ def _dispatch_machine_cycle_locked(
     runtime.last_scheduler_diagnostic_probes = ()
     runtime.last_cycle_had_demand = False
     runtime.last_cycle_consumed_binding = False
-    # Poll handoffs before registry/recovery work, including the no-binding
-    # case. A pending reservation must not keep an idle agent alive forever
-    # without making progress on its bounded launch deadline.
-    launch_batch.poll()
-    if getattr(runtime, "pending_launch_handoffs", {}):
-        runtime.last_cycle_had_demand = True
+    runtime.last_cycle_validated_project_ids = frozenset()
+    has_isolation_executor = isinstance(getattr(runtime, "project_io_executor", None), ProjectIOExecutor)
+    if not has_isolation_executor:
+        # Keep the existing synchronous caller's pre-registry handoff poll
+        # order. Isolated launches are polled only after safe controller setup.
+        launch_batch.poll()
+        if getattr(runtime, "pending_launch_handoffs", {}):
+            runtime.last_cycle_had_demand = True
     with diagnostic_span("machine.registry.load"):
         registry_revision, registered = runtime.load_registry_snapshot()
     runtime.working_set.reconcile(registered, revision=registry_revision)
+    if has_isolation_executor:
+        try:
+            runtime.activation_wake.capture(registry_revision, registered)
+        except (OSError, RuntimeError, ValueError, KeyError, TypeError):
+            runtime.last_cycle_had_demand = True
     runtime.working_set.poll_dormant(limit=4)
-    _activate_due_maintenance_retries(runtime)
-    resident_supervised = [
-        binding
-        for binding in runtime.working_set.resident_bindings()
-        if runtime.registration_status(binding)["state"] != "superseded"
-    ]
+    _activate_due_maintenance_retries(runtime, registered)
+    resident_bindings = runtime.working_set.resident_bindings()
+    project_io_controller = _project_io_controller(runtime)
+    isolated_mode = project_io_controller is not None
+    validated_configs = (
+        project_io_controller.advance_binding_validation(resident_bindings, registry_revision)
+        if project_io_controller is not None
+        else {}
+    )
+    if project_io_controller is not None:
+        _advance_machine_snapshot_publications(runtime, project_io_controller, validated_configs)
+        _advance_registration_renewals(runtime, project_io_controller, registry_revision, registered)
+        _advance_activation_working_set(runtime, project_io_controller, registry_revision, registered)
+        project_io_controller.advance_upgrade_work(registered, registry_revision)
+        resident_bindings = runtime.working_set.resident_bindings()
+        project_io_controller.advance_submission_control(resident_bindings, registry_revision)
+        project_io_controller.advance_observation_maintenance(resident_bindings, registry_revision)
+        project_io_controller.advance_notification_maintenance(registered, registry_revision)
+        project_io_controller.advance_progress_work(registered, registry_revision)
+        recovery_enrollment = getattr(runtime, "recovery_enrollment", None)
+        if recovery_enrollment is not None:
+            recovery_enrollment.advance(project_io_controller, registered, registry_revision)
+        project_io_controller.advance_group_service_probes(resident_bindings, registry_revision)
+        launch_batch.poll(isolated=True)
+        if getattr(runtime, "pending_launch_handoffs", {}):
+            runtime.last_cycle_had_demand = True
+    if isolated_mode:
+        runtime.last_cycle_validated_project_ids = frozenset(validated_configs)
+    if isolated_mode:
+        resident_supervised = list(resident_bindings)
+    else:
+        resident_supervised = [
+            binding for binding in resident_bindings if runtime.registration_status(binding)["state"] != "superseded"
+        ]
     omitted_dormant_enabled = runtime.working_set.has_dormant_enabled_binding()
     supervised = resident_supervised
     if supervisors is not None:
@@ -1292,6 +2064,18 @@ def _dispatch_machine_cycle_locked(
         for project_id in set(supervisors) - supervised_ids:
             del supervisors[project_id]
             getattr(runtime, "supervisor_generations", {}).pop(project_id, None)
+    if project_io_controller is not None:
+        return _dispatch_isolated_machine_cycle(
+            runtime,
+            controller=project_io_controller,
+            bindings=supervised,
+            validated_configs=validated_configs,
+            registry_revision=registry_revision,
+            launch_batch=launch_batch,
+            available_gpus=available_gpus,
+            instance_id=instance_id,
+            omitted_dormant_enabled=omitted_dormant_enabled,
+        )
     if not supervised:
         try:
             _observe_gpu_policy(
@@ -1315,6 +2099,21 @@ def _dispatch_machine_cycle_locked(
         binding.project_id: runtime.working_set.begin_turn(binding, "maintenance") for binding in supervised
     }
     for binding in supervised:
+        if isolated_mode:
+            cfg = validated_configs.get(binding.project_id)
+            if cfg is None:
+                results.append(
+                    {
+                        "project_id": binding.project_id,
+                        "launched": [],
+                        "status": "binding_validation_pending",
+                    }
+                )
+                continue
+            readable[binding.project_id] = cfg
+            readable_bindings[binding.project_id] = binding
+            runtime.last_cycle_consumed_binding = True
+            continue
         if not binding.enabled and runtime.binding_state(binding) != "draining":
             continue
         if not runtime.binding_write_eligible(binding, renew=True):
@@ -1700,18 +2499,29 @@ def _acknowledge_scheduler_turns(
         runtime.working_set.acknowledge(turn, quiescent=quiescent)
 
 
-def _activate_due_maintenance_retries(runtime: MachineRuntime) -> None:
+def _activate_due_maintenance_retries(
+    runtime: MachineRuntime,
+    registered: Sequence[ProjectBinding],
+) -> None:
     """Wake backoff-delayed Projects when their durable retry becomes due."""
     now = time.monotonic()
+    current_by_project = {binding.project_id: binding for binding in registered}
     for project_id, (binding, due_at) in tuple(runtime.maintenance_retry_deadlines.items()):
+        current = current_by_project.get(project_id)
+        if current != binding or not current.enabled:
+            runtime.maintenance_retry_deadlines.pop(project_id, None)
+            runtime.maintenance_retry_idle_blocked_projects.discard(project_id)
+            continue
         if now < due_at:
             continue
         try:
             runtime.working_set.activate(binding, "maintenance_retry_due")
         except ValueError:
             runtime.maintenance_retry_deadlines.pop(project_id, None)
+            runtime.maintenance_retry_idle_blocked_projects.discard(project_id)
         else:
             runtime.maintenance_retry_deadlines.pop(project_id, None)
+            runtime.maintenance_retry_idle_blocked_projects.discard(project_id)
 
 
 def _advance_resident_maintenance_turn(
@@ -1740,6 +2550,7 @@ def _advance_resident_maintenance_turn(
 
     project_id = selected.project_id
     runtime.maintenance_retry_deadlines.pop(project_id, None)
+    runtime.maintenance_retry_idle_blocked_projects.discard(project_id)
     try:
         progress = advance_maintenance_work(
             readable[project_id],
@@ -1767,6 +2578,8 @@ def _advance_resident_maintenance_turn(
                     if parsed is not None and parsed.tzinfo is not None:
                         delay = max(0.0, (parsed - datetime.now(timezone.utc)).total_seconds())
                         runtime.maintenance_retry_deadlines[project_id] = (selected, time.monotonic() + delay)
+                        if progress.get("idle_blocking", True):
+                            runtime.maintenance_retry_idle_blocked_projects.add(project_id)
         turn = turns.get(project_id)
         if turn is not None:
             runtime.working_set.acknowledge(turn, quiescent=quiescent)

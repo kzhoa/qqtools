@@ -147,6 +147,56 @@ def test_agent_status_accepts_nested_gpu_policy_view_without_runtime_root() -> N
     assert json.loads(render(CliOutput(OutputKind.AGENT_STATUS, payload), "json")) == payload
 
 
+def test_agent_status_renders_project_io_isolation_only_when_degraded() -> None:
+    base = {
+        "action": "status",
+        "machine_runtime_root": "/machine-runtime",
+        "agent_state": "active",
+        "pid": 17,
+        "registry_revision": 0,
+        "projects": [],
+        "upgrade": {"projects": []},
+    }
+    isolation = {
+        "protocol_version": 1,
+        "executor_epoch": "a" * 32,
+        "capacity": 4,
+        "active_worker_count": 1,
+        "overdue_worker_count": 1,
+        "exit_unverified_worker_count": 0,
+        "unreaped_worker_count": 0,
+        "free_slot_count": 3,
+        "supported_hang_limit": 2,
+        "envelope": "degraded",
+        "oldest_overdue_at": "2026-09-28T00:00:00Z",
+        "blocking_project_ids": ["project-a"],
+    }
+
+    degraded = render(CliOutput(OutputKind.AGENT_STATUS, {**base, "project_io_isolation": isolation}), "human")
+    healthy = render(
+        CliOutput(
+            OutputKind.AGENT_STATUS,
+            {
+                **base,
+                "project_io_isolation": {
+                    **isolation,
+                    "active_worker_count": 0,
+                    "overdue_worker_count": 0,
+                    "free_slot_count": 4,
+                    "envelope": "healthy",
+                    "oldest_overdue_at": None,
+                    "blocking_project_ids": [],
+                },
+            },
+        ),
+        "human",
+    )
+
+    assert "Project I/O isolation" in degraded
+    assert "project-a" in degraded
+    assert "Project I/O isolation" not in healthy
+
+
 def test_standalone_gpu_policy_still_requires_runtime_root() -> None:
     with pytest.raises((TypeError, ValueError), match="machine_runtime_root"):
         render(CliOutput(OutputKind.GPU_POLICY, {"action": "shown", **_gpu_policy_view()}), "json")

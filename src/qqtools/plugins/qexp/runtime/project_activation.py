@@ -9,12 +9,12 @@ import uuid
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 
 from .locks import exclusive
 from .paths import shared_paths
 from .records import utc_now
-from .store import atomic_replace, require_json_size
+from .store import atomic_replace, check_mutation_fence, require_json_size
 
 ACTIVATION_VERSION = 1
 MAX_RECORD_BYTES = 16 * 1024
@@ -405,14 +405,21 @@ def _validate_checkpoint_directories(root: Path) -> None:
 
 
 def _sync_directory(path: Path) -> None:
+    check_mutation_fence(path)
     descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW)
     try:
+        check_mutation_fence(path)
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
 
 
-def _ensure_real_directory_chain(root: Path, directory: Path) -> None:
+def _ensure_real_directory_chain(
+    root: Path,
+    directory: Path,
+    *,
+    before_write: Callable[[], None] | None = None,
+) -> None:
     """Create activation directories below root, rejecting links and special files."""
     root_metadata = root.lstat()
     if not stat.S_ISDIR(root_metadata.st_mode):
@@ -436,6 +443,9 @@ def _ensure_real_directory_chain(root: Path, directory: Path) -> None:
 
     for path in reversed(missing):
         try:
+            if before_write is not None:
+                before_write()
+            check_mutation_fence(path)
             path.mkdir()
         except FileExistsError:
             pass
@@ -556,9 +566,15 @@ def _write_durable_record(path: Path, value: dict[str, Any], *, record_type: str
         raise RuntimeError(f"Project activation record could not be durably verified: {path}")
 
 
-def _write_membership_revision_locked(root: Path, project_id: str, revision: int) -> None:
+def _write_membership_revision_locked(
+    root: Path,
+    project_id: str,
+    revision: int,
+    *,
+    before_write: Callable[[], None] | None = None,
+) -> None:
     path = activation_membership_path(root)
-    _ensure_real_directory_chain(root, path.parent)
+    _ensure_real_directory_chain(root, path.parent, before_write=before_write)
     value = {
         "project_activation_membership": {
             "version": ACTIVATION_VERSION,
@@ -568,41 +584,62 @@ def _write_membership_revision_locked(root: Path, project_id: str, revision: int
         }
     }
     _validate_membership(value, project_id)
+    if before_write is not None:
+        before_write()
     _write_durable_record(path, value, record_type="project_activation_membership")
     _sync_directory_chain_to_root(path.parent, root)
 
 
-def _membership_revision_locked(root: Path, project_id: str) -> int:
+def _membership_revision_locked(
+    root: Path,
+    project_id: str,
+    *,
+    before_write: Callable[[], None] | None = None,
+) -> int:
     """Read the membership revision, initializing the durable zero record if absent."""
     path = activation_membership_path(root)
     try:
         value = _read_regular_json(path)
     except FileNotFoundError:
-        _write_membership_revision_locked(root, project_id, 0)
+        _write_membership_revision_locked(root, project_id, 0, before_write=before_write)
         return 0
     return _validate_membership(value, project_id)
 
 
-def _increment_membership_revision_locked(root: Path, project_id: str) -> int:
-    revision = _membership_revision_locked(root, project_id)
+def _increment_membership_revision_locked(
+    root: Path,
+    project_id: str,
+    *,
+    before_write: Callable[[], None] | None = None,
+) -> int:
+    revision = _membership_revision_locked(root, project_id, before_write=before_write)
     if revision >= _MAX_SEQUENCE:
         raise OverflowError("Project activation membership revision is exhausted.")
     revision += 1
-    _write_membership_revision_locked(root, project_id, revision)
+    _write_membership_revision_locked(root, project_id, revision, before_write=before_write)
     return revision
 
 
-def _ensure_pending_event(root: Path, activation: dict[str, Any]) -> None:
+def _ensure_pending_event(
+    root: Path,
+    activation: dict[str, Any],
+    *,
+    before_write: Callable[[], None] | None = None,
+) -> None:
     """Ensure a pending activation has one exact, durable event record."""
     epoch = activation["epoch"]
     sequence = activation["sequence"]
     path = activation_event_path(root, epoch, sequence)
+    if before_write is not None:
+        before_write()
     _ensure_real_directory_chain(root, path.parent)
     _validate_event_directories(root, epoch)
     expected = {"project_activation_event": activation.copy()}
     try:
         value = _read_regular_json(path)
     except FileNotFoundError:
+        if before_write is not None:
+            before_write()
         _write_durable_record(path, expected, record_type="project_activation_event")
         value = _read_regular_json(path)
     _validate_event(value, project_id=activation["identity"]["project_id"], epoch=epoch, sequence=sequence)
@@ -642,8 +679,11 @@ def _assert_no_orphan_event(root: Path, checkpoint: dict[str, Any] | None) -> No
                     raise RuntimeError("Project activation event exists without a checkpoint or pending record.")
 
 
-def _remove_pending(root: Path) -> None:
+def _remove_pending(root: Path, *, before_write: Callable[[], None] | None = None) -> None:
     path = activation_pending_path(root)
+    if before_write is not None:
+        before_write()
+    check_mutation_fence(path)
     path.unlink()
     _sync_directory(path.parent)
 
@@ -652,6 +692,8 @@ def _reconstruct_missing_event_locked(
     root: Path,
     project_id: str,
     checkpoint: dict[str, Any],
+    *,
+    before_write: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
     """Rotate a pre-journal checkpoint into a replayable conservative epoch."""
     previous = checkpoint["project_activation"]
@@ -667,15 +709,21 @@ def _reconstruct_missing_event_locked(
         raise RuntimeError("Project activation reconstruction identity changed.")
     pending = {"project_activation_pending": activation.copy()}
     pending_path = activation_pending_path(root)
+    if before_write is not None:
+        before_write()
     _ensure_real_directory_chain(root, pending_path.parent)
+    if before_write is not None:
+        before_write()
     _write_durable_record(pending_path, pending, record_type="project_activation_pending")
     _sync_directory_chain_to_root(pending_path.parent, root)
-    _ensure_pending_event(root, activation)
+    _ensure_pending_event(root, activation, before_write=before_write)
     committed = {"project_activation": activation.copy()}
     checkpoint_path = activation_checkpoint_path(root)
+    if before_write is not None:
+        before_write()
     _write_durable_record(checkpoint_path, committed, record_type="project_activation")
     _sync_directory_chain_to_root(checkpoint_path.parent, root)
-    _remove_pending(root)
+    _remove_pending(root, before_write=before_write)
     return committed
 
 
@@ -690,7 +738,12 @@ def _event_journal_is_absent(root: Path) -> bool:
     return False
 
 
-def _recover_pending_locked(root: Path, project_id: str) -> dict[str, Any] | None:
+def _recover_pending_locked(
+    root: Path,
+    project_id: str,
+    *,
+    before_write: Callable[[], None] | None = None,
+) -> dict[str, Any] | None:
     """Recover or validate activation state while holding the writer lock."""
     checkpoint = _read_checkpoint_record(root, project_id)
     pending = _read_pending(root, project_id)
@@ -701,7 +754,12 @@ def _recover_pending_locked(root: Path, project_id: str) -> dict[str, Any] | Non
             except _MissingActivationEvent:
                 if not _event_journal_is_absent(root):
                     raise
-                return _reconstruct_missing_event_locked(root, project_id, checkpoint)
+                return _reconstruct_missing_event_locked(
+                    root,
+                    project_id,
+                    checkpoint,
+                    before_write=before_write,
+                )
         elif _read_snapshot_record(root, project_id) is not None:
             raise RuntimeError("Project activation snapshot has no matching checkpoint.")
         _assert_no_orphan_event(root, checkpoint)
@@ -729,13 +787,15 @@ def _recover_pending_locked(root: Path, project_id: str) -> dict[str, Any] | Non
     else:
         raise RuntimeError("Project activation pending record is not contiguous with the checkpoint.")
 
-    _ensure_pending_event(root, activation)
+    _ensure_pending_event(root, activation, before_write=before_write)
     committed = {"project_activation": activation.copy()}
     if current_activation != activation:
         checkpoint_path = activation_checkpoint_path(root)
+        if before_write is not None:
+            before_write()
         _write_durable_record(checkpoint_path, committed, record_type="project_activation")
         _sync_directory_chain_to_root(checkpoint_path.parent, root)
-    _remove_pending(root)
+    _remove_pending(root, before_write=before_write)
     return committed
 
 
@@ -747,13 +807,18 @@ def recover_project_activation(root: Path) -> dict[str, Any] | None:
 
 
 @contextmanager
-def project_activation_transaction(cfg: object, reason: str) -> Iterator[dict[str, Any]]:
+def project_activation_transaction(
+    cfg: object,
+    reason: str,
+    *,
+    before_write: Callable[[], None] | None = None,
+) -> Iterator[dict[str, Any]]:
     """Publish recoverable activation evidence across one authoritative mutation."""
     reason = _validate_reason(reason)
     root = Path(cfg.shared_root)
     with exclusive(root / "locks" / "project-activation-v1.lock"):
         project_id = _project_id(root)
-        current = _recover_pending_locked(root, project_id)
+        current = _recover_pending_locked(root, project_id, before_write=before_write)
         previous = current["project_activation"] if current is not None else None
         if previous is None:
             epoch = _validate_epoch(uuid.uuid4().hex)
@@ -779,7 +844,11 @@ def project_activation_transaction(cfg: object, reason: str) -> Iterator[dict[st
 
         pending_path = activation_pending_path(root)
         event_path = activation_event_path(root, epoch, sequence)
+        if before_write is not None:
+            before_write()
         _ensure_real_directory_chain(root, pending_path.parent)
+        if before_write is not None:
+            before_write()
         _ensure_real_directory_chain(root, event_path.parent)
         _sync_directory_chain_to_root(event_path.parent, root)
         try:
@@ -788,27 +857,31 @@ def project_activation_transaction(cfg: object, reason: str) -> Iterator[dict[st
             pass
         else:
             raise RuntimeError("Project activation pending record appeared during publication.")
+        if before_write is not None:
+            before_write()
         _write_durable_record(pending_path, pending, record_type="project_activation_pending")
         _sync_directory_chain_to_root(pending_path.parent, root)
-        _ensure_pending_event(root, activation)
+        _ensure_pending_event(root, activation, before_write=before_write)
         record = {"project_activation": activation.copy()}
 
         try:
             yield record
         except BaseException as body_error:
             try:
-                committed = _recover_pending_locked(root, project_id)
+                committed = _recover_pending_locked(root, project_id, before_write=before_write)
                 if committed != record:
                     raise RuntimeError("Project activation transaction did not commit its pending record.")
-                _maybe_compact_activation_locked(root, project_id, committed)
+                if before_write is None:
+                    _maybe_compact_activation_locked(root, project_id, committed)
             except BaseException as finalize_error:
                 raise body_error from finalize_error
             raise
         else:
-            committed = _recover_pending_locked(root, project_id)
+            committed = _recover_pending_locked(root, project_id, before_write=before_write)
             if committed != record:
                 raise RuntimeError("Project activation transaction did not commit its pending record.")
-            _maybe_compact_activation_locked(root, project_id, committed)
+            if before_write is None:
+                _maybe_compact_activation_locked(root, project_id, committed)
 
 
 def publish_project_activation(cfg: object, reason: str) -> dict[str, Any]:
@@ -883,6 +956,7 @@ def _delete_compacted_prefix_locked(
         # Validate before unlinking so compaction never masks a corrupted retained event.
         value = _read_regular_json(path)
         _validate_event(value, project_id=project_id, epoch=epoch, sequence=sequence)
+        check_mutation_fence(path)
         path.unlink()
     _sync_directory_chain_to_root(directory, root)
 

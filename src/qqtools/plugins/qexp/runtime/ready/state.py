@@ -15,7 +15,7 @@ from ..protocol_compatibility import (
     minimum_ready_writer,
 )
 from ..records import utc_now
-from ..store import atomic_replace, read_json
+from ..store import atomic_replace, check_mutation_fence, read_json
 from .diagnostics import (
     MAX_REASONS,
     InvalidReasonList,
@@ -45,7 +45,9 @@ def ensure_ready_layout(cfg: object) -> None:
         "ready_locks",
         "ready_primary",
     ):
-        paths[name].mkdir(parents=True, exist_ok=True)
+        if not paths[name].exists():
+            check_mutation_fence(paths[name])
+            paths[name].mkdir(parents=True, exist_ok=True)
     path = ready_state_path(cfg.shared_root)
     if not path.exists():
         atomic_replace(
@@ -79,7 +81,10 @@ def _activate_empty_ready_index(cfg: object, build_id: str) -> None:
     paths = shared_paths(cfg.shared_root)
     if any(paths["tasks"].iterdir()):
         raise RuntimeError("empty ready projection activation requires a root without Tasks.")
-    (paths["ready_primary"] / "routes").mkdir(parents=True, exist_ok=True)
+    routes = paths["ready_primary"] / "routes"
+    if not routes.exists():
+        check_mutation_fence(routes)
+        routes.mkdir(parents=True, exist_ok=True)
     atomic_replace(
         projection_state_path(cfg),
         {

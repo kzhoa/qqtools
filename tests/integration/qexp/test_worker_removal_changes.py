@@ -282,8 +282,8 @@ def test_prelaunch_cancel_crash_has_reachable_terminal_owner(tmp_path, monkeypat
     tail = journal.snapshot().tail
     original = lifecycle.atomic_replace
 
-    def stop_after_attempt(path, value):
-        original(path, value)
+    def stop_after_attempt(path, value, **kwargs):
+        original(path, value, **kwargs)
         if path == attempt_path(cfg.shared_root, task.task_id, 1):
             raise ProcessStopped
 
@@ -309,10 +309,10 @@ def test_old_obligation_accepts_identified_recovery_and_terminal_successors(tmp_
         # the abandoned terminal request; its requested effect must not replay.
         original = lifecycle.atomic_replace
 
-        def stop_before_attempt(path, value):
+        def stop_before_attempt(path, value, **kwargs):
             if path == attempt_path(cfg.shared_root, task.task_id, 1):
                 raise ProcessStopped
-            return original(path, value)
+            return original(path, value, **kwargs)
 
         tail = journal.snapshot().tail
         with monkeypatch.context() as patch:

@@ -14,7 +14,7 @@ from ..locks import exclusive
 from ..paths import shared_paths, task_path
 from ..protocol_compatibility import OBSERVATION_CAPABILITY
 from ..records import TASK_ID_PATTERN
-from ..store import atomic_replace, read_json, read_json_limited, require_json_size
+from ..store import atomic_replace, check_mutation_fence, read_json, read_json_limited, require_json_size
 
 if TYPE_CHECKING:
     from ..records import TaskRecord
@@ -129,6 +129,7 @@ def write_state(cfg: object, state: dict[str, Any]) -> None:
     """Atomically persist a validated, bounded observation state."""
     value = _validate_state(cfg, state)
     root = observation_path(cfg)
+    check_mutation_fence(root)
     root.mkdir(parents=True, exist_ok=True)
     require_json_size(value, max_bytes=MAX_STATE_BYTES, record_type="task_observation_state")
     atomic_replace(root / "state.json", value)
@@ -189,8 +190,10 @@ def initialize_generation(cfg: object, state: dict[str, Any]) -> Path:
     value = _validate_state(cfg, state)
     root = observation_path(cfg)
     generations = root / "generations"
+    check_mutation_fence(generations)
     generations.mkdir(parents=True, exist_ok=True)
     generation = generations / value["generation"]
+    check_mutation_fence(generation)
     generation.mkdir(parents=True, exist_ok=True)
     catalog = _catalog_tree(generation)
     _ensure_tree_root(catalog)
@@ -279,9 +282,11 @@ def _retire_empty_partition(base: Path, tree: Any, catalog: Any, catalog_key: st
     if keys or not page.exhausted:
         return
     root = _tree_root(tree)
+    check_mutation_fence(root)
     root.unlink(missing_ok=True)
     parent = root.parent
     if parent != base and parent.exists():
+        check_mutation_fence(parent)
         parent.rmdir()
         _fsync_directory(parent.parent)
     catalog.discard(catalog_key)

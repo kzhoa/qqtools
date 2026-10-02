@@ -9,6 +9,7 @@ from qqtools.plugins.qexp.runtime.store import (
     atomic_replace,
     cas_update,
     create_if_absent,
+    fenced_mutations,
     iter_json,
     read_json,
 )
@@ -56,3 +57,30 @@ def test_iter_json_returns_sorted_regular_json_files(tmp_path: Path) -> None:
     (tmp_path / "link.json").symlink_to(tmp_path / "a.json")
 
     assert iter_json(tmp_path) == [tmp_path / "a.json", tmp_path / "b.json"]
+
+
+def test_mutation_fence_is_scoped_and_checked_after_temporary_write(tmp_path: Path) -> None:
+    shared = tmp_path / "shared"
+    path = shared / "record.json"
+    atomic_replace(path, {"value": "original"})
+    revoked = False
+
+    def fence():
+        if revoked:
+            raise RuntimeError("epoch revoked")
+
+    def revoke_before_replace(_stat):
+        nonlocal revoked
+        revoked = True
+
+    with fenced_mutations(shared, fence):
+        with pytest.raises(RuntimeError, match="epoch revoked"):
+            atomic_replace(path, {"value": "stale"}, before_replace=revoke_before_replace)
+        assert read_json(path) == {"value": "original"}
+        with pytest.raises(RuntimeError, match="epoch revoked"):
+            create_if_absent(shared / "new.json", {"value": "stale"})
+        assert not (shared / "new.json").exists()
+        atomic_replace(tmp_path / "local.json", {"value": "local"})
+    atomic_replace(path, {"value": "current"})
+    assert read_json(path) == {"value": "current"}
+    assert sorted(item.name for item in shared.iterdir()) == ["record.json"]

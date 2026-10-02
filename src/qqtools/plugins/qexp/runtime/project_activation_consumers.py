@@ -11,7 +11,7 @@ import uuid
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 
 from .locks import exclusive
 from .project_activation import (
@@ -71,6 +71,7 @@ def register_consumer(
     project_id: str,
     registration_generation: str,
     process_fence: str,
+    before_shared_write: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
     """Fence a consumer process, preserving progress only within the current epoch."""
     identity = _validate_identity(runtime_id, project_id, registration_generation)
@@ -78,7 +79,7 @@ def register_consumer(
     root = Path(root)
     path = consumer_progress_path(root, runtime_id, registration_generation)
 
-    with exclusive(root / "locks" / "project-activation-v1.lock"):
+    with _consumer_mutation_lock(root, before_shared_write):
         try:
             checkpoint = read_project_activation(root)
         except _MissingActivationEvent:
@@ -90,7 +91,14 @@ def register_consumer(
         if existing is not None and existing["project_activation_consumer"]["state"] == "retired":
             raise ValueError("A retired Project activation consumer generation cannot be registered again.")
         if existing is None:
-            _increment_membership_revision_locked(root, project_id)
+            # Membership is itself durable shared state, so announce possible
+            # mutation before changing it as well as immediately before the
+            # consumer record replace below.
+            _increment_membership_revision_locked(
+                root,
+                project_id,
+                before_write=before_shared_write,
+            )
 
         acknowledgement = None
         if existing is not None:
@@ -99,7 +107,13 @@ def register_consumer(
                 acknowledgement = previous.copy()
 
         record = _build_record(identity, process_fence, acknowledgement, "active")
-        return _write_consumer_record(root, path, identity, record)
+        return _write_consumer_record(
+            root,
+            path,
+            identity,
+            record,
+            before_shared_write=before_shared_write,
+        )
 
 
 def ack_consumer(
@@ -113,6 +127,7 @@ def ack_consumer(
     sequence: int,
     reconstructed_floor: int | None = None,
     require_current: bool = False,
+    before_shared_write: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
     """Persist contiguous progress after local active/waiting state is durably handed off."""
     identity = _validate_identity(runtime_id, project_id, registration_generation)
@@ -124,7 +139,7 @@ def ack_consumer(
     root = Path(root)
     path = consumer_progress_path(root, runtime_id, registration_generation)
 
-    with exclusive(root / "locks" / "project-activation-v1.lock"):
+    with _consumer_mutation_lock(root, before_shared_write):
         record = _read_consumer_record(root, path, identity)
         if record is None:
             raise ValueError("Project activation consumer is not registered.")
@@ -174,7 +189,13 @@ def ack_consumer(
                 raise ValueError("Project activation acknowledgement has a missing event.")
 
         updated = _build_record(identity, process_fence, {"epoch": epoch, "sequence": sequence}, "active")
-        return _write_consumer_record(root, path, identity, updated)
+        return _write_consumer_record(
+            root,
+            path,
+            identity,
+            updated,
+            before_shared_write=before_shared_write,
+        )
 
 
 def retire_consumer(
@@ -206,26 +227,43 @@ def retire_consumer(
         return _write_consumer_record(root, path, identity, retired)
 
 
+@contextmanager
+def _consumer_mutation_lock(
+    root: Path,
+    before_shared_write: Callable[[], None] | None,
+) -> Iterator[None]:
+    """Fence creation of the shared lock file before taking the consumer lock."""
+    lock_path = root / "locks" / "project-activation-v1.lock"
+    try:
+        lock_path.lstat()
+    except FileNotFoundError:
+        if before_shared_write is not None:
+            before_shared_write()
+    with exclusive(lock_path):
+        yield
+
+
 def retire_consumer_after_registration_removal(
     root: Path,
     *,
     runtime_id: str,
     project_id: str,
     registration_generation: str,
+    before_shared_write: Callable[[], None] | None = None,
 ) -> dict[str, Any] | None:
     """Retire only this consumer after its exact machine binding was durably removed.
 
-    The internal caller must hold the machine registry guard and have established that
-    this exact `(runtime_id, project_id, registration_generation, shared_root)` identity
-    is absent from the committed registry. This function does not establish that proof;
-    it only applies it to the matching consumer record under the Project activation lock.
-    Missing and already-retired consumers are successful so an interrupted removal can
-    safely retry from its durable machine-local intent.
+    The caller supplies a fence callback that revalidates the executor epoch and exact
+    binding absence before each shared mutation. No machine-local lock may span this
+    function's Project I/O. Missing and already-retired consumers are successful so an
+    interrupted removal can safely retry from its durable machine-local intent.
     """
     identity = _validate_identity(runtime_id, project_id, registration_generation)
     root = Path(root)
     path = consumer_progress_path(root, runtime_id, registration_generation)
 
+    if before_shared_write is not None:
+        before_shared_write()
     with _existing_activation_lock(root):
         record = _read_consumer_record(root, path, identity)
         if record is None:
@@ -233,9 +271,15 @@ def retire_consumer_after_registration_removal(
         progress = record["project_activation_consumer"]
         if progress["state"] == "retired":
             return record
-        _increment_membership_revision_locked(root, project_id)
+        _increment_membership_revision_locked(root, project_id, before_write=before_shared_write)
         retired = _build_record(identity, progress["process_fence"], progress["ack"], "retired")
-        return _write_consumer_record(root, path, identity, retired)
+        return _write_consumer_record(
+            root,
+            path,
+            identity,
+            retired,
+            before_shared_write=before_shared_write,
+        )
 
 
 @contextmanager
@@ -381,7 +425,13 @@ def _validate_consumer_record(
     return value
 
 
-def _validate_directory_chain(root: Path, directory: Path, *, create: bool) -> bool:
+def _validate_directory_chain(
+    root: Path,
+    directory: Path,
+    *,
+    create: bool,
+    before_write: Callable[[], None] | None = None,
+) -> bool:
     try:
         root_metadata = root.lstat()
     except FileNotFoundError:
@@ -398,17 +448,18 @@ def _validate_directory_chain(root: Path, directory: Path, *, create: bool) -> b
     current = root
     for part in parts:
         current /= part
-        if create:
-            try:
-                current.mkdir()
-            except FileExistsError:
-                pass
         try:
             metadata = current.lstat()
         except FileNotFoundError:
-            if create:
-                raise RuntimeError(f"Project activation consumer path is missing: {current}") from None
-            return False
+            if not create:
+                return False
+            try:
+                if before_write is not None:
+                    before_write()
+                current.mkdir()
+            except FileExistsError:
+                pass
+            metadata = current.lstat()
         if not stat.S_ISDIR(metadata.st_mode):
             raise RuntimeError(f"Project activation consumer path is not a real directory: {current}")
     return True
@@ -475,13 +526,22 @@ def _write_consumer_record(
     path: Path,
     identity: dict[str, str],
     record: dict[str, Any],
+    *,
+    before_shared_write: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
-    if not _validate_directory_chain(root, path.parent, create=True):
+    if not _validate_directory_chain(
+        root,
+        path.parent,
+        create=True,
+        before_write=before_shared_write,
+    ):
         raise RuntimeError(f"Project activation consumer directory is unavailable: {path.parent}")
     _validate_consumer_record(record, path=path, root=root, identity=identity)
     encoded_size = len(json.dumps(record, ensure_ascii=False, sort_keys=True, indent=2).encode("utf-8"))
     if encoded_size > _MAX_RECORD_BYTES:
         raise ValueError(f"Project activation consumer record exceeds {_MAX_RECORD_BYTES} bytes.")
+    if before_shared_write is not None:
+        before_shared_write()
     replaced = atomic_replace(path, record)
     if replaced is None or not stat.S_ISREG(replaced.st_mode) or replaced.st_size > _MAX_RECORD_BYTES:
         raise RuntimeError(f"Project activation consumer record could not be durably replaced: {path}")

@@ -122,6 +122,70 @@ def test_old_root_automatically_builds_and_activates(tmp_path):
     assert read_json(source_path(cfg, operation))["submission"]["state"] == "committed"
 
 
+def test_bootstrap_and_pending_lanes_converge_with_fresh_typed_continuations(tmp_path):
+    cfg, task, _operation = setup_source(tmp_path)
+    control.request_control_rebuild(cfg)
+    continuation = None
+    reasons = set()
+    for _ in range(1000):
+        owner = SubmissionControlMaintenance(cfg, continuation=continuation)
+        try:
+            result = owner.advance()
+            reasons.add(result["reason"])
+            continuation = owner.continuation
+        finally:
+            owner.close()
+        state = control.read_control_state(cfg)
+        if state["state"] == "active" and result["reason"] == "pending_idle":
+            break
+    else:
+        pytest.fail("fresh worker continuations starved a maintenance lane")
+    assert "source_selected" in reasons
+    assert "bootstrap_complete" in reasons
+    assert control.read_submission_state(cfg, task.submission_operation_id) == "committed"
+    assert not control.pending_path(cfg, task.submission_operation_id).exists()
+
+
+def test_pending_cookie_advances_past_busy_head_across_fresh_owners(tmp_path, monkeypatch):
+    cfg = init_shared_root(tmp_path / "project/.qexp", "worker", runtime_root=tmp_path / "runtime")
+    busy = submit(cfg, ["true"], task_id="busy").submission_operation_id
+    healthy = submit(cfg, ["true"], task_id="healthy").submission_operation_id
+    for operation_id in (busy, healthy):
+        control.request_repair(cfg, operation_id)
+    from qqtools.plugins.qexp.runtime import submission_control_maintenance as maintenance
+    from qqtools.plugins.qexp.runtime.locks import exclusive
+
+    original_read = maintenance.read_directory_entry
+
+    def read_entry(path, offset):
+        if path != control.control_paths(cfg)["pending"]:
+            return original_read(path, offset)
+        if offset == 0:
+            return f"{busy}.json", 1
+        if offset == 1:
+            return f"{healthy}.json", 2
+        return None, 2
+
+    monkeypatch.setattr(maintenance, "read_directory_entry", read_entry)
+    continuation = None
+    with exclusive(control.operation_lock_path(cfg, busy)) as acquired:
+        assert acquired
+        for _ in range(30):
+            owner = SubmissionControlMaintenance(cfg, continuation=continuation)
+            try:
+                result = owner.advance()
+                continuation = owner.continuation
+            finally:
+                owner.close()
+            if not control.pending_path(cfg, healthy).exists():
+                break
+            assert result["reason"] != "pending_idle"
+        else:
+            pytest.fail("busy pending head starved its healthy peer")
+        assert control.pending_path(cfg, busy).exists()
+        assert control.read_submission_state(cfg, healthy) == "committed"
+
+
 def test_process_exit_after_truth_before_receipt_recovers(tmp_path, checkout_subprocess_env):
     import subprocess
     import sys

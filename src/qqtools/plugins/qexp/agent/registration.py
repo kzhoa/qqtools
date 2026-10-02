@@ -2,14 +2,13 @@
 
 from __future__ import annotations
 
-import math
 import os
 import stat
 import uuid
 from collections.abc import Callable, Iterator
 from contextlib import ExitStack, contextmanager
 from dataclasses import replace
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from threading import RLock
 from typing import Any
@@ -24,7 +23,7 @@ from ..layout import (
     save_machine_record,
     save_machine_registration,
 )
-from ..lease import LeasePolicy, lease_expiry, load_lease_policy, parse_utc
+from ..lease import lease_expiry, load_lease_policy
 from ..runtime.locks import exclusive, machine_lock
 from ..runtime.paths import (
     machine_path,
@@ -35,34 +34,20 @@ from ..runtime.paths import (
 )
 from ..runtime.project_activation_consumers import read_consumer_progress
 from ..runtime.records import utc_now
+from ..runtime.registration_authority import (
+    RECOVERY_REGISTRATION_PROTOCOL,
+    RECOVERY_REGISTRATION_VERSION,
+    REGISTRATION_VERSION,
+    RegistrationIdentity,
+    observe_registration_renewal,
+    publish_recovery_registration_locked,
+    registration_state,
+    registration_write_guard,
+    validate_registration_record,
+)
 from ..runtime.responsibility_store import DurableIO
 from ..runtime.store import atomic_replace, read_json
-from ..runtime.work_budget import diagnostic_increment, diagnostic_observe_ns
-from .bindings import ProjectBinding
-
-REGISTRY_VERSION = 1
-REGISTRATION_VERSION = 1
-RECOVERY_REGISTRATION_VERSION = 2
-RECOVERY_REGISTRATION_PROTOCOL = "qexp-local-responsibility-v1"
-
-
-def _registration_renewal_interval(policy: LeasePolicy) -> float:
-    # Leave a second service opportunity when a valid Attempt interval is near TTL.
-    return min(policy.renew_interval_seconds, policy.ttl_seconds / 2)
-
-
-def _observe_registration_renewal(previous_expiry: str, policy: LeasePolicy, *, is_reactivation: bool) -> None:
-    """Observe completed publication against the previous renewal target."""
-    diagnostic_increment("registration.reactivation" if is_reactivation else "registration.renewal")
-    try:
-        target = parse_utc(previous_expiry) - timedelta(
-            seconds=policy.ttl_seconds - _registration_renewal_interval(policy)
-        )
-        lateness = max(0.0, (datetime.now(timezone.utc) - target).total_seconds())
-    except (ValueError, TypeError, OverflowError):
-        diagnostic_increment("registration.renewal_lateness_unavailable")
-        return
-    diagnostic_observe_ns("registration.renewal_lateness", int(lateness * 1_000_000_000))
+from .bindings import REGISTRY_VERSION, ProjectBinding, decode_registry
 
 
 def _is_path_present(path: Path) -> bool:
@@ -83,7 +68,7 @@ class MachineRegistration:
         *,
         ensure_layout: Callable[[], None],
         current_instance_id: Callable[[], str],
-        recover_removed_consumer: Callable[[RootConfig, str, str, list[ProjectBinding]], None] | None = None,
+        recover_removed_consumer: Callable[[RootConfig, str, str, list[ProjectBinding]], bool] | None = None,
     ) -> None:
         self.root = Path(root).expanduser().resolve()
         self.paths = machine_runtime_paths(self.root)
@@ -99,6 +84,14 @@ class MachineRegistration:
     def registry_guard(self, *, blocking: bool = True) -> Iterator[bool]:
         self._ensure_layout()
         with exclusive(self.paths["registry_lock"], blocking=blocking) as acquired:
+            yield acquired
+
+    @contextmanager
+    def binding_commit_guard(self, binding: ProjectBinding, *, blocking: bool = True) -> Iterator[bool]:
+        """Fence one binding's local enablement while its shared write commits."""
+        self._ensure_layout()
+        path = self.paths["locks"] / "binding-commits" / f"{binding.project_id}.lock"
+        with exclusive(path, blocking=blocking) as acquired:
             yield acquired
 
     def load_registry(self) -> tuple[int, list[ProjectBinding]]:
@@ -173,23 +166,7 @@ class MachineRegistration:
 
     @staticmethod
     def _decode_registry(value: dict[str, Any]) -> tuple[int, tuple[ProjectBinding, ...]]:
-        registry = value.get("registry")
-        if not isinstance(registry, dict) or registry.get("version") != REGISTRY_VERSION:
-            raise RuntimeError("machine registry is malformed or unsupported.")
-        revision = registry.get("revision")
-        bindings = registry.get("bindings")
-        if not isinstance(revision, int) or revision < 0 or not isinstance(bindings, list):
-            raise RuntimeError("machine registry is malformed.")
-        try:
-            parsed = tuple(
-                sorted(
-                    (ProjectBinding.from_dict(item) for item in bindings),
-                    key=lambda item: item.project_id,
-                )
-            )
-        except (TypeError, ValueError) as exc:
-            raise RuntimeError("machine registry contains a malformed project binding.") from exc
-        return revision, parsed
+        return decode_registry(value)
 
     def load_registry_uncached(self) -> tuple[int, list[ProjectBinding]]:
         """Read and validate the physical registry without consulting process cache."""
@@ -292,7 +269,7 @@ class MachineRegistration:
             },
         )
 
-    def rollback_pending_locked(self) -> None:
+    def rollback_pending_locked(self, *, before_effect: Callable[[], None] | None = None) -> None:
         """Restore the last incomplete registration before accepting a new mutation."""
         path = self.paths["registration_transaction"]
         if not path.exists():
@@ -333,20 +310,31 @@ class MachineRegistration:
                 cfg = load_root_config(item["shared_root"], item["machine_name"])
                 registration_path = machine_registration_path(cfg.shared_root, cfg.machine_name)
                 record = item.get("record")
+                if before_effect is not None:
+                    before_effect()
                 if record is None:
                     registration_path.unlink(missing_ok=True)
+                    DurableIO().sync_directory(registration_path.parent, "registration_rollback")
                 else:
                     save_machine_registration(cfg, record)
             for item in machine_records:
                 cfg = load_root_config(item["shared_root"], item["machine_name"])
                 record_path = machine_path(cfg.shared_root, cfg.machine_name)
                 record = item.get("record")
+                if before_effect is not None:
+                    before_effect()
                 if record is None:
                     record_path.unlink(missing_ok=True)
+                    DurableIO().sync_directory(record_path.parent, "registration_rollback")
                 else:
                     save_machine_record(cfg, record)
+            if before_effect is not None:
+                before_effect()
             self.save_registry_locked(max(revision, current_revision) + 1, bindings)
+            if before_effect is not None:
+                before_effect()
             path.unlink(missing_ok=True)
+            DurableIO().sync_directory(path.parent, "registration_rollback")
 
     def ensure_binding(
         self,
@@ -370,8 +358,10 @@ class MachineRegistration:
         with self.registry_guard():
             self.rollback_pending_locked()
             revision, bindings = self.load_registry()
-            if self._recover_removed_consumer is not None:
-                self._recover_removed_consumer(cfg, stable_id, runtime_instance_id, bindings)
+            force_new_generation = bool(
+                self._recover_removed_consumer is not None
+                and self._recover_removed_consumer(cfg, stable_id, runtime_instance_id, bindings)
+            )
             current = next(
                 (
                     item
@@ -401,14 +391,19 @@ class MachineRegistration:
             affected_configs = [cfg]
             if current is None and same_project:
                 affected_configs.append(same_project[0].root_config())
-            registration_records = [(item, load_machine_registration(item)) for item in affected_configs]
-            machine_records = [(item, load_machine_record(item)) for item in affected_configs]
-            self._save_registration_transaction(
-                revision=revision,
-                bindings=bindings,
-                registrations=registration_records,
-                machine_records=machine_records,
-            )
+            # A shared-only recovery publisher must see either the new protocol
+            # in this rollback snapshot or its durable pending journal. Capturing
+            # the old record before taking shared ownership permits a late
+            # rollback to resurrect version 1 after recovery preparation.
+            with self._registration_guards(*affected_configs):
+                registration_records = [(item, load_machine_registration(item)) for item in affected_configs]
+                machine_records = [(item, load_machine_record(item)) for item in affected_configs]
+                self._save_registration_transaction(
+                    revision=revision,
+                    bindings=bindings,
+                    registrations=registration_records,
+                    machine_records=machine_records,
+                )
             try:
                 if current is None and same_project:
                     registration = self._replace_registration(
@@ -425,6 +420,7 @@ class MachineRegistration:
                         runtime_instance_id,
                         current,
                         adopt_existing=adopt_existing,
+                        force_new_generation=force_new_generation,
                     )
                 binding = ProjectBinding(
                     stable_id,
@@ -465,6 +461,7 @@ class MachineRegistration:
         current: ProjectBinding | None,
         *,
         adopt_existing: bool,
+        force_new_generation: bool = False,
     ) -> dict[str, str]:
         """Acquire or renew one project-owned logical-machine generation."""
         with self._registration_guard(cfg):
@@ -474,6 +471,7 @@ class MachineRegistration:
                 runtime_instance_id,
                 current,
                 adopt_existing=adopt_existing,
+                force_new_generation=force_new_generation,
             )
 
     def _acquire_registration_locked(
@@ -484,6 +482,7 @@ class MachineRegistration:
         current: ProjectBinding | None,
         *,
         adopt_existing: bool,
+        force_new_generation: bool = False,
     ) -> dict[str, str]:
         """Acquire registration while the caller holds the project registration fence."""
         policy = load_lease_policy(cfg)
@@ -506,8 +505,8 @@ class MachineRegistration:
             and current.runtime_root in {None, str(self.root)}
         ):
             same_owner = True
-        retired_same_owner = False
-        if same_owner and current is None and isinstance(registration, dict):
+        retired_same_owner = force_new_generation
+        if not retired_same_owner and same_owner and current is None and isinstance(registration, dict):
             consumer = read_consumer_progress(
                 cfg.shared_root,
                 runtime_id=runtime_instance_id,
@@ -635,34 +634,13 @@ class MachineRegistration:
 
     @staticmethod
     def validate_registration_record(record: dict[str, Any], project_id: str, cfg: RootConfig) -> None:
-        version = record.get("version")
-        if type(version) is not int or version not in {REGISTRATION_VERSION, RECOVERY_REGISTRATION_VERSION}:
-            raise RuntimeError("project machine registration uses an unsupported protocol version.")
-        if version == RECOVERY_REGISTRATION_VERSION and (
-            type(record.get("protocol_version")) is not int
-            or record["protocol_version"] != version
-            or record.get("recovery_protocol") != RECOVERY_REGISTRATION_PROTOCOL
-        ):
-            raise RuntimeError("project machine registration has an unsupported recovery protocol.")
-        if record.get("project_id") != project_id or record.get("shared_root") != str(cfg.shared_root):
-            raise RuntimeError("project machine registration does not match Project identity.")
-        if record.get("machine_name") != cfg.machine_name:
-            raise RuntimeError("project machine registration does not match the requested logical name.")
-        for key in ("generation", "runtime_instance_id", "runtime_root", "eligibility_expires_at"):
-            if not isinstance(record.get(key), str) or not record[key]:
-                raise RuntimeError("project machine registration is malformed.")
+        validate_registration_record(record, project_id, cfg)
 
     _validate_registration_record = validate_registration_record
 
     @staticmethod
     def registration_state(record: dict[str, Any]) -> str:
-        try:
-            expires_at = parse_utc(record["eligibility_expires_at"])
-        except (KeyError, TypeError, ValueError):
-            return "invalid"
-        if record.get("state") == "superseded":
-            return "superseded"
-        return "eligible" if expires_at > datetime.now(timezone.utc) else "expired"
+        return registration_state(record)
 
     _registration_state = registration_state
 
@@ -684,26 +662,10 @@ class MachineRegistration:
             if not eligible:
                 return False
             registration = load_machine_registration(cfg)["registration"]
-            if registration["version"] == RECOVERY_REGISTRATION_VERSION:
-                # A prior replace may be visible after a failed directory
-                # sync. Readable preparation is not yet a durable fence.
-                DurableIO().sync_directory(
-                    machine_registration_path(cfg.shared_root, cfg.machine_name).parent,
-                    "recovery_registration_fence",
-                )
-                return True
-            # A reboot must not resurrect a retired version-1 rollback
-            # snapshot after the shared protocol fence becomes durable.
-            DurableIO().sync_directory(self.paths["registration_transaction"].parent, "recovery_registration")
-            registration = dict(registration)
-            registration.update(
-                version=RECOVERY_REGISTRATION_VERSION,
-                protocol_version=RECOVERY_REGISTRATION_VERSION,
-                recovery_protocol=RECOVERY_REGISTRATION_PROTOCOL,
-                client_version=__version__,
-                updated_at=utc_now(),
-            )
-            save_machine_registration(cfg, {"registration": registration})
+            if registration["version"] != RECOVERY_REGISTRATION_VERSION:
+                # Retire local rollback durability before the shared-only fence.
+                DurableIO().sync_directory(self.paths["registration_transaction"].parent, "recovery_registration")
+            publish_recovery_registration_locked(cfg, registration)
             return True
 
     def registration_status(self, binding: ProjectBinding) -> dict[str, Any]:
@@ -749,29 +711,20 @@ class MachineRegistration:
     def reactivate_binding(self, binding: ProjectBinding) -> bool:
         """Renew an expired registration when its generation was not superseded."""
         cfg = binding.root_config()
-        policy = load_lease_policy(cfg)
-        with self._registration_guard(cfg):
-            raw = load_machine_registration(cfg)
-            record = raw.get("registration") if isinstance(raw, dict) else None
-            if not isinstance(record, dict):
-                return False
-            self.validate_registration_record(record, binding.project_id, cfg)
-            if (
-                record.get("state") == "superseded"
-                or record.get("generation") != binding.registration_generation
-                or record.get("runtime_instance_id") != binding.runtime_instance_id
-                or binding.runtime_instance_id != self._current_instance_id()
-                or record.get("runtime_root") != str(self.root)
-                or binding.runtime_root not in {None, str(self.root)}
-            ):
-                return False
-            record = dict(record)
-            previous_expiry = record["eligibility_expires_at"]
-            record["eligibility_expires_at"] = lease_expiry(policy)
-            record["updated_at"] = utc_now()
-            save_machine_registration(cfg, {"registration": record})
-            _observe_registration_renewal(previous_expiry, policy, is_reactivation=True)
-            return True
+        identity = RegistrationIdentity(
+            binding.project_id, binding.registration_generation, binding.runtime_instance_id, str(self.root)
+        )
+
+        def is_current() -> bool:
+            return binding.runtime_instance_id == self._current_instance_id() and binding.runtime_root in {
+                None,
+                str(self.root),
+            }
+
+        with registration_write_guard(
+            cfg, identity, is_current=is_current, allow_reactivation=True, force_renewal=True
+        ) as record:
+            return record is not None
 
     @contextmanager
     def binding_write_guard(
@@ -779,53 +732,28 @@ class MachineRegistration:
         binding: ProjectBinding,
         *,
         renewal_horizon_seconds: float = 0.0,
+        before_shared_write: Callable[[], None] | None = None,
     ) -> Iterator[bool]:
         """Fence an authoritative write, renewing the current generation when due."""
-        if (
-            not isinstance(renewal_horizon_seconds, (int, float))
-            or isinstance(renewal_horizon_seconds, bool)
-            or not math.isfinite(renewal_horizon_seconds)
-            or renewal_horizon_seconds < 0
-        ):
-            raise ValueError("renewal_horizon_seconds must be a finite nonnegative number.")
         cfg = binding.root_config()
-        policy = load_lease_policy(cfg)
-        with self._registration_guard(cfg):
-            raw = load_machine_registration(cfg)
-            record = raw.get("registration") if isinstance(raw, dict) else None
-            if not isinstance(record, dict):
-                yield False
-                return
-            self.validate_registration_record(record, binding.project_id, cfg)
-            if (
-                self.registration_state(record) != "eligible"
-                or record.get("generation") != binding.registration_generation
-                or record.get("runtime_instance_id") != binding.runtime_instance_id
-                or binding.runtime_instance_id != self._current_instance_id()
-                or record.get("runtime_root") != str(self.root)
-                or binding.runtime_root not in {None, str(self.root)}
-            ):
-                yield False
-                return
-            previous_expiry = record["eligibility_expires_at"]
-            expires_at = parse_utc(previous_expiry)
-            next_expiry = lease_expiry(policy)
-            parsed_next_expiry = parse_utc(next_expiry)
-            renew_at = expires_at - timedelta(seconds=policy.ttl_seconds - _registration_renewal_interval(policy))
-            now = datetime.now(timezone.utc)
-            horizon = now + timedelta(seconds=renewal_horizon_seconds)
-            # Derive scheduling from fenced durable state, never cached authority.
-            # Dormant round-robin callers renew early when the current lease
-            # would not survive until their next bounded service opportunity.
-            if parsed_next_expiry != expires_at and (
-                now >= renew_at or expires_at <= horizon or parsed_next_expiry < expires_at
-            ):
-                record = dict(record)
-                record["eligibility_expires_at"] = next_expiry
-                record["updated_at"] = utc_now()
-                save_machine_registration(cfg, {"registration": record})
-                _observe_registration_renewal(previous_expiry, policy, is_reactivation=False)
-            yield True
+        identity = RegistrationIdentity(
+            binding.project_id, binding.registration_generation, binding.runtime_instance_id, str(self.root)
+        )
+
+        def is_current() -> bool:
+            return binding.runtime_instance_id == self._current_instance_id() and binding.runtime_root in {
+                None,
+                str(self.root),
+            }
+
+        with registration_write_guard(
+            cfg,
+            identity,
+            is_current=is_current,
+            renewal_horizon_seconds=renewal_horizon_seconds,
+            before_shared_write=before_shared_write,
+        ) as record:
+            yield record is not None
 
     def binding_write_eligible(
         self,
@@ -854,9 +782,16 @@ class MachineRegistration:
         raise ValueError(f"machine registry has no project {candidate!r}.")
 
     def set_enabled(self, identifier: str | Path, enabled: bool) -> ProjectBinding:
-        with self.registry_guard():
-            revision, bindings = self.load_registry()
-            current = self._find_binding(bindings, identifier)
-            updated = replace(current, enabled=enabled)
-            self.save_registry_locked(revision + 1, [updated if item == current else item for item in bindings])
+        _observed_revision, observed_bindings = self.load_registry()
+        observed = self._find_binding(observed_bindings, identifier)
+        # Never hold the machine-wide registry lock while waiting for a
+        # Project-scoped commit fence owned by an isolated worker.
+        with self.binding_commit_guard(observed):
+            with self.registry_guard():
+                revision, bindings = self.load_registry()
+                current = self._find_binding(bindings, observed.project_id)
+                if current != observed:
+                    raise RuntimeError("project binding changed while enablement waited for its commit fence.")
+                updated = replace(current, enabled=enabled, _canonical_paths=True)
+                self.save_registry_locked(revision + 1, [updated if item == current else item for item in bindings])
         return updated

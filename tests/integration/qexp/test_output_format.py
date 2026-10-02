@@ -515,7 +515,9 @@ def test_project_list_human_and_json_share_the_registry_result(tmp_path: Path, c
 
     assert main(base) == 0
     human = capsys.readouterr().out
-    assert human.splitlines()[0].startswith("Project ID")
+    lines = human.splitlines()
+    assert lines[0] == "Registry revision: 1; inventory revision: 1"
+    assert lines[1].startswith("Project ID")
     assert binding["project_id"] in human
     assert str(cfg.shared_root) in human
     assert cfg.machine_name in human

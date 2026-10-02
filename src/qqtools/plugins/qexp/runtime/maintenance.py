@@ -1794,6 +1794,7 @@ def advance_maintenance_work(
             "maintenance_state": state,
             "next_due_at": selection.get("next_due_at"),
             "more": selection.get("more", False),
+            "idle_blocking": state == "waiting",
             "budget": ledger.report(),
         }
 
@@ -1801,7 +1802,9 @@ def advance_maintenance_work(
     kind = identity["kind"]
     if descriptor["state"] == "prepared":
         if _prepared_truth_committed(cfg, descriptor):
-            descriptor = activate_work(cfg, descriptor)
+            cursor = descriptor.get("cursor")
+            has_business_wake = isinstance(cursor, dict) and cursor.get("activation_mode") == "business"
+            descriptor = activate_work(cfg, descriptor, publish_activation=not has_business_wake)
         else:
             due_at = (datetime.now(timezone.utc) + timedelta(seconds=1)).isoformat()
             update_work(
@@ -1814,7 +1817,12 @@ def advance_maintenance_work(
                 failure={"code": "producer_handoff_pending", "type": "TransientWait"},
                 publish_activation=False,
             )
-            return {"maintenance_state": "waiting", "next_due_at": due_at, "budget": ledger.report()}
+            return {
+                "maintenance_state": "waiting",
+                "next_due_at": due_at,
+                "idle_blocking": False,
+                "budget": ledger.report(),
+            }
 
     if kind == "full_audit":
         progress = advance_full_audit(

@@ -11,6 +11,8 @@ import pytest
 
 from qqtools.plugins.qexp import init_shared_root
 from qqtools.plugins.qexp.agent import activation_consumer_retirement as retirement_module
+from qqtools.plugins.qexp.agent import control_plane as control_plane_module
+from qqtools.plugins.qexp.agent import dispatch_loop as dispatch_loop_module
 from qqtools.plugins.qexp.agent.context import (
     MACHINE_RUNTIME_ENV,
     MachineRuntime,
@@ -32,6 +34,7 @@ from qqtools.plugins.qexp.agent.lifecycle import (
     start_machine_agent,
     stop_machine_agent,
 )
+from qqtools.plugins.qexp.agent.project_io_executor import ProjectIOExecutor
 from qqtools.plugins.qexp.agent.setup import initialize_machine
 from qqtools.plugins.qexp.commands.cleanup import clean
 from qqtools.plugins.qexp.commands.group import create_group
@@ -54,6 +57,38 @@ from tests.helpers.qexp.clock import set_offer_evaluation_time
 from tests.helpers.qexp.lifecycle import wait_until
 
 pytestmark = [pytest.mark.integration, pytest.mark.qexp_fast_io]
+
+
+def test_isolated_control_plane_never_constructs_legacy_authority_supervisor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = init_shared_root(tmp_path / "project" / ".qexp", "gpu-1")
+    runtime = MachineRuntime(tmp_path / "machine")
+    runtime.add_binding(cfg.shared_root, cfg.machine_name)
+    executor = ProjectIOExecutor(runtime)
+    executor.begin_epoch()
+    runtime.project_io_executor = executor
+    assert dispatch_loop_module._project_io_controller(runtime) is not None
+
+    def reject_legacy_owner(*_args, **_kwargs):
+        raise AssertionError("isolated production control plane constructed AuthoritySupervisor")
+
+    monkeypatch.setattr(control_plane_module, "_AuthoritySupervisor", reject_legacy_owner)
+    plane = _MachineControlPlane(
+        runtime,
+        instance_id="test",
+        loop_interval=0.1,
+        started_at="2026-09-29T00:00:00Z",
+        available_gpus=[],
+    )
+    try:
+        assert plane._run_authority_cycle() == 0.1
+        assert plane._supervisors == {}
+    finally:
+        plane.stop()
+        runtime.attempt_supervision_coordinator.close()
+        executor.shutdown()
 
 
 def test_group_reservation_limit_is_atomic_across_provisionals(tmp_path: Path) -> None:
@@ -175,120 +210,62 @@ def test_registry_add_list_disable_and_remove_project_binding(tmp_path: Path) ->
     assert runtime.load_registry() == (3, [])
 
 
-def test_registry_removal_retires_the_exact_activation_consumer_generation(tmp_path: Path) -> None:
+def test_registry_removal_retains_the_exact_activation_consumer_retirement_intent(tmp_path: Path) -> None:
     cfg = init_shared_root(tmp_path / "project" / ".qexp", "gpu-1", runtime_root=tmp_path / "legacy-runtime")
     runtime = MachineRuntime(tmp_path / "machine-runtime")
     binding = runtime.add_binding(cfg.shared_root, cfg.machine_name)
-    runtime.working_set.reconcile([binding])
     disabled = runtime.set_enabled(binding.project_id, False)
     runtime.remove_binding(disabled.project_id)
 
-    progress = read_consumer_progress(
-        cfg.shared_root,
-        runtime_id=runtime.instance_id,
-        project_id=disabled.project_id,
-        registration_generation=disabled.registration_generation,
-    )
-    assert progress["project_activation_consumer"]["state"] == "retired"
-    assert progress["project_activation_consumer"]["identity"]["registration_generation"] == (
-        disabled.registration_generation
-    )
+    assert runtime.activation_consumer_retirements.select_pending((), limit=64) == (disabled,)
 
 
-def test_registry_removal_retries_shared_consumer_retirement_from_intent(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_registry_removal_does_not_access_shared_consumer_inline(tmp_path: Path) -> None:
     cfg = init_shared_root(tmp_path / "project" / ".qexp", "gpu-1", runtime_root=tmp_path / "legacy-runtime")
     runtime = MachineRuntime(tmp_path / "machine-runtime")
     binding = runtime.add_binding(cfg.shared_root, cfg.machine_name)
-    runtime.working_set.reconcile([binding])
     disabled = runtime.set_enabled(binding.project_id, False)
-    original_retire = retirement_module.retire_consumer_after_registration_removal
-    attempts = 0
-
-    def fail_once(*args, **kwargs):
-        nonlocal attempts
-        attempts += 1
-        if attempts == 1:
-            raise OSError("shared retirement unavailable")
-        return original_retire(*args, **kwargs)
-
-    monkeypatch.setattr(retirement_module, "retire_consumer_after_registration_removal", fail_once)
-    with pytest.raises(OSError, match="shared retirement unavailable"):
+    hidden = cfg.shared_root.with_name(".qexp-unavailable")
+    cfg.shared_root.rename(hidden)
+    try:
         runtime.remove_binding(disabled.project_id)
-    assert runtime.registration.load_registry()[1] == []
+        assert runtime.registration.load_registry()[1] == []
+    finally:
+        hidden.rename(cfg.shared_root)
 
     replacement = runtime.add_binding(cfg.shared_root, cfg.machine_name)
-    assert attempts == 2
     assert replacement.registration_generation != disabled.registration_generation
-    progress = read_consumer_progress(
-        cfg.shared_root,
-        runtime_id=runtime.instance_id,
-        project_id=disabled.project_id,
-        registration_generation=disabled.registration_generation,
-    )
-    assert progress["project_activation_consumer"]["state"] == "retired"
+    assert runtime.activation_consumer_retirements.select_pending((replacement,), limit=64) == (disabled,)
 
 
 def test_reregistration_after_removal_allocates_a_new_consumer_generation(tmp_path: Path) -> None:
     cfg = init_shared_root(tmp_path / "project" / ".qexp", "gpu-1", runtime_root=tmp_path / "legacy-runtime")
     runtime = MachineRuntime(tmp_path / "machine-runtime")
     first = runtime.add_binding(cfg.shared_root, cfg.machine_name)
-    runtime.working_set.reconcile([first])
     disabled = runtime.set_enabled(first.project_id, False)
     runtime.remove_binding(disabled.project_id)
 
     replacement = runtime.add_binding(cfg.shared_root, cfg.machine_name)
-    runtime.working_set.reconcile([replacement])
-
     assert replacement.registration_generation != disabled.registration_generation
-    replacement_progress = read_consumer_progress(
-        cfg.shared_root,
-        runtime_id=runtime.instance_id,
-        project_id=replacement.project_id,
-        registration_generation=replacement.registration_generation,
-    )
-    assert replacement_progress["project_activation_consumer"]["state"] == "active"
+    assert runtime.activation_consumer_retirements.select_pending((replacement,), limit=64) == (disabled,)
 
 
-def test_retirement_intent_survives_temporary_shared_root_absence(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_retirement_intent_recovery_does_not_access_temporarily_absent_shared_root(tmp_path: Path) -> None:
     cfg = init_shared_root(tmp_path / "project" / ".qexp", "gpu-1", runtime_root=tmp_path / "legacy-runtime")
     runtime = MachineRuntime(tmp_path / "machine-runtime")
     binding = runtime.add_binding(cfg.shared_root, cfg.machine_name)
-    runtime.working_set.reconcile([binding])
     disabled = runtime.set_enabled(binding.project_id, False)
-    original_retire = retirement_module.retire_consumer_after_registration_removal
 
-    def unavailable(*_args, **_kwargs):
-        raise OSError("shared retirement unavailable")
-
-    monkeypatch.setattr(retirement_module, "retire_consumer_after_registration_removal", unavailable)
-    with pytest.raises(OSError, match="shared retirement unavailable"):
-        runtime.remove_binding(disabled.project_id)
+    runtime.remove_binding(disabled.project_id)
 
     hidden = cfg.shared_root.with_name(".qexp-unavailable")
     cfg.shared_root.rename(hidden)
-    monkeypatch.setattr(
-        retirement_module,
-        "retire_consumer_after_registration_removal",
-        original_retire,
-    )
     try:
-        with pytest.raises(RuntimeError, match="root is unavailable"):
-            runtime.load_registry()
+        restarted = MachineRuntime(runtime.root)
+        assert restarted.load_registry()[1] == []
+        assert restarted.activation_consumer_retirements.select_pending((), limit=64) == (disabled,)
     finally:
         hidden.rename(cfg.shared_root)
-
-    runtime.load_registry()
-    progress = read_consumer_progress(
-        cfg.shared_root,
-        runtime_id=runtime.instance_id,
-        project_id=disabled.project_id,
-        registration_generation=disabled.registration_generation,
-    )
-    assert progress["project_activation_consumer"]["state"] == "retired"
 
 
 def test_retirement_recovery_scans_once_then_retries_bounded_slices(
@@ -337,18 +314,16 @@ def test_retirement_recovery_rejects_root_rename_even_when_restored(
     cfg = init_shared_root(tmp_path / "project" / ".qexp", "gpu-1", runtime_root=tmp_path / "legacy-runtime")
     runtime = MachineRuntime(tmp_path / "machine-runtime")
     binding = runtime.add_binding(cfg.shared_root, cfg.machine_name)
-    runtime.working_set.reconcile([binding])
-    disabled = runtime.set_enabled(binding.project_id, False)
-    original_retire = retirement_module.retire_consumer_after_registration_removal
-
-    monkeypatch.setattr(
-        retirement_module,
-        "retire_consumer_after_registration_removal",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("shared retirement unavailable")),
+    activation_consumers_module.register_consumer(
+        cfg.shared_root,
+        runtime_id=runtime.instance_id,
+        project_id=binding.project_id,
+        registration_generation=binding.registration_generation,
+        process_fence="process-a",
     )
-    with pytest.raises(OSError, match="shared retirement unavailable"):
-        runtime.remove_binding(disabled.project_id)
-    monkeypatch.setattr(retirement_module, "retire_consumer_after_registration_removal", original_retire)
+    disabled = runtime.set_enabled(binding.project_id, False)
+    original_retire = activation_consumers_module.retire_consumer_after_registration_removal
+    runtime.remove_binding(disabled.project_id)
 
     original_lock = activation_consumers_module._existing_activation_lock
     hidden = cfg.shared_root.with_name(".qexp-renamed")
@@ -364,10 +339,20 @@ def test_retirement_recovery_rejects_root_rename_even_when_restored(
 
     monkeypatch.setattr(activation_consumers_module, "_existing_activation_lock", rename_during_retirement)
     with pytest.raises(RuntimeError, match="root changed"):
-        runtime.load_registry()
+        original_retire(
+            cfg.shared_root,
+            runtime_id=runtime.instance_id,
+            project_id=disabled.project_id,
+            registration_generation=disabled.registration_generation,
+        )
 
     monkeypatch.setattr(activation_consumers_module, "_existing_activation_lock", original_lock)
-    runtime.load_registry()
+    original_retire(
+        cfg.shared_root,
+        runtime_id=runtime.instance_id,
+        project_id=disabled.project_id,
+        registration_generation=disabled.registration_generation,
+    )
     progress = read_consumer_progress(
         cfg.shared_root,
         runtime_id=runtime.instance_id,
@@ -377,7 +362,7 @@ def test_retirement_recovery_rejects_root_rename_even_when_restored(
     assert progress["project_activation_consumer"]["state"] == "retired"
 
 
-def test_retirement_retry_preserves_whole_batch_after_registry_failure(
+def test_retirement_retry_preserves_whole_batch_after_local_intent_read_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     cfg = init_shared_root(tmp_path / "project" / ".qexp", "gpu-1", runtime_root=tmp_path / "legacy-runtime")
@@ -388,12 +373,18 @@ def test_retirement_retry_preserves_whole_batch_after_registry_failure(
     for index in range(2):
         manager.prepare(replace(template, project_id=f"project-{index}", registration_generation=f"generation-{index}"))
 
-    monkeypatch.setattr(
-        runtime.registration,
-        "load_registry",
-        lambda: (_ for _ in ()).throw(OSError("registry unavailable")),
-    )
-    with pytest.raises(OSError, match="registry unavailable"):
+    original_read = retirement_module._read_intent
+    reads = 0
+
+    def fail_once(*args, **kwargs):
+        nonlocal reads
+        reads += 1
+        if reads == 1:
+            raise OSError("intent unavailable")
+        return original_read(*args, **kwargs)
+
+    monkeypatch.setattr(retirement_module, "_read_intent", fail_once)
+    with pytest.raises(OSError, match="intent unavailable"):
         manager.recover([], runtime.registration)
 
     assert len(manager._pending_set) == 2
@@ -1647,7 +1638,7 @@ run_machine_agent_loop(sys.argv[1], loop_interval=0.05, available_gpus=[])
             process.wait(timeout=5.0)
 
 
-def test_machine_control_heartbeat_skips_binding_without_write_eligibility(
+def test_machine_control_heartbeat_queues_without_resident_write_eligibility(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     cfg = init_shared_root(tmp_path / "project" / ".qexp", "gpu-1", runtime_root=tmp_path / "legacy")
@@ -1675,8 +1666,11 @@ def test_machine_control_heartbeat_skips_binding_without_write_eligibility(
 
     control_plane._publish_heartbeat()
 
-    assert eligibility_checks == [(binding, True)]
-    assert control_plane._heartbeat_snapshot["operations"]["counters"]["heartbeat.write_guard_rejected_projects"] == 1
+    assert eligibility_checks == []
+    intent = runtime.machine_snapshot_intent()
+    assert intent is not None
+    assert intent.bindings == (binding,)
+    assert control_plane._heartbeat_snapshot["observation_status"] == "queued"
     assert not (cfg.shared_root / "machines" / cfg.machine_name / "state" / "agent.json").exists()
 
 
@@ -1703,7 +1697,7 @@ def test_machine_agent_loop_rejects_non_main_thread_without_publishing_identity(
     assert not (runtime.paths["agent"] / "status.json").exists()
 
 
-def test_machine_control_heartbeat_is_not_blocked_by_slow_maintenance(
+def test_machine_control_snapshot_intent_is_not_blocked_by_slow_maintenance(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     cfg = init_shared_root(tmp_path / "project" / ".qexp", "gpu-1", runtime_root=tmp_path / "legacy-runtime")
@@ -1716,7 +1710,6 @@ def test_machine_control_heartbeat_is_not_blocked_by_slow_maintenance(
         started_at="2026-01-01T00:00:00Z",
         available_gpus=[],
     )
-    heartbeat_path = cfg.shared_root / "machines" / cfg.machine_name / "state" / "agent.json"
     maintenance_started = Event()
 
     def slow_maintenance(*_args, **_kwargs) -> None:
@@ -1726,8 +1719,7 @@ def test_machine_control_heartbeat_is_not_blocked_by_slow_maintenance(
     monkeypatch.setattr("qqtools.plugins.qexp.agent.dispatch_loop.maintain_project", slow_maintenance)
     control_plane.start()
     try:
-        assert heartbeat_path.exists()
-        heartbeat_path.unlink()
+        assert runtime.machine_snapshot_intent() is not None
         worker = Thread(
             target=dispatch_machine_cycle_locked,
             kwargs={
@@ -1740,11 +1732,13 @@ def test_machine_control_heartbeat_is_not_blocked_by_slow_maintenance(
         worker.start()
         assert maintenance_started.wait(timeout=1.0)
         deadline = time.monotonic() + 0.1
-        while not heartbeat_path.exists() and time.monotonic() < deadline:
+        next_intent = None
+        while next_intent is None and time.monotonic() < deadline:
+            next_intent = runtime.machine_snapshot_intent()
             time.sleep(0.005)
         worker.join(timeout=1.0)
         assert not worker.is_alive()
-        assert heartbeat_path.exists()
+        assert next_intent is not None
     finally:
         control_plane.stop()
 
@@ -2235,8 +2229,8 @@ def test_ineligible_registration_only_exit_releases_capacity_without_shared_muta
 def test_registration_renewal_diagnostics_measure_completed_publication(tmp_path, monkeypatch, is_reactivation):
     from datetime import datetime, timedelta, timezone
 
-    from qqtools.plugins.qexp.agent import registration as registration_owner
     from qqtools.plugins.qexp.lease import load_lease_policy
+    from qqtools.plugins.qexp.runtime import registration_authority as registration_owner
     from qqtools.plugins.qexp.runtime.work_budget import RuntimeDiagnostics, activate_diagnostics
 
     cfg = init_shared_root(tmp_path / "project" / ".qexp", "gpu-1", runtime_root=tmp_path / "legacy")
@@ -2296,7 +2290,7 @@ def test_registration_renewal_diagnostics_measure_completed_publication(tmp_path
 
 
 @pytest.mark.parametrize("is_due", [False, True])
-def test_heartbeat_snapshot_counts_actual_registration_publications(tmp_path, is_due):
+def test_heartbeat_snapshot_queue_does_not_claim_registration_publication(tmp_path, is_due):
     cfg = init_shared_root(tmp_path / "project" / ".qexp", "gpu-1", runtime_root=tmp_path / "legacy")
     runtime = MachineRuntime(tmp_path / "machine")
     binding = runtime.add_binding(cfg.shared_root, cfg.machine_name)
@@ -2316,16 +2310,46 @@ def test_heartbeat_snapshot_counts_actual_registration_publications(tmp_path, is
         started_at="2026-09-18T00:00:00Z",
         available_gpus=[],
     )
+    registration_path = cfg.shared_root / "machines" / cfg.machine_name / "registration.json"
+    registration_before = registration_path.read_bytes()
     plane._publish_heartbeat()
     sample = plane._heartbeat_snapshot
-    assert sample["observation_status"] == "returned"
+    assert sample["observation_status"] == "queued"
     counters = sample["operations"]["counters"]
-    # Both paths validate authority, but only the first due guard publishes.
-    assert counters.get("registration.renewal", 0) == int(is_due)
-    assert counters.get("registration.renewal_lateness.observations", 0) == int(is_due)
-    assert counters["store.atomic_replace.calls"] >= 1 + int(is_due)
-    assert (cfg.shared_root / "machines" / cfg.machine_name / "state" / "agent.json").exists()
+    assert counters.get("registration.renewal", 0) == 0
+    assert counters.get("registration.renewal_lateness.observations", 0) == 0
+    assert registration_path.read_bytes() == registration_before
+    assert not (cfg.shared_root / "machines" / cfg.machine_name / "state" / "agent.json").exists()
+    assert runtime.machine_snapshot_intent() is not None
     assert runtime.registration_status(binding)["write_eligible"]
+
+
+def test_dispatch_consumes_heartbeat_snapshot_intent_through_isolated_worker(tmp_path):
+    cfg = init_shared_root(tmp_path / "project" / ".qexp", "gpu-1", runtime_root=tmp_path / "legacy")
+    runtime = MachineRuntime(tmp_path / "machine")
+    runtime.add_binding(cfg.shared_root, cfg.machine_name)
+    executor = ProjectIOExecutor(runtime)
+    executor.begin_epoch()
+    runtime.project_io_executor = executor
+    runtime.authority_ready_generations = {}
+    plane = _MachineControlPlane(
+        runtime,
+        instance_id="test-agent",
+        loop_interval=0.25,
+        started_at="2026-09-18T00:00:00Z",
+        available_gpus=[],
+    )
+    heartbeat_path = cfg.shared_root / "machines" / cfg.machine_name / "state" / "agent.json"
+    try:
+        plane._publish_heartbeat()
+        assert plane._heartbeat_snapshot["observation_status"] == "queued"
+        deadline = time.monotonic() + 10.0
+        while not heartbeat_path.exists() and time.monotonic() < deadline:
+            dispatch_machine_cycle_locked(runtime, available_gpus=[], supervise=False, publish_snapshots=False)
+            time.sleep(0.02)
+        assert heartbeat_path.exists()
+    finally:
+        executor.shutdown()
 
 
 @pytest.mark.parametrize("lane", ["active", "provisional", "cpu_active", "cpu_provisional"])
@@ -2355,7 +2379,7 @@ def test_malformed_capacity_does_not_stop_heartbeat_and_is_retained(tmp_path, la
     try:
         status = "capacity_unavailable"
         if value == {"reservation": {"state": "active", "gpu_ids": [0, "bad"]}}:
-            status = "publication_unavailable"
+            status = "queued"
         else:
             assert plane._reserved_gpu_ids() is None
         for sequence in (1, 2):
@@ -2366,7 +2390,7 @@ def test_malformed_capacity_does_not_stop_heartbeat_and_is_retained(tmp_path, la
         path.rename(tmp_path / "retained-invalid.json")
         plane._publish_heartbeat()
         assert plane._heartbeat_snapshot["sequence"] == 3
-        assert plane._heartbeat_snapshot["observation_status"] == "returned"
+        assert plane._heartbeat_snapshot["observation_status"] == "queued"
         assert (tmp_path / "retained-invalid.json").read_bytes() == original
     finally:
         plane.stop()

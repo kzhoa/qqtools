@@ -9,7 +9,9 @@ import os
 import uuid
 from collections.abc import Iterator
 from contextlib import ExitStack, contextmanager
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 from .authority_scan import is_path_present
 from .responsibility_store import Conflict, DurableIO, Ledger, Unavailable, validate_captured_writer
@@ -47,6 +49,99 @@ def is_same_capture_owner(previous: dict, current: dict) -> bool:
 
 class CaptureBusy(Conflict):
     """Capture retention defers destructive maintenance, not compatible dispatch."""
+
+
+@dataclass(frozen=True, slots=True)
+class SourceHold:
+    """Exact durable source retention, not admission or completion authority."""
+
+    source_root: Path
+    target_root: Path
+    instance: str
+    capture_id: str
+
+    def to_dict(self) -> dict:
+        return {
+            "format": SOURCE_CAPTURE_FORMAT,
+            "runtime_root": str(self.source_root),
+            "target_root": str(self.target_root),
+            "instance": self.instance,
+            "capture_id": self.capture_id,
+            "phase": "pending",
+        }
+
+
+def source_hold_for_capture(state: dict) -> SourceHold:
+    """Derive a source identity from captured target metadata without source I/O."""
+    source, target = state.get("legacy_source"), state.get("runtime_root")
+    for value in (source, target):
+        if (
+            not isinstance(value, str)
+            or not value
+            or not Path(value).is_absolute()
+            or ".." in Path(value).parts
+            or "\x00" in value
+            or str(Path(value)) != value
+            or Path(value) == Path("/")
+        ):
+            raise Unavailable("source retention requires canonical captured runtime roots")
+    if (
+        state.get("format") != CAPTURE_FORMAT
+        or state.get("phase") != "pending"
+        or source == target
+        or not isinstance(state.get("instance"), str)
+        or len(state["instance"]) != 32
+        or any(character not in "0123456789abcdef" for character in state["instance"])
+        or not isinstance(state.get("capture_id"), str)
+        or len(state["capture_id"]) != 32
+        or any(character not in "0123456789abcdef" for character in state["capture_id"])
+        or not isinstance(state.get("pending"), list)
+        or len(state["pending"]) > CAPTURE_BATCH_SIZE
+        or (state.get("progress") is not None and not isinstance(state["progress"], dict))
+    ):
+        raise Unavailable("source retention capture identity is invalid")
+    return SourceHold(Path(source), Path(target), state["instance"], state["capture_id"])
+
+
+def _retain_source_locked(state: dict, *, before_source_write: Callable[[], None] | None = None) -> SourceHold:
+    hold = source_hold_for_capture(state)
+    if hold.source_root.resolve() != hold.source_root:
+        raise Unavailable("writer capture source is not its captured canonical root")
+    if not hold.source_root.is_dir():
+        raise Unavailable("writer capture legacy source directory is unavailable")
+    path = hold.source_root / CAPTURE_FILE
+    try:
+        existing = read_json_limited(path, max_bytes=CAPTURE_BYTES)
+    except FileNotFoundError:
+        if is_path_present(path):
+            raise Unavailable("writer capture source hold is not readable") from None
+        if state.get("progress") is not None or state["pending"]:
+            raise Unavailable("writer capture source hold disappeared after observation") from None
+        if before_source_write is not None:
+            before_source_write()
+        atomic_replace(path, hold.to_dict())
+    else:
+        if existing != hold.to_dict():
+            raise Conflict("legacy source already belongs to another writer capture")
+        if before_source_write is not None:
+            before_source_write()
+        DurableIO().sync_directory(hold.source_root, "writer_capture_source")
+    return hold
+
+
+def retain_capture_source(state: dict, *, before_source_write: Callable[[], None] | None = None) -> SourceHold:
+    """Establish/replay a hold using source ownership only and no target writes.
+
+    Caller retains the exact pending target capture and revalidates its ownership
+    before every source durability effect. Source hold replay requires the same
+    directory barrier as initial publication; visible bytes alone are no proof.
+    """
+    state = copy.deepcopy(state)
+    hold = source_hold_for_capture(state)
+    with _capture_parent_guard(hold.source_root.parent, is_exclusive=True) as acquired:
+        if not acquired:
+            raise CaptureBusy("writer source retention or cleanup is busy")
+        return _retain_source_locked(state, before_source_write=before_source_write)
 
 
 @contextmanager
@@ -148,7 +243,11 @@ class WriterCaptureCheckpoint:
         self.ledger = ledger
         if legacy_source is not None and not legacy_source.is_absolute():
             raise ValueError("writer capture source must be absolute")
-        self.legacy_source = legacy_source.resolve() if legacy_source is not None else None
+        # Source roots come from canonical runtime configuration/retained capture.
+        # Resolving them here would access foreign storage in local orchestration.
+        if legacy_source is not None and (".." in legacy_source.parts or "\x00" in str(legacy_source)):
+            raise ValueError("writer capture source must be canonical")
+        self.legacy_source = legacy_source
         if self.legacy_source == self.runtime_root:
             raise ValueError("writer capture source must differ from its target")
         self.path = self.runtime_root / CAPTURE_FILE
@@ -231,29 +330,7 @@ class WriterCaptureCheckpoint:
     def _retain_source(self) -> None:
         if self.legacy_source is None:
             return
-        if not self.legacy_source.is_dir():
-            raise Unavailable("writer capture legacy source directory is unavailable")
-        expected = {
-            "format": SOURCE_CAPTURE_FORMAT,
-            "runtime_root": str(self.legacy_source),
-            "target_root": str(self.runtime_root),
-            "instance": self.ledger.instance,
-            "capture_id": self._state["capture_id"],
-            "phase": "pending",
-        }
-        path = self.legacy_source / CAPTURE_FILE
-        try:
-            state = read_json_limited(path, max_bytes=CAPTURE_BYTES)
-        except FileNotFoundError:
-            if is_path_present(path):
-                raise Unavailable("writer capture source hold is not readable") from None
-            if self._state.get("progress") is not None or self._state["pending"]:
-                raise Unavailable("writer capture source hold disappeared after observation") from None
-            atomic_replace(path, expected)
-        else:
-            if state != expected:
-                raise Conflict("legacy source already belongs to another writer capture")
-            DurableIO().sync_directory(self.legacy_source, "writer_capture_source")
+        _retain_source_locked(self._state)
 
     @property
     def capture_id(self) -> str:
@@ -297,14 +374,14 @@ class WriterCaptureCheckpoint:
             raise
 
     def _replay(self) -> None:
-        from .responsibility_backfill import capture_local_writer
+        from .responsibility_backfill import apply_captured_writer
 
         state = self._state
         if state is None:
             raise RuntimeError("writer capture requires an active observation scope")
         for record in state["pending"]:
             source = record.get("legacy_source")
-            capture_local_writer(
+            apply_captured_writer(
                 self.ledger,
                 self.runtime_root,
                 record["identity"],
@@ -318,28 +395,63 @@ class WriterCaptureCheckpoint:
             self._state = cleared
 
     @contextmanager
-    def observe(self) -> Iterator[WriterCaptureCheckpoint]:
-        """Replay prior intent and establish durable retention before caller reads."""
+    def _loaded_state(self) -> Iterator[WriterCaptureCheckpoint]:
         if self._state is not None:
             raise Conflict("writer observation scope is already active")
+        try:
+            from .responsibility_completion import COMPLETION_FILE
+
+            if is_path_present(self.runtime_root / GENERATION_FILE):
+                raise Conflict("writer capture generation transition is pending")
+            if is_path_present(self.runtime_root / COMPLETION_FILE):
+                raise Conflict("completed writer capture cannot be reopened")
+            self._state = self._load_or_begin()
+            yield self
+        finally:
+            self._state = None
+
+    def prepare_local(self) -> dict:
+        """Durably retain target metadata before requesting separate source retention.
+
+        This does not replay pending observations, inspect the source, admit a
+        writer, or certify coverage. Existing pending batches remain recoverable.
+        """
+        with _capture_parent_guard(self.runtime_root.parent, is_exclusive=True) as acquired:
+            if not acquired:
+                raise CaptureBusy("writer target capture or cleanup is busy")
+            with self._loaded_state():
+                return copy.deepcopy(self._state)
+
+    @contextmanager
+    def observe_local(self, source_hold: SourceHold | None = None) -> Iterator[WriterCaptureCheckpoint]:
+        """Replay local intent using an exact separately established source hold.
+
+        The caller owns source-hold acquisition/consumption and the binding.
+        Durable source retention excludes destructive cleanup until target
+        completion/release; this scope neither renews nor releases that hold.
+        """
+        with _capture_parent_guard(self.runtime_root.parent, is_exclusive=True) as acquired:
+            if not acquired:
+                raise CaptureBusy("writer target capture or cleanup is busy")
+            with self._loaded_state():
+                expected = source_hold_for_capture(self._state) if self.legacy_source is not None else None
+                if source_hold != expected:
+                    raise Conflict("local writer observation requires its exact retained source hold")
+                self._replay()
+                yield self
+
+    @contextmanager
+    def observe(self) -> Iterator[WriterCaptureCheckpoint]:
+        """Replay prior intent and establish durable retention before caller reads."""
         roots = [self.runtime_root] + ([self.legacy_source] if self.legacy_source is not None else [])
         with ExitStack() as stack:
             for parent in sorted({root.parent for root in roots}):
                 if not stack.enter_context(_capture_parent_guard(parent, is_exclusive=True)):
                     raise CaptureBusy("writer capture or cleanup is busy")
-            try:
-                from .responsibility_completion import COMPLETION_FILE
-
-                if is_path_present(self.runtime_root / GENERATION_FILE):
-                    raise Conflict("writer capture generation transition is pending")
-                if is_path_present(self.runtime_root / COMPLETION_FILE):
-                    raise Conflict("completed writer capture cannot be reopened")
-                self._state = self._load_or_begin()
+            with self._loaded_state():
                 self._retain_source()
                 self._replay()
                 yield self
-            finally:
-                self._state = None
 
     def record(self, observations: list[dict], *, progress: dict | None = None) -> None:
         """Journal exact observations before publishing their Ledger memberships."""

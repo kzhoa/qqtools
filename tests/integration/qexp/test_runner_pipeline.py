@@ -147,6 +147,7 @@ def test_runner_publishes_registration_and_exit_observation_only(tmp_path: Path,
     assert "--parent-pid" in launched["command"]
     registration_path = cfg.runtime_root / "process-registrations" / f"{attempt.attempt_id}.json"
     registration = json.loads(registration_path.read_text())["process_registration"]
+    assert registration["reservation_id"] == attempt.reservation_id
     assert registration["wrapper_start_time_ticks"] is not None
     assert registration["process_group_start_time_ticks"] == FakeChild.pid + 100
     observation_path = cfg.runtime_root / "process-observations" / f"{attempt.attempt_id}.json"

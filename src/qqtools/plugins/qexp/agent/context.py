@@ -3,24 +3,27 @@
 from __future__ import annotations
 
 import errno
+import math
 import os
 import shlex
 import shutil
 import tempfile
 import time
 import uuid
+from collections.abc import Callable, Collection, Mapping, Sequence
 from contextlib import closing, contextmanager
 from contextvars import ContextVar
+from copy import deepcopy
 from dataclasses import dataclass, replace
 from hashlib import sha256
 from pathlib import Path
-from threading import RLock
+from threading import Lock, RLock
 from typing import Any, Iterator
 
 from ..config_types import RootConfig
 from ..infrastructure.host import host_instance_id as _host_instance_id
 from ..layout import load_machine_record, load_machine_registration, load_root_config
-from ..runtime.authority_scan import is_path_present, iter_evidence_files, validate_evidence_path
+from ..runtime.authority_scan import EvidenceScan, is_path_present, iter_evidence_files, validate_evidence_path
 from ..runtime.group_discovery.session_owner import GroupSourceOwner
 from ..runtime.locks import exclusive, shared
 from ..runtime.paths import local_paths, machine_project_paths, machine_runtime_paths, shared_paths
@@ -28,6 +31,7 @@ from ..runtime.records import utc_now
 from ..runtime.store import atomic_replace, iter_json, read_json
 from ..runtime.work_budget import AdaptiveBatchSizer
 from .activation_consumer_retirement import ActivationConsumerRetirements
+from .activation_wake import ActivationWakeFence
 from .bindings import ProjectBinding
 from .dispatch_probe import PrimaryProbeSession
 from .identity import MachineRuntimeUninitializedError, load_identity_record, require_fresh_runtime
@@ -104,6 +108,31 @@ class ExecutionContext:
         return self.machine_runtime.root if self.binding else self.cfg.runtime_root
 
 
+@dataclass(frozen=True, slots=True)
+class MachineSnapshotIntent:
+    """One replaceable, machine-local snapshot publication input set."""
+
+    bindings: tuple[ProjectBinding, ...]
+    registry_revision: int
+    instance_id: str
+    pid: int | None
+    visible_gpu_ids: tuple[int, ...]
+    reservations: tuple[dict[str, Any], ...]
+    heartbeat_interval_seconds: float
+    started_at: str
+    gpu_policy: dict[str, Any]
+
+
+@dataclass(frozen=True, slots=True)
+class RegistrationRenewalIntent:
+    """One replaceable, machine-local dormant-registration renewal request."""
+
+    bindings: tuple[ProjectBinding, ...]
+    registry_revision: int
+    renewal_horizon_seconds: int | float
+    heartbeat_interval_seconds: int | float
+
+
 def resolve_execution_context(cfg: RootConfig, machine_runtime_root: str | Path | None = None) -> ExecutionContext:
     """Resolve the registered machine reservation backend for a project operation."""
     return MachineRuntime(machine_runtime_root).execution_context(cfg)
@@ -114,6 +143,10 @@ class MachineRuntime:
 
     def __init__(self, root: str | Path | None = None) -> None:
         self.root = resolve_machine_runtime_root(root)
+        self._machine_snapshot_intent_lock = Lock()
+        self._pending_machine_snapshot_intent: MachineSnapshotIntent | None = None
+        self._registration_renewal_intent_lock = Lock()
+        self._pending_registration_renewal_intent: RegistrationRenewalIntent | None = None
         self._scheduler_authority_gate = RLock()
         self._scheduler_authority_pid: int | None = None
         self._registry_guard_depth: ContextVar[int] = ContextVar(f"registry_guard_depth_{id(self)}", default=0)
@@ -153,8 +186,14 @@ class MachineRuntime:
         self.upgrade_next_pass_at = 0.0
         self.notification_next_pass_at = 0.0
         self.maintenance_retry_deadlines: dict[str, tuple[ProjectBinding, float]] = {}
+        self.maintenance_retry_idle_blocked_projects: set[str] = set()
         self.upgrade_admission_blocked_projects: set[str] = set()
         self.supervisor_generations: dict[str, str | None] = {}
+        self.authority_process_scans: dict[tuple[str, ...], EvidenceScan] = {}
+        self.authority_process_offset = 0
+        self.authority_process_intents: dict[str, dict[str, Any]] = {}
+        self.authority_process_observations: dict[str, dict[str, Any]] = {}
+        self.authority_process_next_due: dict[tuple[str, ...], float] = {}
         # A direct runner may need more than one scheduler cycle to publish its
         # durable launch intent.  Keep those handoffs in process memory while
         # the machine reservation remains authoritative.  The dispatch layer
@@ -170,6 +209,128 @@ class MachineRuntime:
             recover_removed_consumer=self._recover_removed_consumer_locked,
         )
         self.working_set = BindingWorkingSet(self)
+        self.activation_wake = ActivationWakeFence(self)
+
+    def publish_machine_snapshot_intent(
+        self,
+        *,
+        bindings: Sequence[ProjectBinding],
+        registry_revision: int,
+        instance_id: str,
+        pid: int | None,
+        visible_gpu_ids: Sequence[int],
+        reservations: Sequence[Mapping[str, Any]],
+        heartbeat_interval_seconds: float,
+        started_at: str,
+        gpu_policy: Mapping[str, Any],
+    ) -> None:
+        """Replace the pending snapshot intent with copied current-cycle inputs."""
+        intent = MachineSnapshotIntent(
+            bindings=tuple(bindings),
+            registry_revision=registry_revision,
+            instance_id=instance_id,
+            pid=pid,
+            visible_gpu_ids=tuple(visible_gpu_ids),
+            reservations=tuple(deepcopy(dict(item)) for item in reservations),
+            heartbeat_interval_seconds=heartbeat_interval_seconds,
+            started_at=started_at,
+            gpu_policy=deepcopy(dict(gpu_policy)),
+        )
+        with self._machine_snapshot_intent_lock:
+            self._pending_machine_snapshot_intent = intent
+
+    def machine_snapshot_intent(
+        self,
+        *,
+        validated_project_ids: Sequence[str] | None = None,
+    ) -> MachineSnapshotIntent | None:
+        """Read the newest intent once at least one captured binding is validated."""
+        with self._machine_snapshot_intent_lock:
+            intent = self._pending_machine_snapshot_intent
+            if intent is not None and validated_project_ids is not None:
+                validated = frozenset(validated_project_ids)
+                if not any(binding.project_id in validated for binding in intent.bindings):
+                    return None
+            return intent
+
+    def publish_registration_renewal_intent(
+        self,
+        *,
+        bindings: Sequence[ProjectBinding],
+        registry_revision: int,
+        renewal_horizon_seconds: int | float,
+        heartbeat_interval_seconds: int | float,
+    ) -> None:
+        """Replace the newest renewal input with copied, validated local data."""
+        if type(registry_revision) is not int or registry_revision < 0:
+            raise ValueError("registry_revision must be a nonnegative integer.")
+        if (
+            type(renewal_horizon_seconds) not in {int, float}
+            or renewal_horizon_seconds <= 0
+            or renewal_horizon_seconds > 86_400
+            or not math.isfinite(renewal_horizon_seconds)
+        ):
+            raise ValueError("renewal_horizon_seconds must be finite and in (0, 86400].")
+        if (
+            type(heartbeat_interval_seconds) not in {int, float}
+            or heartbeat_interval_seconds <= 0
+            or heartbeat_interval_seconds > 86_400
+            or not math.isfinite(heartbeat_interval_seconds)
+        ):
+            raise ValueError("heartbeat_interval_seconds must be finite and in (0, 86400].")
+        if not isinstance(bindings, Sequence) or isinstance(bindings, str | bytes) or len(bindings) > 64:
+            raise ValueError("bindings must be a sequence of at most 64 ProjectBinding values.")
+        copied_bindings = tuple(bindings)
+        if any(not isinstance(binding, ProjectBinding) for binding in copied_bindings):
+            raise ValueError("bindings must contain only ProjectBinding values.")
+        intent = RegistrationRenewalIntent(
+            bindings=copied_bindings,
+            registry_revision=registry_revision,
+            renewal_horizon_seconds=renewal_horizon_seconds,
+            heartbeat_interval_seconds=heartbeat_interval_seconds,
+        )
+        with self._registration_renewal_intent_lock:
+            self._pending_registration_renewal_intent = intent
+
+    def registration_renewal_intent(self) -> RegistrationRenewalIntent | None:
+        """Return the newest renewal input without consuming it."""
+        with self._registration_renewal_intent_lock:
+            return self._pending_registration_renewal_intent
+
+    def complete_registration_renewal_intent(self, intent: RegistrationRenewalIntent) -> bool:
+        """Clear one exact completed batch without erasing a newer replacement."""
+        with self._registration_renewal_intent_lock:
+            if self._pending_registration_renewal_intent is not intent:
+                return False
+            self._pending_registration_renewal_intent = None
+            return True
+
+    def advance_registration_renewal_intent(
+        self,
+        intent: RegistrationRenewalIntent,
+        completed_project_ids: Collection[str],
+    ) -> tuple[bool, RegistrationRenewalIntent | None]:
+        """Remove exact completed members while retaining the rest of the batch."""
+        completed = frozenset(completed_project_ids)
+        if any(not isinstance(project_id, str) or not project_id for project_id in completed):
+            raise ValueError("completed_project_ids must contain nonempty strings.")
+        with self._registration_renewal_intent_lock:
+            if self._pending_registration_renewal_intent is not intent:
+                return False, self._pending_registration_renewal_intent
+            remaining = tuple(binding for binding in intent.bindings if binding.project_id not in completed)
+            if len(remaining) == len(intent.bindings):
+                return True, intent
+            if remaining:
+                retained = RegistrationRenewalIntent(
+                    bindings=remaining,
+                    registry_revision=intent.registry_revision,
+                    renewal_horizon_seconds=intent.renewal_horizon_seconds,
+                    heartbeat_interval_seconds=intent.heartbeat_interval_seconds,
+                )
+                self._pending_registration_renewal_intent = retained
+                return True, retained
+            self._pending_registration_renewal_intent = None
+            return True, None
 
     @property
     def instance_id(self) -> str:
@@ -248,6 +409,15 @@ class MachineRuntime:
         self.paths["cursor"].parent.mkdir(parents=True, exist_ok=True)
         self.paths["gpu_policy_observation"].parent.mkdir(parents=True, exist_ok=True)
         self.paths["gpu_policy_warnings"].parent.mkdir(parents=True, exist_ok=True)
+        for name in (
+            "project_io_root",
+            "project_io_requests",
+            "project_io_results",
+            "project_io_processes",
+            "project_io_resolved",
+        ):
+            self.paths[name].mkdir(parents=True, exist_ok=True)
+        self.paths["project_io_lock"].parent.mkdir(parents=True, exist_ok=True)
         if create_identity and not self.paths["identity"].exists():
             atomic_replace(self.paths["identity"], {"machine_runtime": {"instance_id": uuid.uuid4().hex}})
 
@@ -479,24 +649,25 @@ class MachineRuntime:
         project_id: str,
         runtime_instance_id: str,
         bindings: list[ProjectBinding],
-    ) -> None:
-        """Recover the exact shared generation before registration may reuse it."""
+    ) -> bool:
+        """Report an exact durable retirement before registration may reuse it."""
         raw = load_machine_registration(cfg)
         record = raw.get("registration") if isinstance(raw, dict) else None
         if not isinstance(record, dict):
-            return
+            return False
         generation = record.get("generation")
         if (
             record.get("runtime_instance_id") != runtime_instance_id
             or record.get("runtime_root") != str(self.root)
             or not isinstance(generation, str)
         ):
-            return
-        self.activation_consumer_retirements.recover_exact_locked(
+            return False
+        return self.activation_consumer_retirements.recover_exact_locked(
             runtime_id=runtime_instance_id,
             project_id=project_id,
             registration_generation=generation,
             shared_root=cfg.shared_root,
+            machine_name=cfg.machine_name,
             snapshot=bindings,
         )
 
@@ -637,9 +808,24 @@ class MachineRuntime:
         return self.registration.reactivate_binding(binding)
 
     @contextmanager
-    def binding_write_guard(self, binding: ProjectBinding) -> Iterator[bool]:
-        with self.registration.binding_write_guard(binding) as eligible:
+    def binding_write_guard(
+        self,
+        binding: ProjectBinding,
+        *,
+        renewal_horizon_seconds: float = 0.0,
+        before_shared_write: Callable[[], None] | None = None,
+    ) -> Iterator[bool]:
+        with self.registration.binding_write_guard(
+            binding,
+            renewal_horizon_seconds=renewal_horizon_seconds,
+            before_shared_write=before_shared_write,
+        ) as eligible:
             yield eligible
+
+    @contextmanager
+    def binding_commit_guard(self, binding: ProjectBinding, *, blocking: bool = True) -> Iterator[bool]:
+        with self.registration.binding_commit_guard(binding, blocking=blocking) as acquired:
+            yield acquired
 
     def binding_write_eligible(
         self,
@@ -1006,6 +1192,17 @@ class MachineRuntime:
         """Bound an agent sleep by the earliest in-process handoff deadline."""
         if maximum < 0:
             raise ValueError("maximum wait must not be negative")
+        project_io_executor = getattr(self, "project_io_executor", None)
+        if project_io_executor is not None:
+            try:
+                isolation = project_io_executor.status_view()
+                if (
+                    isolation["active_worker_count"] > isolation["overdue_worker_count"]
+                    or project_io_executor.has_ready_result()
+                ):
+                    maximum = min(maximum, 0.05)
+            except (OSError, RuntimeError, ValueError, KeyError, TypeError):
+                pass
         if not self.pending_launch_handoffs:
             return maximum
         now = time.monotonic()

@@ -75,6 +75,85 @@ def finish(scanner, *, limit=7):
         scanner.close()
 
 
+def test_enrolled_process_census_uses_consumed_source_hold_without_source_io(tmp_path, monkeypatch):
+    cfg, ledger, source, proc = fixture(tmp_path, monkeypatch)
+    process(proc, cfg, 101, runtime_root=source)
+    checkpoint = journal.WriterCaptureCheckpoint(ledger, cfg.runtime_root, legacy_source=source)
+    hold = journal.retain_capture_source(checkpoint.prepare_local())
+    source_bytes = (source / journal.CAPTURE_FILE).read_bytes()
+    owner = {
+        "project_id": "project-a",
+        "shared_root": str(cfg.shared_root),
+        "machine_name": cfg.machine_name,
+        "owner_root": str(tmp_path / "machine"),
+        "owner_instance": "a" * 64,
+        "registration_generation": "generation-a",
+    }
+
+    def check(path):
+        if isinstance(path, int):
+            return
+        path = Path(os.fsdecode(path))
+        if path == source.parent or source.parent in path.parents or path == cfg.shared_root:
+            pytest.fail("local process census accessed shared/source storage")
+
+    with monkeypatch.context() as guarded:
+        for obj, name in (
+            (Path, "resolve"),
+            (Path, "open"),
+            (os, "open"),
+            (os, "stat"),
+            (os, "lstat"),
+            (os, "scandir"),
+        ):
+            original = getattr(obj, name)
+
+            def local_only(path, *args, _method=original, **kwargs):
+                check(path)
+                return _method(path, *args, **kwargs)
+
+            guarded.setattr(obj, name, local_only)
+        scanner = capture.RunnerProcessCapture(cfg, ledger, source_hold=hold)
+        scanner.prepare_admission(owner)
+        finish(scanner)
+        first = ledger.lookup("task-attempt-1")
+        restarted = capture.RunnerProcessCapture(cfg, ledger, source_hold=hold)
+        restarted.prepare_admission(owner)
+        assert not restarted.restart_after_reboot()
+        assert restarted.take().entries_visited == 0
+        restarted.close()
+        assert ledger.lookup("task-attempt-1") == first
+    assert first["captured_writers"][0]["pid"] == 101
+    assert first["legacy_source"] == str(source)
+    assert (source / journal.CAPTURE_FILE).read_bytes() == source_bytes
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_process_census_never_resolves_shared_or_foreign_runner_roots(tmp_path, monkeypatch, legacy):
+    cfg, ledger, source, proc = fixture(tmp_path, monkeypatch)
+    process(proc, cfg, 101, runtime_root=source if legacy else None)
+    foreign = tmp_path / "foreign/.qexp"
+    command = (
+        "\0".join(["python", "-m", capture.RUNNER_MODULE, "--shared-root", str(foreign), "--machine", cfg.machine_name])
+        + "\0"
+    ).encode()
+    process(proc, cfg, 102, command=command)
+    original_resolve = Path.resolve
+
+    def local_resolve(path, *args, **kwargs):
+        assert path not in {cfg.shared_root, foreign}, "process census attempted shared path resolution"
+        return original_resolve(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", local_resolve)
+    scanner = capture.RunnerProcessCapture(cfg, ledger, legacy_source=source if legacy else None)
+    finish(scanner)
+    member = ledger.lookup("task-attempt-1")
+    assert member["captured_writers"][0]["pid"] == 101
+    assert member["captured_writers"][0]["start_time_ticks"] == 1010
+    if legacy:
+        assert journal.has_pending_writer_capture(source)
+
+
 @pytest.mark.parametrize("limit", [1, 7, 63, 64])
 def test_process_pages_capture_current_and_legacy_without_history(tmp_path, monkeypatch, limit):
     cfg, ledger, source, proc = fixture(tmp_path, monkeypatch)

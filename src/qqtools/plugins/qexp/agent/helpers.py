@@ -61,6 +61,13 @@ def _read_pid(runtime: MachineRuntime) -> int | None:
 
 def _machine_is_true_idle(runtime: MachineRuntime, *, has_consumed_binding: bool) -> bool:
     """Retain unfinished recovery and reservations before on-demand idle exit."""
+    project_io_executor = getattr(runtime, "project_io_executor", None)
+    if project_io_executor is not None:
+        try:
+            if project_io_executor.has_unfinished_work():
+                return False
+        except (OSError, RuntimeError, ValueError, KeyError, TypeError):
+            return False
     if getattr(runtime, "pending_launch_handoffs", {}):
         return False
     if getattr(runtime, "upgrade_discovery_unknown", False):
@@ -68,6 +75,8 @@ def _machine_is_true_idle(runtime: MachineRuntime, *, has_consumed_binding: bool
     if getattr(runtime, "upgrade_idle_blocked_projects", set()):
         return False
     if getattr(runtime, "recovery_enrollment_pending_projects", set()):
+        return False
+    if getattr(runtime, "maintenance_retry_idle_blocked_projects", set()):
         return False
     if not has_consumed_binding:
         # Startup waits until the current process has validated and consumed a binding.
@@ -87,6 +96,19 @@ def _machine_is_true_idle(runtime: MachineRuntime, *, has_consumed_binding: bool
         return False
     if resident_bindings and not global_policy.exit_when_idle:
         return False
+    if project_io_executor is not None:
+        # Every lane and the activation replay have to settle asynchronously.
+        # Never replace a missing proof by a synchronous shared-root scan here.
+        if resident_bindings or not runtime.activation_wake.is_current():
+            return False
+        try:
+            _revision, registered = runtime.load_registry_snapshot()
+            if registered and not global_policy.exit_when_idle:
+                return False
+            snapshot = reservation_snapshot(runtime.root)
+        except (OSError, RuntimeError, ValueError, KeyError, TypeError):
+            return False
+        return not snapshot.active and not snapshot.provisional
     for binding in resident_bindings:
         try:
             with closing(runtime.iter_recovery_blockers(binding, should_use_capture=True)) as blockers:

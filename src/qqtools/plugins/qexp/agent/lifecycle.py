@@ -11,7 +11,6 @@ import threading
 import time
 import traceback
 import uuid
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -36,13 +35,12 @@ from ..machine_dispatch_plan import (
     reduce_dispatch_cursor,
 )
 from ..machine_state import publish_machine_snapshots, publish_machine_stop_snapshot
-from ..notification_migration import NotificationMaintenanceWorker, notification_migration_status
+from ..notification_cleanup import cleanup_credentials
+from ..notification_migration import notification_migration_status
 from ..notifications import notification_runtime
 from ..project_maintenance import maintain_project, reconcile_reservation
-from ..runtime.group_discovery.service import MachineGroupDiscoveryWorker
 from ..runtime.group_namespace import inspect_group_authority
 from ..runtime.locks import exclusive
-from ..runtime.observation.maintenance import MachineObservationWorker
 from ..runtime.paths import local_paths, shared_paths
 from ..runtime.ready import (
     ReadyProbeBudgetExhausted,
@@ -63,8 +61,7 @@ from ..runtime.resources.reservations import (
     reservation_snapshot,
 )
 from ..runtime.store import atomic_replace, iter_json, read_json
-from ..runtime.submission_control_maintenance import MachineSubmissionControlWorker
-from ..runtime.upgrade.machine import MachineUpgradeWorker, discover_registered_upgrades, inspect_registered_upgrades
+from ..runtime.upgrade.machine import inspect_registered_upgrades
 from ..runtime.work_budget import (
     DIAGNOSTIC_PUBLISH_INTERVAL_SECONDS,
     AdaptiveBatchSizer,
@@ -107,6 +104,9 @@ from .helpers import (
 )
 from .inventory import exact_binding_for_entry, load_inventory, reconcile_live_bindings_locked
 from .project_admin import _stop_verified_legacy_agent, migrate_project
+from .project_io_controller import ProjectIOController
+from .project_io_executor import ProjectIOExecutor
+from .project_io_stop import publish_project_stop_snapshots
 from .recovery_capture import inspect_recovery_capture
 from .recovery_enrollment import RecoveryEnrollment
 from .scheduler_diagnostics import SchedulerDiagnosticStore, unavailable_summary
@@ -147,6 +147,10 @@ def get_machine_agent_status(
         process_status = {}
     if not isinstance(process_status, dict):
         process_status = {}
+    try:
+        project_io_isolation = ProjectIOExecutor(machine_runtime).status_view()
+    except Exception:
+        project_io_isolation = ProjectIOExecutor._unknown_status()
     upgrade = inspect_registered_upgrades(machine_runtime)
     try:
         diagnostics = diagnostics_status(
@@ -282,6 +286,7 @@ def get_machine_agent_status(
         "upgrade": upgrade,
         "notification_migration": notification_migration,
         "gpu_policy": gpu_policy,
+        "project_io_isolation": project_io_isolation,
         "warnings": list(gpu_policy.get("warnings", [])),
     }
     if diagnostics is not None:
@@ -354,6 +359,7 @@ def run_machine_agent_loop(
         raise MachineAgentStartError(f"machine agent is already running with pid {current_identity[0]}.")
     started_at = utc_now()
     control_plane: _MachineControlPlane | None = None
+    project_io_executor: ProjectIOExecutor | None = None
     scheduler_wakeup = threading.Event()
     stop = False
     stop_reason: str | None = None
@@ -373,12 +379,8 @@ def run_machine_agent_loop(
     readiness_view_initialized = False
     cycle_completed = False
     idle_since: float | None = None
-    upgrade_worker: MachineUpgradeWorker | None = None
-    notification_worker: NotificationMaintenanceWorker | None = None
-    discovery_worker: MachineGroupDiscoveryWorker | None = None
-    observation_worker: MachineObservationWorker | None = None
-    submission_control_worker: MachineSubmissionControlWorker | None = None
     recovery_enrollment = RecoveryEnrollment(machine_runtime)
+    machine_runtime.recovery_enrollment = recovery_enrollment
     emitted_gpu_warning_fingerprint: str | None = None
     idle_shutdown_guard = None
     agent_revision = 0
@@ -504,6 +506,13 @@ def run_machine_agent_loop(
                 raise RuntimeError("agent diagnostic publication was rejected")
 
         try:
+            project_io_executor = ProjectIOExecutor(machine_runtime)
+            project_io_executor.begin_epoch()
+            machine_runtime.project_io_executor = project_io_executor
+            # Establish the sole Project-I/O owner before any control-plane
+            # thread starts.  The lifecycle must never expose a production
+            # window where the legacy authority supervisor can claim a turn.
+            _dispatch._project_io_controller(machine_runtime)
             previous_term = signal.signal(signal.SIGTERM, request_stop)
             previous_int = signal.signal(signal.SIGINT, request_stop)
             pid_path.write_text(str(os.getpid()), encoding="utf-8")
@@ -555,16 +564,14 @@ def run_machine_agent_loop(
                 scheduler_wakeup=scheduler_wakeup,
             )
             control_plane.start()
-            discovery_worker = MachineGroupDiscoveryWorker(machine_runtime)
-            discovery_worker.start()
-            observation_worker = MachineObservationWorker(machine_runtime)
-            observation_worker.start()
-            submission_control_worker = MachineSubmissionControlWorker(machine_runtime)
-            submission_control_worker.start()
             while not stop:
                 scheduler_wakeup.clear()
                 if stop:
                     break
+                try:
+                    project_io_executor.poll()
+                except (OSError, RuntimeError, ValueError, KeyError, TypeError):
+                    pass
                 try:
                     agent_config = load_agent_config(machine_runtime)
                     policy_revision_requested = agent_config.revision
@@ -580,22 +587,9 @@ def run_machine_agent_loop(
                     # Local registry failure is retried without occupying the
                     # independent authority and heartbeat control loops.
                     pass
-                try:
-                    discovery = discover_registered_upgrades(machine_runtime)
-                    if upgrade_worker is None or not upgrade_worker.is_alive:
-                        if (
-                            discovery.get("runnable_project_ids")
-                            and time.monotonic() >= machine_runtime.upgrade_next_pass_at
-                        ):
-                            upgrade_worker = MachineUpgradeWorker(machine_runtime)
-                            upgrade_worker.start()
-                except (OSError, RuntimeError, ValueError, KeyError, TypeError):
-                    pass
-                if (
-                    notification_worker is None or not notification_worker.is_alive
-                ) and time.monotonic() >= machine_runtime.notification_next_pass_at:
-                    notification_worker = NotificationMaintenanceWorker(machine_runtime)
-                    notification_worker.start()
+                if time.monotonic() >= machine_runtime.notification_next_pass_at:
+                    cleanup_credentials(machine_runtime.root, limit=8, blocking=False)
+                    machine_runtime.notification_next_pass_at = time.monotonic() + 5.0
                 try:
                     with machine_runtime.migration_read_guard() as is_migration_clear:
                         if is_migration_clear:
@@ -610,11 +604,13 @@ def run_machine_agent_loop(
                                 publish_snapshots=False,
                             )
                             cycle_completed = True
-                            if not has_consumed_binding and (
-                                machine_runtime.last_cycle_consumed_binding
-                                or _consume_first_registered_binding(machine_runtime)
-                            ):
-                                has_consumed_binding = True
+                            if not has_consumed_binding:
+                                if getattr(machine_runtime, "project_io_executor", None) is not None:
+                                    has_consumed_binding = machine_runtime.last_cycle_consumed_binding
+                                elif machine_runtime.last_cycle_consumed_binding or _consume_first_registered_binding(
+                                    machine_runtime
+                                ):
+                                    has_consumed_binding = True
                 except (OSError, RuntimeError, ValueError, KeyError, TypeError):
                     # A transient shared-root failure must not stop supervision of other projects.
                     pass
@@ -663,6 +659,12 @@ def run_machine_agent_loop(
                             or reconciled_inventory_revision != observed_inventory_revision
                             or reconciled_registry_revision != registry_revision
                             or reconciled_policy_revision != policy_revision_requested
+                            or (
+                                project_io_executor is not None
+                                and not enabled_project_ids.issubset(
+                                    getattr(machine_runtime, "last_cycle_validated_project_ids", frozenset())
+                                )
+                            )
                         )
                         if view_changed:
                             enabled_project_ids = {
@@ -675,15 +677,29 @@ def run_machine_agent_loop(
                             entry_by_binding = {
                                 (entry.project_id, entry.shared_root): entry for entry in observed_entries
                             }
-                            reconciled_project_ids = [
-                                binding.project_id
-                                for binding in observed_bindings
-                                if binding.enabled
-                                and (entry := entry_by_binding.get((binding.project_id, binding.shared_root)))
-                                is not None
-                                and not exact_binding_for_entry(entry, observed_bindings)[1]
-                                and machine_runtime.registration_status(binding).get("write_eligible", False)
-                            ]
+                            project_io_controller = getattr(machine_runtime, "project_io_controller", None)
+                            if project_io_executor is not None and isinstance(
+                                project_io_controller, ProjectIOController
+                            ):
+                                reconciled_project_ids = [
+                                    binding.project_id
+                                    for binding in observed_bindings
+                                    if binding.enabled
+                                    and (entry := entry_by_binding.get((binding.project_id, binding.shared_root)))
+                                    is not None
+                                    and not exact_binding_for_entry(entry, observed_bindings)[1]
+                                    and project_io_controller.validated_config(binding, registry_revision) is not None
+                                ]
+                            else:
+                                reconciled_project_ids = [
+                                    binding.project_id
+                                    for binding in observed_bindings
+                                    if binding.enabled
+                                    and (entry := entry_by_binding.get((binding.project_id, binding.shared_root)))
+                                    is not None
+                                    and not exact_binding_for_entry(entry, observed_bindings)[1]
+                                    and machine_runtime.registration_status(binding).get("write_eligible", False)
+                                ]
                             enabled_projects_reconciled = enablement_view_converged and enabled_project_ids.issubset(
                                 set(reconciled_project_ids)
                             )
@@ -705,6 +721,12 @@ def run_machine_agent_loop(
                         and enabled_project_ids
                         and policy_revision_acknowledged == policy_revision_requested
                         and enabled_projects_reconciled
+                        and (
+                            project_io_executor is None
+                            or enabled_project_ids.issubset(
+                                getattr(machine_runtime, "last_cycle_validated_project_ids", frozenset())
+                            )
+                        )
                     )
                     _publish_process_status(
                         machine_runtime,
@@ -781,6 +803,12 @@ def run_machine_agent_loop(
                     idle_since = None
                 pending_wait = getattr(machine_runtime, "pending_launch_wait_seconds", None)
                 wait_seconds = pending_wait(loop_interval) if callable(pending_wait) else loop_interval
+                project_io_controller = getattr(machine_runtime, "project_io_controller", None)
+                if isinstance(project_io_controller, ProjectIOController):
+                    try:
+                        wait_seconds = project_io_controller.pending_wait_seconds(wait_seconds)
+                    except (OSError, RuntimeError, ValueError, KeyError, TypeError):
+                        pass
                 scheduler_wakeup.wait(wait_seconds)
         except BaseException as exc:
             primary_exception = exc
@@ -796,6 +824,13 @@ def run_machine_agent_loop(
             frozen_stop_reason = stop_reason or "stopped"
             stop_reason = frozen_stop_reason
             primary_exception_evidence = safe_error_facts(primary_exception) if primary_exception is not None else None
+
+            # Fence Project I/O authority before any cleanup that may itself
+            # block. Later shutdown performs the bounded signal/reap sequence.
+            if project_io_executor is None:
+                record_cleanup_step("project_io_executor_fence")
+            else:
+                run_cleanup_step("project_io_executor_fence", project_io_executor.fence_epoch)
 
             def publish_stopping_evidence() -> None:
                 evidence: dict[str, object] = {
@@ -821,111 +856,45 @@ def run_machine_agent_loop(
             run_cleanup_step("publish_stopping_evidence", publish_stopping_evidence)
             run_cleanup_step("recovery_enrollment_stop", recovery_enrollment.stop)
 
-            background_workers = {
-                "submission_control_worker_stop": submission_control_worker,
-                "observation_worker_stop": observation_worker,
-                "discovery_worker_stop": discovery_worker,
-                "upgrade_worker_stop": upgrade_worker,
-                "notification_worker_stop": notification_worker,
-            }
-            active_workers = {name: worker for name, worker in background_workers.items() if worker is not None}
-            for name, worker in background_workers.items():
-                if worker is None:
-                    record_cleanup_step(name)
-            if active_workers:
-                worker_pool = None
-                try:
-                    worker_pool = ThreadPoolExecutor(max_workers=len(active_workers))
-                except BaseException as exc:
-                    for name in active_workers:
-                        record_cleanup_step(name, exc)
-                else:
-                    futures = {}
-                    reported_worker_steps: set[str] = set()
-                    for name, worker in active_workers.items():
-                        try:
-                            futures[worker_pool.submit(worker.stop)] = name
-                        except BaseException as exc:
-                            record_cleanup_step(name, exc)
-                            reported_worker_steps.add(name)
-                    try:
-                        for future in as_completed(futures):
-                            name = futures[future]
-                            try:
-                                future.result()
-                            except BaseException as exc:
-                                record_cleanup_step(name, exc)
-                            else:
-                                record_cleanup_step(name)
-                            reported_worker_steps.add(name)
-                    except BaseException as exc:
-                        for name in active_workers.keys() - reported_worker_steps:
-                            record_cleanup_step(name, exc)
-                            reported_worker_steps.add(name)
-                    try:
-                        worker_pool.shutdown(wait=True)
-                    except BaseException as exc:
-                        record_cleanup_step("background_worker_pool_shutdown", exc)
-                    else:
-                        record_cleanup_step("background_worker_pool_shutdown")
-            else:
-                record_cleanup_step("background_worker_pool_shutdown")
-
             if control_plane is None:
                 record_cleanup_step("control_plane_stop")
             else:
                 run_cleanup_step("control_plane_stop", control_plane.stop)
 
+            def close_attempt_supervision() -> None:
+                coordinator = getattr(machine_runtime, "attempt_supervision_coordinator", None)
+                if coordinator is not None:
+                    coordinator.close()
+
+            run_cleanup_step("attempt_supervision_coordinator_close", close_attempt_supervision)
+
+            def close_progress_observation() -> None:
+                controller = getattr(machine_runtime, "project_io_controller", None)
+                if isinstance(controller, ProjectIOController):
+                    controller.progress.close()
+
+            run_cleanup_step("progress_observation_close", close_progress_observation)
+
+            if project_io_executor is None:
+                record_cleanup_step("project_io_executor_shutdown")
+            else:
+                run_cleanup_step("project_io_executor_shutdown", project_io_executor.shutdown)
+
             def publish_project_stops() -> None:
                 expected_identity = (os.getpid(), instance_id, start_ticks)
                 if _active_machine_identity(machine_runtime) != expected_identity:
                     return
-                try:
-                    gpu_policy_snapshot = show_gpu_policy(machine_runtime)
-                except (OSError, RuntimeError, ValueError, KeyError, TypeError):
-                    gpu_policy_snapshot = None
-                try:
-                    reservations = list(reservation_snapshot(machine_runtime.root).reservations)
-                    reserved = sorted({gpu_id for item in reservations for gpu_id in item.get("gpu_ids", [])})
-                except (KeyError, OSError, ValueError):
-                    reserved = []
-                try:
-                    _, registered = machine_runtime.load_registry()
-                except (OSError, RuntimeError, ValueError):
-                    registered = []
-
-                def publish_stop(binding: ProjectBinding) -> None:
-                    cfg = _helpers._binding_config(machine_runtime, binding)
-                    with machine_runtime.binding_write_guard(binding) as is_eligible:
-                        if is_eligible:
-                            publish_machine_stop_snapshot(
-                                cfg,
-                                instance_id=instance_id,
-                                pid=None,
-                                agent_mode=load_machine_policy(cfg).agent_mode,
-                                visible_gpu_ids=(
-                                    gpu_policy_snapshot.get("visible_gpu_ids") or []
-                                    if gpu_policy_snapshot is not None
-                                    else _visible_gpus(cfg)
-                                ),
-                                reserved_gpu_ids=reserved,
-                                heartbeat_interval_seconds=loop_interval,
-                                started_at=started_at,
-                                idle_since_at=None if reserved else utc_now(),
-                                stop_reason=frozen_stop_reason,
-                                gpu_policy=gpu_policy_snapshot,
-                            )
-
-                errors: list[BaseException] = []
-                with ThreadPoolExecutor(max_workers=min(4, max(1, len(registered)))) as pool:
-                    futures = [pool.submit(publish_stop, binding) for binding in registered]
-                    for future in as_completed(futures):
-                        try:
-                            future.result()
-                        except BaseException as exc:
-                            errors.append(exc)
-                if errors:
-                    raise RuntimeError(f"{len(errors)} Project stop publication(s) failed") from errors[0]
+                if project_io_executor is None:
+                    raise RuntimeError("Project stop publication requires the isolated executor.")
+                publish_project_stop_snapshots(
+                    machine_runtime,
+                    project_io_executor,
+                    instance_id=instance_id,
+                    available_gpus=available_gpus,
+                    heartbeat_interval_seconds=loop_interval,
+                    started_at=started_at,
+                    stop_reason=frozen_stop_reason,
+                )
 
             run_cleanup_step("project_stop_publications", publish_project_stops)
 
@@ -1076,10 +1045,10 @@ def _confirm_idle_shutdown(
     """Recheck demand while excluding a concurrent activation decision.
 
     Submission publishes its durable ready work before entering the same
-    lifecycle guard in ``ensure_machine_agent_started``.  Holding the guard
-    from this final dispatch through stopped-status publication closes the
-    window where activation could accept an agent that had already committed
-    to idle shutdown.
+    lifecycle guard in ``ensure_machine_agent_started``. Isolated callers check
+    captured local wake and registry identities instead of dispatching shared
+    work under that guard. Hold it through stopped-status publication so a
+    concurrent activation cannot accept an agent already committed to exit.
     """
 
     # The process already owns scheduler authority. Lifecycle operations take
@@ -1095,16 +1064,21 @@ def _confirm_idle_shutdown(
             if not is_migration_clear:
                 guard.__exit__(None, None, None)
                 return None
-            _dispatch.dispatch_machine_cycle_locked(
-                runtime,
-                available_gpus=available_gpus,
-                executor=executor,
-                instance_id=instance_id,
-                heartbeat_interval_seconds=loop_interval,
-                started_at=started_at,
-                supervise=False,
-                publish_snapshots=False,
-            )
+            if getattr(runtime, "project_io_executor", None) is not None:
+                if not runtime.activation_wake.is_current():
+                    guard.__exit__(None, None, None)
+                    return None
+            else:
+                _dispatch.dispatch_machine_cycle_locked(
+                    runtime,
+                    available_gpus=available_gpus,
+                    executor=executor,
+                    instance_id=instance_id,
+                    heartbeat_interval_seconds=loop_interval,
+                    started_at=started_at,
+                    supervise=False,
+                    publish_snapshots=False,
+                )
         if not _machine_is_true_idle(runtime, has_consumed_binding=has_consumed_binding):
             guard.__exit__(None, None, None)
             return None
@@ -1178,6 +1152,7 @@ def ensure_machine_agent_started(
     if machine_runtime.paths["replacement_transaction"].exists():
         raise MachineAgentStartBlockedError("machine agent start is blocked by a pending machine replacement.")
     with machine_runtime.agent_lifecycle_guard():
+        machine_runtime.activation_wake.publish_locked()
         status = get_machine_agent_status(machine_runtime)
         if status["is_running"]:
             return None, status

@@ -111,9 +111,7 @@ def ensure_managed_project_agent_active(
     managed = managed_project_agent_status(cfg, machine_runtime=machine_runtime)
     if managed is None:
         return None
-    runtime, _binding, status = managed
-    if status["is_running"]:
-        return "already_running", status
+    runtime, _binding, _status = managed
     try:
         is_started, status = _ensure_machine_agent_started(runtime)
     except MachineAgentStartBlockedError as exc:
@@ -124,7 +122,9 @@ def ensure_managed_project_agent_active(
         raise AgentActivationError(
             f"machine agent could not be started: {exc}", next_action=_agent_start_command(runtime)
         ) from exc
-    return ("started" if is_started else "already_running"), status
+    if is_started:
+        return "started", status
+    return "already_running", {**_status, **status}
 
 
 def ensure_local_agent_active(cfg: RootConfig, *, reason: str, machine_runtime: MachineRuntime | None = None) -> bool:

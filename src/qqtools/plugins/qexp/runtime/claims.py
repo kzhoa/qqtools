@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Callable
 
 from ..config_types import RootConfig
 from .group_discovery.changes import record_task_change
@@ -13,7 +13,14 @@ from .store import CASConflict, create_if_absent, iter_json, read_json
 from .tasks import load_task, save_task
 
 
-def archive_claim(cfg: RootConfig, task_id: str, claim: dict[str, Any], reason: str) -> bool:
+def archive_claim(
+    cfg: RootConfig,
+    task_id: str,
+    claim: dict[str, Any],
+    reason: str,
+    *,
+    mutation_fence: Callable[[], None] | None = None,
+) -> bool:
     """Persist one immutable terminal record for a fenced claim."""
     token = claim.get("fencing_token")
     if not isinstance(token, int):
@@ -32,11 +39,15 @@ def archive_claim(cfg: RootConfig, task_id: str, claim: dict[str, Any], reason: 
         }
     }
     try:
+        if mutation_fence is not None:
+            mutation_fence()
         create_if_absent(path, record)
     except CASConflict:
         return True
     except OSError:
         try:
+            if mutation_fence is not None:
+                mutation_fence()
             create_if_absent(pending_path, record)
         except (CASConflict, OSError):
             pass

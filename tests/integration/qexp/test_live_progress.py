@@ -331,11 +331,17 @@ def test_cleanup_removes_progress_sidecars(cfg, monkeypatch):
     p = projector(cfg)
     p.tick()
     p.close()
+    for version in (1, 2):
+        path = cfg.runtime_root / "progress-coordinator" / f"v{version}" / f"{attempt.attempt_id}.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        replace_advisory_snapshot(path, {"cadence": {}})
     clean(cfg, task_id=task.task_id, reservation_runtime_root=cfg.runtime_root)
     assert not (cfg.shared_root / "progress" / task.task_id).exists()
     assert not local_progress_path(cfg.runtime_root, attempt.attempt_id).parent.exists()
     for directory in ("progress-contexts", "progress-observed", "progress-diagnostics"):
         assert not (cfg.runtime_root / directory / f"{attempt.attempt_id}.json").exists()
+    for version in (1, 2):
+        assert not (cfg.runtime_root / "progress-coordinator" / f"v{version}" / f"{attempt.attempt_id}.json").exists()
 
 
 def test_real_guardian_inherits_channel_and_runs_public_api(cfg, monkeypatch):
@@ -385,85 +391,29 @@ def test_real_guardian_inherits_channel_and_runs_public_api(cfg, monkeypatch):
     assert read_logs(cfg, task.task_id).strip() == "done"
 
 
-def test_progress_loop_is_separate_and_stop_is_bounded(monkeypatch, tmp_path):
-    import threading
-    import time
+def test_idle_progress_coordinator_does_not_poll_shared_registration(tmp_path):
     from types import SimpleNamespace
 
-    from qqtools.plugins.qexp.agent import progress_loop
+    from qqtools.plugins.qexp.agent.bindings import ProjectBinding
+    from qqtools.plugins.qexp.agent.progress_coordinator import ProgressObservationCoordinator
 
-    entered, release = threading.Event(), threading.Event()
-    binding = SimpleNamespace(project_id="p", registration_generation="g", enabled=True)
-    runtime_root = tmp_path / "project-runtime"
-    mailbox = runtime_root / "progress" / "attempt" / "latest.json"
-    mailbox.parent.mkdir(parents=True)
-    mailbox.write_text("{}")
-
-    class Runtime:
-        def load_registry(self):
-            return 1, [binding]
-
-        def project_paths(self, project_id):
-            assert project_id == "p"
-            return {"root": runtime_root}
-
-        def binding_state(self, selected):
-            return "enabled"
-
-        def binding_write_eligible(self, selected, *, renew=False):
-            assert selected is binding
-            assert renew is False
-            return True
-
-    class SlowProjector:
-        def __init__(self, cfg, **kwargs):
-            assert kwargs["registration_generation"] == "g"
-
-        def tick(self):
-            entered.set()
-            release.wait(5)
-
-        def close(self):
-            pass
-
-    monkeypatch.setattr(progress_loop, "ProgressProjector", SlowProjector)
-    monkeypatch.setattr(progress_loop.helpers, "_binding_config", lambda *args: object())
-    loop = progress_loop.ProgressObservationLoop(Runtime())
-    try:
-        loop.start()
-        assert entered.wait(2)
-        assert loop._thread.name == "qexp-machine-progress"
-        assert loop._thread.daemon
-        before = time.monotonic()
-        loop.stop()
-        assert time.monotonic() - before < 2
-    finally:
-        release.set()
-        loop.stop()
-
-
-def test_idle_progress_loop_does_not_poll_shared_registration(monkeypatch, tmp_path):
-    from types import SimpleNamespace
-
-    from qqtools.plugins.qexp.agent import progress_loop
-
-    binding = SimpleNamespace(project_id="p", registration_generation="g", enabled=True)
+    binding = ProjectBinding.from_canonical_paths("p", tmp_path / "project/.qexp", "gpu-1", registration_generation="g")
     runtime_root = tmp_path / "project-runtime"
     runtime_root.mkdir()
 
     class Runtime:
-        def load_registry(self):
-            return 1, [binding]
-
         def project_paths(self, project_id):
             return {"root": runtime_root}
 
-        def binding_state(self, selected):
-            return "enabled"
-
         def binding_write_eligible(self, *args, **kwargs):
-            pytest.fail("idle progress loop touched shared registration")
+            pytest.fail("idle progress coordinator touched shared registration")
 
-    loop = progress_loop.ProgressObservationLoop(Runtime())
-    loop.cycle()
-    assert not loop._projectors
+    calls = []
+    controller = SimpleNamespace(
+        executor=SimpleNamespace(unresolved_requests=lambda: ()),
+        advance_progress_projection=lambda _bindings, _revision, parameters: calls.append(parameters) or {},
+    )
+    coordinator = ProgressObservationCoordinator(Runtime())
+    coordinator.advance(controller, [binding], 1)
+    assert calls == [{}]
+    assert all(not entry.projectors for entry in coordinator._entries.values())

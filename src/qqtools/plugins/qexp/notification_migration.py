@@ -7,7 +7,6 @@ import os
 import stat
 import time
 from pathlib import Path
-from threading import Event, Thread
 from typing import Any
 
 from .agent.bindings import ProjectBinding
@@ -21,38 +20,6 @@ from .runtime.store import atomic_replace
 _CURSOR_SCHEMA_VERSION = 1
 _MAX_CURSOR_BYTES = 4096
 _CURSOR_NAME = "migration-cursor.json"
-
-
-class NotificationMaintenanceWorker:
-    """Advance a bounded notification migration and retention pass off the scheduler thread."""
-
-    def __init__(self, runtime: MachineRuntime) -> None:
-        self.runtime = runtime
-        self._stop = Event()
-        self._thread = Thread(target=self._run, name="qexp-notification-maintenance", daemon=True)
-
-    @property
-    def is_alive(self) -> bool:
-        return self._thread.is_alive()
-
-    def start(self) -> None:
-        self._thread.start()
-
-    def stop(self) -> None:
-        self._stop.set()
-        if self._thread.is_alive():
-            self._thread.join(timeout=2.0)
-
-    def _run(self) -> None:
-        try:
-            if not self._stop.is_set():
-                advance_notification_migration(self.runtime, limit=4)
-            if not self._stop.is_set():
-                cleanup_credentials(self.runtime.root, limit=8)
-        except (OSError, RuntimeError, ValueError):
-            pass
-        finally:
-            self.runtime.notification_next_pass_at = time.monotonic() + 5.0
 
 
 def _private_file_stat(value: os.stat_result) -> None:
@@ -250,7 +217,8 @@ def advance_notification_migration(runtime: MachineRuntime, *, limit: int = 4) -
         ValueError: If ``limit`` is not a positive integer or cursor storage is unsafe.
         OSError: If cursor storage cannot be read or durably replaced.
 
-    Call this from the machine maintenance worker, not the scheduling thread.
+    This synchronous public maintenance entry is not used by the global agent;
+    its isolated notification handler calls the same reconciliation transaction.
     """
     if type(limit) is not int or limit < 1:
         raise ValueError("limit must be a positive integer.")

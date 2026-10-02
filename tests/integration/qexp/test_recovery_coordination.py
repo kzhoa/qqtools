@@ -1,5 +1,6 @@
 """Lifecycle coordination separates productive steps from external waits."""
 
+import time
 from concurrent.futures import ThreadPoolExecutor
 from threading import Event
 from types import SimpleNamespace
@@ -7,12 +8,14 @@ from types import SimpleNamespace
 import pytest
 
 from qqtools.plugins.qexp import init_shared_root
-from qqtools.plugins.qexp.agent import dispatch_loop, recovery_enrollment
+from qqtools.plugins.qexp.agent import dispatch_loop
 from qqtools.plugins.qexp.agent.context import MachineRuntime
-from qqtools.plugins.qexp.agent.recovery_capture import RecoveryProgress
+from qqtools.plugins.qexp.agent.project_io_controller import ProjectIOController
+from qqtools.plugins.qexp.agent.project_io_executor import ProjectIOExecutor
 from qqtools.plugins.qexp.agent.recovery_enrollment import RecoveryEnrollment
 from qqtools.plugins.qexp.runtime.group_discovery import service
-from qqtools.plugins.qexp.runtime.store import read_json
+from qqtools.plugins.qexp.runtime.store import atomic_replace, read_json
+from tests.helpers.qexp.lifecycle import wait_until
 
 pytestmark = [pytest.mark.integration, pytest.mark.qexp_fast_io]
 
@@ -59,45 +62,72 @@ def test_dispatch_allows_registration_but_excludes_migration_and_rollback(tmp_pa
     assert not runtime.paths["registration_transaction"].exists()
 
 
-def test_productive_binding_continues_while_waiting_binding_observes_own_backoff(tmp_path, monkeypatch):
+@pytest.mark.parametrize("has_scheduler_services", [False, True])
+def test_productive_binding_continues_while_waiting_binding_observes_own_backoff(
+    tmp_path, monkeypatch, has_scheduler_services
+):
     runtime = MachineRuntime(tmp_path / "machine")
     _, waiting = register(tmp_path, runtime, "waiting")
     _, advancing = register(tmp_path, runtime, "advancing")
     now = [10.0]
-    monkeypatch.setattr(recovery_enrollment, "time", SimpleNamespace(monotonic=lambda: now[0]))
+    atomic_replace(runtime.migration_path(waiting.project_id), {"migration": {"state": "prepared"}})
     enrollment = RecoveryEnrollment(runtime)
-    calls = []
-    complete = False
+    executor = ProjectIOExecutor(runtime)
+    controller = ProjectIOController(runtime, executor, monotonic=lambda: now[0])
+    starts = []
+    start = executor.start
 
-    def advance(binding, *, should_prepare_only):
-        calls.append(binding)
-        if complete:
-            return RecoveryProgress.COMPLETE
-        return RecoveryProgress.WAITING if binding == waiting else RecoveryProgress.ADVANCED
+    def observe_start(request_id, **kwargs):
+        request = executor._load_request(request_id)
+        if request.project_id == waiting.project_id and request.operation_kind == "recovery_admission":
+            starts.append(request_id)
+        return start(request_id, **kwargs)
 
-    monkeypatch.setattr(enrollment, "_advance_binding", advance)
+    monkeypatch.setattr(executor, "start", observe_start)
 
-    def run_pass():
-        enrollment._advance_pass()
-        enrollment._refresh_pending()
+    def advance():
+        revision, bindings = runtime.load_registry_snapshot()
+        with controller.admission_turn():
+            if has_scheduler_services:
+                controller.advance_scheduler_observations([advancing], revision, lane="gpu", admission_role="primary")
+                controller.advance_scheduler_claims(
+                    [advancing],
+                    revision,
+                    lane="gpu",
+                    admission_role="primary",
+                    observations={},
+                    available_gpu_ids=[],
+                    available_cpu_slots=0,
+                )
+            enrollment.advance(controller, bindings, revision)
+
+    def healthy_completed():
+        advance()
+        return advancing in enrollment._settled
+
+    def all_completed():
+        advance()
+        return not runtime.recovery_enrollment_pending_projects
 
     try:
-        run_pass()
-        assert len(calls) == 2 and set(calls) == {waiting, advancing}
-        run_pass()
-        assert len(calls) == 3 and calls[-1] == advancing
-        assert runtime.recovery_enrollment_pending_projects == {waiting.project_id, advancing.project_id}
-        complete = True
-        run_pass()
-        assert enrollment._settled == {advancing}
-        run_pass()
-        assert enrollment._thread is None
-        now[0] += recovery_enrollment.PASS_INTERVAL_SECONDS
-        run_pass()
-        assert enrollment._settled == {waiting, advancing}
-        assert not runtime.recovery_enrollment_pending_projects
+        with runtime.scheduler_authority() as acquired:
+            assert acquired
+            executor.begin_epoch()
+            wait_until("productive-binding-settled", healthy_completed, stage="recovery-enrollment:backoff", timeout=20)
+            assert starts and len(starts) == 1
+            assert runtime.recovery_enrollment_pending_projects == {waiting.project_id}
+            runtime.migration_path(waiting.project_id).unlink()
+            now[0] += 0.999
+            for _ in range(3):
+                advance()
+                assert len(starts) == 1
+            now[0] += 0.001
+            wait_until("waiting-binding-resumed", all_completed, stage="recovery-enrollment:retry", timeout=20)
+            assert len(starts) == 2
+            assert enrollment._settled == {waiting, advancing}
     finally:
         enrollment.stop()
+        executor.shutdown()
 
 
 def test_group_discovery_cooldown_does_not_recheck_shared_authority(tmp_path, monkeypatch):
@@ -114,43 +144,40 @@ def test_group_discovery_cooldown_does_not_recheck_shared_authority(tmp_path, mo
     assert checks == [binding]
 
 
-def test_slow_capture_shutdown_retains_scheduler_authority_until_worker_stops(tmp_path, monkeypatch):
+def test_slow_capture_shutdown_fences_workers_before_releasing_scheduler_authority(tmp_path):
+    from qqtools.plugins.qexp.runtime.locks import machine_lock
+
     runtime = MachineRuntime(tmp_path / "machine")
-    register(tmp_path, runtime, "project")
+    cfg, binding = register(tmp_path, runtime, "project")
     enrollment = RecoveryEnrollment(runtime)
-    entered, release, stopping, stopped = Event(), Event(), Event(), Event()
-
-    def capture_step(capture):
-        entered.set()
-        assert release.wait(10)
-        return RecoveryProgress.WAITING
-
-    monkeypatch.setattr(recovery_enrollment.RecoveryCapture, "advance_step", capture_step)
-
-    def own_agent():
+    executor = ProjectIOExecutor(runtime)
+    controller = ProjectIOController(runtime, executor)
+    registration_path = cfg.shared_root / "machines" / cfg.machine_name / "registration.json"
+    before = registration_path.read_bytes()
+    try:
         with runtime.scheduler_authority() as acquired:
             assert acquired
-            enrollment.poll()
-            assert entered.wait(5)
-            stopping.set()
-            enrollment.stop()
-        stopped.set()
-
-    with ThreadPoolExecutor(max_workers=1) as pool:
-        owner = pool.submit(own_agent)
-        try:
-            assert stopping.wait(5)
-            # Exercise the former two-second join timeout while capture is held
-            # at an explicit signal. A successor must remain excluded throughout.
-            assert not stopped.wait(2.2)
-            successor = MachineRuntime(runtime.root)
-            with successor.scheduler_authority() as acquired:
-                assert not acquired
-        finally:
-            release.set()
-        owner.result(timeout=5)
-    assert stopped.is_set()
-    assert not enrollment._thread.is_alive()
+            executor.begin_epoch()
+            with machine_lock(binding.shared_root, binding.machine_name) as acquired:
+                assert acquired
+                revision, bindings = runtime.load_registry_snapshot()
+                with controller.admission_turn():
+                    enrollment.advance(controller, bindings, revision)
+                assert executor.status_view()["active_worker_count"] == 1
+                executor.fence_epoch()
+                started = time.monotonic()
+                enrollment.stop()
+                assert time.monotonic() - started < 1.0
+                with MachineRuntime(runtime.root).scheduler_authority() as acquired:
+                    assert not acquired
+                status = executor.shutdown()
+                assert time.monotonic() - started < 5.0
+                assert not executor._load_epoch().active
+                assert status["active_worker_count"] == status["exit_unverified_worker_count"] == 0
+                assert registration_path.read_bytes() == before
+    finally:
+        enrollment.stop()
+        executor.shutdown()
     with MachineRuntime(runtime.root).scheduler_authority() as acquired:
         assert acquired
 

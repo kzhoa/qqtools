@@ -3,9 +3,11 @@ from __future__ import annotations
 import base64
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
+from qqtools.plugins.qexp.agent import scheduler_diagnostics as diagnostic_module
 from qqtools.plugins.qexp.agent.bindings import ProjectBinding
 from qqtools.plugins.qexp.agent.context import MachineRuntime
 from qqtools.plugins.qexp.agent.dispatch_loop import (
@@ -15,6 +17,12 @@ from qqtools.plugins.qexp.agent.dispatch_loop import (
 )
 from qqtools.plugins.qexp.agent.inventory import InventoryReconciliation, ProjectInventoryEntry
 from qqtools.plugins.qexp.agent.scheduler_diagnostics import SchedulerDiagnosticStore
+
+
+@pytest.fixture(autouse=True)
+def _deterministic_publication_clock(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep store-contract tests independent of host filesystem latency."""
+    monkeypatch.setattr(diagnostic_module, "time", SimpleNamespace(monotonic_ns=lambda: 0))
 
 
 def _identity(index: int = 1, *, project_id: str = "project-a") -> dict[str, object]:
@@ -472,7 +480,10 @@ def test_cycle_publication_materializes_bounded_decision_and_finding(tmp_path: P
     assert len(summary["decision_samples"]) == 1
 
 
-def test_decision_retention_evicts_at_sixty_five_identities(tmp_path: Path) -> None:
+def test_decision_retention_evicts_at_sixty_five_identities(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # Retention is a record-count contract, not a host filesystem speed test.
+    # Deadline enforcement has a separate deterministic boundary test below.
+    monkeypatch.setattr(diagnostic_module, "time", SimpleNamespace(monotonic_ns=lambda: 0))
     runtime = MachineRuntime(tmp_path / "machine-runtime")
     store = SchedulerDiagnosticStore(runtime)
     for index in range(65):
@@ -488,6 +499,27 @@ def test_decision_retention_evicts_at_sixty_five_identities(tmp_path: Path) -> N
     decision_paths = list((runtime.root / "diagnostics" / "scheduler-v1" / "decisions").glob("*.json"))
     assert len(decision_paths) == 64
     assert store.summary_view()["status"] == "available"
+
+
+def test_publication_deadline_rejects_late_work_without_spending_budget(monkeypatch: pytest.MonkeyPatch) -> None:
+    now_ns = [100]
+    monkeypatch.setattr(diagnostic_module, "time", SimpleNamespace(monotonic_ns=lambda: now_ns[0]))
+    budget = diagnostic_module._WriteBudget(0)
+    now_ns[0] += diagnostic_module.MAX_PUBLICATION_ADMISSION_NS
+    budget.admit(7)
+    assert (budget.operations, budget.encoded_bytes) == (1, 7)
+    now_ns[0] += 1
+    with pytest.raises(OSError, match="publication_admission_deadline"):
+        budget.admit(11)
+    assert (budget.operations, budget.encoded_bytes) == (1, 7)
+    budget.admit(11, final=True)
+    assert (budget.operations, budget.encoded_bytes) == (2, 18)
+    with pytest.raises(OSError, match="publication_byte_limit"):
+        budget.admit(diagnostic_module.MAX_PUBLICATION_BYTES, final=True)
+    assert (budget.operations, budget.encoded_bytes) == (2, 18)
+    budget.operations = diagnostic_module.MAX_PUBLICATION_OPERATIONS
+    with pytest.raises(OSError, match="publication_operation_limit"):
+        budget.admit(0, final=True)
 
 
 def test_pending_resolution_forces_incomplete_views_until_recovery(

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -23,7 +24,7 @@ from .layout import project_id as layout_project_id
 from .layout import shared_attempt_log_path
 from .observer_provisioning import observer_lock, submit_observer_job
 from .runtime.paths import attempt_path, local_paths, shared_paths
-from .runtime.records import AttemptRecord
+from .runtime.records import AttemptRecord, validate_identifier
 from .runtime.store import read_json
 from .runtime.tasks import load_task
 from .runtime.work_budget import diagnostic_span
@@ -39,6 +40,39 @@ _LAUNCH_FAILURE_CODES = frozenset(
     }
 )
 _DIAGNOSTIC_LIMIT = 512
+_LOWERCASE_HEX_32 = re.compile(r"[0-9a-f]{32}\Z")
+
+
+def _validate_authorized_claim_identity(value: object) -> dict[str, Any]:
+    """Validate the exact machine-issued claim ticket without reading Project state."""
+    fields = {"task_id", "attempt_id", "attempt_number", "fencing_token", "reservation_id"}
+    if not isinstance(value, Mapping) or set(value) != fields:
+        raise ValueError("authorized launch claim identity must contain the exact required fields.")
+    identity = dict(value)
+    task_id = identity["task_id"]
+    attempt_id = identity["attempt_id"]
+    reservation_id = identity["reservation_id"]
+    attempt_number = identity["attempt_number"]
+    fencing_token = identity["fencing_token"]
+    try:
+        task_id = validate_identifier(task_id, "authorized launch task_id")
+    except ValueError as exc:
+        raise ValueError("authorized launch task_id is invalid.") from exc
+    if type(attempt_number) is not int or attempt_number < 1:
+        raise ValueError("authorized launch attempt_number must be a positive integer.")
+    if type(fencing_token) is not int or fencing_token < 1:
+        raise ValueError("authorized launch fencing_token must be a positive integer.")
+    try:
+        attempt_id = validate_identifier(attempt_id, "authorized launch attempt_id")
+    except ValueError as exc:
+        raise ValueError("authorized launch attempt_id is invalid.") from exc
+    if attempt_id != f"{task_id}-attempt-{attempt_number}":
+        raise ValueError("authorized launch attempt identity is inconsistent.")
+    try:
+        validate_identifier(reservation_id, "authorized launch reservation_id")
+    except ValueError as exc:
+        raise ValueError("authorized launch reservation_id is invalid.") from exc
+    return identity
 
 
 @dataclass(slots=True, eq=False)
@@ -521,6 +555,57 @@ class Executor:
             ) from exc
 
         return handle, self._launch_handoff(cfg, attempt.attempt_id, timeout_seconds, handle)
+
+    def initiate_authorized_attempt(
+        self,
+        cfg: RootConfig,
+        *,
+        claim_identity: Mapping[str, Any],
+        launch_id: str,
+        launch_handoff_timeout_seconds: int | float,
+    ) -> tuple[LaunchHandle, LaunchHandoff]:
+        """Start a runner from an exact isolated authorization ticket.
+
+        This entry point does not inspect Project state or open the shared
+        Attempt log. The runner validates shared authority and publishes its
+        launch intent after it starts.
+        """
+        identity = _validate_authorized_claim_identity(claim_identity)
+        if not isinstance(launch_id, str) or _LOWERCASE_HEX_32.fullmatch(launch_id) is None:
+            raise ValueError("authorized launch_id must be a lowercase 32-character hexadecimal ID.")
+        timeout_seconds = validate_launch_handoff_timeout_seconds(launch_handoff_timeout_seconds)
+
+        task_id = identity["task_id"]
+        attempt_id = identity["attempt_id"]
+        try:
+            process = self.spawn_runner(
+                self.build_runner_argv(
+                    cfg,
+                    task_id,
+                    attempt_id,
+                    identity["fencing_token"],
+                    launch_id,
+                ),
+                cwd=str(cfg.runtime_root),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                env=os.environ.copy(),
+                start_new_session=True,
+            )
+        except Exception as exc:
+            raise ExecutorLaunchBackendError(f"direct runner launch failed: {exc}") from exc
+
+        handle = LaunchHandle("detached", process, runner_process=process)
+        try:
+            _start_runner_reaper(process)
+        except Exception as exc:
+            raise ExecutorLaunchBackendError(
+                f"direct runner reaper failed: {exc}",
+                handle=handle,
+            ) from exc
+
+        return handle, self._launch_handoff(cfg, attempt_id, timeout_seconds, handle)
 
     def attach_observer(
         self,

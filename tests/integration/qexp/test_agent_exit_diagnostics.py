@@ -163,6 +163,8 @@ def test_foreground_sigterm_records_signal_and_completed_cleanup(
     assert summary["reason"] == "stopped_by_signal"
     assert summary["handled_signal"] == signal.SIGTERM
     assert summary["cleanup_outcome"] == "succeeded"
+    cleanup_steps = list(record["writers"]["agent"]["cleanup_steps"])
+    assert cleanup_steps.index("project_io_executor_fence") < cleanup_steps.index("recovery_enrollment_stop")
     status = read_json(runtime.paths["agent"] / "status.json")["machine_agent"]
     assert status["state"] == "stopped"
     assert status["stop_reason"] == "stopped_by_signal"

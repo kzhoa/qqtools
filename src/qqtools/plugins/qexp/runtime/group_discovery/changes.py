@@ -10,7 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, Any, Iterator
+from typing import TYPE_CHECKING, Any, Callable, Iterator
 
 from ...config_types import RootConfig
 from ..group_namespace import is_group_authority_isolated
@@ -122,10 +122,10 @@ def _before_evidence(
     }
 
 
-def _invalidate_after_io_error(journal: GroupRechecks) -> None:
+def _invalidate_after_io_error(journal: GroupRechecks, mutation_fence: Callable[[], None] | None = None) -> None:
     """Invalidate a partially published ticket, allowing its original error."""
 
-    journal.invalidate()
+    journal.invalidate(before_write=mutation_fence)
 
 
 @contextmanager
@@ -135,6 +135,7 @@ def record_task_change(
     owner: str,
     *,
     details: dict[str, Any] | None = None,
+    mutation_fence: Callable[[], None] | None = None,
 ) -> Iterator[None]:
     """Record one Group Task change before the caller applies its authority effect.
 
@@ -151,7 +152,13 @@ def record_task_change(
     # remains enabled; publication becomes mandatory after the writer fence.
     from .service import publish_group_locator_for_transition
 
-    publish_group_locator_for_transition(cfg, task.group_name, "control", "task_change")
+    publish_group_locator_for_transition(
+        cfg,
+        task.group_name,
+        "control",
+        "task_change",
+        before_write=mutation_fence,
+    )
 
     journal = GroupRechecks(cfg.shared_root, task.group_name)
     if journal.snapshot() is None:
@@ -160,7 +167,13 @@ def record_task_change(
 
     # The recheck ticket becomes eligible for metadata reclamation once its
     # settlement closes; publish maintenance work before beginning that ticket.
-    publish_group_locator_for_transition(cfg, task.group_name, "maintenance", "metadata_cleanup")
+    publish_group_locator_for_transition(
+        cfg,
+        task.group_name,
+        "maintenance",
+        "metadata_cleanup",
+        before_write=mutation_fence,
+    )
 
     persisted_task = load_task(cfg, task.task_id)
     evidence = _before_evidence(cfg, persisted_task, {} if details is None else details)
@@ -171,9 +184,10 @@ def record_task_change(
             task.group_membership_sequence,
             owner,
             evidence,
+            before_write=mutation_fence,
         )
     except OSError:
-        _invalidate_after_io_error(journal)
+        _invalidate_after_io_error(journal, mutation_fence)
         ticket = None
 
     if ticket is None:
@@ -185,9 +199,9 @@ def record_task_change(
     except BaseException:
         raise
     try:
-        journal.resolve(ticket)
+        journal.resolve(ticket, before_write=mutation_fence)
     except OSError:
-        _invalidate_after_io_error(journal)
+        _invalidate_after_io_error(journal, mutation_fence)
         return
 
 

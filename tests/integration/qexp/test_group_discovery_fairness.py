@@ -129,6 +129,9 @@ def test_disabled_binding_ack_indexes_resources_once(tmp_path, monkeypatch):
             return super().values()
 
     class WorkingSet:
+        def is_lane_quiescent(self, item, lane):
+            return False
+
         def begin_turn(self, item, lane):
             return item, lane
 

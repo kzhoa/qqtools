@@ -24,7 +24,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Callable
 
 from ...agent.context import MachineRuntime, ProjectBinding
 from ...agent.working_set import BindingTurn
@@ -42,6 +42,7 @@ from ..paths import group_path, shared_paths, submission_path
 from ..project_activation import project_activation_transaction
 from ..records import validate_group_name, validate_identifier
 from ..store import atomic_replace, read_json_limited, require_json_size
+from .control import GroupControlCursor, advance_group_control_rechecks
 from .slice_io import SliceIO
 from .source_revision import SourceRevision
 from .source_sweep import SubmissionSourceSweep
@@ -74,6 +75,67 @@ _MAX_LOCATOR_CANDIDATES = 64
 _MAX_SERVICE_DESCRIPTORS = 256
 
 
+def _directory_revision(path: Path) -> dict[str, int] | None:
+    """Return a restart-safe directory identity for a durable sweep."""
+
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return None
+    if not stat.S_ISDIR(info.st_mode):
+        raise ValueError(f"Group discovery source path is not a directory: {path}")
+    return {
+        "device": info.st_dev,
+        "inode": info.st_ino,
+        "size": info.st_size,
+        "mtime_ns": info.st_mtime_ns,
+        "ctime_ns": info.st_ctime_ns,
+    }
+
+
+class _DurableSubmissionSourceSweep:
+    """One-entry sweep whose Linux directory cookie crosses worker processes."""
+
+    def __init__(self, directory: Path, *, offset: int) -> None:
+        self._directory = directory
+        self.offset = offset
+        self.is_closed = False
+        self._close_requested = False
+
+    def request_close(self) -> None:
+        self._close_requested = True
+        self.is_closed = True
+
+    def advance(
+        self,
+        io: SliceIO,
+        *,
+        max_entries: int = 1,
+        soft_deadline: float | None = None,
+    ) -> Any:
+        del io, soft_deadline
+        if self._close_requested or self.is_closed:
+            return SimpleNamespace(state="closed", candidates=(), reason=None)
+        if max_entries < 1:
+            raise ValueError("max_entries must be positive")
+        try:
+            name, next_offset = read_directory_entry(self._directory, self.offset)
+        except FileNotFoundError:
+            self.is_closed = True
+            return SimpleNamespace(state="complete", candidates=(), reason=None)
+        self.offset = next_offset
+        if name is None:
+            self.is_closed = True
+            return SimpleNamespace(state="complete", candidates=(), reason=None)
+        if not name.endswith(".json"):
+            return SimpleNamespace(state="progressed", candidates=(), reason=None)
+        try:
+            validate_identifier(name[:-5], "submission operation id")
+        except (TypeError, ValueError):
+            return SimpleNamespace(state="progressed", candidates=(), reason=None)
+        return SimpleNamespace(state="page", candidates=(self._directory / name,), reason=None)
+
+
 @dataclass(slots=True)
 class _GroupServiceEntry:
     """Retained discovery and maintenance owners for one Group key."""
@@ -88,8 +150,7 @@ class _GroupServiceEntry:
     locator_observed_at: dict[str, float] = field(default_factory=dict)
     locator_mode: bool = False
     pending_lane: str | None = None
-    control_generation: int | None = None
-    control_sequence: int = 1
+    control_cursor: GroupControlCursor = field(default_factory=GroupControlCursor)
     retry_delay: float = 1.0
     locator_retry_delay: dict[str, float] = field(default_factory=dict)
     locator_cooldown_until: dict[str, float] = field(default_factory=dict)
@@ -214,6 +275,8 @@ def publish_group_locator_for_transition(
     group: str,
     lane: str,
     reason: str,
+    *,
+    before_write: Callable[[], None] | None = None,
 ) -> dict[str, Any] | None:
     """Dual-publish a Group service locator at an existing Group writer fence.
 
@@ -235,7 +298,7 @@ def publish_group_locator_for_transition(
 
     from . import activation, locator
 
-    with project_activation_transaction(cfg, f"group_locator_{lane}"):
+    with project_activation_transaction(cfg, f"group_locator_{lane}", before_write=before_write):
         activation_path = cfg.shared_root / "schema" / "group-service.json"
         try:
             activation_record = read_json_limited(activation_path, max_bytes=_MAX_RECORD_BYTES)
@@ -251,6 +314,8 @@ def publish_group_locator_for_transition(
 
         active = activation.is_group_service_active(cfg.shared_root)
         try:
+            if before_write is not None:
+                before_write()
             return locator.publish_group_locator_locked(cfg, group, lane, reason)
         except (OSError, RuntimeError, ValueError, KeyError, TypeError):
             if fenced or active:
@@ -261,7 +326,15 @@ def publish_group_locator_for_transition(
 class GroupDiscoveryService:
     """Advance one Group's source qualification and membership coverage."""
 
-    def __init__(self, root: Path, group: str, *, mode: str = "legacy", locator_generation: int | None = None) -> None:
+    def __init__(
+        self,
+        root: Path,
+        group: str,
+        *,
+        mode: str = "legacy",
+        locator_generation: int | None = None,
+        continuation: dict[str, Any] | None = None,
+    ) -> None:
         self._root = _absolute_path(root, "root")
         validated_group = validate_group_name(group)
         if validated_group is None:
@@ -273,7 +346,12 @@ class GroupDiscoveryService:
             raise ValueError("locator mode requires a positive locator generation")
         self._mode = mode
         self._locator_generation = locator_generation
-        self._debt_offset = 0
+        self._durable_sweeps = continuation is not None
+        continuation = continuation or {}
+        self._bootstrap_offset = int(continuation.get("bootstrap_offset", 0))
+        self._bootstrap_revision = continuation.get("bootstrap_revision")
+        self._debt_offset = int(continuation.get("debt_offset", 0))
+        self._debt_revision = continuation.get("debt_revision")
 
         self._coverage: Any | None = None
         self._coverage_directory: Path | None = None
@@ -326,6 +404,23 @@ class GroupDiscoveryService:
         """Whether this service currently retains its one source recovery owner."""
 
         return self._source is not None and not self._source.is_closed
+
+    @property
+    def continuation(self) -> dict[str, Any]:
+        """Return restart-safe traversal state for an isolated worker slice."""
+
+        sweep = self._sweep
+        if isinstance(sweep, _DurableSubmissionSourceSweep):
+            if self._sweep_kind == "bootstrap":
+                self._bootstrap_offset = sweep.offset
+            elif self._sweep_kind == "debt":
+                self._debt_offset = sweep.offset
+        return {
+            "bootstrap_offset": self._bootstrap_offset,
+            "bootstrap_revision": self._bootstrap_revision,
+            "debt_offset": self._debt_offset,
+            "debt_revision": self._debt_revision,
+        }
 
     def update_locator_generation(self, generation: int) -> None:
         """Refresh the generation observed by the active locator traversal."""
@@ -864,7 +959,21 @@ class GroupDiscoveryService:
             self._sweep_kind = kind
             return
         self._sweep_missing = False
-        self._sweep = SubmissionSourceSweep(directory, page_size=_SWEEP_PAGE_SIZE)
+        if self._durable_sweeps:
+            revision = _directory_revision(directory)
+            if kind == "bootstrap":
+                if revision != self._bootstrap_revision:
+                    self._bootstrap_offset = 0
+                    self._bootstrap_revision = revision
+                offset = self._bootstrap_offset
+            else:
+                if revision != self._debt_revision:
+                    self._debt_offset = 0
+                    self._debt_revision = revision
+                offset = self._debt_offset
+            self._sweep = _DurableSubmissionSourceSweep(directory, offset=offset)
+        else:
+            self._sweep = SubmissionSourceSweep(directory, page_size=_SWEEP_PAGE_SIZE)
         self._sweep_kind = kind
         self._sweep_complete = False
 
@@ -922,6 +1031,9 @@ class GroupDiscoveryService:
         self._clear_active()
         if debt and debt_path is not None:
             self._delete_debt(Path(debt_path))
+            if self._durable_sweeps:
+                self._debt_offset = 0
+                self._debt_revision = None
         if self._mode == "locator":
             # Source-debt removal changes its directory revision, so restart
             # from zero instead of trusting a cookie across that mutation.
@@ -1305,8 +1417,12 @@ class MachineGroupDiscoveryWorker:
                 complete = False
             if not complete:
                 continue
-            if not self._runtime.working_set.acknowledge(turn, quiescent=True):
+            if self._runtime.working_set.is_lane_quiescent(binding, "group"):
+                continue
+            if not self._runtime.working_set.is_current_turn(turn):
                 self._refresh_group_turn_for_key(binding_key, sweeps, complete_at)
+                continue
+            self._runtime.working_set.acknowledge(turn, quiescent=True)
 
     def _ack_disabled_bindings(
         self,
@@ -1319,6 +1435,8 @@ class MachineGroupDiscoveryWorker:
         for binding in bindings:
             binding_key = self._binding_key(binding)
             if binding_key in resource_binding_keys:
+                continue
+            if self._runtime.working_set.is_lane_quiescent(binding, "group"):
                 continue
             turn = self._runtime.working_set.begin_turn(binding, "group")
             self._runtime.working_set.acknowledge(turn, quiescent=True)
@@ -1874,99 +1992,17 @@ class MachineGroupDiscoveryWorker:
             self._schedule_entry_retry(entry, "control")
             return False
 
-        with group_writer_lock(cfg, group, blocking=False) as acquired:
-            if not acquired:
-                self._schedule_entry_retry(entry, "control")
-                return False
-            from .rechecks import GroupRechecks
-
-            journal = GroupRechecks(cfg.shared_root, group)
-            position = journal.snapshot()
-            if position is None:
-                entry.control_generation = None
-                entry.control_sequence = 1
-                return self._acknowledge_control_locked(cfg, entry, observed, journal, None)
-            retention = journal.retention(position)
-            if entry.control_generation != position.generation:
-                entry.control_generation = position.generation
-                entry.control_sequence = retention.deleted + 1
-            if entry.control_sequence <= retention.deleted:
-                entry.control_sequence = retention.deleted + 1
-            if entry.control_sequence <= position.tail:
-                sequence = entry.control_sequence
-                try:
-                    event = journal.read(position, sequence)
-                except (OSError, RuntimeError, ValueError, KeyError):
-                    self._schedule_entry_retry(entry, "control")
-                    return False
-                if event.get("state") == "in_flight":
-                    from ..locks import task_lock
-                    from .changes import settle_task_change
-
-                    task_id = event.get("task_id")
-                    if not isinstance(task_id, str):
-                        self._schedule_entry_retry(entry, "control")
-                        return False
-                    with task_lock(cfg.shared_root, task_id, blocking=False) as has_task_lock:
-                        if not has_task_lock:
-                            self._schedule_entry_retry(entry, "control")
-                            return False
-                        settled, _results = settle_task_change(cfg, event)
-                    if not settled:
-                        self._schedule_entry_retry(entry, "control")
-                        return False
-                entry.control_sequence += 1
-                entry.locator_retry_delay["control"] = 1.0
-                entry.locator_cooldown_until.pop("control", None)
-                return False
-            return self._acknowledge_control_locked(cfg, entry, observed, journal, position)
-
-    def _acknowledge_control_locked(
-        self,
-        cfg: Any,
-        entry: _GroupServiceEntry,
-        observed: dict[str, Any],
-        journal: Any,
-        position: Any | None,
-    ) -> bool:
-        from . import locator
-
-        def retirement_ready() -> bool:
-            latest = journal.snapshot()
-            if position is None:
-                if latest is not None:
-                    return False
-            elif (
-                latest is None
-                or latest.generation != position.generation
-                or latest.tail != position.tail
-                or entry.control_generation != latest.generation
-                or entry.control_sequence <= latest.tail
-            ):
-                return False
-            from ..operation_store import iter_active_operation_paths
-            from ..store import read_json
-
-            for operation_path in iter_active_operation_paths(cfg, "group_control", include_legacy=False):
-                operation = read_json(operation_path)
-                control = operation.get("group_control", {})
-                if control.get("group_name") == entry.group and control.get("state") not in {
-                    "completed",
-                    "superseded",
-                }:
-                    return False
-            return True
-
         try:
-            return locator.acknowledge_group_locator_locked(
-                cfg,
-                entry.group,
-                "control",
-                observed["generation"],
-                retirement_ready=retirement_ready,
-            )
+            state = advance_group_control_rechecks(cfg, group, observed["generation"], entry.control_cursor)
         except (OSError, RuntimeError, ValueError, KeyError, TypeError):
+            self._schedule_entry_retry(entry, "control")
             return False
+        if state == "blocked":
+            self._schedule_entry_retry(entry, "control")
+        else:
+            entry.locator_retry_delay["control"] = 1.0
+            entry.locator_cooldown_until.pop("control", None)
+        return state == "quiescent"
 
     def _queue_entry_close(
         self,

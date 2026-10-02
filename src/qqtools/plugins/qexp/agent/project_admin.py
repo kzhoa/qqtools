@@ -548,15 +548,24 @@ def _enable_command(machine_runtime: MachineRuntime, binding: ProjectBinding) ->
 def enable_project(runtime: MachineRuntime | str | Path | None, identifier: str | Path) -> ProjectBinding:
     """Revalidate a binding's current generation and enable new admission."""
     machine_runtime = runtime if isinstance(runtime, MachineRuntime) else MachineRuntime(runtime)
+    observed_revision, observed_bindings = machine_runtime.load_registry()
+    observed = machine_runtime._find_binding(observed_bindings, identifier)
+    is_eligible = machine_runtime.binding_write_eligible(observed, renew=True)
+    status = None if is_eligible else machine_runtime.registration_status(observed)
+
     with machine_runtime.registry_guard():
         revision, bindings = machine_runtime.load_registry()
-        current = machine_runtime._find_binding(bindings, identifier)
-        if not machine_runtime.binding_write_eligible(current, renew=True):
-            status = machine_runtime.registration_status(current)
+        try:
+            current = machine_runtime._find_binding(bindings, observed.project_id)
+        except ValueError:
+            raise RuntimeError("Project registry changed during enablement validation; retry.") from None
+        if revision != observed_revision or current != observed:
+            raise RuntimeError("Project registry changed during enablement validation; retry.")
+        if not is_eligible:
             raise RuntimeError(
-                f"cannot enable project {current.project_id!r}: registration is "
+                f"cannot enable project {observed.project_id!r}: registration is "
                 f"{status.get('state', 'unavailable')}; resolve registration authority first."
             )
-        updated = replace(current, enabled=True)
+        updated = replace(current, enabled=True, _canonical_paths=True)
         machine_runtime._save_registry(revision + 1, [updated if item == current else item for item in bindings])
     return updated

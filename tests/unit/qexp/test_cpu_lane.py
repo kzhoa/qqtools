@@ -55,6 +55,47 @@ def test_cpu_lane_capacity_serializes_reservations(tmp_path: Path):
     assert set_cpu_lane_capacity(runtime, capacity=0).capacity == 0
 
 
+def test_cpu_borrow_admission_survives_reservation_attachment(tmp_path: Path):
+    runtime = tmp_path / "runtime"
+    set_cpu_lane_capacity(runtime, capacity=2)
+    value = reserve_cpu(
+        runtime,
+        "task-1",
+        1,
+        attempt_id="attempt-1",
+        fencing_token=1,
+        group_name="group-1",
+        admitted_as_borrow=True,
+        worker_scheduling_role="borrow",
+        group_worker_set_epoch=3,
+        worker_state_epoch=4,
+    )
+    attach_cpu(runtime, value["reservation"]["reservation_id"], "attempt-1", 1)
+    _policy, reservations = cpu_reservation_snapshot(runtime)
+    assert reservations[0]["admission"] == {
+        "admitted_as_borrow": True,
+        "worker_scheduling_role": "borrow",
+        "group_worker_set_epoch": 3,
+        "worker_state_epoch": 4,
+        "gpu_limit_gpus": None,
+    }
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        {"admitted_as_borrow": 1},
+        {"worker_state_epoch": True},
+        {"group_worker_set_epoch": -1},
+        {"admitted_as_borrow": True, "worker_scheduling_role": "primary", "group_name": "group-1"},
+        {"admitted_as_borrow": True, "worker_scheduling_role": "borrow"},
+    ],
+)
+def test_cpu_lane_rejects_invalid_admission_metadata(tmp_path: Path, metadata):
+    with pytest.raises(ValueError):
+        reserve_cpu(tmp_path, "task-1", 1, **metadata)
+
+
 def test_cpu_lane_rejects_invalid_resource_requests():
     with pytest.raises(ValueError, match="requested_cpus"):
         TaskSpec(["echo"], "/tmp", 0, None, "cpu")

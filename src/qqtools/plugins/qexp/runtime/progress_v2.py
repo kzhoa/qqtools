@@ -15,7 +15,7 @@ import time
 from collections import OrderedDict
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Literal
 
 from qqtools.qexp._progress_protocol import (
     MAX_SNAPSHOT_BYTES,
@@ -251,10 +251,17 @@ class ProgressV2Projector:
         resolver=resolve_progress_binding,
         clock=time.monotonic,
         wall_clock=None,
+        shared_snapshot: Callable[[dict[str, Any]], dict[str, Any] | None] | None = None,
+        shared_publish: Callable[
+            [dict[str, Any], dict[str, Any], dict[str, Any]], Literal["deferred", "published", "final"]
+        ]
+        | None = None,
     ) -> None:
         self.cfg = cfg
         self._registration_generation = identifier(registration_generation)
         self._resolve = resolver
+        self._shared_snapshot = shared_snapshot
+        self._shared_publish = shared_publish
         self._clock = clock
         if wall_clock is None:
             from .progress import _now
@@ -325,9 +332,10 @@ class ProgressV2Projector:
         try:
             shared_latest = _validate_projection_v2(
                 read_advisory_snapshot(
-                    _shared_path(self.cfg, binding["task_id"], attempt_id),
-                    max_bytes=MAX_SNAPSHOT_BYTES,
-                ),
+                    _shared_path(self.cfg, binding["task_id"], attempt_id), max_bytes=MAX_SNAPSHOT_BYTES
+                )
+                if self._shared_snapshot is None
+                else self._shared_snapshot(binding),
                 binding,
                 require_generation=True,
             )
@@ -370,6 +378,10 @@ class ProgressV2Projector:
             _observed_path(self.cfg, attempt_id).unlink(missing_ok=True)
         except OSError:
             pass
+        try:
+            (Path(self.cfg.runtime_root) / "progress-coordinator" / "v2" / f"{attempt_id}.json").unlink(missing_ok=True)
+        except OSError:
+            pass
 
     def _projection_for_payload(
         self,
@@ -392,6 +404,50 @@ class ProgressV2Projector:
             "advanced_at": now if advanced else latest["advanced_at"],
             "progress": {key: item for key, item in payload.items() if key not in {"protocol_version", "update_id"}},
         }
+
+    def _publish_snapshot(
+        self, context_path: Path, context: dict[str, Any], binding: dict[str, Any], latest: dict[str, Any]
+    ) -> str:
+        if self._shared_publish is not None:
+            outcome = self._shared_publish(context, binding, latest)
+            if outcome not in {"deferred", "published", "final"}:
+                raise ValueError("invalid progress v2 publication outcome")
+            return outcome
+        from .progress_projection import publish_progress_snapshot
+
+        result = publish_progress_snapshot(
+            self.cfg,
+            context,
+            binding,
+            latest,
+            resolver=lambda _cfg, selected: self._binding(selected),
+            context_alive=context_path.exists,
+            writer=replace_advisory_snapshot,
+        )
+        if result["state"] == "retired":
+            self._retire(binding["attempt_id"])
+        if result["state"] != "published":
+            return "deferred"
+        return "final" if result["binding"]["terminal"] else "published"
+
+    def acknowledge_publication(self, attempt_id: str, published: dict[str, Any], *, terminal: bool) -> None:
+        """Acknowledge a matching projection without resetting local sampling cadence."""
+        state = self._entries.get(attempt_id)
+        if state is None:
+            return
+        if state["latest"] is None or published != state["latest"]:
+            raise ValueError("progress v2 publication does not match the local accepted observation")
+        state["published"] = published
+        state["shared_initial_available"] = False
+        if terminal:
+            state["shared_final_available"] = False
+        succeeded_at = self._clock()
+        if math.isfinite(state["shared_next_due"]):
+            state["shared_next_due"] = _next_deadline(state["shared_next_due"], succeeded_at, state["interval"])
+        else:
+            state["shared_next_due"] = _initial_deadline(attempt_id, succeeded_at, state["interval"])
+        if terminal:
+            self._retire(attempt_id)
 
     def _observe_policy(
         self,
@@ -481,38 +537,12 @@ class ProgressV2Projector:
         if not due:
             return
 
-        with exclusive(_progress_lock_path(self.cfg.shared_root, binding["task_id"]), blocking=False) as acquired:
-            if not acquired:
-                return
-            current_binding = self._binding(context)
-            if current_binding is None or not context_path.exists():
-                self._retire(attempt_id)
-                return
-            if (
-                current_binding["fencing_token"] != binding["fencing_token"]
-                or current_binding["registration_generation"] != self._registration_generation
-            ):
-                return
-            shared_path = _shared_path(self.cfg, binding["task_id"], attempt_id)
-            try:
-                shared_path.parent.mkdir(parents=True, exist_ok=True)
-                replace_advisory_snapshot(shared_path, latest, max_bytes=MAX_SNAPSHOT_BYTES)
-                if not context_path.exists():
-                    shared_path.unlink(missing_ok=True)
-                    return
-            except OSError:
-                return
-        state["published"] = latest
-        state["shared_initial_available"] = False
-        if binding["terminal"]:
-            state["shared_final_available"] = False
-        succeeded_at = self._clock()
-        if math.isfinite(state["shared_next_due"]):
-            state["shared_next_due"] = _next_deadline(state["shared_next_due"], succeeded_at, interval)
-        else:
-            state["shared_next_due"] = _initial_deadline(attempt_id, succeeded_at, interval)
-        if binding["terminal"]:
-            self._retire(attempt_id)
+        try:
+            outcome = self._publish_snapshot(context_path, context, binding, latest)
+        except OSError:
+            return
+        if outcome != "deferred":
+            self.acknowledge_publication(attempt_id, latest, terminal=outcome == "final" or binding["terminal"])
 
     def _observe(self, attempt_id: str) -> None:
         context_path = _context_path(self.cfg, attempt_id)
@@ -723,6 +753,7 @@ def cleanup_local_progress_v2(cfg: Any, task_id: str, attempt_ids: set[str]) -> 
 
     for attempt_id in targets:
         mailbox = _local_mailbox_path(cfg.runtime_root, attempt_id)
+        _unlink_record(Path(cfg.runtime_root) / "progress-coordinator" / "v2" / f"{attempt_id}.json", removed)
         _unlink_record(mailbox, removed)
         try:
             temporaries = list(mailbox.parent.glob(f".{mailbox.name}.*"))

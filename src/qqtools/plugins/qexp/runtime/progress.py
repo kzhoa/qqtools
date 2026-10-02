@@ -1,7 +1,7 @@
 """Attempt-bound application observations, isolated from execution authority.
 
 The passive runner provisions only machine-local channel identity. The agent's
-separate observation thread is the sole shared progress writer. Nothing in this
+isolated progress transaction is the sole agent shared progress writer. Nothing in this
 module renews an Attempt lease, changes Task/Attempt truth, sends a signal, or
 releases a resource.
 """
@@ -16,7 +16,7 @@ from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Literal
 
 from qqtools.qexp._progress_protocol import (
     MAX_PAYLOAD_BYTES,
@@ -380,12 +380,19 @@ class ProgressProjector:
         clock=time.monotonic,
         wall_clock=_now,
         resolver=resolve_progress_binding,
+        shared_snapshot: Callable[[dict[str, Any]], dict[str, Any] | None] | None = None,
+        shared_publish: Callable[
+            [dict[str, Any], dict[str, Any], dict[str, Any]], Literal["deferred", "published", "final"]
+        ]
+        | None = None,
     ) -> None:
         self.cfg = cfg
         self._registration_generation = identifier(registration_generation)
         self._clock = clock
         self._wall_clock = wall_clock
         self._resolve = resolver
+        self._shared_snapshot = shared_snapshot
+        self._shared_publish = shared_publish
         self._entries: OrderedDict[str, dict[str, Any]] = OrderedDict()
         self._scan = None
 
@@ -473,7 +480,9 @@ class ProgressProjector:
             # A shared snapshot from another registration generation is not used
             # as recovery evidence by a new projector.
             shared_latest = _validate_projection(
-                read_advisory_snapshot(shared_path),
+                read_advisory_snapshot(shared_path)
+                if self._shared_snapshot is None
+                else self._shared_snapshot(binding),
                 binding,
                 require_generation=True,
             )
@@ -515,7 +524,7 @@ class ProgressProjector:
             # A selected Attempt may still have a v2 mailbox in this directory.
             # Final Task cleanup owns removal of the whole local mailbox tree.
             pass
-        for directory in ("progress-observed", "progress-diagnostics"):
+        for directory in ("progress-observed", "progress-diagnostics", "progress-coordinator/v1"):
             try:
                 _local_path(self.cfg, directory, attempt_id).unlink(missing_ok=True)
             except OSError:
@@ -540,6 +549,53 @@ class ProgressProjector:
             "advanced_at": now if advanced else latest["advanced_at"],
             "progress": {key: item for key, item in payload.items() if key not in {"protocol_version", "update_id"}},
         }
+
+    def _publish_snapshot(
+        self, context_path: Path, context: dict[str, Any], binding: dict[str, Any], latest: dict[str, Any]
+    ) -> str:
+        if self._shared_publish is not None:
+            outcome = self._shared_publish(context, binding, latest)
+            if outcome not in {"deferred", "published", "final"}:
+                raise ValueError("invalid progress publication outcome")
+            return outcome
+        from .progress_projection import publish_progress_snapshot
+
+        result = publish_progress_snapshot(
+            self.cfg,
+            context,
+            binding,
+            latest,
+            resolver=lambda _cfg, selected: self._binding(selected),
+            context_alive=context_path.exists,
+            writer=replace_advisory_snapshot,
+        )
+        if result["state"] == "retired":
+            self._retire(binding["attempt_id"])
+        if result["state"] != "published":
+            return "deferred"
+        return "final" if result["binding"]["terminal"] else "published"
+
+    def acknowledge_publication(self, attempt_id: str, published: dict[str, Any], *, terminal: bool) -> None:
+        """Advance the existing cadence only after exact shared publication evidence."""
+        state = self._entries.get(attempt_id)
+        if state is None:
+            return
+        latest = state["latest"]
+        if latest is None or published != latest:
+            raise ValueError("progress publication does not match the local accepted observation")
+        state["published"] = published
+        succeeded_at = self._clock()
+        state["last_write"] = succeeded_at
+        if "interval" in state:
+            state["shared_initial_available"] = False
+            if terminal:
+                state["shared_final_available"] = False
+            if math.isfinite(state["shared_next_due"]):
+                state["shared_next_due"] = _next_deadline(state["shared_next_due"], succeeded_at, state["interval"])
+            else:
+                state["shared_next_due"] = _initial_deadline(attempt_id, succeeded_at, state["interval"])
+        if terminal:
+            self._retire(attempt_id)
 
     def _observe_policy(
         self,
@@ -636,39 +692,13 @@ class ProgressProjector:
         if not due:
             return
 
-        # This advisory lock is deliberately outside qexp's Task/Attempt
-        # authority lock order. Cleanup uses the same lock after marking the
-        # Task as cleaning, so stale projection writes cannot recreate it.
-        with exclusive(_progress_lock_path(self.cfg.shared_root, binding["task_id"]), blocking=False) as acquired:
-            if not acquired:
-                return
-            current_binding = self._binding(context)
-            if current_binding is None or not context_path.exists():
-                self._retire(attempt_id)
-                return
-            if (
-                current_binding["fencing_token"] != binding["fencing_token"]
-                or current_binding["registration_generation"] != self._registration_generation
-            ):
-                return
-            shared_path = shared_progress_path(self.cfg.shared_root, binding["task_id"], attempt_id)
-            try:
-                shared_path.parent.mkdir(parents=True, exist_ok=True)
-                replace_advisory_snapshot(shared_path, latest)
-            except OSError:
-                self._diagnostic(attempt_id, "projection_unavailable", interval=interval)
-                return
-        state["published"] = latest
-        state["shared_initial_available"] = False
-        if binding["terminal"]:
-            state["shared_final_available"] = False
-        succeeded_at = self._clock()
-        if math.isfinite(state["shared_next_due"]):
-            state["shared_next_due"] = _next_deadline(state["shared_next_due"], succeeded_at, interval)
-        else:
-            state["shared_next_due"] = _initial_deadline(attempt_id, succeeded_at, interval)
-        if binding["terminal"]:
-            self._retire(attempt_id)
+        try:
+            outcome = self._publish_snapshot(context_path, context, binding, latest)
+        except OSError:
+            self._diagnostic(attempt_id, "projection_unavailable", interval=interval)
+            return
+        if outcome != "deferred":
+            self.acknowledge_publication(attempt_id, latest, terminal=outcome == "final" or binding["terminal"])
 
     def observe(self, attempt_id: str) -> None:
         """Observe one context. Public only to keep single-attempt tests deterministic."""
@@ -753,32 +783,13 @@ class ProgressProjector:
         if now_monotonic - state["last_write"] < interval:
             return
 
-        # This advisory lock is deliberately outside qexp's Task/Attempt authority
-        # lock order. Cleanup uses the same lock after marking the Task as cleaning,
-        # which fences stale projection writes without delaying lease renewal.
-        with exclusive(_progress_lock_path(self.cfg.shared_root, binding["task_id"]), blocking=False) as acquired:
-            if not acquired:
-                return
-            current_binding = self._binding(context)
-            if current_binding is None or not context_path.exists():
-                self._retire(attempt_id)
-                return
-            if (
-                current_binding["fencing_token"] != binding["fencing_token"]
-                or current_binding["registration_generation"] != self._registration_generation
-            ):
-                return
-            shared_path = shared_progress_path(self.cfg.shared_root, binding["task_id"], attempt_id)
-            try:
-                shared_path.parent.mkdir(parents=True, exist_ok=True)
-                replace_advisory_snapshot(shared_path, latest)
-            except OSError:
-                self._diagnostic(attempt_id, "projection_unavailable")
-                return
-        state["last_write"] = now_monotonic
-        state["published"] = latest
-        if current_binding["terminal"]:
-            self._retire(attempt_id)
+        try:
+            outcome = self._publish_snapshot(context_path, context, binding, latest)
+        except OSError:
+            self._diagnostic(attempt_id, "projection_unavailable")
+            return
+        if outcome != "deferred":
+            self.acknowledge_publication(attempt_id, latest, terminal=outcome == "final" or binding["terminal"])
 
 
 def _running_registration_generation(cfg: Any, machine_name: str) -> str:
@@ -926,7 +937,7 @@ def cleanup_local_progress(cfg: Any, task_id: str, attempt_ids: set[str]) -> lis
                 removed.append(str(mailbox_dir))
         except OSError:
             pass
-        for directory in ("progress-observed", "progress-diagnostics"):
+        for directory in ("progress-observed", "progress-diagnostics", "progress-coordinator/v1"):
             path = _local_path(cfg, directory, attempt_id)
             _unlink_record(path, removed)
             try:

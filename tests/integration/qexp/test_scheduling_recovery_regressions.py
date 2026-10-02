@@ -13,7 +13,11 @@ from qqtools.plugins.qexp.commands.group import (
     show_group,
 )
 from qqtools.plugins.qexp.doctor import repair_metadata
-from qqtools.plugins.qexp.project_maintenance import offer_due_tasks, reconcile_project_reservations
+from qqtools.plugins.qexp.project_maintenance import (
+    classify_reservation,
+    offer_due_tasks,
+    reconcile_project_reservations,
+)
 from qqtools.plugins.qexp.runner import run_attempt
 from qqtools.plugins.qexp.runtime.attempt_recovery import recover_running_attempt
 from qqtools.plugins.qexp.runtime.maintenance import advance_maintenance_work
@@ -22,9 +26,14 @@ from qqtools.plugins.qexp.runtime.operation_store import active_operation_path, 
 from qqtools.plugins.qexp.runtime.paths import attempt_path
 from qqtools.plugins.qexp.runtime.process_evidence import ProcessEvidence
 from qqtools.plugins.qexp.runtime.records import AttemptRecord
-from qqtools.plugins.qexp.runtime.resources.reservations import reserve, reserved_gpu_ids
+from qqtools.plugins.qexp.runtime.resources.reservations import (
+    ReservationIdentity,
+    active_reservations,
+    reserve,
+    reserved_gpu_ids,
+)
 from qqtools.plugins.qexp.runtime.store import atomic_replace, read_json
-from qqtools.plugins.qexp.runtime.tasks import load_task
+from qqtools.plugins.qexp.runtime.tasks import load_task, save_task
 from qqtools.plugins.qexp.scheduler import (
     authorize_launch,
     cancel_task,
@@ -472,6 +481,34 @@ def test_recovery_cas_issues_new_fencing_token(tmp_path: Path):
     assert recovered.result["reason"] is None
     reconcile_project_reservations(cfg)
     assert reserved_gpu_ids(cfg.runtime_root) == {0}
+
+
+def test_shared_reservation_classifier_never_releases_blocked_or_malformed_claim(tmp_path: Path) -> None:
+    cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
+    task = submit(cfg, ["echo", "ok"])
+    attempt = claim_task(cfg, task.task_id, [0])
+    assert attempt is not None
+    identity = ReservationIdentity.from_record(active_reservations(cfg.runtime_root)[0])
+    blocked_task = load_task(cfg, task.task_id)
+    blocked_task.state["projection"] = "blocked"
+    blocked_task.claim_control["active_claim"] = None
+    save_task(cfg, blocked_task)
+
+    blocked = classify_reservation(cfg, identity)
+    assert blocked.outcome == "isolated"
+    assert ReservationIdentity.from_record(active_reservations(cfg.runtime_root)[0]) == identity
+
+    current = load_task(cfg, task.task_id)
+    current.state["projection"] = "queued"
+    current.claim_control["active_claim"] = {
+        "reservation_id": identity.reservation_id,
+        "attempt_id": identity.attempt_id,
+        "fencing_token": "malformed",
+    }
+    save_task(cfg, current)
+    with pytest.raises(ValueError, match="active claim"):
+        classify_reservation(cfg, identity)
+    assert ReservationIdentity.from_record(active_reservations(cfg.runtime_root)[0]) == identity
 
 
 def test_resident_waits_for_complete_orphan_handoff(tmp_path: Path, monkeypatch):

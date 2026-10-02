@@ -8,7 +8,7 @@ from collections.abc import Generator, Iterator
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Mapping
 
 from .authority_scan import iter_evidence_entries
 from .locks import exclusive
@@ -27,6 +27,7 @@ FORMAT = "qexp-local-responsibility-backfill-v1"
 LANES = tuple(RECORD_KEYS)
 BATCH_SIZE = 64
 STATE_BYTES = 1024 * 1024
+_MAX_EVIDENCE_RECORD_BYTES = 8 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -43,7 +44,25 @@ class BackfillProgress:
         return self.completed_lanes == self.total_lanes
 
 
+@dataclass(frozen=True, slots=True)
+class CapturedEvidenceLocator:
+    """Non-authorizing source identity; never contains commands or credentials."""
+
+    source_root: Path
+    lane: str
+    relative: str
+    identity: str
+    task_id: str | None
+    attempt_number: int | None
+
+    @property
+    def payload(self) -> dict:
+        return {"task_id": self.task_id, "attempt_number": self.attempt_number}
+
+
 def _relative_record(name: str, value: object) -> Path:
+    if name not in RECORD_KEYS:
+        raise ValueError(f"unknown evidence capture lane: {name}")
     if not isinstance(value, str):
         raise Unavailable("backfill path must be relative JSON evidence")
     path = Path(value)
@@ -59,6 +78,83 @@ def _relative_record(name: str, value: object) -> Path:
     return path
 
 
+def _evidence_identity(name: str, relative: Path) -> str:
+    relative = _relative_record(name, str(relative))
+    identity = relative.parent.name if name == "termination_decisions" else relative.stem
+    return validate_identifier(identity, "attempt_id")
+
+
+def _canonical_capture_root(root: Path) -> Path:
+    root = Path(root)
+    if not root.is_absolute() or ".." in root.parts or "\x00" in str(root):
+        raise ValueError("capture root must be a canonical absolute runtime path")
+    return root
+
+
+def read_capture_locator(
+    source_root: Path,
+    name: str,
+    relative: Path,
+    *,
+    should_require_record: bool = False,
+) -> CapturedEvidenceLocator | None:
+    """Read one bounded source record without target locks or ledger effects.
+
+    The caller owns source retention/cleanup exclusion and supplies its captured
+    canonical root. A missing retained record is an error, not an empty result.
+    """
+    source_root = _canonical_capture_root(source_root)
+    relative = _relative_record(name, str(relative))
+    identity = _evidence_identity(name, relative)
+    directory = local_paths(source_root)[name]
+    path = directory / relative
+    try:
+        for parent in {directory, path.parent}:
+            if not stat.S_ISDIR(parent.stat(follow_symlinks=False).st_mode):
+                raise Unavailable(f"backfill evidence parent is not a directory: {parent}")
+        if not stat.S_ISREG(path.stat(follow_symlinks=False).st_mode):
+            raise Unavailable(f"backfill evidence is not a regular file: {path}")
+        value = read_json_limited(path, max_bytes=_MAX_EVIDENCE_RECORD_BYTES, record_type="capture_source_evidence")
+    except FileNotFoundError:
+        if should_require_record:
+            raise Unavailable(f"retained backfill evidence disappeared: {path}") from None
+        return None
+    record = value.get(RECORD_KEYS[name])
+    if not isinstance(record, dict) or record.get("attempt_id", identity) != identity:
+        raise Unavailable(f"backfill evidence identity does not match its path: {path}")
+    payload = recovery_locator(identity, record)
+    return CapturedEvidenceLocator(
+        source_root, name, str(relative), identity, payload["task_id"], payload["attempt_number"]
+    )
+
+
+def _apply_capture_locator_locked(ledger: Ledger, runtime_root: Path, captured: CapturedEvidenceLocator) -> None:
+    """Apply only a validated locator while the target evidence-write guard is held."""
+    if captured.source_root == runtime_root:
+        ledger.capture_local(captured.identity, captured.payload)
+    else:
+        ledger.capture_source(captured.identity, captured.payload, captured.source_root)
+
+
+def apply_capture_locator(ledger: Ledger, runtime_root: Path, captured: CapturedEvidenceLocator) -> None:
+    """Apply a consumed source observation using target-local I/O only.
+
+    Caller-owned retained capture supplies the exact source/binding identity.
+    This neither reopens that source nor grants execution or cleanup authority.
+    """
+    runtime_root = _canonical_capture_root(runtime_root)
+    if ledger.root.resolve() != responsibility_root(runtime_root).resolve():
+        raise ValueError("captured locator ledger does not belong to this runtime")
+    _canonical_capture_root(captured.source_root)
+    identity = _evidence_identity(captured.lane, Path(captured.relative))
+    if captured.identity != identity or recovery_locator(identity, captured.payload) != captured.payload:
+        raise Unavailable("captured evidence locator identity is invalid")
+    with evidence_write_guard(runtime_root, identity) as acquired:
+        if not acquired:
+            raise Conflict(f"backfill evidence is busy: {identity}")
+        _apply_capture_locator_locked(ledger, runtime_root, captured)
+
+
 def capture_local_record(
     ledger: Ledger,
     runtime_root: Path,
@@ -69,36 +165,17 @@ def capture_local_record(
     should_require_record: bool = False,
 ) -> None:
     """Keep source evidence intact and capture identity under the cleanup fence."""
-    relative = _relative_record(name, str(relative))
-    identity = relative.parent.name if name == "termination_decisions" else relative.stem
-    validate_identifier(identity, "attempt_id")
+    identity = _evidence_identity(name, relative)
     if source_root is not None and (not source_root.is_absolute() or source_root.resolve() == runtime_root.resolve()):
         raise ValueError("backfill source must be a different absolute runtime")
-    directory = local_paths(source_root or runtime_root)[name]
-    path = directory / relative
     with evidence_write_guard(runtime_root, identity) as acquired:
         if not acquired:
             raise Conflict(f"backfill evidence is busy: {identity}")
-        try:
-            for parent in {directory, path.parent}:
-                if not stat.S_ISDIR(parent.stat(follow_symlinks=False).st_mode):
-                    raise Unavailable(f"backfill evidence parent is not a directory: {parent}")
-            if not stat.S_ISREG(path.stat(follow_symlinks=False).st_mode):
-                raise Unavailable(f"backfill evidence is not a regular file: {path}")
-            value = read_json(path)
-        except FileNotFoundError:
-            if should_require_record:
-                raise Unavailable(f"retained backfill evidence disappeared: {path}") from None
-            # A cooperating cleanup may retire the source after enumeration.
-            return
-        record = value.get(RECORD_KEYS[name])
-        if not isinstance(record, dict) or record.get("attempt_id", identity) != identity:
-            raise Unavailable(f"backfill evidence identity does not match its path: {path}")
-        payload = recovery_locator(identity, record)
-        if source_root is None:
-            ledger.capture_local(identity, payload)
-        else:
-            ledger.capture_source(identity, payload, source_root)
+        captured = read_capture_locator(
+            source_root or runtime_root, name, relative, should_require_record=should_require_record
+        )
+        if captured is not None:
+            _apply_capture_locator_locked(ledger, runtime_root, captured)
 
 
 def capture_local_writer(
@@ -110,7 +187,23 @@ def capture_local_writer(
     *,
     source_root: Path | None = None,
 ) -> int:
-    """Persist an observed process locator under the same guard as cleanup.
+    """Normalize an outside caller's source before the local capture transaction."""
+    if source_root is not None and not source_root.is_absolute():
+        raise ValueError("captured writer source must be absolute")
+    source_root = source_root.resolve() if source_root is not None else None
+    return apply_captured_writer(ledger, runtime_root, identity, payload, writer, source_root=source_root)
+
+
+def apply_captured_writer(
+    ledger: Ledger,
+    runtime_root: Path,
+    identity: str,
+    payload: dict,
+    writer: dict,
+    *,
+    source_root: Path | None = None,
+) -> int:
+    """Apply a retained writer using canonical captured roots and local I/O only.
 
     Caller-owned process discovery supplies the actual Linux identity. Capturing
     one writer neither proves a complete inventory nor authorizes its execution.
@@ -119,12 +212,12 @@ def capture_local_writer(
         raise ValueError("captured writer ledger does not belong to this runtime")
     validate_identifier(identity, "attempt_id")
     locator = recovery_locator(identity, payload)
+    if source_root is not None and _canonical_capture_root(source_root) == runtime_root.resolve():
+        raise ValueError("captured writer source must be a different absolute runtime")
     with evidence_write_guard(runtime_root, identity) as acquired:
         if not acquired:
             raise Conflict(f"captured writer evidence is busy: {identity}")
         if source_root is not None:
-            if not source_root.is_absolute() or source_root.resolve() == runtime_root.resolve():
-                raise ValueError("captured writer source must be a different absolute runtime")
             return ledger.capture_writer(identity, locator, writer, source_root=source_root)
         return ledger.capture_writer(identity, locator, writer)
 
@@ -217,6 +310,10 @@ class ResponsibilityBackfill:
             current = self._process_revision()["writer_sweep_revision"]
             if type(revision) is not int or not 1 <= revision <= current:
                 raise Unavailable("invalid evidence process sweep revision")
+        if "source_cursor" in state:
+            from .responsibility_source_scan import source_scan_cursor
+
+            source_scan_cursor(state["source_cursor"])
         return ledger, state
 
     def _process_revision(self) -> dict:
@@ -237,13 +334,16 @@ class ResponsibilityBackfill:
             lane=0,
             at_end=False,
         )
+        state.pop("source_cursor", None)
         self._save(state)
 
     def _save(self, state: dict) -> None:
         state["revision"] += 1
         atomic_replace(self.path, state)
 
-    def take(self, limit: int = BATCH_SIZE, *, should_cross_lanes: bool = False) -> BackfillProgress | None:
+    def take(
+        self, limit: int = BATCH_SIZE, *, should_cross_lanes: bool = False, allow_source: bool = True
+    ) -> BackfillProgress | None:
         """Bound new visits/record captures; None means the backfill lock is busy.
 
         Enrolled capture also replays at most 64 pending writer observations;
@@ -262,11 +362,15 @@ class ResponsibilityBackfill:
                 remaining = limit
                 visited = processed = 0
                 while remaining:
-                    progress = self._take_locked(remaining)
+                    progress = self._take_locked(remaining, allow_source=allow_source)
                     visited += progress.entries_visited
                     processed += progress.records_processed
                     remaining -= max(1, progress.entries_visited, progress.records_processed)
-                    if not should_cross_lanes or progress.is_sweep_complete:
+                    if (
+                        not should_cross_lanes
+                        or progress.is_sweep_complete
+                        or (not allow_source and progress.completed_lanes >= len(LANES))
+                    ):
                         break
                 return BackfillProgress(
                     progress.capture_id,
@@ -279,6 +383,107 @@ class ResponsibilityBackfill:
         except BaseException:
             self.close()
             raise
+
+    def next_source_work(self) -> dict[str, Any] | None:
+        """Recover the next source intent exclusively from target-local records."""
+        if self.process_capture is None:
+            raise Unavailable("source work requires retained process capture")
+        with (
+            self.process_capture.completed_sweep(),
+            exclusive(self.runtime_root / "locks" / "responsibility-backfill.lock", blocking=False) as acquired,
+        ):
+            if not acquired:
+                return None
+            _ledger, state = self._load()
+            if self._needs_new_sweep(state) and not state["pending"]:
+                self._restart_sweep(state)
+            return self._source_work(state)
+
+    def _source_work(self, state: dict) -> dict[str, Any] | None:
+        from .responsibility_source_scan import initial_source_scan_cursor
+
+        if not len(LANES) <= state["lane"] < self.total_lanes:
+            return None
+        parameters = {
+            "capture_id": state["writer_capture_id"],
+            "backfill_id": state["capture_id"],
+            "backfill_revision": state["revision"],
+            "lane": LANES[state["lane"] % len(LANES)],
+        }
+        if state["pending"]:
+            return {"operation": "read", "parameters": {**parameters, "relative": state["pending"][0]}}
+        return {
+            "operation": "scan",
+            "parameters": {**parameters, "cursor": state.get("source_cursor", initial_source_scan_cursor())},
+        }
+
+    def apply_source_scan(self, parameters: Mapping[str, Any], scan: Mapping[str, Any] | None) -> bool:
+        """Journal exact discovery before any source record can be consumed.
+
+        None is a stale scan: discard only its advisory cursor and rescan, never
+        a pending record or capture identity. Lost results simply repeat discovery.
+        """
+        from .responsibility_source_scan import source_scan_result
+
+        if self.process_capture is None:
+            raise Unavailable("source discovery requires retained process capture")
+        with (
+            self.process_capture.completed_sweep(),
+            exclusive(self.runtime_root / "locks" / "responsibility-backfill.lock", blocking=False) as acquired,
+        ):
+            if not acquired:
+                return False
+            _ledger, state = self._load()
+            if self._source_work(state) != {"operation": "scan", "parameters": dict(parameters)}:
+                return False
+            if self._needs_new_sweep(state):
+                self._restart_sweep(state)
+                return False
+            if scan is None:
+                state.pop("source_cursor", None)
+            else:
+                validated = source_scan_result(scan, parameters["lane"])
+                state.update(
+                    pending=validated["pending"], source_cursor=validated["cursor"], at_end=validated["at_end"]
+                )
+                if state["at_end"] and not state["pending"]:
+                    state["lane"] += 1
+                    state["at_end"] = False
+                    state.pop("source_cursor", None)
+            self._save(state)
+            return True
+
+    def apply_source_record(self, parameters: Mapping[str, Any], captured: CapturedEvidenceLocator) -> bool:
+        """Apply and retire one journaled observation using local I/O only."""
+        if self.process_capture is None:
+            raise Unavailable("source observation requires retained process capture")
+        with (
+            self.process_capture.completed_sweep(),
+            exclusive(self.runtime_root / "locks" / "responsibility-backfill.lock", blocking=False) as acquired,
+        ):
+            if not acquired:
+                return False
+            ledger, state = self._load()
+            if self._source_work(state) != {"operation": "read", "parameters": dict(parameters)}:
+                return False
+            if (
+                captured.source_root != self.process_capture.checkpoint.legacy_source
+                or captured.lane != parameters["lane"]
+                or captured.relative != parameters["relative"]
+            ):
+                raise Unavailable("source observation differs from its retained pending record")
+            apply_capture_locator(ledger, self.runtime_root, captured)
+            state["pending"] = state["pending"][1:]
+            if not state["pending"]:
+                if self._needs_new_sweep(state):
+                    self._restart_sweep(state)
+                    return True
+                if state["at_end"]:
+                    state["lane"] += 1
+                    state["at_end"] = False
+                    state.pop("source_cursor", None)
+            self._save(state)
+            return True
 
     @contextmanager
     def completed_capture(self) -> Iterator[dict]:
@@ -296,7 +501,7 @@ class ResponsibilityBackfill:
                 raise Unavailable("evidence capture is incomplete")
             yield state
 
-    def _take_locked(self, limit: int) -> BackfillProgress:
+    def _take_locked(self, limit: int, *, allow_source: bool = True) -> BackfillProgress:
         ledger, state = self._load()
         if self._needs_new_sweep(state) and not state["pending"]:
             self._restart_sweep(state)
@@ -305,6 +510,8 @@ class ResponsibilityBackfill:
             self.close()
             self._cursor_key = cursor_key
         visited = processed = 0
+        if not allow_source and state["lane"] >= len(LANES):
+            return BackfillProgress(state["capture_id"], state["lane"], len(state["pending"]), 0, 0, self.total_lanes)
         if state["lane"] < self.total_lanes:
             source_index, lane = divmod(state["lane"], len(LANES))
             source_root = self.sources[source_index]
@@ -349,6 +556,7 @@ class ResponsibilityBackfill:
             elif state["at_end"] and not state["pending"]:
                 state["lane"] += 1
                 state["at_end"] = False
+                state.pop("source_cursor", None)
                 self.close()
                 self._save(state)
             elif processed:

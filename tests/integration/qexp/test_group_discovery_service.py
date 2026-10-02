@@ -214,50 +214,48 @@ def test_preparing_source_revision_does_not_hide_later_commit(tmp_path):
         close(resumed)
 
 
-def test_agent_lifecycle_starts_discovery_and_still_exits_when_idle(tmp_path):
+def test_agent_lifecycle_uses_typed_group_service_and_exits_when_idle(tmp_path):
     import subprocess
     import sys
     from pathlib import Path
 
-    cfg = isolated_group(tmp_path, tail=100)
-    source_file(
-        submission_path(cfg.shared_root, "large"),
-        operation="large",
-        tasks=[f"t{i}" for i in range(100)],
-        sequences=list(range(1, 101)),
-    )
+    cfg = isolated_group(tmp_path, tail=0)
     runtime = MachineRuntime(tmp_path / "machine")
     runtime.add_binding(cfg.shared_root, cfg.machine_name)
     program = r"""
 import sys
-from pathlib import Path
 from qqtools.plugins.qexp.agent import lifecycle
-original = lifecycle.MachineGroupDiscoveryWorker
-marker = Path(sys.argv[2])
-class ObservedWorker(original):
-    def start(self):
-        super().start()
-        marker.with_suffix(".started").write_text("started")
-    def stop(self):
-        super().stop()
-        if self.is_alive:
-            raise RuntimeError("discovery outlived idle shutdown")
-        marker.with_suffix(".stopped").write_text("stopped")
-lifecycle.MachineGroupDiscoveryWorker = ObservedWorker
+from qqtools.plugins.qexp.runtime.group_discovery import service
+class ForbiddenWorker:
+    def __init__(self, *args, **kwargs):
+        raise RuntimeError("legacy Group discovery worker was started")
+service.MachineGroupDiscoveryWorker = ForbiddenWorker
 lifecycle.run_machine_agent_loop(sys.argv[1], loop_interval=0.05, available_gpus=[])
 """
     environment = dict(os.environ)
     environment["PYTHONPATH"] = str(Path(__file__).resolve().parents[3] / "src")
-    marker = tmp_path / "worker"
-    child = subprocess.run(
-        [sys.executable, "-c", program, str(runtime.root), str(marker)],
+    child = subprocess.Popen(
+        [sys.executable, "-c", program, str(runtime.root)],
         env=environment,
-        capture_output=True,
-        timeout=20,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
     )
-    assert child.returncode == 0, child.stderr.decode()
-    assert marker.with_suffix(".started").exists()
-    assert marker.with_suffix(".stopped").exists()
+    try:
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            if GroupCoverage(cfg.shared_root, "experiment").status().is_complete:
+                break
+            if child.poll() is not None:
+                raise AssertionError(child.stderr.read().decode())
+            time.sleep(0.02)
+        else:
+            raise AssertionError("typed Group service did not complete")
+        _stdout, stderr = child.communicate(timeout=15)
+        assert child.returncode == 0, stderr.decode()
+    finally:
+        if child.poll() is None:
+            child.kill()
+            child.wait()
     assert not runtime.paths["pid"].exists()
 
 

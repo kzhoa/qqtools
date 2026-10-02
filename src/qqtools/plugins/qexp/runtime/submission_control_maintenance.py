@@ -6,6 +6,7 @@ import os
 import stat
 import threading
 import time
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -18,7 +19,8 @@ from .group_discovery.submission_projection import SubmissionProjection
 from .locks import exclusive
 from .paths import shared_paths, submission_path
 from .records import validate_identifier
-from .store import atomic_replace, require_json_size
+from .store import atomic_replace, check_mutation_fence, require_json_size
+from .submission_control_continuation import submission_control_continuation
 
 _MAX_CONTROL_STATE_BYTES = 8 * 1024
 _MAX_CHECKPOINT_BYTES = 512 * 1024
@@ -84,6 +86,7 @@ def _unlink_durable(path: Path) -> bool:
     """Unlink one derived record and fence its parent directory."""
 
     try:
+        check_mutation_fence(path)
         path.unlink()
     except FileNotFoundError:
         return False
@@ -160,18 +163,31 @@ class _OperationResult:
 class SubmissionControlMaintenance:
     """Advance one bounded Submission proof build or repair slice."""
 
-    def __init__(self, cfg: RootConfig) -> None:
+    def __init__(self, cfg: RootConfig, *, continuation: Mapping[str, Any] | None = None) -> None:
         if not isinstance(cfg, RootConfig):
             raise TypeError("cfg must be a RootConfig")
         self._cfg = cfg
         self._closed = False
         self._directories_ready = False
-        self._pending_iterator: os.ScandirIterator[str] | None = None
-        self._pending_lane = True
+        cursor = submission_control_continuation(continuation)
+        self._pending_lane = cursor["pending_lane"]
+        self._pending_offset = cursor["pending_offset"]
+        self._pending_inode = cursor["pending_inode"]
+        self._pending_had_work = cursor["pending_had_work"]
+
+    @property
+    def continuation(self) -> dict[str, Any]:
+        """Return bounded traversal state, never parser payloads or descriptors."""
+        return {
+            "pending_lane": self._pending_lane,
+            "pending_offset": self._pending_offset,
+            "pending_inode": self._pending_inode,
+            "pending_had_work": self._pending_had_work,
+        }
 
     @property
     def is_closed(self) -> bool:
-        """Return whether this maintenance owner has released its iterator."""
+        """Return whether this maintenance owner has closed."""
 
         return self._closed
 
@@ -194,14 +210,7 @@ class SubmissionControlMaintenance:
             return {"state": "waiting", "reason": f"maintenance:{type(exc).__name__}:{exc}"}
 
     def close(self) -> None:
-        """Release the pending directory iterator owned by this instance."""
-
-        if self._closed:
-            return
-        iterator = self._pending_iterator
-        self._pending_iterator = None
-        if iterator is not None:
-            iterator.close()
+        """Close the owner; each slice already closes its own directory stream."""
         self._closed = True
 
     def _ensure_directories(self, paths: dict[str, Path]) -> None:
@@ -317,25 +326,34 @@ class SubmissionControlMaintenance:
     def _advance_pending(self, paths: dict[str, Path]) -> dict[str, Any]:
         pending = paths["pending"]
         try:
-            _directory_stamp(pending)
+            stamp = _directory_stamp(pending)
+            if self._pending_inode != stamp[1]:
+                self._pending_offset = 0
+                self._pending_inode = stamp[1]
+                self._pending_had_work = False
+            offset = self._pending_offset
+            name, next_offset = read_directory_entry(pending, offset)
+            after_stamp = _directory_stamp(pending)
         except OSError as exc:
+            self._pending_offset = 0
             return {"state": "waiting", "reason": f"pending_directory_unavailable:{exc}"}
-        except ValueError as exc:
+        except (RuntimeError, ValueError) as exc:
+            self._pending_offset = 0
             return {"state": "waiting", "reason": f"pending_directory_invalid:{exc}"}
-        if self._pending_iterator is None:
-            try:
-                self._pending_iterator = os.scandir(pending)
-            except FileNotFoundError:
-                return {"state": "waiting", "reason": "pending_directory_missing"}
-            except OSError as exc:
-                return {"state": "waiting", "reason": f"pending_directory_unavailable:{exc}"}
-        try:
-            entry = next(self._pending_iterator)
-        except StopIteration:
-            self._pending_iterator.close()
-            self._pending_iterator = None
-            return {"state": "waiting", "reason": "pending_idle"}
-        name = entry.name
+        if after_stamp[1] != stamp[1]:
+            self._pending_inode = after_stamp[1]
+            self._pending_offset = 0
+            self._pending_had_work = False
+            return {"state": "waiting", "reason": "pending_directory_changed"}
+        if name is None:
+            # A cookie is only traversal progress, never proof of absence.
+            # Only a clean, unchanged sweep may acknowledge this lane idle.
+            idle = not self._pending_had_work and stamp == after_stamp
+            self._pending_offset = 0
+            self._pending_had_work = False
+            return {"state": "waiting", "reason": "pending_idle" if idle else "pending_scan_complete"}
+        self._pending_offset = next_offset
+        self._pending_had_work = True
         if not isinstance(name, str) or not name.endswith(".json"):
             return {"state": "waiting", "reason": "pending_entry_skipped"}
         operation_id = name[:-5]

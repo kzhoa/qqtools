@@ -3,37 +3,27 @@
 from __future__ import annotations
 
 import math
-import os
-import stat
 import time
 import uuid
 from collections import OrderedDict
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from datetime import datetime
 from pathlib import Path
 from threading import RLock
 from typing import TYPE_CHECKING, Any
 
-from ..runtime.project_activation import (
-    read_project_activation,
-    read_project_activation_events,
-    read_project_activation_snapshot,
-)
-from ..runtime.project_activation_consumers import ack_consumer, register_consumer
 from ..runtime.records import utc_now
-from ..runtime.store import atomic_replace, read_json_limited
+from ..runtime.store import atomic_replace
 from .bindings import ProjectBinding
 
 if TYPE_CHECKING:
     from .context import MachineRuntime
 
 SERVICE_LANES = ("scheduler", "authority", "group", "observation", "submission", "maintenance")
-_LEGACY_SERVICE_LANES = frozenset({"scheduler", "authority", "group", "observation", "submission"})
 _RECORD_VERSION = 1
 _MAX_REASON_BYTES = 128
-_MAX_RECORD_BYTES = 16 * 1024
 _COLD_RECONCILE_SECONDS = 60.0
+_OBSERVATION_INTERVAL_SECONDS = 5.0
 _monotonic = time.monotonic
 _CheckpointSignature = tuple[str, int] | None
 _Identity = tuple[str, str, str | None]
@@ -50,10 +40,35 @@ class BindingTurn:
     lane: str
     checkpoint: _CheckpointSignature
     unknown: bool = False
+    wake_generation: int = 0
 
     @property
     def identity(self) -> _Identity:
         return self.runtime_id, self.project_id, self.registration_generation
+
+
+@dataclass(frozen=True, slots=True)
+class ActivationObservationIntent:
+    """Exact durable cursor handed to one asynchronous activation observation."""
+
+    binding: ProjectBinding
+    replay_epoch: str | None
+    replay_sequence: int
+    expected_checkpoint: _CheckpointSignature
+
+
+@dataclass(frozen=True, slots=True)
+class ActivationAcknowledgementIntent:
+    """Exact replay acknowledgement and local quiescence snapshot for one binding."""
+
+    binding: ProjectBinding
+    epoch: str
+    sequence: int
+    reconstructed_floor: int | None
+    require_current: bool
+    checkpoint: _CheckpointSignature
+    wake_generation: int
+    lane_revision: int
 
 
 @dataclass(slots=True)
@@ -72,6 +87,12 @@ class _BindingState:
     replay_epoch: str | None = None
     replay_sequence: int = 0
     reconstructed_floor: int | None = None
+    activation_observed: bool = False
+    replay_proposal: tuple[str, int, int | None, bool] | None = None
+    acknowledgement_intent: ActivationAcknowledgementIntent | None = None
+    lane_revision: int = 0
+    next_observation_at: float = 0.0
+    observation_due: bool = True
 
 
 class BindingWorkingSet:
@@ -94,6 +115,7 @@ class BindingWorkingSet:
         self._reconcile_target_revision: int | None = None
         self._wake_generations: dict[_Identity, int] = {}
         self._reconcile_generation = 0
+        self._activation_offsets: dict[str, int] = {}
         self._cold_probes = 0
         self._activations = 0
 
@@ -125,18 +147,6 @@ class BindingWorkingSet:
                 for identity, binding in current.items()
                 if (state := self._states.get(identity)) is None or state.binding.shared_root != binding.shared_root
             ]
-            retries = [
-                (identity, binding)
-                for identity, binding in current.items()
-                if (state := self._states.get(identity)) is not None
-                and state.binding.shared_root == binding.shared_root
-                and not state.consumer_registered
-            ]
-
-        # Read old local progress without holding the coordinator lock. Its state is
-        # never trusted as readiness; only its integrity affects the unknown marker.
-        progress_validity = {identity: self._valid_saved_progress(binding) for identity, binding in additions}
-        registrations = {identity: self._register_consumer(binding) for identity, binding in additions + retries}
 
         with self._lock:
             if reconcile_generation != self._reconcile_generation:
@@ -167,15 +177,6 @@ class BindingWorkingSet:
                         self._wake_locked(identity, state, reason="binding_enabled", unknown=False)
                 else:
                     self._add_resident_locked(identity)
-            for identity, _binding in retries:
-                state = retained.get(identity)
-                if state is not None and registrations[identity] is not None:
-                    state.consumer_registered = True
-                    state.replay_epoch, state.replay_sequence = registrations[identity]
-                    state.unknown = False
-                    state.reason = "consumer_registration_recovered"
-                    state.updated_at = utc_now()
-                    self._persist_locked(identity, state)
             self._wake_generations = {
                 identity: generation for identity, generation in self._wake_generations.items() if identity in retained
             }
@@ -184,13 +185,10 @@ class BindingWorkingSet:
                     continue
                 state = _BindingState(
                     binding=binding,
-                    unknown=not progress_validity[identity] or registrations[identity] is None,
-                    consumer_registered=registrations[identity] is not None,
+                    unknown=True,
+                    consumer_registered=False,
                 )
-                if registrations[identity] is not None:
-                    state.replay_epoch, state.replay_sequence = registrations[identity]
-                if state.unknown:
-                    state.reason = "startup_progress_unknown"
+                state.reason = "startup_activation_unknown"
                 self._states[identity] = state
                 self._add_resident_locked(identity)
                 self._persist_locked(identity, state)
@@ -226,13 +224,18 @@ class BindingWorkingSet:
         with self._lock:
             return bool(self._dormant_enabled)
 
-    def renew_dormant_registrations(
+    @property
+    def process_fence(self) -> str:
+        """Return this process's stable activation-consumer fence."""
+        return self._process_fence
+
+    def select_dormant_registration_renewals(
         self,
         *,
         limit: int = 64,
         heartbeat_interval_seconds: float = 5.0,
-    ) -> tuple[int, int]:
-        """Renew a bounded fair slice without restoring hot Project context."""
+    ) -> tuple[tuple[ProjectBinding, ...], float]:
+        """Select a bounded fair dormant slice without touching Project storage."""
         if type(limit) is not int or limit < 1:
             raise ValueError("limit must be a positive integer.")
         if (
@@ -253,22 +256,343 @@ class BindingWorkingSet:
                 state = self._states.get(identity)
                 if state is not None and state.state == "dormant" and state.binding.enabled:
                     selected.append(state.binding)
-        renewed = 0
-        for binding in selected:
-            try:
-                renewed += bool(
-                    self._runtime.binding_write_eligible(
-                        binding,
-                        renew=True,
-                        renewal_horizon_seconds=renewal_horizon,
-                    )
+        return tuple(selected), renewal_horizon
+
+    def select_registration_renewals(
+        self,
+        *,
+        limit: int = 64,
+        heartbeat_interval_seconds: float = 5.0,
+    ) -> tuple[tuple[ProjectBinding, ...], float]:
+        """Select enabled registrations fairly, independent of Project work state."""
+        if (
+            type(heartbeat_interval_seconds) not in {int, float}
+            or not math.isfinite(heartbeat_interval_seconds)
+            or heartbeat_interval_seconds <= 0
+        ):
+            raise ValueError("heartbeat_interval_seconds must be a finite positive number.")
+        with self._lock:
+            selected = self._fair_states_locked("registration_renewal", lambda state: state.binding.enabled, limit)
+            count = sum(state.binding.enabled for state in self._states.values())
+            rounds_to_revisit = max(1, math.ceil(count / limit))
+            horizon = (rounds_to_revisit + 1) * heartbeat_interval_seconds
+            return tuple(state.binding for _identity, state in selected), horizon
+
+    def select_activation_registrations(self, *, limit: int = 64) -> tuple[ProjectBinding, ...]:
+        """Select enabled unregistered bindings fairly without Project I/O."""
+        with self._lock:
+            selected = self._fair_states_locked(
+                "registration",
+                lambda state: state.binding.enabled and not state.consumer_registered,
+                limit,
+            )
+            return tuple(state.binding for _identity, state in selected)
+
+    def apply_activation_registrations(
+        self,
+        bindings: Sequence[ProjectBinding],
+        results: Mapping[str, Mapping[str, Any]],
+    ) -> None:
+        """Apply exact isolated consumer-registration completions locally."""
+        by_project = {binding.project_id: binding for binding in bindings}
+        with self._lock:
+            for project_id, evidence in results.items():
+                binding = by_project.get(project_id)
+                if binding is None:
+                    continue
+                identity = self._identity(binding)
+                state = self._states.get(identity)
+                if state is None or state.binding != binding or evidence.get("outcome") != "registered":
+                    continue
+                acknowledgement = evidence.get("acknowledgement")
+                state.consumer_registered = True
+                if acknowledgement is None:
+                    state.replay_epoch = None
+                    state.replay_sequence = 0
+                elif self._is_checkpoint_record(acknowledgement):
+                    state.replay_epoch = acknowledgement["epoch"]
+                    state.replay_sequence = acknowledgement["sequence"]
+                else:
+                    continue
+                state.activation_observed = False
+                state.replay_proposal = None
+                state.observation_due = True
+                state.reason = "consumer_registered"
+                state.updated_at = utc_now()
+                self._persist_locked(identity, state)
+
+    def select_activation_observations(self, *, limit: int = 64) -> tuple[ActivationObservationIntent, ...]:
+        """Select due observation cursors fairly without touching Project storage."""
+        now = _monotonic()
+        with self._lock:
+            selected = self._fair_states_locked(
+                "observation",
+                lambda state: (
+                    state.binding.enabled
+                    and state.consumer_registered
+                    and (state.observation_due or (state.state == "resident" and now >= state.next_observation_at))
+                ),
+                limit,
+            )
+            return tuple(
+                ActivationObservationIntent(
+                    binding=state.binding,
+                    replay_epoch=state.replay_epoch,
+                    replay_sequence=state.replay_sequence,
+                    expected_checkpoint=state.checkpoint,
                 )
-            except (OSError, RuntimeError, ValueError, KeyError, TypeError):
-                continue
-        return len(selected), renewed
+                for _identity, state in selected
+            )
+
+    def retain_activation_observation_intent(
+        self,
+        binding: ProjectBinding,
+        *,
+        replay_epoch: str | None,
+        replay_sequence: int,
+    ) -> ActivationObservationIntent | None:
+        """Rebuild an exact still-current intent for unresolved worker ownership."""
+        identity = self._identity(binding)
+        with self._lock:
+            state = self._states.get(identity)
+            if (
+                state is None
+                or state.binding != binding
+                or state.replay_epoch != replay_epoch
+                or state.replay_sequence != replay_sequence
+            ):
+                return None
+            return ActivationObservationIntent(binding, replay_epoch, replay_sequence, state.checkpoint)
+
+    def is_activation_observation_due(
+        self,
+        binding: ProjectBinding,
+        *,
+        replay_epoch: str | None,
+        replay_sequence: int,
+    ) -> bool:
+        """Revalidate a collected observation intent immediately before grant."""
+        now = _monotonic()
+        with self._lock:
+            state = self._states.get(self._identity(binding))
+            return bool(
+                state is not None
+                and state.binding == binding
+                and state.binding.enabled
+                and state.consumer_registered
+                and state.replay_epoch == replay_epoch
+                and state.replay_sequence == replay_sequence
+                and (state.observation_due or (state.state == "resident" and now >= state.next_observation_at))
+            )
+
+    def apply_activation_observations(
+        self,
+        intents: Sequence[ActivationObservationIntent],
+        results: Mapping[str, Mapping[str, Any]],
+    ) -> None:
+        """Apply bounded replay observations and wake changed dormant bindings."""
+        by_project = {intent.binding.project_id: intent for intent in intents}
+        now = _monotonic()
+        with self._lock:
+            for project_id, evidence in results.items():
+                intent = by_project.get(project_id)
+                if intent is None:
+                    continue
+                binding = intent.binding
+                identity = self._identity(binding)
+                state = self._states.get(identity)
+                if (
+                    state is None
+                    or state.binding != binding
+                    or state.replay_epoch != intent.replay_epoch
+                    or state.replay_sequence != intent.replay_sequence
+                ):
+                    continue
+                if evidence.get("outcome") != "observed":
+                    self._wake_locked(identity, state, reason="checkpoint_unreadable", unknown=True)
+                    continue
+                checkpoint_record = evidence.get("checkpoint")
+                if checkpoint_record is None:
+                    checkpoint = None
+                    proposal = None
+                else:
+                    replay = evidence.get("replay")
+                    if not self._is_checkpoint_record(checkpoint_record) or not isinstance(replay, Mapping):
+                        continue
+                    if (
+                        replay.get("epoch") != checkpoint_record["epoch"]
+                        or type(replay.get("sequence")) is not int
+                        or replay["sequence"] < 1
+                        or type(replay.get("complete")) is not bool
+                    ):
+                        continue
+                    floor = replay.get("reconstructed_floor")
+                    if floor is not None and (type(floor) is not int or floor < 1 or floor > replay["sequence"]):
+                        continue
+                    checkpoint = (checkpoint_record["epoch"], checkpoint_record["sequence"])
+                    proposal = (replay["epoch"], replay["sequence"], floor, replay["complete"])
+                previous_checkpoint = state.checkpoint
+                was_dormant = state.state == "dormant"
+                if checkpoint != previous_checkpoint:
+                    self._wake_locked(
+                        identity,
+                        state,
+                        reason="checkpoint_changed",
+                        unknown=False,
+                        checkpoint=checkpoint,
+                    )
+                elif was_dormant and now >= state.next_cold_reconcile_at:
+                    self._wake_locked(identity, state, reason="cold_reconciliation", unknown=False)
+                if checkpoint is not None and state.replay_epoch is not None and state.replay_epoch != checkpoint[0]:
+                    # register_consumer is the mutation that deliberately clears
+                    # a durable acknowledgement from an obsolete epoch.  Do not
+                    # attempt to acknowledge the replacement epoch until that
+                    # fenced mutation has completed in an isolated worker.
+                    state.consumer_registered = False
+                    state.activation_observed = False
+                    state.replay_proposal = None
+                    state.observation_due = True
+                    state.unknown = True
+                    state.reason = "activation_epoch_registration_pending"
+                    state.updated_at = utc_now()
+                    self._persist_locked(identity, state)
+                    continue
+                state.activation_observed = True
+                state.replay_proposal = proposal
+                state.observation_due = False
+                state.next_observation_at = now + _OBSERVATION_INTERVAL_SECONDS
+                state.unknown = not state.consumer_registered
+                state.updated_at = utc_now()
+                all_acknowledged = self._all_lanes_acknowledged(state)
+                if all_acknowledged and checkpoint is None and state.consumer_registered:
+                    self._enter_dormant_locked(identity, state)
+                else:
+                    self._persist_locked(identity, state)
+
+    def select_activation_acknowledgements(
+        self,
+        *,
+        limit: int = 64,
+    ) -> tuple[ActivationAcknowledgementIntent, ...]:
+        """Select exact replay acknowledgements after every lane is quiescent."""
+        with self._lock:
+            selected = self._fair_states_locked(
+                "acknowledgement",
+                lambda state: (
+                    state.binding.enabled
+                    and state.consumer_registered
+                    and state.checkpoint is not None
+                    and self._all_lanes_acknowledged(state)
+                    and (state.acknowledgement_intent is not None or state.replay_proposal is not None)
+                ),
+                limit,
+            )
+            intents: list[ActivationAcknowledgementIntent] = []
+            for identity, state in selected:
+                intent = state.acknowledgement_intent
+                if intent is None:
+                    proposal = state.replay_proposal
+                    if proposal is None or state.checkpoint is None:
+                        continue
+                    epoch, sequence, floor, complete = proposal
+                    intent = ActivationAcknowledgementIntent(
+                        binding=state.binding,
+                        epoch=epoch,
+                        sequence=sequence,
+                        reconstructed_floor=floor,
+                        require_current=bool(complete and state.checkpoint == (epoch, sequence)),
+                        checkpoint=state.checkpoint,
+                        wake_generation=self._wake_generations.get(identity, 0),
+                        lane_revision=state.lane_revision,
+                    )
+                    state.acknowledgement_intent = intent
+                intents.append(intent)
+            return tuple(intents)
+
+    def retain_activation_acknowledgement_intent(
+        self,
+        binding: ProjectBinding,
+        *,
+        epoch: str,
+        sequence: int,
+        reconstructed_floor: int | None,
+        require_current: bool,
+    ) -> ActivationAcknowledgementIntent | None:
+        """Return the local intent still owning one unresolved shared ack."""
+        identity = self._identity(binding)
+        with self._lock:
+            state = self._states.get(identity)
+            intent = None if state is None or state.binding != binding else state.acknowledgement_intent
+            if (
+                intent is None
+                or intent.epoch != epoch
+                or intent.sequence != sequence
+                or intent.reconstructed_floor != reconstructed_floor
+                or intent.require_current != require_current
+            ):
+                return None
+            return intent
+
+    def apply_activation_acknowledgements(
+        self,
+        intents: Sequence[ActivationAcknowledgementIntent],
+        results: Mapping[str, Mapping[str, Any]],
+    ) -> None:
+        """Absorb monotonic shared progress; only exact current completions retire."""
+        by_project = {intent.binding.project_id: intent for intent in intents}
+        with self._lock:
+            for project_id, evidence in results.items():
+                intent = by_project.get(project_id)
+                acknowledgement = evidence.get("acknowledgement")
+                if intent is None:
+                    continue
+                identity = self._identity(intent.binding)
+                state = self._states.get(identity)
+                if state is None or state.binding != intent.binding:
+                    continue
+                if (
+                    evidence.get("outcome") != "acknowledged"
+                    or not self._is_checkpoint_record(acknowledgement)
+                    or acknowledgement != {"epoch": intent.epoch, "sequence": intent.sequence}
+                ):
+                    if state.acknowledgement_intent == intent:
+                        state.acknowledgement_intent = None
+                        state.replay_proposal = None
+                        state.observation_due = True
+                        state.unknown = True
+                        state.reason = "activation_ack_unavailable"
+                        state.updated_at = utc_now()
+                        self._persist_locked(identity, state)
+                    continue
+                # The shared cursor is monotonic durable truth even when local
+                # service turns changed while the worker was running.
+                current_epoch = state.checkpoint[0] if state.checkpoint is not None else None
+                if state.replay_epoch == intent.epoch and state.replay_sequence <= intent.sequence:
+                    state.replay_sequence = intent.sequence
+                elif state.replay_epoch is None or current_epoch == intent.epoch:
+                    state.replay_epoch = intent.epoch
+                    state.replay_sequence = intent.sequence
+                is_exact = state.acknowledgement_intent == intent
+                if is_exact:
+                    state.acknowledgement_intent = None
+                    state.replay_proposal = None
+                if (
+                    is_exact
+                    and intent.require_current
+                    and state.checkpoint == intent.checkpoint == (intent.epoch, intent.sequence)
+                    and self._wake_generations.get(identity, 0) == intent.wake_generation
+                    and state.lane_revision == intent.lane_revision
+                    and self._all_lanes_acknowledged(state)
+                ):
+                    self._enter_dormant_locked(identity, state)
+                else:
+                    state.observation_due = True
+                    state.reason = "activation_replay_pending"
+                    state.updated_at = utc_now()
+                    self._persist_locked(identity, state)
 
     def begin_turn(self, binding: ProjectBinding, lane: str) -> BindingTurn:
-        """Observe activation before one lane performs service work."""
+        """Capture one lane turn using only the latest isolated observation."""
         if lane not in SERVICE_LANES:
             raise ValueError(f"unknown working-set service lane: {lane!r}")
         identity = self._identity(binding)
@@ -285,52 +609,86 @@ class BindingWorkingSet:
                     None,
                     unknown=True,
                 )
+            if state.state == "dormant":
+                self._wake_locked(identity, state, reason="service_turn", unknown=state.unknown)
+            state.state = "resident"
+            state.acknowledgements[lane] = None
+            state.acknowledged_lanes.discard(lane)
+            state.lane_revision += 1
+            state.startup_pending = True
+            state.reason = "service_turn"
+            state.updated_at = utc_now()
+            self._add_resident_locked(identity)
+            self._persist_locked(identity, state)
+            return BindingTurn(
+                runtime_id,
+                binding.project_id,
+                binding.registration_generation,
+                binding.shared_root,
+                lane,
+                state.checkpoint,
+                state.unknown or not state.activation_observed or not state.consumer_registered,
+                self._wake_generations.get(identity, 0),
+            )
 
-        signature, unknown = self._read_signature(binding)
-
+    def is_current_turn(self, turn: BindingTurn) -> bool:
+        """Check local proof identity without waking a binding or advancing a lane."""
         with self._lock:
-            state = self._states.get(identity)
-            if state is None or state.binding.shared_root != binding.shared_root:
-                return BindingTurn(
-                    runtime_id,
-                    binding.project_id,
-                    binding.registration_generation,
-                    binding.shared_root,
-                    lane,
-                    signature,
-                    unknown=True,
-                )
-            if unknown:
-                self._wake_locked(identity, state, reason="checkpoint_unreadable", unknown=True)
-            elif state.state == "dormant":
-                reason = "checkpoint_changed" if signature != state.checkpoint else "service_turn"
-                self._wake_locked(identity, state, reason=reason, unknown=False, checkpoint=signature)
-            else:
-                if signature != state.checkpoint:
-                    state.acknowledgements = dict.fromkeys(SERVICE_LANES)
-                    state.acknowledged_lanes.clear()
-                    state.startup_pending = True
-                state.checkpoint = signature
-                state.state = "resident"
-                state.acknowledgements[lane] = None
-                state.acknowledged_lanes.discard(lane)
-                state.startup_pending = True
-                state.reason = "service_turn"
-                state.unknown = False
-                state.updated_at = utc_now()
-                self._persist_locked(identity, state)
-        return BindingTurn(
-            runtime_id,
-            binding.project_id,
-            binding.registration_generation,
-            binding.shared_root,
-            lane,
-            signature,
-            unknown,
-        )
+            state = self._states.get(turn.identity)
+            return bool(
+                state is not None
+                and state.binding.shared_root == turn.shared_root
+                and turn.lane in SERVICE_LANES
+                and turn.wake_generation == self._wake_generations.get(turn.identity, 0)
+                and turn.checkpoint == state.checkpoint
+                and not turn.unknown
+                and not state.unknown
+                and state.consumer_registered
+            )
+
+    def has_current_activation(self, binding: ProjectBinding) -> bool:
+        """Return whether service turns can bind to a fully observed activation."""
+        with self._lock:
+            state = self._states.get(self._identity(binding))
+            return bool(
+                state is not None
+                and state.binding == binding
+                and not state.unknown
+                and state.consumer_registered
+                and state.activation_observed
+            )
+
+    def is_lane_quiescent(self, binding: ProjectBinding, lane: str) -> bool:
+        """Recognize a settled lane without certifying final activation replay."""
+        if lane not in SERVICE_LANES:
+            raise ValueError("unknown binding service lane.")
+        with self._lock:
+            state = self._states.get(self._identity(binding))
+            return bool(
+                state is not None
+                and state.binding == binding
+                and not state.unknown
+                and state.consumer_registered
+                and lane in state.acknowledged_lanes
+                and state.acknowledgements[lane] == state.checkpoint
+            )
+
+    def is_turn_observation_pending(self, turn: BindingTurn) -> bool:
+        """Recognize an unchanged unknown turn without certifying quiescence."""
+        with self._lock:
+            state = self._states.get(turn.identity)
+            return bool(
+                state is not None
+                and state.binding.shared_root == turn.shared_root
+                and turn.lane in SERVICE_LANES
+                and turn.wake_generation == self._wake_generations.get(turn.identity, 0)
+                and turn.checkpoint == state.checkpoint
+                and turn.unknown
+                and (state.unknown or not state.activation_observed or not state.consumer_registered)
+            )
 
     def acknowledge(self, turn: BindingTurn, *, quiescent: bool) -> bool:
-        """Commit a lane acknowledgement only if its checkpoint is still current."""
+        """Record local quiescence; shared acknowledgement is asynchronous."""
         identity = turn.identity
         with self._lock:
             state = self._states.get(identity)
@@ -339,37 +697,20 @@ class BindingWorkingSet:
                 or state.binding.shared_root != turn.shared_root
                 or turn.lane not in SERVICE_LANES
                 or turn.runtime_id != identity[0]
+                or turn.wake_generation != self._wake_generations.get(identity, 0)
+                or turn.checkpoint != state.checkpoint
             ):
                 return False
-            wake_generation = self._wake_generations.get(identity, 0)
-
-        signature, unknown = self._read_signature(state.binding)
-
-        with self._lock:
-            current_state = self._states.get(identity)
-            if (
-                current_state is not state
-                or current_state.binding.shared_root != turn.shared_root
-                or turn.runtime_id != identity[0]
-                or self._wake_generations.get(identity, 0) != wake_generation
-            ):
-                return False
-            state = current_state
-            if unknown or turn.unknown:
-                self._wake_locked(identity, state, reason="checkpoint_unreadable", unknown=True)
-                return False
-            if signature != turn.checkpoint:
-                self._wake_locked(
-                    identity,
-                    state,
-                    reason="checkpoint_changed",
-                    unknown=False,
-                    checkpoint=signature,
-                )
+            if turn.unknown or state.unknown or not state.activation_observed or not state.consumer_registered:
+                state.observation_due = True
+                state.reason = "activation_observation_pending"
+                state.updated_at = utc_now()
+                self._persist_locked(identity, state)
                 return False
             if not quiescent:
                 state.acknowledgements[turn.lane] = None
                 state.acknowledged_lanes.discard(turn.lane)
+                state.lane_revision += 1
                 state.state = "resident"
                 state.startup_pending = True
                 state.reason = "lane_active"
@@ -378,74 +719,27 @@ class BindingWorkingSet:
                 self._persist_locked(identity, state)
                 return False
 
-            state.checkpoint = signature
-            state.acknowledgements[turn.lane] = signature
+            state.acknowledgements[turn.lane] = state.checkpoint
             state.acknowledged_lanes.add(turn.lane)
+            state.lane_revision += 1
             state.reason = "quiescent"
             state.updated_at = utc_now()
             all_acknowledged = state.acknowledged_lanes == set(SERVICE_LANES) and all(
-                state.acknowledgements[lane] == signature for lane in SERVICE_LANES
+                state.acknowledgements[lane] == state.checkpoint for lane in SERVICE_LANES
             )
-            if all_acknowledged and not self._persist_locked(identity, state):
-                self._wake_locked(identity, state, reason="local_progress_unavailable", unknown=True)
-                return False
-            replay_before = (state.replay_epoch, state.replay_sequence, state.reconstructed_floor)
-            replay_complete = True
-            if all_acknowledged and signature is not None:
-                try:
-                    if state.replay_epoch != signature[0]:
-                        registration = self._register_consumer(state.binding)
-                        if registration is None:
-                            raise RuntimeError("Project activation consumer re-registration failed")
-                        state.consumer_registered = True
-                        state.replay_epoch, state.replay_sequence = registration
-                    replay_complete = self._replay_events(state, signature)
-                except (OSError, RuntimeError, ValueError, KeyError, TypeError):
-                    self._wake_locked(identity, state, reason="activation_replay_unavailable", unknown=True)
-                    return False
-            if all_acknowledged and replay_complete:
-                was_dormant = state.state == "dormant"
-                state.state = "dormant"
-                state.startup_pending = False
-                state.unknown = False
-                if not was_dormant:
-                    state.next_cold_reconcile_at = _monotonic() + _COLD_RECONCILE_SECONDS
-            else:
-                state.state = "resident"
-                state.startup_pending = True
-                if all_acknowledged:
-                    state.reason = "activation_replay_pending"
-                self._add_resident_locked(identity)
-            persisted = self._persist_locked(identity, state)
-            if persisted and all_acknowledged:
-                if not state.consumer_registered or turn.registration_generation is None:
-                    persisted = False
-                elif signature is not None:
-                    try:
-                        ack_consumer(
-                            turn.shared_root,
-                            runtime_id=turn.runtime_id,
-                            project_id=turn.project_id,
-                            registration_generation=turn.registration_generation,
-                            process_fence=self._process_fence,
-                            epoch=signature[0],
-                            sequence=state.replay_sequence,
-                            reconstructed_floor=state.reconstructed_floor,
-                            require_current=state.state == "dormant",
-                        )
-                    except (OSError, RuntimeError, ValueError, KeyError, TypeError):
-                        persisted = False
-                if not persisted:
-                    state.replay_epoch, state.replay_sequence, state.reconstructed_floor = replay_before
-                    self._wake_locked(identity, state, reason="consumer_ack_unavailable", unknown=True)
-                    return False
-            if not replay_complete:
-                return False
-            if persisted and state.state == "dormant":
-                self._add_dormant_locked(identity)
-            else:
-                self._remove_dormant_locked(identity)
-            return persisted
+            state.state = "resident"
+            state.startup_pending = True
+            self._add_resident_locked(identity)
+            if all_acknowledged:
+                state.reason = "activation_ack_pending"
+                if state.checkpoint is None:
+                    # A final isolated observation must confirm that no
+                    # checkpoint appeared after the service turns.
+                    state.activation_observed = False
+                    state.replay_proposal = None
+                    state.observation_due = True
+            self._persist_locked(identity, state)
+            return False
 
     def poll_dormant(
         self,
@@ -453,32 +747,30 @@ class BindingWorkingSet:
         *,
         limit: int = 4,
     ) -> list[ProjectBinding]:
-        """Cold-check a bounded fair slice of dormant bindings."""
+        """Queue a bounded fair dormant slice for isolated observation."""
         if type(limit) is not int or limit < 1:
             raise ValueError("limit must be a positive integer.")
         if bindings is not None and not bindings:
             return []
+        now = _monotonic()
 
         eligibility: dict[_Identity, dict[Path, ProjectBinding]] | None = None
-        registry_identities: list[_Identity] = []
         if bindings is not None:
             eligibility = {}
             for binding in bindings:
                 identity = self._identity(binding)
-                registry_identities.append(identity)
                 eligibility.setdefault(identity, {})[binding.shared_root] = binding
 
-        selected: list[tuple[_Identity, _BindingState, ProjectBinding, _CheckpointSignature]] = []
         with self._lock:
             for _ in range(min(limit, len(self._dormant_roster))):
-                if len(selected) >= limit:
-                    break
                 identity, _marker = self._dormant_roster.popitem(last=False)
                 self._dormant_roster[identity] = None
                 if identity not in self._dormant_members:
                     continue
                 state = self._states.get(identity)
                 if state is None or state.state != "dormant":
+                    continue
+                if now < state.next_cold_reconcile_at:
                     continue
                 roots = eligibility.get(identity) if eligibility is not None else None
                 binding = (
@@ -487,56 +779,10 @@ class BindingWorkingSet:
                 if eligibility is None and binding is not None and not binding.enabled:
                     continue
                 if binding is not None:
-                    selected.append((identity, state, binding, state.checkpoint))
-
-        observations: list[
-            tuple[_Identity, _BindingState, ProjectBinding, _CheckpointSignature, _CheckpointSignature, bool]
-        ] = []
-        for identity, observed_state, binding, checkpoint in selected:
-            try:
-                signature, unknown = self._read_signature(binding)
-            finally:
-                with self._lock:
+                    state.observation_due = True
                     self._cold_probes += 1
-            observations.append((identity, observed_state, binding, checkpoint, signature, unknown))
-
-        with self._lock:
-            awakened: set[tuple[_Identity, Path]] = set()
-            for identity, observed_state, binding, checkpoint, signature, unknown in observations:
-                state = self._states.get(identity)
-                if (
-                    state is not observed_state
-                    or state.binding.shared_root != binding.shared_root
-                    or state.state != "dormant"
-                    or state.checkpoint != checkpoint
-                ):
-                    continue
-                if unknown:
-                    self._wake_locked(identity, state, reason="checkpoint_unreadable", unknown=True)
-                    awakened.add((identity, binding.shared_root))
-                elif signature != state.checkpoint:
-                    self._wake_locked(
-                        identity,
-                        state,
-                        reason="checkpoint_changed",
-                        unknown=False,
-                        checkpoint=signature,
-                    )
-                    awakened.add((identity, binding.shared_root))
-                elif _monotonic() >= state.next_cold_reconcile_at:
-                    self._wake_locked(identity, state, reason="cold_reconciliation", unknown=False)
-                    awakened.add((identity, binding.shared_root))
-            if bindings is None:
-                return [
-                    binding
-                    for identity, _state, binding, _checkpoint, _signature, _unknown in observations
-                    if (identity, binding.shared_root) in awakened
-                ]
-            return [
-                binding
-                for binding, identity in zip(bindings, registry_identities, strict=True)
-                if (identity, binding.shared_root) in awakened
-            ]
+        # Observation completion, not selection, decides whether to wake.
+        return []
 
     def activate(self, binding: ProjectBinding, reason: str) -> None:
         """Restore exact current binding residency after local work appears."""
@@ -552,6 +798,9 @@ class BindingWorkingSet:
             state.state = "resident"
             state.acknowledgements = dict.fromkeys(SERVICE_LANES)
             state.acknowledged_lanes.clear()
+            state.lane_revision += 1
+            state.replay_proposal = None
+            state.observation_due = True
             state.startup_pending = True
             state.reason = reason
             state.updated_at = utc_now()
@@ -575,59 +824,62 @@ class BindingWorkingSet:
                 "activations": self._activations,
             }
 
+    def _fair_states_locked(
+        self,
+        service: str,
+        predicate: Any,
+        limit: int,
+    ) -> list[tuple[_Identity, _BindingState]]:
+        if type(limit) is not int or limit < 1 or limit > 64:
+            raise ValueError("activation selection limit must be an integer from 1 to 64.")
+        candidates = [(identity, state) for identity, state in self._states.items() if predicate(state)]
+        if not candidates:
+            self._activation_offsets.pop(service, None)
+            return []
+        offset = self._activation_offsets.get(service, 0) % len(candidates)
+        ordered = candidates[offset:] + candidates[:offset]
+        selected = ordered[:limit]
+        self._activation_offsets[service] = (offset + len(selected)) % len(candidates)
+        return selected
+
+    @staticmethod
+    def _is_checkpoint_record(value: object) -> bool:
+        if not isinstance(value, Mapping) or set(value) != {"epoch", "sequence"}:
+            return False
+        epoch = value.get("epoch")
+        try:
+            parsed = uuid.UUID(hex=epoch) if isinstance(epoch, str) else None
+        except ValueError:
+            return False
+        return bool(
+            parsed is not None
+            and parsed.int != 0
+            and parsed.hex == epoch
+            and type(value.get("sequence")) is int
+            and value["sequence"] >= 1
+        )
+
+    @staticmethod
+    def _all_lanes_acknowledged(state: _BindingState) -> bool:
+        return state.acknowledged_lanes == set(SERVICE_LANES) and all(
+            state.acknowledgements[lane] == state.checkpoint for lane in SERVICE_LANES
+        )
+
+    def _enter_dormant_locked(self, identity: _Identity, state: _BindingState) -> None:
+        state.state = "dormant"
+        state.startup_pending = False
+        state.unknown = False
+        state.reason = "quiescent"
+        state.updated_at = utc_now()
+        state.next_cold_reconcile_at = _monotonic() + _COLD_RECONCILE_SECONDS
+        if self._persist_locked(identity, state):
+            self._add_dormant_locked(identity)
+
     def _identity(self, binding: ProjectBinding) -> _Identity:
         with self._lock:
             if self._runtime_id is None:
                 self._runtime_id = self._runtime.instance_id
             return self._runtime_id, binding.project_id, binding.registration_generation
-
-    def _register_consumer(self, binding: ProjectBinding) -> tuple[str | None, int] | None:
-        if binding.registration_generation is None:
-            return None
-        try:
-            record = register_consumer(
-                binding.shared_root,
-                runtime_id=self._identity(binding)[0],
-                project_id=binding.project_id,
-                registration_generation=binding.registration_generation,
-                process_fence=self._process_fence,
-            )
-        except (OSError, RuntimeError, ValueError, KeyError, TypeError):
-            return None
-        acknowledgement = record["project_activation_consumer"]["ack"]
-        if acknowledgement is None:
-            return None, 0
-        return acknowledgement["epoch"], acknowledgement["sequence"]
-
-    @staticmethod
-    def _replay_events(state: _BindingState, signature: tuple[str, int]) -> bool:
-        epoch, sequence = signature
-        if state.replay_epoch != epoch:
-            state.replay_epoch = epoch
-            state.replay_sequence = 0
-        state.reconstructed_floor = None
-        if state.replay_sequence > sequence:
-            raise ValueError("activation replay cursor exceeds the current checkpoint")
-        snapshot = read_project_activation_snapshot(state.binding.shared_root)
-        if snapshot is not None:
-            snapshot_record = snapshot["project_activation_snapshot"]
-            if snapshot_record["epoch"] == epoch and state.replay_sequence < snapshot_record["floor_sequence"]:
-                # This path is reached only after every service lane has durably
-                # reconciled the binding's authoritative active/waiting indexes.
-                state.replay_sequence = snapshot_record["floor_sequence"]
-                state.reconstructed_floor = snapshot_record["floor_sequence"]
-        if state.replay_sequence == sequence:
-            return True
-        batch = read_project_activation_events(
-            state.binding.shared_root,
-            epoch=epoch,
-            after_sequence=state.replay_sequence,
-            limit=min(256, sequence - state.replay_sequence),
-        )
-        if not batch:
-            raise ValueError("activation replay made no progress")
-        state.replay_sequence += len(batch)
-        return state.replay_sequence == sequence
 
     @staticmethod
     def _validate_reason(reason: str) -> None:
@@ -639,101 +891,6 @@ class BindingWorkingSet:
             raise ValueError("working-set reason must be valid UTF-8.") from exc
         if len(encoded) > _MAX_REASON_BYTES or any(ord(char) < 0x20 or ord(char) == 0x7F for char in reason):
             raise ValueError("working-set reason must be at most 128 bytes without control characters.")
-
-    @staticmethod
-    def _read_signature(binding: ProjectBinding) -> tuple[_CheckpointSignature, bool]:
-        try:
-            record = read_project_activation(binding.shared_root)
-        except (OSError, RuntimeError, ValueError, KeyError, TypeError):
-            return None, True
-        if record is None:
-            return None, False
-        value = record["project_activation"]
-        return (value["epoch"], value["sequence"]), False
-
-    def _valid_saved_progress(self, binding: ProjectBinding) -> bool:
-        path = self._progress_path(binding)
-        try:
-            metadata = path.lstat()
-            if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > _MAX_RECORD_BYTES:
-                return False
-            value = read_json_limited(path, max_bytes=_MAX_RECORD_BYTES, record_type="working_set")
-            record = value.get("working_set")
-            if type(record) is not dict or set(record) != {
-                "version",
-                "identity",
-                "process_fence",
-                "state",
-                "checkpoint",
-                "acknowledgements",
-                "acknowledged_lanes",
-                "reason",
-                "updated_at",
-            }:
-                return False
-            identity = record["identity"]
-            if type(identity) is not dict or set(identity) != {"runtime_id", "project_id", "registration_generation"}:
-                return False
-            if identity != {
-                "runtime_id": self._runtime_id,
-                "project_id": binding.project_id,
-                "registration_generation": binding.registration_generation,
-            }:
-                return False
-            if type(record["version"]) is not int or record["version"] != _RECORD_VERSION:
-                return False
-            if type(record["process_fence"]) is not str or not record["process_fence"]:
-                return False
-            if record["state"] not in {"resident", "dormant"}:
-                return False
-            if not self._valid_signature(record["checkpoint"]):
-                return False
-            acks = record["acknowledgements"]
-            if type(acks) is not dict or (set(acks) != set(SERVICE_LANES) and set(acks) != _LEGACY_SERVICE_LANES):
-                return False
-            if not all(self._valid_signature(signature) for signature in acks.values()):
-                return False
-            acknowledged_lanes = record["acknowledged_lanes"]
-            if (
-                type(acknowledged_lanes) is not list
-                or len(acknowledged_lanes) != len(set(acknowledged_lanes))
-                or any(lane not in SERVICE_LANES for lane in acknowledged_lanes)
-            ):
-                return False
-            if record["state"] == "dormant" and (
-                set(acknowledged_lanes) != set(SERVICE_LANES)
-                or any(acks[lane] != record["checkpoint"] for lane in SERVICE_LANES)
-            ):
-                return False
-            self._validate_reason(record["reason"])
-            if type(record["updated_at"]) is not str or not record["updated_at"]:
-                return False
-            timestamp = datetime.fromisoformat(record["updated_at"].replace("Z", "+00:00"))
-            if timestamp.tzinfo is None or timestamp.utcoffset() is None:
-                return False
-            return True
-        except (OSError, ValueError, TypeError, KeyError, RuntimeError):
-            return False
-
-    @staticmethod
-    def _valid_signature(value: object) -> bool:
-        if value is None:
-            return True
-        epoch = value.get("epoch") if type(value) is dict else None
-        if not isinstance(epoch, str):
-            return False
-        try:
-            parsed_epoch = uuid.UUID(hex=epoch)
-        except (ValueError, AttributeError):
-            return False
-        return (
-            type(value) is dict
-            and set(value) == {"epoch", "sequence"}
-            and epoch == parsed_epoch.hex
-            and parsed_epoch.int != 0
-            and type(value["sequence"]) is int
-            and value["sequence"] >= 1
-        )
 
     def _progress_path(self, binding: ProjectBinding) -> Path:
         return self._runtime.project_paths(binding.project_id)["root"] / "working-set-v1.json"
@@ -752,12 +909,15 @@ class BindingWorkingSet:
         state.state = "resident"
         state.acknowledgements = dict.fromkeys(SERVICE_LANES)
         state.acknowledged_lanes.clear()
+        state.lane_revision += 1
         state.startup_pending = True
         state.reason = reason
         state.unknown = unknown
         state.updated_at = utc_now()
         if checkpoint is not ...:
             state.checkpoint = checkpoint  # type: ignore[assignment]
+        state.replay_proposal = None
+        state.observation_due = True
         if was_dormant:
             self._activations += 1
         self._add_resident_locked(identity)

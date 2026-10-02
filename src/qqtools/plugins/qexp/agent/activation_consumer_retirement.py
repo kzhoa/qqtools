@@ -7,14 +7,13 @@ import os
 import re
 import stat
 from collections import deque
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path
 from threading import Lock, RLock
 from typing import TYPE_CHECKING, Any
 
-from ..runtime.project_activation_consumers import retire_consumer_after_registration_removal
 from ..runtime.store import atomic_replace
 from .bindings import ProjectBinding
 
@@ -24,9 +23,11 @@ if TYPE_CHECKING:
 _MAX_INTENT_BYTES = 16 * 1024
 _MAX_RECOVERY_RECORDS = 16
 _MAX_RECOVERY_QUEUE_ENTRIES = 64
-_INTENT_DIRECTORY = "activation-consumer-retirements-v1"
+_INTENT_DIRECTORY = "activation-consumer-retirements-v2"
 _RECORD_NAME = "activation_consumer_retirement"
-_RECORD_FIELDS = frozenset({"version", "runtime_id", "project_id", "registration_generation", "shared_root"})
+_RECORD_FIELDS = frozenset(
+    {"version", "runtime_id", "project_id", "registration_generation", "shared_root", "machine_name"}
+)
 _IDENTIFIER = re.compile(r"[A-Za-z0-9_-]{1,128}\Z", re.ASCII)
 
 
@@ -36,6 +37,7 @@ class _RetirementIntent:
     project_id: str
     registration_generation: str
     shared_root: str
+    machine_name: str
 
 
 class ActivationConsumerRetirements:
@@ -69,7 +71,7 @@ class ActivationConsumerRetirements:
         self._enqueue(path)
 
     def complete(self, binding: ProjectBinding) -> None:
-        """Retire and clear an intent after the caller committed registry removal.
+        """Queue an intent after the caller committed registry removal.
 
         The internal caller must still hold the machine registry guard and have
         saved a registry revision in which this exact binding is absent.
@@ -81,11 +83,10 @@ class ActivationConsumerRetirements:
             raise RuntimeError(f"activation consumer retirement intent is missing after registry removal: {path}")
         if stored != intent:
             raise RuntimeError(f"activation consumer retirement intent does not match the removed binding: {path}")
-        self._retire_and_clear(intent)
-        self._discard(path)
+        self._enqueue(path)
 
     def recover(self, snapshot: Sequence[ProjectBinding], registration: MachineRegistration) -> None:
-        """Recover all startup absences once, then retry a fair bounded batch."""
+        """Validate local intents and requeue bounded batches without Project I/O."""
         with self._lock:
             startup = not self._startup_recovered
         if startup:
@@ -94,30 +95,11 @@ class ActivationConsumerRetirements:
                     startup = not self._startup_recovered
                 if startup:
                     paths = _list_intent_paths(self.root)
-                    # Startup is explicitly allowed to inspect the full machine-local
-                    # intent tree. Recheck each absence in its own short registry
-                    # critical section so cross-root retirement I/O never pins the
-                    # registry lock across the complete startup population.
                     for path in paths:
                         intent = _read_intent(self.root, path)
                         if intent is None:
                             continue
-                        if _is_registered(intent, snapshot):
-                            self._enqueue(path)
-                            continue
-                        with registration.registry_guard():
-                            _revision, current = registration.load_registry()
-                            current_intent = _read_intent(self.root, path)
-                            if current_intent is None:
-                                continue
-                            if current_intent != intent:
-                                raise RuntimeError(
-                                    f"activation consumer retirement intent changed during recovery: {path}"
-                                )
-                            if _is_registered(current_intent, current):
-                                self._enqueue(path)
-                                continue
-                            self._retire_and_clear(current_intent)
+                        self._enqueue(path)
                     with self._lock:
                         self._startup_recovered = True
             return
@@ -128,25 +110,7 @@ class ActivationConsumerRetirements:
                 intent = _read_intent(self.root, path)
                 if intent is None:
                     continue
-                if _is_registered(intent, snapshot):
-                    self._enqueue(path)
-                    continue
-                # Nonblocking acquisition lets load_registry remain safe when it is
-                # itself called inside an already-held registry guard.
-                with registration.registry_guard(blocking=False) as acquired:
-                    if not acquired:
-                        self._enqueue(path)
-                        continue
-                    _revision, current = registration.load_registry()
-                    current_intent = _read_intent(self.root, path)
-                    if current_intent is None:
-                        continue
-                    if current_intent != intent:
-                        raise RuntimeError(f"activation consumer retirement intent changed during recovery: {path}")
-                    if _is_registered(current_intent, current):
-                        self._enqueue(path)
-                        continue
-                    self._retire_and_clear(current_intent)
+                self._enqueue(path)
             except Exception:
                 for unprocessed in selected[index:]:
                     self._enqueue(unprocessed)
@@ -159,25 +123,132 @@ class ActivationConsumerRetirements:
         project_id: str,
         registration_generation: str,
         shared_root: Path,
+        machine_name: str,
         snapshot: Sequence[ProjectBinding],
-    ) -> None:
-        """Recover one target while the caller holds the machine registry guard."""
+    ) -> bool:
+        """Requeue one exact local intent while the caller holds the registry guard."""
         intent = _RetirementIntent(
             _validate_identifier(runtime_id, "runtime_id"),
             _validate_identifier(project_id, "project_id"),
             _validate_identifier(registration_generation, "registration_generation"),
             _validate_shared_root(str(shared_root)),
+            _validate_identifier(machine_name, "machine_name"),
         )
         path = _intent_path(self.root, intent)
         stored = _read_intent(self.root, path)
         if stored is None:
-            return
+            return False
         if stored != intent:
             raise RuntimeError(f"activation consumer retirement intent conflicts with its identity path: {path}")
-        if _is_registered(intent, snapshot):
-            return
-        self._retire_and_clear(intent)
-        self._discard(path)
+        self._enqueue(path)
+        return not _is_registered(intent, snapshot)
+
+    def select_pending(
+        self,
+        snapshot: Sequence[ProjectBinding],
+        *,
+        limit: int = _MAX_RECOVERY_QUEUE_ENTRIES,
+    ) -> tuple[ProjectBinding, ...]:
+        """Select absent retirement intents fairly, at most one generation per Project."""
+        if type(limit) is not int or limit < 1:
+            raise ValueError("limit must be a positive integer.")
+        limit = min(limit, _MAX_RECOVERY_QUEUE_ENTRIES)
+        registered = tuple(snapshot)
+        selected: list[ProjectBinding] = []
+        seen_projects: set[str] = set()
+        with self._lock:
+            roster_size = len(self._pending_paths)
+            for _ in range(roster_size):
+                path = self._pending_paths.popleft()
+                if path not in self._pending_set:
+                    continue
+                self._pending_paths.append(path)
+                intent = _read_intent(self.root, path)
+                if intent is None:
+                    self._pending_set.discard(path)
+                    continue
+                if _is_registered(intent, registered):
+                    continue
+                if intent.project_id in seen_projects or len(selected) >= limit:
+                    continue
+                selected.append(self._binding_for_intent(path, intent, registered))
+                seen_projects.add(intent.project_id)
+        return tuple(selected)
+
+    def select_exact(
+        self,
+        *,
+        runtime_id: str,
+        project_id: str,
+        registration_generation: str,
+        shared_root: Path,
+        machine_name: str,
+        snapshot: Sequence[ProjectBinding] = (),
+    ) -> ProjectBinding | None:
+        """Return one exact pending intent for an unresolved worker request."""
+        intent = _RetirementIntent(
+            _validate_identifier(runtime_id, "runtime_id"),
+            _validate_identifier(project_id, "project_id"),
+            _validate_identifier(registration_generation, "registration_generation"),
+            _validate_shared_root(str(shared_root)),
+            _validate_identifier(machine_name, "machine_name"),
+        )
+        path = _intent_path(self.root, intent)
+        stored = _read_intent(self.root, path)
+        if stored is None:
+            return None
+        if stored != intent:
+            raise RuntimeError(f"activation consumer retirement intent conflicts with its identity path: {path}")
+        self._enqueue(path)
+        return self._binding_for_intent(path, intent, tuple(snapshot))
+
+    def apply_completions(
+        self,
+        selected: Sequence[ProjectBinding],
+        completions: Mapping[str, Mapping[str, Any]],
+    ) -> None:
+        """Clear only selected exact intents whose isolated worker retired them."""
+        if not isinstance(completions, Mapping):
+            raise ValueError("retirement completions must be a mapping by project_id.")
+        consumed_projects: set[str] = set()
+        for binding in selected:
+            if binding.project_id in consumed_projects:
+                continue
+            evidence = completions.get(binding.project_id)
+            if (
+                not isinstance(evidence, Mapping)
+                or set(evidence) != {"outcome", "consumer_existed"}
+                or evidence.get("outcome") != "retired"
+                or type(evidence.get("consumer_existed")) is not bool
+            ):
+                continue
+            consumed_projects.add(binding.project_id)
+            intent = _intent_for_binding(binding)
+            path = _intent_path(self.root, intent)
+            stored = _read_intent(self.root, path)
+            if stored is None:
+                continue
+            if stored != intent:
+                raise RuntimeError(f"activation consumer retirement intent changed before clearing: {path}")
+            _clear_intent(self.root, intent)
+            self._discard(path)
+
+    def _binding_for_intent(
+        self,
+        path: Path,
+        intent: _RetirementIntent,
+        snapshot: Sequence[ProjectBinding],
+    ) -> ProjectBinding:
+        del path, snapshot
+        return ProjectBinding.from_canonical_paths(
+            intent.project_id,
+            Path(intent.shared_root),
+            intent.machine_name,
+            enabled=False,
+            registration_generation=intent.registration_generation,
+            runtime_instance_id=intent.runtime_id,
+            runtime_root=str(self.root),
+        )
 
     def _enqueue(self, path: Path) -> None:
         with self._lock:
@@ -202,15 +273,6 @@ class ActivationConsumerRetirements:
                 selected.append(path)
         return selected
 
-    def _retire_and_clear(self, intent: _RetirementIntent) -> None:
-        retire_consumer_after_registration_removal(
-            Path(intent.shared_root),
-            runtime_id=intent.runtime_id,
-            project_id=intent.project_id,
-            registration_generation=intent.registration_generation,
-        )
-        _clear_intent(self.root, intent)
-
 
 def _intent_for_binding(binding: ProjectBinding) -> _RetirementIntent:
     runtime_id = _validate_identifier(binding.runtime_instance_id, "runtime_id")
@@ -219,17 +281,19 @@ def _intent_for_binding(binding: ProjectBinding) -> _RetirementIntent:
     shared_root = Path(binding.shared_root)
     if not shared_root.is_absolute() or shared_root != shared_root.resolve():
         raise ValueError("Project binding shared_root must be an absolute canonical path.")
-    return _RetirementIntent(runtime_id, project_id, generation, str(shared_root))
+    machine_name = _validate_identifier(binding.machine_name, "machine_name")
+    return _RetirementIntent(runtime_id, project_id, generation, str(shared_root), machine_name)
 
 
 def _intent_record(intent: _RetirementIntent) -> dict[str, Any]:
     return {
         _RECORD_NAME: {
-            "version": 1,
+            "version": 2,
             "runtime_id": intent.runtime_id,
             "project_id": intent.project_id,
             "registration_generation": intent.registration_generation,
             "shared_root": intent.shared_root,
+            "machine_name": intent.machine_name,
         }
     }
 
@@ -273,13 +337,14 @@ def _validate_record(value: object, root: Path, path: Path) -> _RetirementIntent
     record = value[_RECORD_NAME]
     if type(record) is not dict or set(record) != _RECORD_FIELDS:
         raise ValueError("activation consumer retirement intent has missing or unknown fields.")
-    if type(record["version"]) is not int or record["version"] != 1:
+    if type(record["version"]) is not int or record["version"] != 2:
         raise ValueError("activation consumer retirement intent version is unsupported.")
     intent = _RetirementIntent(
         _validate_identifier(record["runtime_id"], "runtime_id"),
         _validate_identifier(record["project_id"], "project_id"),
         _validate_identifier(record["registration_generation"], "registration_generation"),
         _validate_shared_root(record["shared_root"]),
+        _validate_identifier(record["machine_name"], "machine_name"),
     )
     if path != _intent_path(root, intent):
         raise ValueError("activation consumer retirement intent path does not match its identity.")
@@ -325,6 +390,7 @@ def _is_registered(intent: _RetirementIntent, bindings: Sequence[ProjectBinding]
         and binding.project_id == intent.project_id
         and binding.registration_generation == intent.registration_generation
         and str(binding.shared_root) == intent.shared_root
+        and binding.machine_name == intent.machine_name
         for binding in bindings
     )
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import stat
 from pathlib import Path
 from typing import Any, Iterator, Literal
 
@@ -145,14 +146,15 @@ def iter_active_operation_paths(
     limit: int = 64,
     include_legacy: bool = False,
     cursor: dict[str, Any] | None = None,
+    strict_active_files: bool = False,
 ) -> Iterator[Path]:
     """Stream a bounded page of active truths and retained legacy operations."""
     if type(limit) is not int or limit <= 0:
         raise ValueError("active operation limit must be a positive integer.")
     active = shared_paths(cfg.shared_root)[_active_key(kind)]
     archive = shared_paths(cfg.shared_root)[kind]
-    cursor_path = local_paths(cfg.runtime_root)["maintenance_cursors"] / f"{kind}.json"
     if cursor is None:
+        cursor_path = local_paths(cfg.runtime_root)["maintenance_cursors"] / f"{kind}.json"
         try:
             cursor_record = read_json(cursor_path).get("active_operation_cursor", {})
         except (FileNotFoundError, OSError, TypeError, ValueError):
@@ -234,6 +236,8 @@ def iter_active_operation_paths(
             continue
         path = directory / name
         if lane == "active":
+            if strict_active_files and not stat.S_ISREG(path.lstat().st_mode):
+                raise ValueError("active operation must be a regular non-symlink file")
             if path.is_file():
                 yielded += 1
                 yield path
@@ -255,7 +259,8 @@ def iter_active_operation_paths(
 
 def _operation_state(kind: ActiveOperationKind, record: dict) -> object:
     key = "availability_operation" if kind == "availability" else kind
-    return record.get(key, {}).get("state")
+    value = record.get(key, {})
+    return value.get("state") if isinstance(value, dict) else None
 
 
 def _terminal_states(kind: ActiveOperationKind) -> frozenset[str]:
@@ -268,11 +273,14 @@ def _operation_is_terminal(kind: ActiveOperationKind, record: dict) -> bool:
     state = _operation_state(kind, record)
     if state in _terminal_states(kind):
         return True
+    payload = record.get(kind, {})
+    if not isinstance(payload, dict):
+        return False
     if (
         kind == "group_control"
-        and record.get(kind, {}).get("operation_type") == "worker_remove"
+        and payload.get("operation_type") == "worker_remove"
         and state == "blocked"
-        and record.get(kind, {}).get("blocked_reason") == "legacy_worker_incarnation_unknown"
+        and payload.get("blocked_reason") == "legacy_worker_incarnation_unknown"
     ):
         return True
     if kind == "group_control" and record.get(kind, {}).get("operation_type") == "worker_remove_v2":

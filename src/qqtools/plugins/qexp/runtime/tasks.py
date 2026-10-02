@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import os
+from typing import Callable
 
 from .paths import task_path
 from .records import TaskRecord
-from .store import atomic_replace, read_json
+from .store import atomic_replace, fenced_mutations, read_json
 from .work_budget import diagnostic_increment, diagnostic_span
 
 
@@ -21,13 +22,27 @@ def load_task(cfg: object, task_id: str) -> TaskRecord:
         return TaskRecord.from_dict(value)
 
 
-def save_task(cfg: object, task: TaskRecord) -> None:
+def save_task(
+    cfg: object,
+    task: TaskRecord,
+    *,
+    mutation_fence: Callable[[], None] | None = None,
+) -> None:
     from .observation.projection import publish_task
     from .ready import assert_ready_writer_compatible
 
     assert_ready_writer_compatible(cfg)
     path = task_path(cfg.shared_root, task.task_id)
-    publish_task(cfg, task, lambda: atomic_replace(path, task.to_dict()))
+
+    def write_truth() -> None:
+        atomic_replace(
+            path,
+            task.to_dict(),
+            before_replace=(lambda _stat: mutation_fence()) if mutation_fence is not None else None,
+        )
+
+    with fenced_mutations(cfg.shared_root, mutation_fence):
+        publish_task(cfg, task, write_truth)
 
 
 def _unlink_task_truth(cfg: object, task_id: str) -> None:

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import InitVar, dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -42,11 +42,20 @@ class ProjectInventoryEntry:
     enabled: bool = True
     name_source: str = "default"
     name_override: str | None = None
+    _canonical_paths: InitVar[bool] = field(default=False, kw_only=True)
 
-    def __post_init__(self) -> None:
+    def __post_init__(self, _canonical_paths: bool) -> None:
         if not isinstance(self.project_id, str) or not self.project_id or "/" in self.project_id:
             raise ValueError("inventory project_id is invalid.")
-        object.__setattr__(self, "shared_root", Path(self.shared_root).expanduser().resolve())
+        if type(_canonical_paths) is not bool:
+            raise ValueError("_canonical_paths must be a bool.")
+        if _canonical_paths:
+            path = Path(self.shared_root)
+            if not path.is_absolute() or ".." in path.parts or "\x00" in str(path):
+                raise ValueError("shared_root must be a canonical absolute path.")
+            object.__setattr__(self, "shared_root", path)
+        else:
+            object.__setattr__(self, "shared_root", Path(self.shared_root).expanduser().resolve())
         if type(self.enabled) is not bool:
             raise ValueError("inventory enabled must be a bool.")
         if not isinstance(self.name_source, str) or self.name_source not in NAME_SOURCES:
@@ -76,6 +85,7 @@ class ProjectInventoryEntry:
                 enabled=value["enabled"],
                 name_source=value.get("name_source", "default"),
                 name_override=value.get("name_override"),
+                _canonical_paths=True,
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise ValueError("inventory entry is malformed.") from exc
@@ -168,6 +178,7 @@ def _legacy_inventory(runtime: Any) -> list[ProjectInventoryEntry]:
             enabled=binding.enabled,
             name_source="unresolved",
             name_override=binding.machine_name,
+            _canonical_paths=True,
         )
         for binding in bindings
     ]
@@ -251,6 +262,7 @@ def reconcile_live_bindings_locked(runtime: Any, *, repair: bool = True) -> Inve
             binding.enabled,
             entry.name_source,
             entry.name_override,
+            _canonical_paths=True,
         )
         next_entries[next_entries.index(entry)] = updated
 

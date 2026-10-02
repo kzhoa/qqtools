@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import signal
@@ -20,7 +21,10 @@ from qqtools.plugins.qexp.agent.lifecycle import (
     start_machine_agent,
     stop_machine_agent,
 )
-from qqtools.plugins.qexp.runtime.paths import attempt_path, local_paths
+from qqtools.plugins.qexp.layout import machine_state_path
+from qqtools.plugins.qexp.runtime.paths import attempt_path, local_paths, machine_runtime_paths, shared_paths
+from qqtools.plugins.qexp.runtime.project_activation import publish_project_activation
+from qqtools.plugins.qexp.runtime.resources.cpu_lane import set_cpu_lane_capacity
 from qqtools.plugins.qexp.runtime.resources.reservations import active_reservations
 from qqtools.plugins.qexp.runtime.store import atomic_replace, read_json
 from qqtools.plugins.qexp.runtime.tasks import load_task
@@ -233,6 +237,435 @@ def _wait_terminal(cfg, task_id: str) -> object:
     return load_task(cfg, task_id)
 
 
+def test_real_agent_two_hung_worker_primary_and_renewal_qualification(tmp_path: Path) -> None:
+    """Qualify the published two-hung-worker/default-loop latency baseline."""
+    runtime = MachineRuntime(tmp_path / "machine-runtime")
+    healthy_cfg = init_shared_root(
+        tmp_path / "healthy" / ".qexp",
+        "gpu-1",
+        agent_mode="daemon",
+        runtime_root=tmp_path / "healthy-legacy",
+    )
+    healthy = runtime.ensure_binding(healthy_cfg.shared_root, "gpu-1")[0]
+    blocked: list[tuple[object, object, Path, Path]] = []
+    for index in range(2):
+        cfg = init_shared_root(
+            tmp_path / f"blocked-{index}" / ".qexp",
+            "gpu-1",
+            agent_mode="daemon",
+            runtime_root=tmp_path / f"blocked-{index}-legacy",
+        )
+        binding = runtime.ensure_binding(cfg.shared_root, "gpu-1")[0]
+        schema = shared_paths(cfg.shared_root)["schema"] / "version.json"
+        blocked.append((cfg, binding, schema, schema.with_suffix(".qualification-held")))
+    set_cpu_lane_capacity(runtime.root, capacity=1)
+
+    running_marker = tmp_path / "running"
+    running_finish = tmp_path / "running.finish"
+    running = submit(
+        healthy_cfg,
+        [
+            sys.executable,
+            "-c",
+            (
+                "from pathlib import Path\nimport time\n"
+                f"marker=Path({str(running_marker)!r}); finish=Path({str(running_finish)!r})\n"
+                "marker.touch()\n"
+                "deadline=time.monotonic()+90\n"
+                "while not finish.exists():\n"
+                "    if time.monotonic()>deadline: raise SystemExit(99)\n"
+                "    time.sleep(0.02)\n"
+            ),
+        ],
+        working_dir=healthy_cfg.project_root,
+    )
+    qualifying_agent: subprocess.Popen | None = None
+    primary_finish = tmp_path / "primary.finish"
+    foreground_hold = tmp_path / "foreground-hold"
+    background_arm = tmp_path / "background-arm"
+    background_started = tmp_path / "background-started"
+    measurement_gate = tmp_path / "measurement-gate"
+    trace = tmp_path / "worker-trace.jsonl"
+    try:
+        agent_script = r'''
+import json, subprocess, sys, time
+from pathlib import Path
+from qqtools.plugins.qexp.agent.lifecycle import run_machine_agent_loop
+from qqtools.plugins.qexp.agent.project_io_admission import ProjectIOAdmission
+from qqtools.plugins.qexp.agent import project_io_executor
+
+root, healthy, foreground_hold, background_arm, background_started, measurement_gate, trace = sys.argv[1:]
+foreground_hold = Path(foreground_hold)
+background_arm = Path(background_arm)
+background_started = Path(background_started)
+measurement_gate = Path(measurement_gate)
+trace = Path(trace)
+
+real_offer = ProjectIOAdmission.offer
+def offer(self, intent, action):
+    if (
+        foreground_hold.exists()
+        and intent.owner[1] == healthy
+        and intent.service_class in {"authority", "primary"}
+        and not measurement_gate.exists()
+    ):
+        return None
+    return real_offer(self, intent, action)
+ProjectIOAdmission.offer = offer
+
+worker_wrapper = r"""
+import json, sys, time
+from pathlib import Path
+trace, project_id, operation_kind, began, started, gate, hold, *args = sys.argv[1:]
+try:
+    if hold == "1":
+        Path(started).touch()
+        deadline = time.monotonic() + 5
+        while not Path(gate).exists():
+            if time.monotonic() >= deadline:
+                raise SystemExit(98)
+            time.sleep(0.005)
+    from qqtools.plugins.qexp.agent.project_io_worker import main
+    code = main(args)
+finally:
+    with Path(trace).open("a", encoding="utf-8") as stream:
+        stream.write(json.dumps({
+            "project_id": project_id,
+            "operation_kind": operation_kind,
+            "started_at": float(began),
+            "qualification_background": hold == "1",
+            "elapsed_seconds": time.monotonic() - float(began),
+        }, sort_keys=True) + "\n")
+raise SystemExit(code)
+"""
+background_operations = {
+    "upgrade_service", "submission_control_service", "observation_service",
+    "notification_service", "machine_snapshot_publish", "activation_observe",
+    "activation_consumer_register", "activation_consumer_ack",
+}
+real_popen = project_io_executor.subprocess.Popen
+launching = [None]
+background_selected = [False]
+def popen(command, *args, **kwargs):
+    item = launching[0]
+    if item is not None and item[0].project_id == healthy:
+        request, began = item
+        hold = (
+            request is not None
+            and request.operation_kind in background_operations
+            and background_arm.exists()
+            and self_runtime.authority_ready_generations.get(healthy) == request.registration_generation
+            and not background_selected[0]
+        )
+        if hold:
+            background_selected[0] = True
+        command = [
+            command[0], "-c", worker_wrapper, trace, request.project_id, request.operation_kind,
+            str(began), str(background_started), str(measurement_gate), "1" if hold else "0", *command[3:]
+        ]
+    return real_popen(command, *args, **kwargs)
+project_io_executor.subprocess.Popen = popen
+
+real_start = project_io_executor.ProjectIOExecutor.start
+self_runtime = None
+def start(self, request_id, **kwargs):
+    global self_runtime
+    self_runtime = self.runtime
+    request = self._load_request(request_id)
+    began = time.monotonic()
+    launching[0] = (request, began)
+    try:
+        process = real_start(self, request_id, **kwargs)
+    finally:
+        launching[0] = None
+    return process
+project_io_executor.ProjectIOExecutor.start = start
+run_machine_agent_loop(root, available_gpus=[0])
+'''
+        qualifying_agent = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                agent_script,
+                str(runtime.root),
+                healthy.project_id,
+                str(foreground_hold),
+                str(background_arm),
+                str(background_started),
+                str(measurement_gate),
+                str(trace),
+            ],
+            start_new_session=True,
+        )
+        _wait_for(
+            lambda: (
+                load_task(healthy_cfg, running.task_id).state["projection"] == "running" and running_marker.exists()
+            ),
+            timeout=45,
+            description="qualification setup running Attempt",
+        )
+        expected_projects = {healthy.project_id, *(item[1].project_id for item in blocked)}
+        _wait_for(
+            lambda: expected_projects.issubset(set(get_machine_agent_status(runtime)["reconciled_project_ids"])),
+            timeout=45,
+            description="current-agent recovery for every qualification binding",
+        )
+        foreground_hold.touch()
+        before_expiry = load_task(healthy_cfg, running.task_id).claim_control["active_claim"]["lease_expires_at"]
+        # The default lease policy renews after ten seconds. Hold only new
+        # foreground grants so the exact running Attempt is due at measurement.
+        time.sleep(10.1)
+
+        primary_marker = tmp_path / "primary"
+        primary = submit(
+            healthy_cfg,
+            [
+                sys.executable,
+                "-c",
+                (
+                    "from pathlib import Path\nimport time\n"
+                    f"marker=Path({str(primary_marker)!r}); finish=Path({str(primary_finish)!r})\n"
+                    "marker.touch()\n"
+                    "deadline=time.monotonic()+60\n"
+                    "while not finish.exists():\n"
+                    "    if time.monotonic()>deadline: raise SystemExit(99)\n"
+                    "    time.sleep(0.02)\n"
+                ),
+            ],
+            working_dir=healthy_cfg.project_root,
+            requested_gpus=0,
+            requested_cpus=1,
+        )
+        for blocked_cfg, _binding, schema, saved in blocked:
+            schema.rename(saved)
+            os.mkfifo(schema)
+            publish_project_activation(blocked_cfg, "latency_qualification")
+        with runtime.agent_lifecycle_guard():
+            runtime.activation_wake.publish_locked()
+        executor_paths = machine_runtime_paths(runtime.root)
+
+        def held_project_ids() -> set[str]:
+            held_ids: set[str] = set()
+            for path in executor_paths["project_io_requests"].glob("*.json"):
+                try:
+                    request = read_json(path)["project_io_request"]
+                except (OSError, KeyError, TypeError, ValueError):
+                    continue
+                if (executor_paths["project_io_processes"] / path.name).exists():
+                    held_ids.add(request["project_id"])
+            return held_ids
+
+        blocked_ids = {item[1].project_id for item in blocked}
+        _wait_for(
+            lambda: blocked_ids.issubset(held_project_ids()),
+            timeout=30,
+            description="two held qualification workers",
+        )
+        background_arm.touch()
+        _wait_for(
+            background_started.exists,
+            timeout=30,
+            description="one already-running healthy background request",
+        )
+        assert blocked_ids.issubset(held_project_ids())
+        measured_at = time.monotonic()
+        measurement_gate.touch()
+
+        def primary_admitted_and_running_renewed() -> bool:
+            primary_task = load_task(healthy_cfg, primary.task_id)
+            running_task = load_task(healthy_cfg, running.task_id)
+            claim = primary_task.claim_control.get("active_claim")
+            renewed_expiry = running_task.claim_control["active_claim"]["lease_expires_at"]
+            reservations = active_reservations(runtime.root)
+            return (
+                isinstance(claim, dict)
+                and any(item.get("task_id") == primary.task_id for item in reservations)
+                and renewed_expiry != before_expiry
+            )
+
+        _wait_for(
+            primary_admitted_and_running_renewed,
+            timeout=15,
+            description="exact primary admission and applied running-Attempt renewal",
+            on_timeout=lambda: {
+                "primary": load_task(healthy_cfg, primary.task_id).to_dict(),
+                "running": load_task(healthy_cfg, running.task_id).to_dict(),
+                "held_projects": sorted(held_project_ids()),
+                "trace": trace.read_text() if trace.exists() else "",
+            },
+        )
+        assert time.monotonic() - measured_at <= 15
+        assert blocked_ids.issubset(held_project_ids())
+        timings = [json.loads(line) for line in trace.read_text().splitlines()]
+        healthy_timings = [
+            item
+            for item in timings
+            if item["project_id"] == healthy.project_id
+            and (item["qualification_background"] or item["started_at"] >= measured_at)
+        ]
+        assert healthy_timings
+        assert max(item["elapsed_seconds"] for item in healthy_timings) <= 2.0
+        kinds = {item["operation_kind"] for item in healthy_timings}
+        assert kinds & {
+            "upgrade_service",
+            "submission_control_service",
+            "observation_service",
+            "notification_service",
+            "machine_snapshot_publish",
+            "activation_observe",
+            "activation_consumer_register",
+            "activation_consumer_ack",
+        }
+        assert "scheduler_claim" in kinds
+        assert "authority_renewal" in kinds
+    finally:
+        measurement_gate = tmp_path / "measurement-gate"
+        measurement_gate.touch()
+        running_finish.touch()
+        primary_finish.touch()
+        try:
+            stop_machine_agent(runtime)
+        except (OSError, RuntimeError, ValueError):
+            pass
+        for process in (qualifying_agent,):
+            if process is not None and process.poll() is None:
+                process.terminate()
+                process.wait(timeout=8)
+        for _cfg, _binding, schema, saved in blocked:
+            if schema.exists():
+                schema.unlink()
+            if saved.exists():
+                saved.rename(schema)
+
+
+@pytest.mark.parametrize(
+    "binding_count",
+    [1, 2, 8, pytest.param(65, marks=pytest.mark.slow)],
+)
+def test_real_agent_healthy_binding_scale_preserves_incumbent_progress(
+    tmp_path: Path,
+    binding_count: int,
+) -> None:
+    """Qualify mixed scheduling, supervision, and background progress at scale."""
+    from qqtools.plugins.qexp.lease import LeasePolicy, save_lease_policy
+
+    runtime = MachineRuntime(tmp_path / "machine-runtime")
+    configs = []
+    first_markers = []
+    for index in range(binding_count):
+        cfg = init_shared_root(
+            tmp_path / f"project-{index:02d}" / ".qexp",
+            "gpu-1",
+            agent_mode="daemon",
+            runtime_root=tmp_path / f"legacy-{index:02d}",
+        )
+        if binding_count == 65:
+            # Keep this scale qualification about bounded-window fairness. Each
+            # fresh registration is still due immediately under this policy and
+            # must complete one isolated renewal, while dedicated short-lease
+            # tests retain the default-cadence saturation and expiry coverage.
+            save_lease_policy(cfg, LeasePolicy(ttl_seconds=14_400, renew_interval_seconds=7_200.0))
+        runtime.ensure_binding(cfg.shared_root, "gpu-1")
+        configs.append(cfg)
+    set_cpu_lane_capacity(runtime.root, capacity=min(4, binding_count))
+    process = start_machine_agent(runtime, available_gpus=[], loop_interval=0.05)
+    first_tasks = []
+    second_tasks = []
+    try:
+        expected = {binding.project_id for binding in runtime.load_registry()[1]}
+        background_timeout = 3600 if binding_count == 65 else 600
+        _wait_for(
+            lambda: expected.issubset(set(get_machine_agent_status(runtime)["reconciled_project_ids"])),
+            timeout=background_timeout,
+            description=f"real-agent recovery for every one of {binding_count} bindings",
+        )
+        first_entries = list(enumerate(configs))
+        for index, cfg in first_entries:
+            marker = tmp_path / f"first-{index:02d}"
+            first_tasks.append(
+                (
+                    cfg,
+                    submit(
+                        cfg,
+                        [sys.executable, "-c", f"from pathlib import Path; Path({str(marker)!r}).touch()"],
+                        working_dir=cfg.project_root,
+                        requested_gpus=0,
+                        requested_cpus=1,
+                    ),
+                    marker,
+                )
+            )
+            first_markers.append(marker)
+        # Add a second attempt-bearing Task while the first roster still
+        # contains continuously eligible incumbents. Repeating every owner,
+        # including the one initially outside the 64-intent window, proves that
+        # a continuing arrival wave cannot strand an incumbent after its first
+        # scheduling/supervision cycle.
+        _wait_for(
+            lambda: any(marker.exists() for marker in first_markers),
+            timeout=background_timeout,
+            description=f"first scheduling result across {binding_count} bindings",
+        )
+        second_entries = list(enumerate(configs))
+        for index, cfg in second_entries:
+            marker = tmp_path / f"second-{index:02d}"
+            second_tasks.append(
+                (
+                    cfg,
+                    submit(
+                        cfg,
+                        [sys.executable, "-c", f"from pathlib import Path; Path({str(marker)!r}).touch()"],
+                        working_dir=cfg.project_root,
+                        requested_gpus=0,
+                        requested_cpus=1,
+                    ),
+                    marker,
+                )
+            )
+
+        timeout = 3600 if binding_count == 65 else 600
+
+        def every_task_succeeded() -> bool:
+            return all(
+                load_task(cfg, task.task_id).state["projection"] == "succeeded" for cfg, task, _marker in first_tasks
+            ) and all(load_task(cfg, task.task_id).state["projection"] == "succeeded" for cfg, task, _ in second_tasks)
+
+        _wait_for(
+            every_task_succeeded,
+            timeout=timeout,
+            description=f"scale-{binding_count} scheduling and supervision results",
+        )
+        assert all(marker.exists() for marker in first_markers)
+        assert all(marker.exists() for _cfg, _task, marker in second_tasks)
+
+        # The submitted work above activates every binding. Prove background
+        # publication reaches every incumbent while two full scheduling and
+        # supervision waves share the bounded executor.
+        _wait_for(
+            lambda: all(machine_state_path(cfg, "agent.json").exists() for cfg in configs),
+            timeout=background_timeout,
+            description=f"background snapshots for activated bindings at scale {binding_count}",
+        )
+
+        status = get_machine_agent_status(runtime)
+        assert expected.issubset(set(status["reconciled_project_ids"]))
+        selected_roots = {str(cfg.shared_root) for cfg, _task, _marker in first_tasks}
+        _wait_for(
+            lambda: (
+                not any(record.get("shared_root") in selected_roots for record in active_reservations(runtime.root))
+            ),
+            timeout=30,
+            description="scale qualification target reservation cleanup",
+        )
+    finally:
+        try:
+            stop_machine_agent(runtime, timeout=10)
+        except (OSError, RuntimeError, TimeoutError):
+            if process.poll() is None:
+                process.kill()
+        process.wait(timeout=10)
+
+
 def _cleanup(runtime: MachineRuntime, process: subprocess.Popen) -> None:
     try:
         if get_machine_agent_status(runtime)["is_running"]:
@@ -349,6 +782,82 @@ def test_li02_offline_completion_preserves_exit_results(tmp_path: Path, monkeypa
     finally:
         for _name, _exit_code, _phase, _task, marker in branches:
             marker.with_suffix(".finish").touch()
+        _cleanup(runtime, process)
+
+
+def test_agent_projects_both_progress_versions_through_isolated_transactions(tmp_path: Path) -> None:
+    from qqtools.plugins.qexp.observer import inspect_task
+    from qqtools.plugins.qexp.progress_policy import set_progress_policy
+    from qqtools.plugins.qexp.runtime.submission import submit_specs
+
+    project_root = tmp_path / "project"
+    cfg = init_shared_root(project_root / ".qexp", "gpu-1", agent_mode="daemon", runtime_root=tmp_path / "legacy")
+    runtime = MachineRuntime(tmp_path / "machine-runtime")
+    binding = runtime.ensure_binding(cfg.shared_root, "gpu-1")[0]
+    set_progress_policy(cfg.shared_root, 1)
+    marker = tmp_path / "producer"
+    command = [
+        sys.executable,
+        "-c",
+        (
+            "from pathlib import Path\nimport time\nfrom qqtools.qexp import progress\n"
+            "def report(number):\n"
+            "    assert progress.update(stage='train' if number==1 else 'done', current=number, total=2, "
+            "unit='step', metrics={'loss':1/number})\n"
+            "    progress.flush(timeout=1)\n"
+            f"marker=Path({str(marker)!r})\nreport(1)\nmarker.write_text('1')\n"
+            "deadline=time.monotonic()+120\n"
+            "while not marker.with_suffix('.finish').exists():\n"
+            "    if time.monotonic()>deadline: raise SystemExit(99)\n"
+            "    time.sleep(0.02)\n"
+            "report(2)\n"
+        ),
+    ]
+    task = submit_specs(cfg, [{"command": command, "working_directory": str(project_root), "live_progress": True}])[0]
+    process = start_machine_agent(runtime, available_gpus=[0], loop_interval=0.1)
+    try:
+        _wait_running(cfg, task.task_id, marker)
+
+        def both_reports(current: int) -> bool:
+            view = inspect_task(cfg, task.task_id)
+            return (
+                view["progress"].get("progress", {}).get("current") == current
+                and view["progress_extended"].get("progress", {}).get("current") == current
+            )
+
+        # Both protocols share the binding slot with registration, scheduling,
+        # supervision and maintenance. Their full cold-start chain is not the
+        # single-peer primary/renewal 15-second qualification.
+        _wait_for(
+            lambda: both_reports(1),
+            timeout=45,
+            description="both live progress projections",
+            on_timeout=lambda: inspect_task(cfg, task.task_id),
+        )
+        view = inspect_task(cfg, task.task_id)
+        assert view["progress_extended"]["progress"]["metrics"] == {"loss": 1.0}
+        assert view["selected_progress_version"] == 2
+        assert marker.read_text() == "1"
+        marker.with_suffix(".finish").touch()
+        terminal = _wait_terminal(cfg, task.task_id)
+        assert terminal.state["projection"] == "succeeded"
+        _wait_for(
+            lambda: both_reports(2),
+            timeout=75,
+            description="both terminal progress projections",
+            on_timeout=lambda: inspect_task(cfg, task.task_id),
+        )
+        assert load_task(cfg, task.task_id).attempt_control["next_attempt_number"] == 2
+        local_root = runtime.project_paths(binding.project_id)["root"]
+        _wait_for(
+            lambda: (
+                not any((local_root / "progress-contexts").glob("*.json"))
+                and not any((local_root / "progress-v2-contexts").glob("*.json"))
+            ),
+            timeout=15,
+        )
+    finally:
+        marker.with_suffix(".finish").touch()
         _cleanup(runtime, process)
 
 
@@ -528,20 +1037,30 @@ def test_li05_launch_boundary_has_no_duplicate_authorized_process(tmp_path: Path
     script = """
 import os, sys
 from pathlib import Path
-from qqtools.plugins.qexp import scheduler
 from qqtools.plugins.qexp.agent.lifecycle import run_machine_agent_loop
+from qqtools.plugins.qexp.agent.project_io_executor import ProjectIOExecutor
 boundary, root, reached = sys.argv[1:]
-original = scheduler.authorize_launch
-def authorize(*args, **kwargs):
-    if boundary == "before_authorization":
+original_start = ProjectIOExecutor.start
+original_consume = ProjectIOExecutor.consume
+def start(self, request_id, *args, **kwargs):
+    request = self._load_request(request_id)
+    if boundary == "before_authorization" and request.operation_kind == "scheduler_launch_authorize":
         Path(reached).write_text(boundary)
         os._exit(73)
-    result = original(*args, **kwargs)
-    if result:
+    return original_start(self, request_id, *args, **kwargs)
+def consume(self, request_id, current_request):
+    result = original_consume(self, request_id, current_request)
+    if (
+        boundary == "after_authorization"
+        and current_request.operation_kind == "scheduler_launch_authorize"
+        and result is not None
+        and result.evidence.get("outcome") == "authorized"
+    ):
         Path(reached).write_text(boundary)
         os._exit(73)
     return result
-scheduler.authorize_launch = authorize
+ProjectIOExecutor.start = start
+ProjectIOExecutor.consume = consume
 run_machine_agent_loop(root, loop_interval=0.1, available_gpus=[0])
 """
     process = subprocess.Popen(
@@ -681,45 +1200,64 @@ def test_li06_terminal_publication_is_idempotent(tmp_path: Path, boundary: str, 
             atomic_replace(task_path, stored)
             assert expire_claim(cfg, task.task_id, attempt_id, claim["fencing_token"])
         reached = tmp_path / "crash-boundary"
-        script = """
+        worker_script = """
 import os, sys
 from pathlib import Path
-from qqtools.plugins.qexp import lifecycle, authority, scheduler
-from qqtools.plugins.qexp.agent.lifecycle import run_machine_agent_loop
-boundary, root, reached = sys.argv[1:]
+from qqtools.plugins.qexp import lifecycle
+from qqtools.plugins.qexp.agent import project_io_worker
+boundary, reached = sys.argv[1:3]
 def crash():
     Path(reached).write_text(boundary)
     os._exit(73)
 original_replace = lifecycle.atomic_replace
-def replace(path, value):
-    original_replace(path, value)
+def replace(path, value, *args, **kwargs):
+    result = original_replace(path, value, *args, **kwargs)
     if boundary == "attempt" and value.get("attempt", {}).get("phase") == "succeeded":
         crash()
+    return result
 lifecycle.atomic_replace = replace
 original_save = lifecycle.save_task
-def save(cfg, task):
-    original_save(cfg, task)
+def save(cfg, task, *args, **kwargs):
+    result = original_save(cfg, task, *args, **kwargs)
     if boundary == "task" and task.state["projection"] == "succeeded":
         crash()
+    return result
 lifecycle.save_task = save
-original_release = authority.release
-def release(*args, **kwargs):
-    result = original_release(*args, **kwargs)
+raise SystemExit(project_io_worker.main(sys.argv[3:]))
+"""
+        script = """
+import os, sys
+from pathlib import Path
+from qqtools.plugins.qexp.agent import project_io_executor, project_io_supervision
+from qqtools.plugins.qexp.agent.lifecycle import run_machine_agent_loop
+boundary, root, reached, worker_script = sys.argv[1:]
+def crash():
+    Path(reached).write_text(boundary)
+    os._exit(73)
+original_popen = project_io_executor.subprocess.Popen
+original_poll = project_io_executor.ProjectIOExecutor.poll
+def popen(command, *args, **kwargs):
+    if command[1:3] == ["-m", "qqtools.plugins.qexp.agent.project_io_worker"]:
+        command = [command[0], "-c", worker_script, boundary, reached, *command[3:]]
+    return original_popen(command, *args, **kwargs)
+project_io_executor.subprocess.Popen = popen
+def poll(self):
+    result = original_poll(self)
+    if boundary in {"attempt", "task"} and Path(reached).exists():
+        crash()
+    return result
+project_io_executor.ProjectIOExecutor.poll = poll
+original_apply = project_io_supervision._apply_terminal_local_effects
+def apply(*args, **kwargs):
+    result = original_apply(*args, **kwargs)
     if boundary == "reservation":
         crash()
     return result
-authority.release = release
-original_scheduler_release = scheduler._release_task_reservation
-def scheduler_release(*args, **kwargs):
-    result = original_scheduler_release(*args, **kwargs)
-    if boundary == "reservation":
-        crash()
-    return result
-scheduler._release_task_reservation = scheduler_release
+project_io_supervision._apply_terminal_local_effects = apply
 run_machine_agent_loop(root, loop_interval=0.1, available_gpus=[0])
 """
         crashing = subprocess.Popen(
-            [sys.executable, "-c", script, boundary, str(runtime.root), str(reached)],
+            [sys.executable, "-c", script, boundary, str(runtime.root), str(reached), worker_script],
             start_new_session=True,
         )
         _wait_for(reached.exists)
@@ -1041,16 +1579,28 @@ def test_li09_public_process_entrypoint_uses_real_python_runner(tmp_path: Path) 
 @pytest.mark.parametrize("modes", [("on_demand", "on_demand"), ("on_demand", "daemon"), ("daemon", "on_demand")])
 def test_global_idle_policy_considers_every_binding(tmp_path: Path, modes: tuple[str, str]) -> None:
     runtime = MachineRuntime(tmp_path / "machine")
+    configs = []
     for index, mode in enumerate(modes):
         cfg = init_shared_root(
             tmp_path / str(index) / ".qexp", "gpu-1", agent_mode=mode, runtime_root=tmp_path / f"legacy-{index}"
         )
+        configs.append(cfg)
         runtime.ensure_binding(cfg.shared_root, "gpu-1")
+    script = """
+import runpy
+from qqtools.plugins.qexp.agent import lifecycle
+from tests.helpers.qexp.worker_diagnostics import trace_project_io_requests
+def reject_direct_stop_publication(*args, **kwargs):
+    raise AssertionError("agent cleanup performed direct shared stop publication")
+lifecycle.publish_machine_stop_snapshot = reject_direct_stop_publication
+trace_project_io_requests()
+runpy.run_module("qqtools.plugins.qexp.agent.process", run_name="__main__")
+"""
     process = subprocess.Popen(
         [
             sys.executable,
-            "-m",
-            "qqtools.plugins.qexp.agent.process",
+            "-c",
+            script,
             "--machine-runtime-root",
             str(runtime.root),
             "--loop-interval",
@@ -1064,6 +1614,10 @@ def test_global_idle_policy_considers_every_binding(tmp_path: Path, modes: tuple
         if "daemon" not in modes:
             assert process.wait(timeout=10) == 0
             assert not get_machine_agent_status(runtime)["is_running"]
+            assert all(
+                read_json(machine_state_path(cfg, "agent.json"))["agent"]["observed_state"] == "stopped"
+                for cfg in configs
+            )
         else:
             _wait_for(lambda: get_machine_agent_status(runtime)["is_running"])
             with pytest.raises(subprocess.TimeoutExpired):
@@ -1072,7 +1626,7 @@ def test_global_idle_policy_considers_every_binding(tmp_path: Path, modes: tuple
         _cleanup(runtime, process)
 
 
-@pytest.mark.parametrize("failure_point", ["_finalize", "_materialize_registrations", "binding"])
+@pytest.mark.parametrize("failure_point", ["terminal_observe", "terminal_publish", "worker_start"])
 def test_finished_process_releases_capacity_while_publication_is_unavailable(
     tmp_path: Path, failure_point: str
 ) -> None:
@@ -1104,16 +1658,25 @@ def test_finished_process_releases_capacity_while_publication_is_unavailable(
         script = """
 import sys
 from pathlib import Path
-from qqtools.plugins.qexp.authority import AuthoritySupervisor
-from qqtools.plugins.qexp.agent import helpers as machine_agent
 from qqtools.plugins.qexp.agent.lifecycle import run_machine_agent_loop
+from qqtools.plugins.qexp.agent.project_io_controller import ProjectIOController
+from qqtools.plugins.qexp.agent.project_io_executor import ProjectIOExecutor
 def unavailable(self, *args, **kwargs):
     Path(sys.argv[2]).touch()
     raise OSError("injected shared terminal publication outage")
-if sys.argv[3] == "binding":
-    machine_agent._binding_config = unavailable
+if sys.argv[3] == "terminal_observe":
+    ProjectIOController.advance_authority_terminal_observations = unavailable
+elif sys.argv[3] == "terminal_publish":
+    ProjectIOController.advance_authority_terminal_publications = unavailable
 else:
-    setattr(AuthoritySupervisor, sys.argv[3], unavailable)
+    original_start = ProjectIOExecutor.start
+    def start(self, request_id, *args, **kwargs):
+        request = self._load_request(request_id)
+        if request.operation_kind == "authority_terminal_observe":
+            Path(sys.argv[2]).touch()
+            return None
+        return original_start(self, request_id, *args, **kwargs)
+    ProjectIOExecutor.start = start
 run_machine_agent_loop(sys.argv[1], loop_interval=0.1, available_gpus=[0])
 """
         blocked_agent = subprocess.Popen(
@@ -1147,13 +1710,23 @@ import sys
 from pathlib import Path
 from qqtools.plugins.qexp.agent import dispatch_loop as machine_agent
 from qqtools.plugins.qexp.agent import lifecycle
-original = machine_agent._probe_primary_demand
-def probe(*args, **kwargs):
+from qqtools.plugins.qexp.agent.project_io_controller import ProjectIOController
+original = ProjectIOController.advance_scheduler_observations
+original_quiescence = ProjectIOController.advance_scheduler_quiescence
+def probe(self, *args, **kwargs):
     Path(sys.argv[2]).touch()
     if not Path(sys.argv[3]).exists():
-        return machine_agent.PrimaryDemandProbe("unresolved")
-    return original(*args, **kwargs)
-machine_agent._probe_primary_demand = probe
+        # Missing closed observation evidence is unresolved, never no demand.
+        return {}
+    return original(self, *args, **kwargs)
+ProjectIOController.advance_scheduler_observations = probe
+def quiescence(self, *args, **kwargs):
+    # Hold both independent demand-proof paths unresolved; neither supplies
+    # a false empty Source result while the barrier is closed.
+    if not Path(sys.argv[3]).exists():
+        return None
+    return original_quiescence(self, *args, **kwargs)
+ProjectIOController.advance_scheduler_quiescence = quiescence
 lifecycle.run_machine_agent_loop(sys.argv[1], loop_interval=0.1, available_gpus=[0])
 """
     process = subprocess.Popen(
@@ -1194,15 +1767,15 @@ def test_failed_binding_is_not_consumed_for_idle_exit(tmp_path: Path) -> None:
     script = """
 import sys
 from pathlib import Path
-from qqtools.plugins.qexp.agent import helpers as machine_agent
 from qqtools.plugins.qexp.agent import lifecycle
-original = machine_agent._binding_config
-def config(*args):
+from qqtools.plugins.qexp.agent.project_io_controller import ProjectIOController
+original = ProjectIOController.advance_binding_validation
+def validate(self, bindings, registry_revision):
     if not Path(sys.argv[3]).exists():
         Path(sys.argv[2]).touch()
-        raise OSError("unreadable first binding")
-    return original(*args)
-machine_agent._binding_config = config
+        return {}
+    return original(self, bindings, registry_revision)
+ProjectIOController.advance_binding_validation = validate
 lifecycle.run_machine_agent_loop(sys.argv[1], loop_interval=0.1, available_gpus=[0])
 """
     process = subprocess.Popen(
@@ -1236,7 +1809,8 @@ from qqtools.plugins.qexp.agent import lifecycle
 original = machine_agent.dispatch_machine_cycle_locked
 def cycle(*args, **kwargs):
     result = original(*args, **kwargs)
-    Path(sys.argv[2]).touch()
+    if args[0].last_cycle_consumed_binding:
+        Path(sys.argv[2]).touch()
     return result
 machine_agent.dispatch_machine_cycle_locked = cycle
 lifecycle.run_machine_agent_loop(sys.argv[1], loop_interval=0.1, available_gpus=[0])

@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Any
 from ..locks import exclusive
 from ..paths import shared_paths
 from ..records import TaskRecord, utc_now, validate_identifier
-from ..store import atomic_replace, read_json, read_json_limited, require_json_size
+from ..store import atomic_replace, check_mutation_fence, read_json, read_json_limited, require_json_size
 from .group_member_diagnostics import (
     PublicationTracker,
     ReadyMemberCheckError,
@@ -1551,6 +1551,7 @@ def retire_group_ready_member(cfg: object, group_name: str, task_id: str, genera
         record["updated_at"] = utc_now()
         _rewrite_page_locators(cfg, group_name, page, page_entries)
         _write_group(cfg, group_name, state, catalog, partition)
+        check_mutation_fence(locator_path)
         locator_path.unlink(missing_ok=True)
         return True
     except (AttributeError, FileNotFoundError, KeyError, OSError, RuntimeError, TypeError, ValueError) as exc:

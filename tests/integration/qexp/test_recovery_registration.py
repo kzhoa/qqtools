@@ -48,8 +48,43 @@ def test_preparation_preserves_authority_and_retry_does_not_republish(registered
     def unexpected_write(*args, **kwargs):
         pytest.fail("already prepared registration must not be republished")
 
-    monkeypatch.setattr("qqtools.plugins.qexp.agent.registration.save_machine_registration", unexpected_write)
+    monkeypatch.setattr(
+        "qqtools.plugins.qexp.runtime.registration_authority.save_machine_registration", unexpected_write
+    )
     assert prepare(runtime, binding)
+
+
+def test_cli_captures_rollback_snapshot_and_publishes_journal_under_shared_exclusion(registered, monkeypatch):
+    from qqtools.plugins.qexp.agent import registration as registration_module
+    from qqtools.plugins.qexp.runtime.locks import exclusive
+    from qqtools.plugins.qexp.runtime.paths import shared_paths
+
+    runtime, binding, cfg, _path = registered
+    lock = shared_paths(cfg.shared_root)["locks"] / "registrations.lock"
+    original_load = registration_module.load_machine_registration
+    original_save = runtime.registration._save_registration_transaction
+    snapshot_ownership = {}
+    saved = []
+
+    def load(current_cfg):
+        record = original_load(current_cfg)
+        with exclusive(lock, blocking=False) as acquired:
+            snapshot_ownership[id(record)] = not acquired
+        return record
+
+    def save(**kwargs):
+        with exclusive(lock, blocking=False) as acquired:
+            assert not acquired, "CLI published rollback journal outside shared registration exclusion"
+        assert all(snapshot_ownership[id(record)] for _cfg, record in kwargs["registrations"])
+        original_save(**kwargs)
+        assert runtime.paths["registration_transaction"].exists()
+        saved.append(True)
+
+    monkeypatch.setattr(registration_module, "load_machine_registration", load)
+    monkeypatch.setattr(runtime.registration, "_save_registration_transaction", save)
+    assert runtime.ensure_binding(cfg.shared_root, cfg.machine_name) == (binding, False)
+    assert saved == [True]
+    assert not runtime.paths["registration_transaction"].exists()
 
 
 def test_only_current_scheduler_owner_can_prepare(registered):
@@ -234,7 +269,7 @@ def test_process_crash_retries_preparation_without_restoring_old_protocol(regist
     )
     pid = os.fork()
     if pid == 0:
-        from qqtools.plugins.qexp.agent import registration as registration_owner
+        from qqtools.plugins.qexp.runtime import registration_authority as registration_owner
 
         sync = DurableIO.sync_directory
         save = registration_owner.save_machine_registration
@@ -271,7 +306,7 @@ def test_process_crash_retries_preparation_without_restoring_old_protocol(regist
 def test_scheduler_does_not_release_authority_during_preparation(registered, monkeypatch):
     from threading import Event, Thread
 
-    from qqtools.plugins.qexp.agent import registration as registration_owner
+    from qqtools.plugins.qexp.runtime import registration_authority as registration_owner
 
     runtime, binding, _cfg, path = registered
     acquired = Event()
@@ -339,7 +374,7 @@ def test_scheduler_does_not_release_authority_during_preparation(registered, mon
 
 
 def test_visible_protocol_after_failed_publication_requires_retry_barrier(registered, monkeypatch):
-    from qqtools.plugins.qexp.agent import registration as registration_owner
+    from qqtools.plugins.qexp.runtime import registration_authority as registration_owner
 
     runtime, binding, _cfg, path = registered
     save = registration_owner.save_machine_registration

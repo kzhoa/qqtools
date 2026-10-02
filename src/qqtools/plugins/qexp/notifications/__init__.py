@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import time
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
@@ -14,25 +15,72 @@ from typing import Any
 from ..agent.context import MachineRuntime
 from ..config_types import RootConfig
 from ..events import write_notification_diagnostic
-from ..notification_reconciliation import LegacyConflictError, reconcile_legacy
+from ..notification_reconciliation import LegacyConflictError, reconcile_captured_legacy, reconcile_legacy
 from ..notification_resolver import NotificationResolutionError, resolve_delivery, resolve_policy
 from ..runtime.paths import shared_paths
+from ..runtime.records import validate_identifier
 from ..runtime.store import CASConflict, atomic_replace, create_if_absent, read_json
 from .base import Notifier
 from .feishu import FeishuNotifier, NotificationTransportError
 
 REGISTRY: dict[str, Notifier] = {"feishu": FeishuNotifier()}
 _selected_runtime_root: ContextVar[Path | None] = ContextVar("qexp_notification_runtime_root", default=None)
+_delivery_fence: ContextVar[Callable[[], None] | None] = ContextVar("qexp_notification_delivery_fence", default=None)
+
+
+@dataclass(frozen=True, slots=True)
+class _CapturedProjectScope:
+    project_id: str
+    before_shared_capture: Callable[[], None] | None
+    before_local_write: Callable[[], None] | None
+
+
+_captured_project_scope: ContextVar[_CapturedProjectScope | None] = ContextVar(
+    "qexp_notification_captured_project", default=None
+)
 
 
 @contextmanager
-def notification_runtime(runtime_root: Path):
-    """Use the CLI's selected MachineRuntime for inline terminal commits."""
+def notification_runtime(
+    runtime_root: Path,
+    *,
+    project_id: str | None = None,
+    before_shared_capture: Callable[[], None] | None = None,
+    before_local_write: Callable[[], None] | None = None,
+) -> Iterator[None]:
+    """Select private storage, optionally using a worker's captured Project scope.
+
+    Captured scopes must recheck shared registration under the shared source lock.
+    Their local-write fence must not access shared storage beneath the policy lock.
+    Callers without a captured scope retain normal MachineRuntime verification.
+    """
+    scope = None
+    if project_id is not None:
+        validate_identifier(project_id, "project_id")
+        if not callable(before_shared_capture) or not callable(before_local_write):
+            raise ValueError("captured notification scope requires both shared and local fences.")
+        scope = _CapturedProjectScope(project_id, before_shared_capture, before_local_write)
+    elif before_shared_capture is not None or before_local_write is not None:
+        raise ValueError("notification scope fences require a captured project_id.")
     token = _selected_runtime_root.set(runtime_root)
+    scope_token = _captured_project_scope.set(scope)
     try:
         yield
     finally:
+        _captured_project_scope.reset(scope_token)
         _selected_runtime_root.reset(token)
+
+
+@contextmanager
+def notification_delivery_fence(callback: Callable[[], None] | None = None) -> Iterator[None]:
+    """Check the current executor authority immediately before provider delivery."""
+    if callback is not None and not callable(callback):
+        raise TypeError("notification delivery fence must be callable or None.")
+    token = _delivery_fence.set(callback)
+    try:
+        yield
+    finally:
+        _delivery_fence.reset(token)
 
 
 def notification_key(notifier: str, event: Any) -> str:
@@ -91,9 +139,23 @@ class NotificationHook:
         registry = self.registry if self.registry is not None else REGISTRY
         key = notification_key("feishu", event)
         try:
-            runtime = MachineRuntime(_selected_runtime_root.get())
-            project_id = reconcile_legacy(runtime, cfg)
-            effective = resolve_policy(runtime.root, project_id)
+            scope = _captured_project_scope.get()
+            if scope is None:
+                runtime = MachineRuntime(_selected_runtime_root.get())
+                runtime_root = runtime.root
+                project_id = reconcile_legacy(runtime, cfg)
+            else:
+                runtime_root = _selected_runtime_root.get()
+                if runtime_root is None:
+                    raise ValueError("captured notification scope requires private runtime storage.")
+                project_id = reconcile_captured_legacy(
+                    runtime_root,
+                    cfg,
+                    scope.project_id,
+                    before_shared_capture=scope.before_shared_capture,
+                    before_local_write=scope.before_local_write,
+                )
+            effective = resolve_policy(runtime_root, project_id)
         except LegacyConflictError:
             _safe_diagnostic(cfg, "notification_skipped", event, key, "legacy_conflict", "skipped")
             return
@@ -103,7 +165,7 @@ class NotificationHook:
         if not effective["enabled"]:
             return
         try:
-            snapshot = resolve_delivery(runtime.root, project_id)
+            snapshot = resolve_delivery(runtime_root, project_id)
         except NotificationResolutionError as exc:
             _safe_diagnostic(cfg, "notification_skipped", event, key, exc.code, "skipped")
             return
@@ -119,6 +181,9 @@ class NotificationHook:
             return
         _safe_diagnostic(cfg, "notification_claimed", event, key, "send_claimed", "claimed")
         try:
+            delivery_fence = _delivery_fence.get()
+            if delivery_fence is not None:
+                delivery_fence()
             result = provider.send(
                 event,
                 webhook=snapshot["webhook"],

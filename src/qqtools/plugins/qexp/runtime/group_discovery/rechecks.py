@@ -23,7 +23,7 @@ import stat
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from ..group_namespace import group_authority_identity
 from ..records import validate_identifier
@@ -122,6 +122,8 @@ class GroupRechecks:
         sequence: int,
         owner: str,
         evidence: dict[str, Any],
+        *,
+        before_write: Callable[[], None] | None = None,
     ) -> RecheckTicket | None:
         """Publish an in-flight event before advancing the reachable tail.
 
@@ -162,10 +164,14 @@ class GroupRechecks:
         }
         # The generation directory was made durable before this journal was
         # published; atomic_replace then fsyncs the event and that directory.
+        if before_write is not None:
+            before_write()
         atomic_replace(event_path, event)
 
         _require_regular_file(paths["state"], "recheck state")
         next_state = _state_record(identity, position.generation, journal_sequence)
+        if before_write is not None:
+            before_write()
         atomic_replace(paths["state"], next_state)
         return RecheckTicket(position.generation, journal_sequence)
 
@@ -187,7 +193,13 @@ class GroupRechecks:
         event_path = paths["journal"] / str(current.generation) / f"{sequence}.json"
         return self._read_event(event_path, identity, current.generation, sequence)
 
-    def resolve(self, ticket: RecheckTicket, *, outcome: str = "committed") -> None:
+    def resolve(
+        self,
+        ticket: RecheckTicket,
+        *,
+        outcome: str = "committed",
+        before_write: Callable[[], None] | None = None,
+    ) -> None:
         """Resolve an in-flight event, ignoring tickets from invalidated generations."""
 
         _validate_ticket(ticket)
@@ -214,6 +226,8 @@ class GroupRechecks:
             raise ValueError("recheck event has already been resolved differently")
         _validate_event_target_for_replace(event_path)
         event["state"] = outcome
+        if before_write is not None:
+            before_write()
         atomic_replace(event_path, event)
 
     def retention(self, position: RecheckPosition) -> RecheckRetention:
@@ -278,7 +292,7 @@ class GroupRechecks:
             reclaimed += 1
         return reclaimed
 
-    def invalidate(self) -> RecheckPosition:
+    def invalidate(self, *, before_write: Callable[[], None] | None = None) -> RecheckPosition:
         """Revoke the current generation and publish a fresh empty generation."""
 
         paths, identity = self._bound_paths()
@@ -286,9 +300,13 @@ class GroupRechecks:
         current = self._read_position(paths, identity)
         next_generation = current.generation + 1
         generation_path = paths["journal"] / str(next_generation)
+        if before_write is not None:
+            before_write()
         _ensure_directory(generation_path)
         _sync_layout(paths, generation_path)
         _require_regular_file(paths["state"], "recheck state")
+        if before_write is not None:
+            before_write()
         atomic_replace(paths["state"], _state_record(identity, next_generation, 0))
         return RecheckPosition(next_generation, 0)
 

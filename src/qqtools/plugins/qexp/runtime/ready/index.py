@@ -15,7 +15,7 @@ from ..group_namespace import read_group
 from ..locks import exclusive, schema_lock, schema_writer_lock
 from ..paths import group_path, ready_state_path, shared_paths, task_path
 from ..records import TaskRecord, normalize_group_record, utc_now, validate_identifier
-from ..store import atomic_replace, iter_json, read_json
+from ..store import atomic_replace, check_mutation_fence, iter_json, read_json
 from ..submission_control import SubmissionControlUnavailable, read_submission_state
 from ..work_budget import SliceBudget
 from . import primary_candidates, routes, state
@@ -285,7 +285,9 @@ def delete_ready_marker(cfg: object, task_id: str, generation: int) -> bool:
             allocator_path, allocator = routes.load_or_create_allocator_under_lock(cfg.shared_root, route_key)
             allocator["ready_allocator"]["primary_state"] = "updating"
             atomic_replace(allocator_path, allocator)
-        routes.marker_path(cfg.shared_root, reference).unlink(missing_ok=True)
+        marker_path = routes.marker_path(cfg.shared_root, reference)
+        check_mutation_fence(marker_path)
+        marker_path.unlink(missing_ok=True)
         partition_path = routes.partition_record_path(
             cfg.shared_root,
             reference.queue_scope,
@@ -298,6 +300,7 @@ def delete_ready_marker(cfg: object, task_id: str, generation: int) -> bool:
             partition["slots"] = [name for name in partition["slots"] if name != reference.marker_name]
             partition["revision"] += 1
             if not partition["slots"] and partition.get("sealed"):
+                check_mutation_fence(partition_path)
                 partition_path.unlink(missing_ok=True)
                 catalog_path = routes.catalog_path(cfg.shared_root, route_key, reference.catalog_page)
                 if catalog_path.exists():
@@ -321,6 +324,7 @@ def delete_ready_marker(cfg: object, task_id: str, generation: int) -> bool:
                     allocator = read_json(allocator_path)
                     allocator["ready_allocator"]["revision"] += 1
                     atomic_replace(allocator_path, allocator)
+        check_mutation_fence(path)
         path.unlink(missing_ok=True)
         if group_name:
             retire_group_ready_member(cfg, group_name, task_id, generation)
@@ -528,6 +532,8 @@ def _recheck_missing_ready_marker(
 def classify_ready_marker(
     cfg: object,
     reference: ReadyMarkerRef,
+    *,
+    read_only: bool = False,
 ) -> ReadyClassificationResult:
     """Classify one advisory marker against authoritative Task and Submission truth."""
     if reference.generation <= 0 or not reference.task_id:
@@ -546,6 +552,8 @@ def classify_ready_marker(
             if attempt + 1 < _READY_MARKER_READ_ATTEMPTS:
                 time.sleep(_READY_MARKER_RETRY_DELAY_SECONDS)
                 continue
+            if read_only:
+                return _classification_result(cfg, reference, "temporarily_unavailable", "marker_unavailable")
             marker = _recheck_missing_ready_marker(cfg, reference)
             if isinstance(marker, ReadyClassificationResult):
                 return marker
@@ -662,6 +670,8 @@ def classify_ready_marker(
     if _is_ready_publication_pending(cfg, reference, task):
         return _classification_result(cfg, reference, "temporarily_unavailable", "marker_publication_pending", task)
     if _publication_commit_pending(cfg, reference, task):
+        if read_only:
+            return _classification_result(cfg, reference, "temporarily_unavailable", "marker_publication_pending", task)
         try:
             if not commit_ready_publication(cfg, task):
                 return _classification_result(

@@ -2,6 +2,7 @@
 
 import multiprocessing
 import os
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -39,6 +40,217 @@ def observation():
             "start_time_ticks": int(fields[19]),
         },
     }
+
+
+def retained_checkpoint(tmp_path):
+    target = tmp_path / "machine/target"
+    source = tmp_path / "foreign/source"
+    source.mkdir(parents=True)
+    ledger, _checkpoint = setup_capture(target)
+    checkpoint = capture.WriterCaptureCheckpoint(ledger, target, legacy_source=source)
+    return ledger, checkpoint, source
+
+
+def test_separate_source_retention_does_not_reopen_target_or_need_its_parent_lock(tmp_path, monkeypatch):
+    _ledger, checkpoint, source = retained_checkpoint(tmp_path)
+    state = checkpoint.prepare_local()
+    before = checkpoint.path.read_bytes()
+    with capture._capture_parent_guard(checkpoint.runtime_root.parent, is_exclusive=True) as acquired:
+        assert acquired
+        with monkeypatch.context() as guarded:
+            for obj, name in (
+                (Path, "resolve"),
+                (Path, "open"),
+                (os, "open"),
+                (os, "stat"),
+                (os, "lstat"),
+                (os, "scandir"),
+            ):
+                original = getattr(obj, name)
+
+                def source_only(path, *args, _method=original, **kwargs):
+                    if not isinstance(path, int):
+                        candidate = Path(os.fsdecode(path))
+                        if candidate == checkpoint.runtime_root.parent or checkpoint.runtime_root in candidate.parents:
+                            pytest.fail("source retention accessed target storage")
+                    return _method(path, *args, **kwargs)
+
+                guarded.setattr(obj, name, source_only)
+            hold = capture.retain_capture_source(state)
+    assert hold.to_dict() == read_json(source / capture.CAPTURE_FILE)
+    assert checkpoint.path.read_bytes() == before
+
+
+def test_local_preparation_retains_only_target_before_source_becomes_accessible(tmp_path, monkeypatch):
+    target = tmp_path / "target"
+    ledger, _ = setup_capture(target)
+    source = tmp_path / "unavailable/source"
+    original_resolve = Path.resolve
+
+    def local_resolve(path, *args, **kwargs):
+        if path == source or source in path.parents:
+            pytest.fail("target preparation resolved source storage")
+        return original_resolve(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", local_resolve)
+    monkeypatch.setattr(
+        capture, "_retain_source_locked", lambda *_args, **_kwargs: pytest.fail("target retained source")
+    )
+    checkpoint = capture.WriterCaptureCheckpoint(ledger, target, legacy_source=source)
+    state = checkpoint.prepare_local()
+    assert state == read_json(checkpoint.path)
+    assert state["legacy_source"] == str(source)
+    assert state["pending"] == [] and "progress" not in state and "admission" not in state
+    assert not source.exists()
+    assert ledger.find(IDENTITY) is None
+    with capture.capture_cleanup_guard(target) as allowed:
+        assert not allowed
+
+
+def test_local_observation_records_source_writer_without_source_filesystem_access(tmp_path, monkeypatch):
+    ledger, checkpoint, source = retained_checkpoint(tmp_path)
+    state = checkpoint.prepare_local()
+    hold = capture.retain_capture_source(state)
+    captured = {**observation(), "legacy_source": str(source)}
+    hold_bytes = (source / capture.CAPTURE_FILE).read_bytes()
+
+    def check(path):
+        if isinstance(path, int):
+            return
+        path = Path(os.fsdecode(path))
+        if path == source.parent or source.parent in path.parents:
+            pytest.fail("local observation accessed source storage")
+
+    with monkeypatch.context() as guarded:
+        for owner, name in (
+            (Path, "resolve"),
+            (Path, "open"),
+            (os, "open"),
+            (os, "stat"),
+            (os, "lstat"),
+            (os, "scandir"),
+        ):
+            original = getattr(owner, name)
+
+            def local_only(path, *args, _method=original, **kwargs):
+                check(path)
+                return _method(path, *args, **kwargs)
+
+            guarded.setattr(owner, name, local_only)
+        reopened = capture.WriterCaptureCheckpoint(ledger, checkpoint.runtime_root, legacy_source=source)
+        with reopened.observe_local(hold) as current:
+            current.record([captured], progress={"revision": 1})
+        first = ledger.lookup(IDENTITY)
+        with reopened.observe_local(hold) as current:
+            current.record([captured])
+        assert ledger.lookup(IDENTITY) == first
+    assert first["legacy_source"] == str(source)
+    assert first["captured_writers"] == [captured["writer"]]
+    assert (source / capture.CAPTURE_FILE).read_bytes() == hold_bytes
+
+
+@pytest.mark.parametrize("mismatch", ["missing", "capture", "instance", "target", "source"])
+def test_local_observation_requires_exact_source_hold(tmp_path, mismatch):
+    ledger, checkpoint, source = retained_checkpoint(tmp_path)
+    state = checkpoint.prepare_local()
+    hold = capture.retain_capture_source(state)
+    changes = {
+        "capture": {"capture_id": "f" * 32},
+        "instance": {"instance": "other"},
+        "target": {"target_root": tmp_path / "other"},
+        "source": {"source_root": tmp_path / "other"},
+    }
+    wrong = None if mismatch == "missing" else replace(hold, **changes[mismatch])
+    with pytest.raises(Conflict, match="exact retained source hold"):
+        with checkpoint.observe_local(wrong):
+            pytest.fail("mismatched source hold admitted an observation")
+    assert ledger.find(IDENTITY) is None
+    assert read_json(checkpoint.path) == state
+    assert read_json(source / capture.CAPTURE_FILE) == hold.to_dict()
+
+
+def test_source_hold_replay_revalidates_before_directory_barrier(tmp_path, monkeypatch):
+    _ledger, checkpoint, source = retained_checkpoint(tmp_path)
+    state = checkpoint.prepare_local()
+    hold = capture.retain_capture_source(state)
+    original = capture.DurableIO.sync_directory
+    boundaries = []
+
+    def synchronize(self, path, stage):
+        assert boundaries == ["fence"]
+        assert path == source and stage == "writer_capture_source"
+        boundaries.append("sync")
+        return original(self, path, stage)
+
+    monkeypatch.setattr(capture.DurableIO, "sync_directory", synchronize)
+    assert capture.retain_capture_source(state, before_source_write=lambda: boundaries.append("fence")) == hold
+    assert boundaries == ["fence", "sync"]
+
+
+def test_missing_source_hold_after_observation_is_not_recreated(tmp_path):
+    _ledger, checkpoint, source = retained_checkpoint(tmp_path)
+    state = checkpoint.prepare_local()
+    hold = capture.retain_capture_source(state)
+    with checkpoint.observe_local(hold) as current:
+        current.record([], progress={"revision": 1})
+    (source / capture.CAPTURE_FILE).unlink()
+    with pytest.raises(Unavailable, match="disappeared after observation"):
+        capture.retain_capture_source(checkpoint.prepare_local())
+    assert not (source / capture.CAPTURE_FILE).exists()
+
+
+def test_local_reopen_replays_interrupted_writer_intent_without_source_io(tmp_path, monkeypatch):
+    ledger, checkpoint, source = retained_checkpoint(tmp_path)
+    hold = capture.retain_capture_source(checkpoint.prepare_local())
+    captured = {**observation(), "legacy_source": str(source)}
+
+    def interrupted(*_args, **_kwargs):
+        raise OSError("local ledger publication interrupted")
+
+    with monkeypatch.context() as guarded:
+        guarded.setattr(ledger, "capture_writer", interrupted)
+        with pytest.raises(OSError, match="local ledger publication interrupted"):
+            with checkpoint.observe_local(hold) as current:
+                current.record([captured])
+    assert read_json(checkpoint.path)["pending"] == [captured]
+    assert ledger.find(IDENTITY) is None
+    original_resolve = Path.resolve
+
+    def local_resolve(path, *args, **kwargs):
+        if path == source or source in path.parents:
+            pytest.fail("local pending replay resolved source storage")
+        return original_resolve(path, *args, **kwargs)
+
+    with monkeypatch.context() as guarded:
+        guarded.setattr(Path, "resolve", local_resolve)
+        guarded.setattr(
+            capture, "_retain_source_locked", lambda *_args, **_kwargs: pytest.fail("replay renewed source")
+        )
+        reopened = capture.WriterCaptureCheckpoint(Ledger(ledger.root), checkpoint.runtime_root, legacy_source=source)
+        with reopened.observe_local(hold):
+            member = ledger.lookup(IDENTITY)
+    assert member["captured_writers"] == [captured["writer"]]
+    assert member["legacy_source"] == str(source)
+    assert read_json(checkpoint.path)["pending"] == []
+
+
+@pytest.mark.parametrize("existing", [False, True])
+def test_source_retention_fence_failure_leaves_source_and_target_unchanged(tmp_path, existing):
+    _ledger, checkpoint, source = retained_checkpoint(tmp_path)
+    state = checkpoint.prepare_local()
+    if existing:
+        capture.retain_capture_source(state)
+    source_path = source / capture.CAPTURE_FILE
+    source_before = source_path.read_bytes() if source_path.exists() else None
+    target_before = checkpoint.path.read_bytes()
+
+    def fence():
+        raise Conflict("capture owner changed")
+
+    with pytest.raises(Conflict, match="capture owner changed"):
+        capture.retain_capture_source(state, before_source_write=fence)
+    assert checkpoint.path.read_bytes() == target_before
+    assert (source_path.read_bytes() if source_path.exists() else None) == source_before
 
 
 def request():

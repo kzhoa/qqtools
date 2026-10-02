@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from ..records import TASK_ID_PATTERN
-from ..store import atomic_replace
+from ..store import atomic_replace, check_mutation_fence
 from ..work_budget import diagnostic_increment
 
 _VERSION = 1
@@ -606,6 +606,7 @@ class IndexTree:
             raise ValueError(f"observation index node is missing for prefix {prefix!r}: {path}") from exc
         if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
             raise ValueError(f"observation index node must be a regular file: {path}")
+        check_mutation_fence(path)
         os.unlink(path)
         _fsync_directory(path.parent)
 
@@ -627,6 +628,7 @@ class IndexTree:
         return True
 
     def _ensure_partition_directory(self) -> None:
+        check_mutation_fence(self._base)
         self._base.mkdir(parents=True, exist_ok=True)
         _ensure_directory(self._base)
         partitions = self._base / "partitions"
@@ -651,6 +653,7 @@ def _ensure_directory(path: Path) -> bool:
     try:
         metadata = os.lstat(path)
     except FileNotFoundError:
+        check_mutation_fence(path)
         path.mkdir()
         return True
     if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):

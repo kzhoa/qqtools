@@ -250,6 +250,33 @@ class PrimaryProbeSession:
             self._routes[key] = PrimaryProbeRoute(None, None, False)
             self._lane_for_key(key).pending.add(key)
 
+    def snapshot_lane(
+        self, lane: str
+    ) -> tuple[Mapping[RouteKey, PrimaryProbeRoute], tuple[RouteKey, ...], RouteKey | None]:
+        """Expose detached typed state for a bounded worker continuation."""
+        state = self._lanes.get(lane, _LaneState())
+        routes = {key: route for key, route in self._routes.items() if key[2] == lane}
+        pending = tuple(key for key in state.route_keys if key in state.pending)
+        return MappingProxyType(routes), pending, state.next_recheck_key
+
+    def restore_lane(
+        self,
+        lane: str,
+        routes: Mapping[RouteKey, PrimaryProbeRoute],
+        pending: Iterable[RouteKey],
+        next_recheck_key: RouteKey | None,
+    ) -> None:
+        """Replace one lane from a validated typed continuation."""
+        keys = tuple(routes)
+        pending_keys = set(pending)
+        if any(key[2] != lane for key in keys) or not pending_keys.issubset(keys):
+            raise ValueError("probe continuation routes do not match the lane.")
+        if next_recheck_key is not None and next_recheck_key not in routes:
+            raise ValueError("probe continuation recheck route is unknown.")
+        self._routes = {key: route for key, route in self._routes.items() if key[2] != lane}
+        self._routes.update(routes)
+        self._lanes[lane] = _LaneState(keys, pending_keys, next_recheck_key)
+
     def _lane_for_key(self, key: RouteKey) -> _LaneState:
         return self._lanes.setdefault(key[2], _LaneState())
 

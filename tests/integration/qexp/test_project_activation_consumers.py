@@ -87,6 +87,84 @@ def test_consumer_ack_is_fenced_by_current_checkpoint_and_process(tmp_path: Path
     }
 
 
+def test_consumer_mutations_fence_immediately_before_each_shared_replace(tmp_path: Path) -> None:
+    cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime")
+    identity = _identity(cfg)
+    checkpoint = publish_project_activation(cfg, "work")["project_activation"]
+    calls: list[int] = []
+
+    register_consumer(
+        cfg.shared_root,
+        **identity,
+        process_fence="process-a",
+        before_shared_write=lambda: calls.append(len(calls) + 1),
+    )
+    register_call_count = len(calls)
+    assert register_call_count >= 2
+
+    ack_consumer(
+        cfg.shared_root,
+        **identity,
+        process_fence="process-a",
+        epoch=checkpoint["epoch"],
+        sequence=checkpoint["sequence"],
+        before_shared_write=lambda: calls.append(len(calls) + 1),
+    )
+    assert len(calls) == register_call_count + 1
+
+
+def test_consumer_write_fence_failure_prevents_target_replace(tmp_path: Path) -> None:
+    cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime")
+    identity = _identity(cfg)
+    calls = 0
+
+    def fail_before_consumer_replace() -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RuntimeError("fenced before consumer replace")
+
+    with pytest.raises(RuntimeError, match="fenced before consumer replace"):
+        register_consumer(
+            cfg.shared_root,
+            **identity,
+            process_fence="process-a",
+            before_shared_write=fail_before_consumer_replace,
+        )
+
+    assert calls == 2
+    assert read_consumer_progress(cfg.shared_root, **identity) is None
+
+
+def test_first_consumer_fence_failure_leaves_shared_tree_unchanged(tmp_path: Path) -> None:
+    cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime")
+    identity = _identity(cfg)
+
+    def snapshot() -> dict[str, tuple[str, bytes | None]]:
+        return {
+            str(path.relative_to(cfg.shared_root)): (
+                "directory" if path.is_dir() else "file",
+                None if path.is_dir() else path.read_bytes(),
+            )
+            for path in cfg.shared_root.rglob("*")
+        }
+
+    before = snapshot()
+
+    def fenced() -> None:
+        raise RuntimeError("executor epoch fenced")
+
+    with pytest.raises(RuntimeError, match="executor epoch fenced"):
+        register_consumer(
+            cfg.shared_root,
+            **identity,
+            process_fence="process-a",
+            before_shared_write=fenced,
+        )
+
+    assert snapshot() == before
+
+
 def test_consumer_retirement_keeps_replay_proof_and_rejects_reuse(tmp_path: Path) -> None:
     cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime")
     identity = _identity(cfg)

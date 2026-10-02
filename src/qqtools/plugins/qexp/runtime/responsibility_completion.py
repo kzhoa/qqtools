@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import stat
+from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 
 from .authority_scan import is_path_present
@@ -17,13 +20,22 @@ from .responsibility_capture import (
     capture_admission,
 )
 from .responsibility_process_capture import SCAN_FORMAT, _process_scope
-from .responsibility_store import DurableIO, Ledger, Unavailable
+from .responsibility_store import DurableIO, Ledger, Unavailable, read_ledger_instance
 from .store import atomic_replace, read_json_limited, require_json_size
 
 COMPLETION_FILE = "responsibility-capture-complete.json"
 COMPLETION_FORMAT = "qexp-local-capture-complete-v1"
 COMPLETION_BYTES = 16384
 SOURCE_RELEASE_FILE = "responsibility-source-release.json"
+
+
+@dataclass(frozen=True, slots=True)
+class SourceReleaseContext:
+    target_root: Path
+    source_root: Path
+    proof: dict
+    capture: dict
+    receipt: dict
 
 
 def _digest(value: dict) -> str:
@@ -54,7 +66,7 @@ def read_capture_completion(runtime_root: Path, *, should_sync: bool = True) -> 
     if (
         proof.get("format") != COMPLETION_FORMAT
         or proof.get("runtime_root") != str(runtime_root)
-        or proof.get("instance") != Ledger(responsibility_root(runtime_root)).instance
+        or proof.get("instance") != read_ledger_instance(responsibility_root(runtime_root))
         or capture.get("format") != CAPTURE_FORMAT
         or capture.get("phase") != "pending"
         or capture.get("runtime_root") != str(runtime_root)
@@ -84,7 +96,9 @@ def read_capture_completion(runtime_root: Path, *, should_sync: bool = True) -> 
     if source is not None and (
         not isinstance(source, str)
         or not Path(source).is_absolute()
-        or str(Path(source).resolve()) != source
+        or str(Path(source)) != source
+        or ".." in Path(source).parts
+        or "\x00" in source
         or source == str(runtime_root)
     ):
         raise Unavailable("invalid retained capture source")
@@ -155,11 +169,116 @@ def is_source_released(runtime_root: Path, proof: dict) -> bool:
     return True
 
 
+def _source_release_receipt(proof: dict) -> dict:
+    return {
+        "format": "qexp-local-source-release-v1",
+        "completion_digest": _digest(proof),
+        "legacy_source": proof["legacy_source"],
+    }
+
+
+def _prepare_source_release_locked(runtime_root: Path, proof: dict) -> dict | None:
+    """Publish only the local no-source-membership decision under target exclusion."""
+    from .responsibility import responsibility_root
+
+    expected = _source_release_receipt(proof)
+    path = runtime_root / SOURCE_RELEASE_FILE
+    if is_path_present(path):
+        if read_json_limited(path, max_bytes=COMPLETION_BYTES) != expected:
+            raise Unavailable("invalid retained source release proof")
+        DurableIO().sync_directory(runtime_root, "capture_source_release_intent")
+    else:
+        if Ledger(responsibility_root(runtime_root)).has_members():
+            return None
+        atomic_replace(path, expected)
+    return expected
+
+
+def prepare_completed_source_release(runtime_root: Path) -> dict | None:
+    """Retire source ownership locally without probing or modifying the source.
+
+    The existing receipt is replay evidence; later target-only launches do not
+    reopen source ownership. No receipt is published while members remain.
+    """
+    from .responsibility_capture import _capture_parent_guard
+
+    runtime_root = runtime_root.resolve()
+    with _capture_parent_guard(runtime_root.parent, is_exclusive=True) as acquired:
+        if not acquired:
+            return None
+        proof = read_capture_completion(runtime_root)
+        if proof is None:
+            return None
+        if proof["legacy_source"] is None:
+            return _source_release_receipt(proof)
+        return _prepare_source_release_locked(runtime_root, proof)
+
+
+def load_source_release_context(runtime_root: Path, *, completion_digest: str) -> SourceReleaseContext:
+    """Read exact local release proof without locks, writes, or source access."""
+    from .responsibility_backfill import _canonical_capture_root
+
+    runtime_root = _canonical_capture_root(runtime_root)
+    for name in (COMPLETION_FILE, CAPTURE_FILE, SOURCE_RELEASE_FILE, "responsibility-capture-backfill.json"):
+        if not stat.S_ISREG((runtime_root / name).lstat().st_mode):
+            raise Unavailable("source release requires regular local capture metadata")
+    proof = read_capture_completion(runtime_root, should_sync=False)
+    if proof is None or proof["legacy_source"] is None or _digest(proof) != completion_digest:
+        raise Unavailable("source release completion identity changed")
+    receipt = read_json_limited(runtime_root / SOURCE_RELEASE_FILE, max_bytes=COMPLETION_BYTES)
+    if receipt != _source_release_receipt(proof):
+        raise Unavailable("invalid retained source release proof")
+    capture = read_json_limited(runtime_root / CAPTURE_FILE, max_bytes=CAPTURE_BYTES)
+    return SourceReleaseContext(runtime_root, Path(proof["legacy_source"]), proof, capture, receipt)
+
+
+def _release_source_hold_locked(context: SourceReleaseContext, before_source_write: Callable[[], None]) -> bool:
+    """Own source effects only; the caller supplies a fresh local ownership fence."""
+    source = context.source_root
+    if source.resolve() != source or source == context.target_root:
+        raise Unavailable("source release runtime is not its captured canonical source")
+    path = source / CAPTURE_FILE
+    if not is_path_present(path):
+        if source.is_dir():
+            before_source_write()
+            DurableIO().sync_directory(source, "capture_source_release")
+        return True
+    expected = {
+        "format": SOURCE_CAPTURE_FORMAT,
+        "runtime_root": str(source),
+        "target_root": str(context.target_root),
+        "instance": context.proof["instance"],
+        "capture_id": context.capture["capture_id"],
+        "phase": "pending",
+    }
+    if not stat.S_ISREG(path.lstat().st_mode) or read_json_limited(path, max_bytes=CAPTURE_BYTES) != expected:
+        raise Unavailable("retained source does not match completed capture")
+    before_source_write()
+    DurableIO().delete(path)
+    return True
+
+
+def release_source_retention(context: SourceReleaseContext, *, before_source_write: Callable[[], None]) -> bool:
+    """Delete/replay one hold with only source parent exclusion and source I/O."""
+    from .responsibility_capture import _capture_parent_guard
+
+    if (
+        context.receipt != _source_release_receipt(context.proof)
+        or context.proof["runtime_root"] != str(context.target_root)
+        or context.proof["legacy_source"] != str(context.source_root)
+        or context.proof["capture_digest"] != _digest(context.capture)
+    ):
+        raise Unavailable("source release context has no exact durable receipt")
+    with _capture_parent_guard(context.source_root.parent, is_exclusive=True) as acquired:
+        if not acquired:
+            return False
+        return _release_source_hold_locked(context, before_source_write)
+
+
 def release_completed_source(runtime_root: Path) -> bool:
     """Release source retention only after all captured responsibilities retire."""
     from contextlib import ExitStack
 
-    from .responsibility import responsibility_root
     from .responsibility_capture import _capture_parent_guard
 
     runtime_root = runtime_root.resolve()
@@ -175,29 +294,12 @@ def release_completed_source(runtime_root: Path) -> bool:
                 return False
         if read_capture_completion(runtime_root) != proof:
             raise Unavailable("capture completion changed before source release")
-        release_path = runtime_root / SOURCE_RELEASE_FILE
-        expected_release = {
-            "format": "qexp-local-source-release-v1",
-            "completion_digest": _digest(proof),
-            "legacy_source": str(source),
-        }
-        if is_path_present(release_path):
-            if read_json_limited(release_path, max_bytes=COMPLETION_BYTES) != expected_release:
-                raise Unavailable("invalid retained source release proof")
-            DurableIO().sync_directory(runtime_root, "capture_source_release_intent")
-        else:
-            if Ledger(responsibility_root(runtime_root)).has_members():
-                if not is_path_present(source / CAPTURE_FILE):
-                    raise Unavailable("source retention disappeared before release")
-                return False
-            # Retire source ownership before removing its hold. Later current
-            # launches may add target-only members without reopening this source.
-            atomic_replace(release_path, expected_release)
-        if not is_path_present(source / CAPTURE_FILE):
-            if source.is_dir():
-                DurableIO().sync_directory(source, "capture_source_release")
-            return True
-        if not is_source_capture_complete(source, runtime_root):
-            raise Unavailable("retained source does not match completed capture")
-        DurableIO().delete(source / CAPTURE_FILE)
-        return True
+        receipt = _prepare_source_release_locked(runtime_root, proof)
+        if receipt is None:
+            if not is_path_present(source / CAPTURE_FILE):
+                raise Unavailable("source retention disappeared before release")
+            return False
+        capture = read_json_limited(runtime_root / CAPTURE_FILE, max_bytes=CAPTURE_BYTES)
+        return _release_source_hold_locked(
+            SourceReleaseContext(runtime_root, source, proof, capture, receipt), lambda: None
+        )

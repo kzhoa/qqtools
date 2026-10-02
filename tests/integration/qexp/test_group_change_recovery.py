@@ -31,6 +31,48 @@ def failed_task(tmp_path):
     return cfg, task, journal
 
 
+def test_fenced_terminal_replay_does_not_append_group_rechecks(tmp_path):
+    from qqtools.plugins.qexp.lifecycle import TerminalTransition, commit_terminal_transition_locked
+
+    cfg = isolated_group(tmp_path, tail=0)
+    task = submit(cfg, ["true"], group="experiment")
+    attempt = claim_task(cfg, task.task_id, [0])
+    assert authorize_launch(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token)
+    journal = GroupRechecks(cfg.shared_root, "experiment")
+    transition = TerminalTransition(
+        task_id=task.task_id,
+        attempt_id=attempt.attempt_id,
+        attempt_number=attempt.attempt_number,
+        fencing_token=attempt.current_fencing_token,
+        phase="failed",
+        reason="failure",
+        exit_code=None,
+        allowed_task_phases=frozenset({"starting", "running"}),
+        allowed_attempt_phases=frozenset({"starting", "running"}),
+        claim_mode="active",
+        project_io_publication_id="exact-publication",
+    )
+    with authority_locks(cfg, load_task(cfg, task.task_id)):
+        journal.snapshot(initialize=True)
+        committed = commit_terminal_transition_locked(
+            cfg, load_task(cfg, task.task_id), transition, mutation_fence=lambda: None
+        )
+    assert committed.outcome == "committed", committed.reason
+    position = journal.snapshot()
+    assert position.tail == 1
+    assert journal.read(position, 1)["state"] == "committed"
+    for _ in range(3):
+        with authority_locks(cfg, load_task(cfg, task.task_id)):
+            replay = commit_terminal_transition_locked(
+                cfg, load_task(cfg, task.task_id), transition, mutation_fence=lambda: None
+            )
+        assert replay.outcome == "already_committed"
+        assert replay.event.task_id == committed.event.task_id
+        assert replay.event.phase == committed.event.phase
+        assert replay.event.finished_at == committed.event.finished_at
+        assert journal.snapshot() == position
+
+
 def interrupted_retry(cfg, task_id, cut):
     target = "prepare_ready_transition" if cut == "before_task" else "save_task"
     original = getattr(task_commands, target)

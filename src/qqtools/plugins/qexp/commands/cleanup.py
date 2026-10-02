@@ -194,6 +194,16 @@ def _start_cleanup_operation(cfg: RootConfig, task: TaskRecord) -> dict[str, Any
 
 def _cleanup_known_attempt(cfg: RootConfig, attempt: AttemptRecord) -> tuple[list[str], list[str]]:
     """Retain terminal proof before deletion; caller holds the Task cleanup fence."""
+    cadence_removed: list[str] = []
+    if attempt.phase in {"succeeded", "failed", "cancelled"}:
+        for version in (1, 2):
+            path = cfg.runtime_root / "progress-coordinator" / f"v{version}" / f"{attempt.attempt_id}.json"
+            try:
+                path.unlink()
+            except OSError:
+                pass
+            else:
+                cadence_removed.append(str(path))
     paths = local_paths(cfg.runtime_root)
     evidence = [paths[name] / f"{attempt.attempt_id}.json" for name in FLAT_EVIDENCE]
     evidence.append(paths["termination_decisions"] / attempt.attempt_id)
@@ -203,7 +213,7 @@ def _cleanup_known_attempt(cfg: RootConfig, attempt: AttemptRecord) -> tuple[lis
     if root.exists():
         entry = Ledger(root).find(attempt.attempt_id)
     if not existing and entry is None:
-        return [], []
+        return cadence_removed, []
     if attempt.phase not in {"succeeded", "failed", "cancelled"}:
         return [], [f"local_attempt_not_terminal:{attempt.attempt_id}"]
     payload = {"task_id": attempt.task_id, "attempt_number": attempt.attempt_number}
@@ -232,7 +242,7 @@ def _cleanup_known_attempt(cfg: RootConfig, attempt: AttemptRecord) -> tuple[lis
     with exclusive(cfg.runtime_root / "locks" / "responsibility-initialize.lock"):
         ledger = Ledger.open_or_create(root)
     is_complete = complete_cleanup(ledger, cfg.runtime_root, request)
-    removed = [str(path) for path in existing if not path.exists()]
+    removed = cadence_removed + [str(path) for path in existing if not path.exists()]
     blockers = [] if is_complete else [f"local_cleanup_pending:{attempt.attempt_id}"]
     return removed, blockers
 
@@ -832,6 +842,12 @@ def _advance_cleanup_local_step(
         if type(artifact_index) is not int or not 0 <= artifact_index <= len(artifacts):
             return {"state": "intervention", "reason": "local_progress_cursor_invalid"}
         if artifact_index < len(artifacts):
+            if artifact_index == 0:
+                # Optional cadence follows its context without changing the
+                # persisted cleanup cursor's existing artifact numbering.
+                (cfg.runtime_root / "progress-coordinator" / f"v{version}" / f"{attempt_id}.json").unlink(
+                    missing_ok=True
+                )
             artifacts[artifact_index].unlink(missing_ok=True)
             cursor["progress_artifact"] = artifact_index + 1
             return {"state": "in_progress"}

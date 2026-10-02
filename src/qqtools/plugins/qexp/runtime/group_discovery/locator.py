@@ -18,7 +18,7 @@ from typing import Any, Callable
 from ..directory_capture import read_directory_entry
 from ..group_namespace import group_authority_identity
 from ..records import utc_now, validate_group_name
-from ..store import atomic_replace
+from ..store import atomic_replace, check_mutation_fence
 
 LANES = ("control", "maintenance", "membership")
 SHARD_COUNT = 256
@@ -504,6 +504,7 @@ def acknowledge_group_locator_locked(
     ):
         return False
     path = group_locator_path(root, group, lane)
+    check_mutation_fence(path)
     try:
         os.unlink(path)
     except FileNotFoundError:
