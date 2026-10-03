@@ -1,10 +1,19 @@
 from __future__ import annotations
 
+from dataclasses import FrozenInstanceError, fields
+
+import pytest
+
 from qqtools.plugins.qexp.agent.project_io_terminal_proof import (
+    TerminalObservationProof,
+    TerminalPublicationProof,
+    build_terminal_observation_proof,
+    build_terminal_publication_proof,
     build_terminal_transition,
     has_exact_terminal_revisions,
     matches_terminal_lifecycle_event,
     matches_terminal_observation_identity,
+    terminal_proof_matches_candidate,
     terminal_transition_target,
 )
 
@@ -97,5 +106,117 @@ def test_lifecycle_event_binds_committed_task_revision() -> None:
         parameters,
         phase="succeeded",
         reason="completed",
+        exit_code=0,
+    )
+
+
+def _terminal_observation_evidence(parameters: dict[str, object]) -> dict[str, object]:
+    return {
+        "outcome": "already_terminal",
+        "machine_name": "gpu-1",
+        **parameters,
+        "authority_granted": False,
+        "local_effects": [],
+        "source_revisions": _revisions(),
+        "cancel_requested": False,
+        "task_phase": "succeeded",
+        "attempt_phase": "succeeded",
+        "execution_machine_name": "gpu-1",
+        "reservation_machine_name": "gpu-1",
+        "attempt_result_reason": "completed",
+        "attempt_exit_code": 0,
+        "termination_result": None,
+    }
+
+
+def test_observation_proof_is_immutable_and_rejects_candidate_mismatch() -> None:
+    parameters = _parameters()
+    proof = build_terminal_observation_proof(
+        evidence=_terminal_observation_evidence(parameters),
+        parameters=parameters,
+        machine_name="gpu-1",
+        exit_code=0,
+    )
+
+    assert isinstance(proof, TerminalObservationProof)
+    assert terminal_proof_matches_candidate(
+        proof,
+        parameters=parameters,
+        machine_name="gpu-1",
+        exit_code=0,
+    )
+    assert all(not isinstance(getattr(proof, field.name), (dict, list, set)) for field in fields(proof))
+    with pytest.raises(FrozenInstanceError):
+        proof.outcome = "settled_terminal"  # type: ignore[misc]
+
+    mismatched = _parameters()
+    mismatched["process_identity"] = {
+        **parameters["process_identity"],  # type: ignore[dict-item]
+        "wrapper_pid": 202,
+    }
+    assert not terminal_proof_matches_candidate(
+        proof,
+        parameters=mismatched,
+        machine_name="gpu-1",
+        exit_code=0,
+    )
+    assert not terminal_proof_matches_candidate(
+        True,
+        parameters=parameters,
+        machine_name="gpu-1",
+        exit_code=0,
+    )
+
+
+def test_publication_proof_preserves_distinct_provenance() -> None:
+    parameters = _parameters()
+    transition = build_terminal_transition(
+        parameters=parameters,
+        machine_name="gpu-1",
+        exit_code=0,
+        source_revisions=_revisions(),
+        cancel_requested=False,
+    )
+    assert transition is not None
+    evidence = {
+        "outcome": "committed",
+        "machine_name": "gpu-1",
+        **parameters,
+        "authority_granted": False,
+        "local_effects": [],
+        "phase": "succeeded",
+        "transition_reason": "completed",
+        "exit_code": 0,
+        "termination_result": None,
+        "transition_digest": transition["transition_digest"],
+        "source_revisions": _revisions(),
+        "committed_revisions": _revisions(),
+        "reservation_machine_name": "gpu-1",
+        "lifecycle_event": {
+            "task_id": parameters["task_id"],
+            "attempt_id": parameters["attempt_id"],
+            "attempt_number": parameters["attempt_number"],
+            "phase": "succeeded",
+            "reason": "completed",
+            "exit_code": 0,
+            "task_revision": 3,
+        },
+    }
+
+    proof = build_terminal_publication_proof(
+        evidence=evidence,
+        parameters=parameters,
+        machine_name="gpu-1",
+        exit_code=0,
+        transition=transition,
+    )
+
+    assert isinstance(proof, TerminalPublicationProof)
+    assert not isinstance(proof, TerminalObservationProof)
+    assert proof.outcome == "committed"
+    assert terminal_proof_matches_candidate(
+        proof,
+        parameters=parameters,
+        machine_name="gpu-1",
         exit_code=0,
     )

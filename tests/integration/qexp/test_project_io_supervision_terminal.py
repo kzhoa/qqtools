@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -551,14 +552,14 @@ def test_terminal_coordinator_rereads_exact_local_evidence_before_effects(
     original = project_io_supervision._apply_terminal_local_effects
     mutated = False
 
-    def mutate_before_effects(candidate, paths, reconciler):
+    def mutate_before_effects(candidate, proof, paths, reconciler):
         nonlocal mutated
         if not mutated:
             value = read_json(observation)
             value["exit_observation"]["attempt_id"] = "different-attempt"
             atomic_replace(observation, value)
             mutated = True
-        return original(candidate, paths, reconciler)
+        return original(candidate, proof, paths, reconciler)
 
     monkeypatch.setattr(project_io_supervision, "_apply_terminal_local_effects", mutate_before_effects)
     try:
@@ -575,6 +576,121 @@ def test_terminal_coordinator_rereads_exact_local_evidence_before_effects(
         # released capacity; the final local-effect reread still blocks the
         # manifest transition.
         assert not reservation_snapshot(runtime.root).active
+    finally:
+        coordinator.close()
+        executor.shutdown()
+
+
+def test_terminal_coordinator_rejects_proof_for_different_candidate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime, cfg, binding, revision, task, _attempt, _paths, manifest, _observation = _case(
+        tmp_path,
+        exit_code=0,
+    )
+    executor = ProjectIOExecutor(runtime)
+    executor.begin_epoch()
+    controller = ProjectIOController(runtime, executor)
+    coordinator = AttemptSupervisionCoordinator(runtime, controller)
+    original_observation = project_io_supervision._is_terminal_observation_proof
+    original_publication = project_io_supervision._is_terminal_publication_proof
+
+    def mismatch(proof):
+        return None if proof is None else replace(proof, transition_digest="0" * 64)
+
+    monkeypatch.setattr(
+        project_io_supervision,
+        "_is_terminal_observation_proof",
+        lambda evidence, candidate: mismatch(original_observation(evidence, candidate)),
+    )
+    monkeypatch.setattr(
+        project_io_supervision,
+        "_is_terminal_publication_proof",
+        lambda evidence, candidate, transition: mismatch(original_publication(evidence, candidate, transition)),
+    )
+    try:
+        _until(lambda: controller.advance_binding_validation([binding], revision), bool)
+        _until(
+            lambda: coordinator.advance_terminal_completions([binding], revision),
+            lambda _value: load_task(cfg, task.task_id).state["projection"] == "succeeded",
+        )
+        for _ in range(8):
+            coordinator.advance_terminal_completions([binding], revision)
+        assert read_json(manifest)["process"]["observed_state"] == "running"
+    finally:
+        coordinator.close()
+        executor.shutdown()
+
+
+@pytest.mark.parametrize("failure_point", ["replacement", "reconciliation"])
+def test_terminal_coordinator_retries_interrupted_local_effects_without_changing_record(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_point: str,
+) -> None:
+    runtime, cfg, binding, revision, task, _attempt, _paths, manifest, _observation = _case(
+        tmp_path,
+        exit_code=0,
+    )
+    executor = ProjectIOExecutor(runtime)
+    executor.begin_epoch()
+    controller = ProjectIOController(runtime, executor)
+    coordinator = AttemptSupervisionCoordinator(runtime, controller)
+    interruption: dict[str, str] = {}
+    successful_replays = 0
+    original_apply = project_io_supervision._apply_terminal_local_effects
+
+    def observe_replay(*args, **kwargs):
+        nonlocal successful_replays
+        outcome = original_apply(*args, **kwargs)
+        if interruption and outcome == "applied":
+            successful_replays += 1
+        return outcome
+
+    monkeypatch.setattr(project_io_supervision, "_apply_terminal_local_effects", observe_replay)
+
+    if failure_point == "replacement":
+        original_replace = project_io_supervision.atomic_replace
+
+        def interrupt_replace(path, value):
+            if path == manifest and value.get("process", {}).get("observed_state") == "exited" and not interruption:
+                original_replace(path, value)
+                interruption["observed_exited_at"] = value["process"]["observed_exited_at"]
+                raise OSError("injected interruption after replacement")
+            return original_replace(path, value)
+
+        monkeypatch.setattr(project_io_supervision, "atomic_replace", interrupt_replace)
+    else:
+        original_reconcile = project_io_supervision.LocalExitReconciler.reconcile_observation
+
+        def interrupt_reconcile(self, observation, **kwargs):
+            process = read_json(manifest)["process"]
+            if process.get("observed_state") == "exited" and not interruption:
+                interruption["observed_exited_at"] = process["observed_exited_at"]
+                raise OSError("injected interruption before reconciliation")
+            return original_reconcile(self, observation, **kwargs)
+
+        monkeypatch.setattr(
+            project_io_supervision.LocalExitReconciler,
+            "reconcile_observation",
+            interrupt_reconcile,
+        )
+
+    try:
+        _until(lambda: controller.advance_binding_validation([binding], revision), bool)
+        _until(
+            lambda: coordinator.advance_terminal_completions([binding], revision),
+            lambda _value: (
+                bool(interruption)
+                and successful_replays > 0
+                and read_json(manifest)["process"].get("observed_state") == "exited"
+                and not reservation_snapshot(runtime.root).active
+            ),
+        )
+        assert load_task(cfg, task.task_id).state["projection"] == "succeeded"
+        assert binding.project_id not in coordinator._terminal_candidates
+        assert read_json(manifest)["process"]["observed_exited_at"] == interruption["observed_exited_at"]
     finally:
         coordinator.close()
         executor.shutdown()

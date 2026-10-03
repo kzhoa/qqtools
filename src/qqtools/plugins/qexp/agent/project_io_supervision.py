@@ -42,9 +42,17 @@ from .project_io_process import binding_prefix as _authority_due_binding_prefix
 from .project_io_process import binding_signature as _authority_binding_signature
 from .project_io_process import read_process_manifest as _read_process_manifest
 from .project_io_protocol import PROJECT_IO_CAPACITY, ProjectIORequest, authority_terminal_transition_digest
+from .project_io_terminal_proof import (
+    TerminalObservationProof,
+    TerminalPublicationProof,
+    build_terminal_observation_proof,
+    build_terminal_publication_proof,
+    matches_terminal_lifecycle_event,
+    matches_terminal_observation_identity,
+    terminal_proof_matches_candidate,
+)
 from .project_io_terminal_proof import build_terminal_transition as _construct_terminal_transition
 from .project_io_terminal_proof import has_exact_terminal_revisions as _has_exact_terminal_revisions
-from .project_io_terminal_proof import matches_terminal_lifecycle_event, matches_terminal_observation_identity
 from .project_io_terminal_proof import terminal_transition_target as _select_terminal_transition_target
 from .working_set import BindingTurn
 
@@ -1363,42 +1371,12 @@ def _recover_terminal_transition(
 def _is_terminal_observation_proof(
     evidence: Mapping[str, Any] | None,
     candidate: _TerminalCandidate,
-) -> bool:
-    if not isinstance(evidence, Mapping) or not _terminal_observation_matches_candidate(evidence, candidate):
-        return False
-    outcome = evidence.get("outcome")
-    if outcome not in {"already_terminal", "settled_terminal"}:
-        return False
-    if candidate.parameters.get("mode") == "active" and outcome == "settled_terminal":
-        # Preserve the existing active settled-history rule: either prior
-        # termination marker can accompany an otherwise exact settled exit.
-        target = _terminal_transition_target(candidate, False)
-        expected_termination: tuple[str | None, ...] = (None, "already_exited")
-    elif candidate.parameters.get("mode") == "detached_orphan":
-        # Once the shared Attempt is terminal, its exact phase/result fields
-        # are the durable record of whether termination was requested. The
-        # Task flag may have changed while settled history remained intact.
-        expected_cancel = evidence.get("attempt_phase") == "cancelled"
-        target = _terminal_transition_target(candidate, expected_cancel)
-        expected_termination = () if target is None else (target[2],)
-    else:
-        target = _terminal_transition_target(candidate, evidence["cancel_requested"])
-        expected_termination = () if target is None else (target[2],)
-    if target is None:
-        return False
-    phase, reason, _termination_result = target
-    if evidence.get("attempt_phase") != phase:
-        return False
-    if outcome == "already_terminal" and evidence.get("task_phase") != phase:
-        return False
-    if outcome == "settled_terminal" and evidence.get("task_phase") is None:
-        return False
-    return (
-        evidence.get("execution_machine_name") == candidate.binding.machine_name
-        and evidence.get("reservation_machine_name") == candidate.binding.machine_name
-        and evidence.get("attempt_result_reason") == reason
-        and evidence.get("attempt_exit_code") == candidate.exit_code
-        and evidence.get("termination_result") in expected_termination
+) -> TerminalObservationProof | None:
+    return build_terminal_observation_proof(
+        evidence=evidence,
+        parameters=candidate.parameters,
+        machine_name=candidate.binding.machine_name,
+        exit_code=candidate.exit_code,
     )
 
 
@@ -1406,103 +1384,13 @@ def _is_terminal_publication_proof(
     evidence: Mapping[str, Any] | None,
     candidate: _TerminalCandidate,
     transition: Mapping[str, Any] | None,
-) -> bool:
-    if (
-        not isinstance(evidence, Mapping)
-        or not isinstance(transition, Mapping)
-        or evidence.get("outcome") not in {"committed", "already_committed"}
-        or evidence.get("machine_name") != candidate.binding.machine_name
-        or evidence.get("authority_granted") is not False
-        or not isinstance(evidence.get("local_effects"), (list, tuple))
-        or evidence["local_effects"]
-    ):
-        return False
-    parameters = candidate.parameters
-    if not all(
-        evidence.get(field) == parameters[field]
-        for field in (
-            "task_id",
-            "attempt_id",
-            "attempt_number",
-            "fencing_token",
-            "reservation_id",
-            "process_identity",
-            "mode",
-        )
-    ):
-        return False
-    if not all(
-        transition.get(field) == parameters[field]
-        for field in (
-            "task_id",
-            "attempt_id",
-            "attempt_number",
-            "fencing_token",
-            "reservation_id",
-            "process_identity",
-            "mode",
-        )
-    ):
-        return False
-    if not all(
-        evidence.get(evidence_field) == transition.get(transition_field)
-        for evidence_field, transition_field in (
-            ("phase", "phase"),
-            ("transition_reason", "reason"),
-            ("exit_code", "exit_code"),
-            ("termination_result", "termination_result"),
-            ("transition_digest", "transition_digest"),
-            ("source_revisions", "source_revisions"),
-        )
-    ):
-        return False
-    transition_termination_result = transition.get("termination_result")
-    if transition_termination_result not in {None, "already_exited"}:
-        return False
-    target = _terminal_transition_target(
-        candidate,
-        transition_termination_result == "already_exited",
-    )
-    if target is None:
-        return False
-    phase, reason, expected_termination_result = target
-    if (
-        transition.get("phase") != phase
-        or transition.get("reason") != reason
-        or transition.get("exit_code") != candidate.exit_code
-        or transition_termination_result != expected_termination_result
-    ):
-        return False
-    if not _has_exact_terminal_revisions(evidence.get("source_revisions")):
-        return False
-    expected_digest = authority_terminal_transition_digest(
-        mode=parameters["mode"],
-        task_id=parameters["task_id"],
-        attempt_id=parameters["attempt_id"],
-        attempt_number=parameters["attempt_number"],
-        fencing_token=parameters["fencing_token"],
+) -> TerminalPublicationProof | None:
+    return build_terminal_publication_proof(
+        evidence=evidence,
+        parameters=candidate.parameters,
         machine_name=candidate.binding.machine_name,
-        reservation_id=parameters["reservation_id"],
-        process_identity=parameters["process_identity"],
-        phase=phase,
-        reason=reason,
         exit_code=candidate.exit_code,
-        termination_result=transition_termination_result,
-    )
-    if transition.get("transition_digest") != expected_digest:
-        return False
-    reservation_machine = evidence.get("reservation_machine_name")
-    if reservation_machine not in {None, candidate.binding.machine_name} or (
-        parameters["reservation_id"] is not None and reservation_machine != candidate.binding.machine_name
-    ):
-        return False
-    return matches_terminal_lifecycle_event(
-        evidence.get("lifecycle_event"),
-        evidence.get("committed_revisions"),
-        parameters,
-        phase=phase,
-        reason=reason,
-        exit_code=candidate.exit_code,
+        transition=transition,
     )
 
 
@@ -1599,10 +1487,18 @@ def _is_active_terminal_publication_fallback(
 
 def _apply_terminal_local_effects(
     candidate: _TerminalCandidate,
+    proof: TerminalObservationProof | TerminalPublicationProof,
     paths: Mapping[str, Path],
     reconciler: LocalExitReconciler,
 ) -> str:
     """Apply replay-safe local completion only after exact shared terminal proof."""
+    if not terminal_proof_matches_candidate(
+        proof,
+        parameters=candidate.parameters,
+        machine_name=candidate.binding.machine_name,
+        exit_code=candidate.exit_code,
+    ):
+        return "invalid"
     attempt_id = candidate.parameters["attempt_id"]
     acquired_guard = False
     exact_evidence = False
@@ -2998,13 +2894,14 @@ class AttemptSupervisionCoordinator:
             observation_evidence = observation_results.get(project_id)
             publication_evidence = publication_results.get(project_id)
             transition = transition_requests.get(project_id)
-            has_publication_proof = _is_terminal_publication_proof(
+            publication_proof = _is_terminal_publication_proof(
                 publication_evidence,
                 candidate,
                 transition,
             )
-            has_observation_proof = _is_terminal_observation_proof(observation_evidence, candidate)
-            if not has_publication_proof and not has_observation_proof:
+            observation_proof = _is_terminal_observation_proof(observation_evidence, candidate)
+            proof = publication_proof if publication_proof is not None else observation_proof
+            if proof is None:
                 continue
             proven_projects.add(project_id)
             state = self._terminal_states.get(candidate.binding_signature)
@@ -3014,6 +2911,7 @@ class AttemptSupervisionCoordinator:
             try:
                 local_outcome = _apply_terminal_local_effects(
                     candidate,
+                    proof,
                     paths,
                     state.reconciler,
                 )
