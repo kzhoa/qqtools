@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import os
+import subprocess
+import sys
 import threading
 import time
 import uuid
@@ -47,6 +49,32 @@ from qqtools.plugins.qexp.runtime.resources.reservations import (
     reserve,
 )
 from qqtools.plugins.qexp.runtime.store import atomic_replace, read_json
+
+
+def test_fresh_worker_import_does_not_load_executor() -> None:
+    source_root = Path(project_io_worker_module.__file__).parents[4]
+    script = f"""
+import importlib.abc
+import sys
+
+sys.path.insert(0, {str(source_root)!r})
+
+class RejectExecutor(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname == "qqtools.plugins.qexp.agent.project_io_executor":
+            raise RuntimeError("worker imported executor orchestration")
+        return None
+
+sys.meta_path.insert(0, RejectExecutor())
+import qqtools.plugins.qexp.agent.project_io_worker
+assert "qqtools.plugins.qexp.agent.project_io_executor" not in sys.modules
+"""
+
+    result = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, timeout=10, check=False)
+
+    assert result.returncode == 0, result.stderr
+
+
 from qqtools.plugins.qexp.runtime.tasks import load_task, save_task
 from qqtools.plugins.qexp.scheduler import claim_task
 from tests.helpers.qexp.worker_diagnostics import describe_project_io_workers

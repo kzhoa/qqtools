@@ -51,7 +51,6 @@ from .bindings import ProjectBinding, decode_registry
 from .group_service_worker import handle_group_service_request
 from .primary_demand import probe_primary_demand
 from .primary_probe_transport import decode_probe_session, encode_probe_session
-from .project_io_executor import ProjectIOProtocolError, _process_start_time_ticks, _resolve_runtime_id
 from .project_io_protocol import (
     PROJECT_IO_MAX_RECORD_BYTES,
     PROJECT_IO_PROTOCOL_VERSION,
@@ -61,6 +60,7 @@ from .project_io_protocol import (
     ProjectIOResult,
     authority_terminal_transition_digest,
 )
+from .project_io_transport_support import ProjectIOProtocolError, _process_start_time_ticks, _resolve_runtime_id
 
 _REQUEST_ID = re.compile(r"^[0-9a-f]{32}$")
 _HANDSHAKE_SECONDS = 2.0
