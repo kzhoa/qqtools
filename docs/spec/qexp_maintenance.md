@@ -64,6 +64,27 @@ empty phase, or commit one completion proof. No phase runs an unmetered
 transition loop, and ready-index reconstruction no longer loops to completion
 inside one repair invocation.
 
+## Runtime ownership boundaries
+
+`runtime.maintenance` is the stable internal entry surface for existing callers.
+Full-audit orchestration owns capture, phase rotation, successor policy, ordered
+audit checkpoint publication, and repair progress. Outbox service orchestration
+separately owns due-work selection, prepared producer handoff, and per-kind
+descriptor outcomes. A full audit selected from the outbox delegates to the same
+full-audit implementation used by explicit repair and retains the caller's
+invocation ledger.
+
+Bounded domain steps accept only their required continuation and context and
+return explicit progress and evidence updates. They do not import full-audit,
+outbox-service, repair-command, or CLI orchestration. Cleanup's bounded domain
+step likewise belongs to the runtime rather than the cleanup command module.
+These dependency rules are enforced by runtime-organization tests.
+
+Audit descriptor validation, schema migration, and checkpoint publication stay
+cohesive with full-audit orchestration. One checkpoint operation preserves the
+existing descriptor-write, current-pointer publication, and outbox synchronization
+order; these separate durable writes are not claimed to be atomic.
+
 ## Descriptor identity and persistence
 
 The shared descriptor identity is

@@ -11,6 +11,7 @@ from qqtools.plugins.qexp.commands.group import create_group
 from qqtools.plugins.qexp.config_types import RootConfig
 from qqtools.plugins.qexp.doctor import repair_metadata
 from qqtools.plugins.qexp.runtime import maintenance as maintenance_runtime
+from qqtools.plugins.qexp.runtime import maintenance_full_audit
 from qqtools.plugins.qexp.runtime.locks import task_lock
 from qqtools.plugins.qexp.runtime.maintenance import advance_maintenance_work
 from qqtools.plugins.qexp.runtime.maintenance_outbox import (
@@ -114,7 +115,7 @@ def test_full_audit_deadline_rebuild_backs_off_on_task_lock(tmp_path: Path, monk
     assert waiting["retry_count"] == 1
 
     index_path.unlink()
-    monkeypatch.setattr(maintenance_runtime, "_retry_due", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(maintenance_full_audit, "_retry_due", lambda *_args, **_kwargs: True)
     resumed = repair_metadata(cfg, reservation_runtime_root=cfg.runtime_root, max_work_items=1)
 
     assert resumed["outcome"] == "partial"
