@@ -614,6 +614,11 @@ path metadata but never opens or scans log contents. Missing terminal evidence i
 `abnormal_exit_unknown`; qexp does not infer OOM, signal, exit code, or exit time from a vanished PID
 or stale heartbeat. Startup failure text identifies the attempted private log path when available.
 
+SIGTERM, SIGINT, and SIGHUP request orderly agent shutdown in both detached and foreground modes.
+The exit summary records `stopped_by_signal` and the handled signal number; the private log also
+records that number. SIGHUP is neither ignored nor a configuration-reload request. Shutdown retains
+running Attempt ownership and does not terminate training processes.
+
 Diagnostic capture and persistence are best effort. Failure is visible as degraded or unavailable
 coverage but never grants scheduler authority, changes Attempt or reservation ownership, signals a
 runner, or changes readiness and command exit-code semantics. Agent stop, crash, and restart retain

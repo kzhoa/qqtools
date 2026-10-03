@@ -51,7 +51,9 @@ def _foreground_command(
 ) -> list[str]:
     source_lines = [
         "from pathlib import Path",
+        "import signal",
         "from qqtools.plugins.qexp.agent.lifecycle import run_machine_agent_loop",
+        "original_handlers = {s: signal.getsignal(s) for s in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)}",
     ]
     if fail_pid_unlink:
         source_lines.extend(
@@ -98,6 +100,7 @@ def _foreground_command(
             )
         )
     source_lines.append(f"run_machine_agent_loop({str(runtime.root)!r}, loop_interval=0.05, available_gpus=[])")
+    source_lines.append("assert all(signal.getsignal(s) == handler for s, handler in original_handlers.items())")
     return [sys.executable, "-c", "\n".join(source_lines)]
 
 
@@ -131,27 +134,32 @@ def test_exception_after_active_handshake_keeps_traceback_and_specific_reason(
     assert "post-handshake boom" in log_path.read_text(encoding="utf-8")
 
 
-def test_foreground_sigterm_records_signal_and_completed_cleanup(
-    tmp_path: Path, checkout_subprocess_env: dict[str, str]
+@pytest.mark.parametrize("signum", [signal.SIGTERM, signal.SIGINT, signal.SIGHUP], ids=["term", "int", "hup"])
+@pytest.mark.parametrize("is_detached", [False, True], ids=["foreground", "detached"])
+def test_handled_signal_records_reason_log_and_completed_cleanup(
+    tmp_path: Path, checkout_subprocess_env: dict[str, str], signum: int, is_detached: bool
 ) -> None:
     runtime = MachineRuntime(tmp_path / "machine-runtime")
     initialize_machine(runtime, "gpu-1")
-    process = subprocess.Popen(
-        _foreground_command(runtime, raise_after_start=False),
-        env=_child_environment(checkout_subprocess_env),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
+    if is_detached:
+        process = spawn_machine_agent_process(runtime, loop_interval=0.05, available_gpus=[])
+    else:
+        process = subprocess.Popen(
+            _foreground_command(runtime, raise_after_start=False),
+            env=_child_environment(checkout_subprocess_env),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
     try:
         _wait_for(
             lambda: (
                 (runtime.paths["agent"] / "status.json").exists()
                 and read_json(runtime.paths["agent"] / "status.json").get("machine_agent", {}).get("state") == "active"
             ),
-            description="foreground active status",
+            description="agent active status",
         )
-        process.send_signal(signal.SIGTERM)
+        process.send_signal(signum)
         assert process.wait(timeout=15) == 0
     finally:
         if process.poll() is None:
@@ -161,8 +169,9 @@ def test_foreground_sigterm_records_signal_and_completed_cleanup(
     record = _latest_record(runtime)
     summary = summarize_diagnostic_record(record)
     assert summary["reason"] == "stopped_by_signal"
-    assert summary["handled_signal"] == signal.SIGTERM
+    assert summary["handled_signal"] == signum
     assert summary["cleanup_outcome"] == "succeeded"
+    assert f"stopped_by_signal (signal={int(signum)})" in Path(record["log_path"]).read_text(encoding="utf-8")
     cleanup_steps = list(record["writers"]["agent"]["cleanup_steps"])
     assert cleanup_steps.index("project_io_executor_fence") < cleanup_steps.index("recovery_enrollment_stop")
     status = read_json(runtime.paths["agent"] / "status.json")["machine_agent"]

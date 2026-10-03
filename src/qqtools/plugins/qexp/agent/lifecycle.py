@@ -313,7 +313,7 @@ def run_machine_agent_loop(
     initial_capture_error: str | None = None,
     initial_reconciliation_degraded: bool = False,
 ) -> None:
-    """Run the persistent machine agent until SIGTERM or SIGINT."""
+    """Run the persistent machine agent until SIGTERM, SIGINT, or SIGHUP."""
     if loop_interval <= 0:
         raise ValueError("loop_interval must be positive.")
     if threading.current_thread() is not threading.main_thread():
@@ -470,6 +470,7 @@ def run_machine_agent_loop(
             raise RuntimeError("could not determine machine agent process identity.")
         previous_term = None
         previous_int = None
+        previous_hup = None
         is_pid_published = False
         is_status_published = False
         primary_exception: BaseException | None = None
@@ -515,6 +516,7 @@ def run_machine_agent_loop(
             _dispatch._project_io_controller(machine_runtime)
             previous_term = signal.signal(signal.SIGTERM, request_stop)
             previous_int = signal.signal(signal.SIGINT, request_stop)
+            previous_hup = signal.signal(signal.SIGHUP, request_stop)
             pid_path.write_text(str(os.getpid()), encoding="utf-8")
             is_pid_published = True
             _publish_process_status(
@@ -966,6 +968,11 @@ def run_machine_agent_loop(
 
             run_cleanup_step("idle_shutdown_guard_release", release_idle_shutdown_guard)
 
+            if previous_hup is None:
+                record_cleanup_step("restore_sighup_handler")
+            else:
+                run_cleanup_step("restore_sighup_handler", lambda: signal.signal(signal.SIGHUP, previous_hup))
+
             if previous_int is None:
                 record_cleanup_step("restore_sigint_handler")
             else:
@@ -982,7 +989,8 @@ def run_machine_agent_loop(
 
                 def final_log_check() -> None:
                     try:
-                        if not log_service.write(f"machine agent stopping: {frozen_stop_reason}\n"):
+                        signal_detail = f" (signal={handled_signal})" if handled_signal is not None else ""
+                        if not log_service.write(f"machine agent stopping: {frozen_stop_reason}{signal_detail}\n"):
                             raise OSError("final managed log write failed")
                     except BaseException:
                         capture_health_state.update(health="degraded", error="final_log_check_failed")

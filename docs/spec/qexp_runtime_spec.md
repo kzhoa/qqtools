@@ -3708,6 +3708,11 @@ independently. A secondary cleanup error neither replaces a primary exception no
 frozen reason; failed cleanup prevents a successful finalization result. Machine and eligible
 Project snapshots receive the same frozen reason but not authoritative cleanup outcome.
 
+SIGTERM, SIGINT, and SIGHUP use the same orderly stop handler. The first handled signal is retained
+as `handled_signal` and included in the final private log message. Previous handlers are restored
+during cleanup. Signal handlers only request shutdown and wake the loop; diagnostic I/O and service
+cleanup execute outside the handler. This preserves lifecycle independence for running Attempts.
+
 The launcher owns startup outcome, handshake timeout trigger, ordered signal attempts and delivery
 results, and child wait status. It records a process-handshake timeout before sending SIGTERM and
 retains later SIGKILL escalation. This does not alter the separate non-destructive public readiness

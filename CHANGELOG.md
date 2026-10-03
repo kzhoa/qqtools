@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- fix: record SIGHUP as an orderly qexp agent shutdown with signal diagnostics and a private log
+  entry, preserving running training processes and restoring signal handlers after cleanup.
+
 ## v1.3.22
 
 - feat: make qexp dependency validation read only the candidate-reachable same-Group closure and

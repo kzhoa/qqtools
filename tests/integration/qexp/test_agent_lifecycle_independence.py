@@ -676,7 +676,8 @@ def _cleanup(runtime: MachineRuntime, process: subprocess.Popen) -> None:
     process.wait(timeout=5)
 
 
-def test_li01_training_remains_live_and_is_not_relaunched(tmp_path: Path) -> None:
+@pytest.mark.parametrize("is_sighup", [False, True], ids=["agent-stop", "sighup"])
+def test_li01_training_remains_live_and_is_not_relaunched(tmp_path: Path, is_sighup: bool) -> None:
     cfg, runtime, task, marker, process = _start_case(tmp_path, should_wait=True)
     try:
         _wait_running(cfg, task.task_id, marker)
@@ -686,7 +687,14 @@ def test_li01_training_remains_live_and_is_not_relaunched(tmp_path: Path) -> Non
         _wait_for(lambda: read_json(attempt_file)["attempt"]["process"].get("process_group_id") is not None)
         original_process = read_json(attempt_file)["attempt"]["process"]
         _wait_for(marker.exists, timeout=5.0)
-        stop_machine_agent(runtime)
+        if is_sighup:
+            process.send_signal(signal.SIGHUP)
+            assert process.wait(timeout=10) == 0
+            summary = get_machine_agent_status(runtime)["diagnostics"]["summary"]
+            assert summary["reason"] == "stopped_by_signal"
+            assert summary["handled_signal"] == signal.SIGHUP
+        else:
+            stop_machine_agent(runtime)
         progress = marker.with_suffix(".progress")
         _wait_for(progress.exists)
         previous = progress.read_text()

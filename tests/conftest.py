@@ -121,7 +121,8 @@ class _LifecycleGate:
 
     representative_names = frozenset(
         {
-            "test_li01_training_remains_live_and_is_not_relaunched",
+            "test_li01_training_remains_live_and_is_not_relaunched[agent-stop]",
+            "test_li01_training_remains_live_and_is_not_relaunched[sighup]",
             "test_li02_offline_completion_preserves_exit_results",
             "test_li04_sigkill_agent_does_not_kill_runner",
         }
