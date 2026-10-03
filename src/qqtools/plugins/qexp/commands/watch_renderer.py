@@ -239,6 +239,9 @@ def _payload_signature(payload: Mapping[str, Any]) -> tuple[Any, ...]:
             "progress",
             "progress_extended",
             "selected_progress_version",
+            "progress_scoped",
+            "selected_progress_protocol_version",
+            "reporting_policy",
         )
     )
 

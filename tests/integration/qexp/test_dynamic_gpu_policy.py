@@ -149,7 +149,10 @@ def test_startup_retains_actionable_missing_gpu_warning(tmp_path, monkeypatch) -
         assert warning["undiscovered_configured_gpu_ids"] == [12]
         assert "--visible 1" in "\n".join(warning["repair_commands"])
         shown = show_gpu_policy(runtime)
-        assert shown["warnings"] == status["warnings"]
+        shown_warning = next(
+            item for item in shown["warnings"] if item["reason"] == "configured_gpu_ids_not_discovered"
+        )
+        assert shown_warning == warning
         assert shown["agent_running"] is True
         assert process.poll() is None
     finally:

@@ -1768,9 +1768,9 @@ invalid. Finite JSON stays a single ANSI-free structured result: its existing
 `selected_progress_version` (`1`, `2`, or null) fields. A missing extension is
 unavailable, not a fabricated empty metric set.
 
-The viewer selects the latest whole, authorized Attempt observation by accepted
-report time, preferring v2 on a tie. It never joins old metrics to newer v1
-progress. The compact view shows stage, current/total/unit, message, and report
+The legacy JSON selector chooses v1/v2 by accepted report time, preferring v2
+on a tie. Human viewers use the cross-version same-source selector defined
+below, including v3. They never join old metrics to newer progress. The compact view shows stage, current/total/unit, message, and report
 age; details show every accepted metric and omission reason. Unknown totals do
 not create a percentage. An old report retains its original absolute time and
 age; the 2-second viewer refresh does not imply a new report. No countdown,
@@ -2398,3 +2398,64 @@ The bounded path never falls back to scanning historical Tasks. Legacy unlimited
 listing, `top` and full Attempt detail retain their existing costs. Complete
 Task/dependency records can be large; index budgets do not promise a fixed latency
 independent of dependency fan-out or blocking storage I/O.
+
+## Task list presentations and scoped progress
+
+`task list --view default|progress|placement|overall` and `--fields FIELD,...`
+select human presentation only. They are mutually exclusive and invalid with
+JSON. Parsing rejects empty, duplicate and unknown fields before Project reads.
+Custom fields always put `task` first. Default and no-option tables and JSON
+retain their existing output. Presentation does not affect cursor identity.
+
+The ordered presets are:
+
+- progress: task,state,overall-progress,activity,report-age,location
+- placement: task,state,requested-gpus,home,queue,location
+- overall: task,state,overall-progress,location
+
+The registry also includes name, group, claimed-machine, dependency and reason.
+Task identity is `name (task_id)` or the complete ID. Location comes only from
+the selected identity-checked Attempt, never claim or historical inference.
+Terminal placement is absent; orphaned placement is explicitly labeled.
+Only requested dependencies are collected; enriched queries require a positive
+limit at most 1000 or bounded pagination.
+
+New human output measures display cells, preserves selected field order, and
+uses wrapping or labeled blocks on narrow terminals. IDs, counters, units,
+labels and placement are never shortened. Names are limited to 32 cells and
+messages/reasons to 48, with an ellipsis. Redirected output is deterministic.
+Observation failures use numbered reason legends and a Project-aware read-only
+`task show TASK_ID --details` action. Blocked/failed Task reasons remain visible.
+
+Activity reports remain arbitrary stage text with optional counters and message.
+Overall is explicitly declared completed work, never inferred from activity.
+Counters show nearest whole percentage first, comma-grouped numbers, and
+`<100%` when rounding incomplete work would reach 100. Unknown/zero totals
+have no percentage. Report age is time since agent acceptance, not a heartbeat;
+future times show Clock difference. No report and unavailable evidence differ.
+Frozen disabled policy yields Not enabled; a report lacking overall yields
+Not provided. Unknown policy never implies disabled.
+
+`qqtools.qexp.progress.Counter` is an immutable keyword-only container with
+required current/unit and optional total/label. `update(..., overall=None)`
+replaces the complete report, retaining existing activity arguments and bool
+acceptance semantics. Counts are exact nonnegative int64; current cannot exceed
+total. Unit is nonempty at most 32 UTF-8 bytes; optional nonempty label is at
+most 64 bytes. Invalid arguments return False without channel writes.
+`validate_update` accepts the same arguments and returns field-qualified errors
+in signature order without I/O or runtime configuration. Metric omission is
+valid input. Empty errors do not prove publication.
+
+V3 adds separate overall and activity scopes while permanently retaining v1/v2.
+Human finite/show/watch viewers choose the newest authorized whole report by
+acceptance time (higher version on ties), then prefer the highest version proven
+to be the same source update by full identity, fencing, registration, nonempty
+source update ID and equal normalized activity. Keep that report's original
+timestamp; never stitch metrics or counters. Unrelated newer v1/v2 may replace
+v3. JSON show adds progress_scoped and selected_progress_protocol_version;
+legacy progress/progress_extended/selected_progress_version remain unchanged.
+
+qPipeline reports committed training steps as overall labeled Training, retaining
+them during evaluation using its valid start fact or last committed training
+step in the same run. Invalid/missing limits mean unknown total; standalone
+evaluation without a training fact remains activity-only.

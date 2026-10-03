@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import re
 import shlex
+import shutil
 import sys
 from collections.abc import Callable
 from pathlib import Path
@@ -41,6 +42,29 @@ def _parse_page_size(value: str | None) -> int:
         raise ObservationError("invalid_argument", "page_size must be an integer from 1 through 1000.", 2) from exc
 
 
+def _task_list_presentation(
+    cfg: RootConfig,
+    args: argparse.Namespace,
+    fields: tuple[str, ...],
+) -> dict[str, object]:
+    """Build pure-renderer metadata for one selected human Task list."""
+    isatty = getattr(sys.stdout, "isatty", None)
+    terminal_width: int | None = None
+    if callable(isatty) and isatty():
+        try:
+            terminal_width = int(shutil.get_terminal_size().columns)
+        except (AttributeError, OSError, TypeError, ValueError):
+            terminal_width = 80
+        if terminal_width < 1:
+            terminal_width = 80
+    details_command = shlex.join(["qexp", "--project", str(cfg.shared_root), "task", "show", "TASK_ID", "--details"])
+    return {
+        "fields": fields,
+        "terminal_width": terminal_width,
+        "details_command": details_command,
+    }
+
+
 def _task_page_output(
     cfg: RootConfig,
     args: argparse.Namespace,
@@ -49,6 +73,9 @@ def _task_page_output(
 ) -> CliOutput[object]:
     """Render paginated task results and a shell-safe continuation command."""
     presentation: dict[str, object] = {}
+    task_fields = getattr(args, "task_fields", None)
+    if isinstance(task_fields, tuple):
+        presentation.update(_task_list_presentation(cfg, args, task_fields))
     next_cursor = page.get("next_cursor")
     if args.format == "human" and next_cursor is not None:
         command = [
@@ -58,6 +85,12 @@ def _task_page_output(
             "task",
             "list",
         ]
+        view = getattr(args, "view", None)
+        raw_fields = getattr(args, "fields", None)
+        if view is not None:
+            command.extend(("--view", view))
+        elif raw_fields is not None and isinstance(task_fields, tuple):
+            command.extend(("--fields", ",".join(task_fields)))
         if args.phase:
             command.extend(("--phase", args.phase))
         if args.group:
@@ -362,6 +395,7 @@ def dispatch_project(
             # explicit pagination.  This keeps the daily lookup path bounded and
             # gives it the same cursor/filter integrity guarantees as a page query.
             is_paginated = args.page_size is not None or args.cursor is not None or args.name is not None
+            task_fields = getattr(args, "task_fields", None)
             if is_paginated:
                 if args.limit is not None:
                     raise ObservationError(
@@ -377,19 +411,24 @@ def dispatch_project(
                     name=args.name,
                     page_size=page_size,
                     cursor=args.cursor,
+                    **({"fields": task_fields} if isinstance(task_fields, tuple) else {}),
                 )
                 return CommandOutcome(0, _task_page_output(cfg, args, page, page_size))
             else:
                 limit = 50 if args.limit is None else args.limit
+                list_kwargs = {"phase": args.phase, "group": args.group, "limit": limit}
+                if isinstance(task_fields, tuple):
+                    list_kwargs["fields"] = task_fields
                 return CommandOutcome(
                     0,
                     CliOutput(
                         OutputKind.TASK_LIST,
                         [
                             item
-                            for item in observer.list_tasks(cfg, phase=args.phase, group=args.group, limit=limit)
+                            for item in observer.list_tasks(cfg, **list_kwargs)
                             if args.name is None or item.get("name") == args.name
                         ],
+                        _task_list_presentation(cfg, args, task_fields) if isinstance(task_fields, tuple) else {},
                     ),
                 )
         elif handler == "task_show":

@@ -683,3 +683,40 @@ def test_raw_argv_parse_failures_retain_their_structured_routing(
     error = result["error"]
     assert error["code"] == expected_code
     assert bool(captured.err) is stderr_expected
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        ["--view", "progress"],
+        ["--view", "placement"],
+        ["--view", "overall"],
+        ["--fields", "state,reason"],
+        ["--fields", "dependency"],
+    ],
+)
+def test_selected_list_fields_reach_real_cli_output(tmp_path, capsys, options):
+    cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")
+    task = submit(cfg, ["echo", "ok"])
+    assert main([*_base_args(cfg), "task", "list", *options]) == 0
+    output = capsys.readouterr()
+    assert task.task_id in output.out
+    assert "queued" in output.out or "Dependency" in output.out
+    assert output.err == ""
+
+
+def test_selected_list_pagination_normalizes_fields_and_allows_view_change(tmp_path, capsys):
+    import shlex
+
+    cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")
+    for _ in range(3):
+        submit(cfg, ["echo", "ok"])
+    base = _base_args(cfg)
+    assert main([*base, "task", "list", "--fields", " state , location ", "--page-size", "1"]) == 0
+    output = capsys.readouterr().out
+    command = next(line for line in output.splitlines() if "--cursor" in line)
+    tokens = shlex.split(command[command.index("qexp ") :])
+    assert tokens[tokens.index("--fields") + 1] == "task,state,location"
+    cursor = tokens[tokens.index("--cursor") + 1]
+    assert main([*base, "task", "list", "--view", "overall", "--page-size", "1", "--cursor", cursor]) == 0
+    assert "Overall" in capsys.readouterr().out

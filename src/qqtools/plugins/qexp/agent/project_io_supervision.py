@@ -36,6 +36,7 @@ from ..runtime.termination import (
 )
 from ..runtime.work_budget import diagnostic_increment
 from .context import MachineRuntime, ProjectBinding
+from .process_reservation_recovery import ProcessReservationRecovery, registration_reservation
 from .project_io_controller import ProjectIOController
 from .project_io_process import PROCESS_IDENTITY_FIELDS
 from .project_io_process import binding_prefix as _authority_due_binding_prefix
@@ -1595,7 +1596,7 @@ def _read_running_publication_source(
         return None
 
     fencing_token = record.get("fencing_token")
-    reservation_id = record.get("reservation_id")
+    reservation_id = registration_reservation(record, project_root)
     process_created_at = record.get("process_created_at")
     if record.get("machine_name") != binding.machine_name or type(fencing_token) is not int or fencing_token < 1:
         return None
@@ -1803,6 +1804,7 @@ class AttemptSupervisionCoordinator:
     def __init__(self, runtime: MachineRuntime, controller: ProjectIOController) -> None:
         self.runtime = runtime
         self.controller = controller
+        self._reservation_recovery = ProcessReservationRecovery(runtime.root)
         self._scans: dict[tuple[str, ...], _RunningPublicationScans] = {}
         self._running_publication_intents: dict[tuple[str, ...], Mapping[str, Any]] = {}
         self._binding_offset = 0
@@ -1828,6 +1830,7 @@ class AttemptSupervisionCoordinator:
 
     def close(self) -> None:
         """Release all owned advisory scans; repeated calls are harmless."""
+        self._reservation_recovery.close()
         for scans in self._scans.values():
             scans.close()
         self._scans.clear()
@@ -2380,6 +2383,7 @@ class AttemptSupervisionCoordinator:
         """
         results: dict[str, Mapping[str, Any]] = {}
         lanes: tuple[tuple[str, Callable[[], Mapping[str, Any]]], ...] = (
+            ("reservation_recovery", lambda: self._reservation_recovery.advance(bindings)),
             (
                 "authority_renewals",
                 lambda: advance_authority_renewals(self.runtime, self.controller, bindings, registry_revision) or {},
@@ -3770,6 +3774,14 @@ class AttemptSupervisionCoordinator:
                     continue
                 trigger = _termination_trigger(process.record, evidence)
                 if trigger is None:
+                    # A completed healthy observation is not pending termination
+                    # work. Keeping it pinned blocks restart readiness forever.
+                    if (
+                        candidate.decision is None
+                        and candidate.pending_commit is None
+                        and candidate.pending_publication is None
+                    ):
+                        self._termination_candidates.pop(key, None)
                     continue
                 if candidate.trigger is not None and candidate.trigger != trigger:
                     self._termination_candidates.pop(key, None)

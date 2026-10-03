@@ -19,10 +19,12 @@ from pathlib import Path
 from types import FunctionType
 from typing import Any, Callable
 
+from ._progress_arguments import Counter, _validate_update, normalize_overall, validate_update
 from ._progress_protocol import MAX_PAYLOAD_BYTES, replace_advisory_snapshot, validate_payload
 from ._progress_protocol_v2 import MAX_PAYLOAD_V2_BYTES, capture_metrics, fit_payload_v2, semantic_key_v2
+from ._progress_protocol_v3 import MAX_PAYLOAD_V3_BYTES, fit_payload_v3, semantic_key_v3
 
-__all__ = ["update", "flush"]
+__all__ = ["Counter", "flush", "update", "validate_update"]
 
 DEFAULT_PROGRESS_INTERVAL_SECONDS = 30
 _INITIAL_RETRY_DELAY_SECONDS = 1.0
@@ -85,15 +87,14 @@ def _valid_progress_fields(
     unit: object,
     message: object,
 ) -> bool:
-    if not _valid_text(stage, 64):
-        return False
-    if current is not None and (type(current) is not int or not 0 <= current <= 2**63 - 1):
-        return False
-    if total is not None and (type(total) is not int or not 0 <= total <= 2**63 - 1):
-        return False
-    if current is not None and total is not None and current > total:
-        return False
-    return _valid_text(unit, 32, optional=True) and _valid_text(message, 1024, optional=True)
+    return not _validate_update(
+        stage=stage,
+        current=current,
+        total=total,
+        unit=unit,
+        message=message,
+        normalize_activity=False,
+    )
 
 
 def _valid_message_parts(parts: object) -> bool:
@@ -116,7 +117,7 @@ def _same_pending_update(
 ) -> bool:
     if any(
         pending.get(name) != candidate.get(name)
-        for name in ("stage", "current", "total", "unit", "_metrics", "_completeness")
+        for name in ("stage", "current", "total", "unit", "_overall", "_metrics", "_completeness")
     ):
         return False
     if candidate["_message_parts"] is None:
@@ -186,17 +187,21 @@ class _Reporter:
         path: str | Path | None = None,
         *,
         path_v2: str | Path | None = None,
+        path_v3: str | Path | None = None,
         interval_seconds: float = DEFAULT_PROGRESS_INTERVAL_SECONDS,
     ) -> None:
         self._path = Path(path) if path else None
         self._path_v2 = Path(path_v2) if path_v2 else None
+        self._path_v3 = Path(path_v3) if path_v3 else None
         self._v1_state = _OutputState(self._path)
         self._v2_state = _OutputState(self._path_v2)
+        self._v3_state = _OutputState(self._path_v3)
         self._channels = tuple(
             (name, state, max_bytes, key_func)
             for name, state, max_bytes, key_func in (
                 ("v1", self._v1_state, MAX_PAYLOAD_BYTES, _payload_key),
                 ("v2", self._v2_state, MAX_PAYLOAD_V2_BYTES, semantic_key_v2),
+                ("v3", self._v3_state, MAX_PAYLOAD_V3_BYTES, semantic_key_v3),
             )
             if state.path is not None
         )
@@ -215,8 +220,8 @@ class _Reporter:
         return self._path
 
     @property
-    def paths(self) -> tuple[Path | None, Path | None]:
-        return self._path, self._path_v2
+    def paths(self) -> tuple[Path | None, Path | None, Path | None]:
+        return self._path, self._path_v2, self._path_v3
 
     # Keep the established v1 state attributes observable for existing callers
     # and focused diagnostics while storing each channel independently.
@@ -301,11 +306,16 @@ class _Reporter:
         unit: str | None = None,
         message: str | None = None,
         metrics: object = None,
+        overall: Counter | None = None,
         _metrics_source_count: int | None = None,
         _message_parts: _MessageParts | None = None,
         _render_message: _MessageRenderer | None = None,
     ) -> bool:
-        if (self._path is None and self._path_v2 is None) or os.getpid() != self._pid or not _is_primary():
+        if (
+            (self._path is None and self._path_v2 is None and self._path_v3 is None)
+            or os.getpid() != self._pid
+            or not _is_primary()
+        ):
             return False
         try:
             if _message_parts is None:
@@ -314,18 +324,35 @@ class _Reporter:
                 stage = str.__str__(stage) if isinstance(stage, str) else stage
                 unit = str.__str__(unit) if isinstance(unit, str) else unit
                 message = str.__str__(message) if isinstance(message, str) else message
-                if _render_message is not None or not _valid_progress_fields(stage, current, total, unit, message):
+                errors = _validate_update(
+                    stage=stage,
+                    current=current,
+                    total=total,
+                    unit=unit,
+                    message=message,
+                    metrics=metrics,
+                    overall=overall,
+                    normalize_activity=False,
+                )
+                if _render_message is not None or errors:
                     return False
             else:
-                if (
-                    not _valid_message_parts(_message_parts)
-                    or type(_render_message) is not FunctionType
-                    or not _valid_progress_fields(stage, current, total, unit, None)
-                ):
+                errors = _validate_update(
+                    stage=stage,
+                    current=current,
+                    total=total,
+                    unit=unit,
+                    message=None,
+                    metrics=metrics,
+                    overall=overall,
+                    normalize_activity=False,
+                )
+                if not _valid_message_parts(_message_parts) or type(_render_message) is not FunctionType or errors:
                     return False
+            normalized_overall = normalize_overall(overall)
             captured_metrics: dict[str, int | float] | None = None
             completeness: dict[str, Any] | None = None
-            if self._path_v2 is not None:
+            if self._path_v2 is not None or self._path_v3 is not None:
                 captured_metrics, completeness = capture_metrics(metrics)
                 if _metrics_source_count is not None:
                     if (
@@ -354,6 +381,7 @@ class _Reporter:
                 "total": total,
                 "unit": unit,
                 "message": message,
+                "_overall": normalized_overall,
                 "_message_parts": _message_parts,
                 "_render_message": _render_message,
                 "_metrics": captured_metrics,
@@ -372,18 +400,32 @@ class _Reporter:
                         self._wake.set()
                     return True
                 matches_last_written = (
-                    self._path is None
-                    or self._pending_matches_source(
-                        candidate,
-                        self._v1_state.last_written_source,
-                        include_metrics=False,
+                    (
+                        self._path is None
+                        or self._pending_matches_source(
+                            candidate,
+                            self._v1_state.last_written_source,
+                            include_metrics=False,
+                            include_overall=False,
+                        )
                     )
-                ) and (
-                    self._path_v2 is None
-                    or self._pending_matches_source(
-                        candidate,
-                        self._v2_state.last_written_source,
-                        include_metrics=True,
+                    and (
+                        self._path_v2 is None
+                        or self._pending_matches_source(
+                            candidate,
+                            self._v2_state.last_written_source,
+                            include_metrics=True,
+                            include_overall=False,
+                        )
+                    )
+                    and (
+                        self._path_v3 is None
+                        or self._pending_matches_source(
+                            candidate,
+                            self._v3_state.last_written_source,
+                            include_metrics=True,
+                            include_overall=True,
+                        )
                     )
                 )
                 if matches_last_written:
@@ -425,10 +467,11 @@ class _Reporter:
 
     def _build_payload(self, pending: dict[str, Any]) -> dict[str, Any]:
         payloads = self._build_payloads(pending)
-        payload = payloads["v1"]
-        if payload is None:
-            raise ValueError("no v1 progress channel is configured")
-        return payload
+        for name in ("v1", "v2", "v3"):
+            payload = payloads[name]
+            if payload is not None:
+                return payload
+        raise ValueError("no progress channel can encode the pending update")
 
     def _build_payloads(self, pending: dict[str, Any]) -> dict[str, dict[str, Any] | None]:
         update_id = pending.get("_cached_update_id")
@@ -441,21 +484,24 @@ class _Reporter:
             message = renderer(pending["_message_parts"]) if renderer is not None else pending["message"]
             pending["_cached_message"] = message
 
-        payloads: dict[str, dict[str, Any] | None] = {"v1": None, "v2": None}
+        payloads: dict[str, dict[str, Any] | None] = {"v1": None, "v2": None, "v3": None}
         if self._path is not None:
             payload = pending.get("_cached_payload_v1")
             if payload is None:
-                payload = validate_payload(
-                    {
-                        "protocol_version": 1,
-                        "update_id": update_id,
-                        "stage": pending["stage"],
-                        "current": pending["current"],
-                        "total": pending["total"],
-                        "unit": pending["unit"],
-                        "message": message,
-                    }
-                )
+                try:
+                    payload = validate_payload(
+                        {
+                            "protocol_version": 1,
+                            "update_id": update_id,
+                            "stage": pending["stage"],
+                            "current": pending["current"],
+                            "total": pending["total"],
+                            "unit": pending["unit"],
+                            "message": message,
+                        }
+                    )
+                except Exception:
+                    payload = None
                 pending["_cached_payload_v1"] = payload
                 # Retain the original private cache key for compatible diagnostics.
                 pending["_cached_payload"] = payload
@@ -463,19 +509,41 @@ class _Reporter:
         if self._path_v2 is not None:
             payload = pending.get("_cached_payload_v2")
             if payload is None:
-                payload = fit_payload_v2(
-                    update_id=update_id,
-                    stage=pending["stage"],
-                    current=pending["current"],
-                    total=pending["total"],
-                    unit=pending["unit"],
-                    message=message,
-                    metrics=pending["_metrics"],
-                    completeness=pending["_completeness"],
-                )
+                try:
+                    payload = fit_payload_v2(
+                        update_id=update_id,
+                        stage=pending["stage"],
+                        current=pending["current"],
+                        total=pending["total"],
+                        unit=pending["unit"],
+                        message=message,
+                        metrics=pending["_metrics"],
+                        completeness=pending["_completeness"],
+                    )
+                except Exception:
+                    payload = None
                 # None means even the v2 base cannot fit and is a terminal discard.
                 pending["_cached_payload_v2"] = payload
             payloads["v2"] = payload
+        if self._path_v3 is not None:
+            payload = pending.get("_cached_payload_v3")
+            if payload is None:
+                try:
+                    payload = fit_payload_v3(
+                        update_id=update_id,
+                        stage=pending["stage"],
+                        current=pending["current"],
+                        total=pending["total"],
+                        unit=pending["unit"],
+                        message=message,
+                        overall=pending["_overall"],
+                        metrics=pending["_metrics"],
+                        completeness=pending["_completeness"],
+                    )
+                except Exception:
+                    payload = None
+                pending["_cached_payload_v3"] = payload
+            payloads["v3"] = payload
         return payloads
 
     @staticmethod
@@ -484,10 +552,11 @@ class _Reporter:
         source: tuple[Any, ...] | None,
         *,
         include_metrics: bool,
+        include_overall: bool,
     ) -> bool:
         if source is None:
             return False
-        stage, current, total, unit, message, message_parts, renderer, metrics, completeness = source
+        stage, current, total, unit, message, message_parts, renderer, metrics, completeness, overall = source
         if (pending.get("stage"), pending.get("current"), pending.get("total"), pending.get("unit")) != (
             stage,
             current,
@@ -500,9 +569,9 @@ class _Reporter:
                 return False
         elif pending.get("_message_parts") != message_parts or pending.get("_render_message") is not renderer:
             return False
-        return not include_metrics or (
-            pending.get("_metrics") == metrics and pending.get("_completeness") == completeness
-        )
+        if include_metrics and (pending.get("_metrics") != metrics or pending.get("_completeness") != completeness):
+            return False
+        return not include_overall or pending.get("_overall") == overall
 
     @staticmethod
     def _pending_source(pending: dict[str, Any]) -> tuple[Any, ...]:
@@ -516,6 +585,7 @@ class _Reporter:
             pending["_render_message"],
             pending["_metrics"],
             pending["_completeness"],
+            pending["_overall"],
         )
 
     def _due_outputs(
@@ -536,7 +606,8 @@ class _Reporter:
             if self._pending_matches_source(
                 pending,
                 state.last_written_source,
-                include_metrics=name == "v2",
+                include_metrics=name in {"v2", "v3"},
+                include_overall=name == "v3",
             ):
                 continue
             if closing and (state.closing_exhausted or not state.final_exception_available):
@@ -721,14 +792,16 @@ def _get_reporter() -> _Reporter | None:
     global _reporter
     path_value = os.environ.get("QEXP_PROGRESS_PATH")
     path_v2_value = os.environ.get("QEXP_PROGRESS_V2_PATH")
-    if (not path_value and not path_v2_value) or not _is_primary():
+    path_v3_value = os.environ.get("QEXP_PROGRESS_V3_PATH")
+    if (not path_value and not path_v2_value and not path_v3_value) or not _is_primary():
         return None
     desired_path = Path(path_value) if path_value else None
     desired_path_v2 = Path(path_v2_value) if path_v2_value else None
+    desired_path_v3 = Path(path_v3_value) if path_v3_value else None
     current = _reporter
     if current is not None and not current.replaceable():
         # Never route a later Attempt to an older Attempt's still-running writer.
-        if current.paths != (desired_path, desired_path_v2):
+        if current.paths != (desired_path, desired_path_v2, desired_path_v3):
             return None
         return current
     if not _reporter_lock.acquire(blocking=False):
@@ -738,10 +811,11 @@ def _get_reporter() -> _Reporter | None:
         if current is not None and current.replaceable():
             _reporter = None
         if _reporter is not None:
-            return _reporter if _reporter.paths == (desired_path, desired_path_v2) else None
+            return _reporter if _reporter.paths == (desired_path, desired_path_v2, desired_path_v3) else None
         _reporter = _Reporter(
             desired_path,
             path_v2=desired_path_v2,
+            path_v3=desired_path_v3,
             interval_seconds=_environment_interval(),
         )
         return _reporter
@@ -757,13 +831,32 @@ def update(
     unit: str | None = None,
     message: str | None = None,
     metrics: object = None,
+    overall: Counter | None = None,
 ) -> bool:
     """Offer progress to the current qexp Attempt, or safely do nothing."""
     try:
+        if validate_update(
+            stage=stage,
+            current=current,
+            total=total,
+            unit=unit,
+            message=message,
+            metrics=metrics,
+            overall=overall,
+        ):
+            return False
         reporter = _get_reporter()
         if reporter is None:
             return False
-        return reporter.update(stage=stage, current=current, total=total, unit=unit, message=message, metrics=metrics)
+        return reporter.update(
+            stage=stage,
+            current=current,
+            total=total,
+            unit=unit,
+            message=message,
+            metrics=metrics,
+            overall=overall,
+        )
     except Exception:
         return False
 
@@ -777,10 +870,22 @@ def _offer_managed_progress(
     message_parts: _MessageParts,
     render_message: _MessageRenderer,
     metrics: object = None,
+    overall: Counter | None = None,
     _metrics_source_count: int | None = None,
 ) -> bool:
     """Offer bounded primitive progress data for formatting by the writer."""
     try:
+        if _validate_update(
+            stage=stage,
+            current=current,
+            total=total,
+            unit=unit,
+            message=None,
+            metrics=metrics,
+            overall=overall,
+            normalize_activity=False,
+        ):
+            return False
         reporter = _get_reporter()
         if reporter is None:
             return False
@@ -790,6 +895,7 @@ def _offer_managed_progress(
             total=total,
             unit=unit,
             metrics=metrics,
+            overall=overall,
             _metrics_source_count=_metrics_source_count,
             _message_parts=message_parts,
             _render_message=render_message,

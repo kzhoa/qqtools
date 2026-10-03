@@ -21,6 +21,7 @@ from ..layout import context_path
 from ..notifications import notification_runtime
 from ..runtime.observation.api import ObservationError
 from ..runtime.ready import format_failure_diagnostic
+from ..task_list_fields import ENRICHED_FIELDS, resolve_task_fields
 from .command_spec import CommandSpec, ContextKind, OutputMode
 from .errors import CliOperationalError, CliUsageError, classify_cli_error
 from .local_handlers import LOCAL_HANDLERS, dispatch_local
@@ -134,6 +135,39 @@ def _emit_wait_error(
     )
     _emit(CliOutput(OutputKind.TASK_WAIT, result), "json")
     return exit_code
+
+
+def _validate_task_list_options(args: argparse.Namespace) -> None:
+    """Resolve task-list presentation options before Project or domain reads."""
+    if getattr(getattr(args, "command_spec", None), "handler", None) != "task_list":
+        return
+
+    view = getattr(args, "view", None)
+    fields = getattr(args, "fields", None)
+    output_format = getattr(args, "format", "human")
+    if output_format == "json" and (view is not None or fields is not None):
+        raise CliUsageError(
+            "task list --view/--fields are human-only; remove presentation options for JSON, "
+            "or use either a preset or explicit fields for human output."
+        )
+    try:
+        args.task_fields = resolve_task_fields(view, fields)
+    except ValueError as exc:
+        raise CliUsageError(str(exc)) from exc
+
+    task_fields = args.task_fields
+    if task_fields is None:
+        return
+    is_indexed = any(getattr(args, option, None) is not None for option in ("page_size", "cursor", "name"))
+    if is_indexed:
+        if getattr(args, "limit", None) is not None:
+            raise CliUsageError("--limit conflicts with --page-size, --cursor, or --name.")
+        return
+    if not ENRICHED_FIELDS.intersection(task_fields):
+        return
+    limit = 50 if getattr(args, "limit", None) is None else args.limit
+    if type(limit) is not int or not 1 <= limit <= 1000:
+        raise CliUsageError("enriched task list selections require --limit from 1 through 1000.")
 
 
 def _emit(output: CliOutput[object], output_format: str, *, flush: bool = False) -> None:
@@ -335,6 +369,7 @@ def main(argv: list[str] | None = None) -> int:
         project_presentation, presentation_deferred = _present_selection(selection, args, invocation_cwd)
 
     try:
+        _validate_task_list_options(args)
         explicit_format = any(token == "--format" or token.startswith("--format=") for token in raw_argv)
         if explicit_format and handler == "agent_run":
             raise CliUsageError("agent run is foreground debugging and does not support --format.")

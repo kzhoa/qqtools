@@ -79,9 +79,14 @@ def test_productive_binding_continues_while_waiting_binding_observes_own_backoff
 
     def observe_start(request_id, **kwargs):
         request = executor._load_request(request_id)
-        if request.project_id == waiting.project_id and request.operation_kind == "recovery_admission":
+        process = start(request_id, **kwargs)
+        if (
+            process is not None
+            and request.project_id == waiting.project_id
+            and request.operation_kind == "recovery_admission"
+        ):
             starts.append(request_id)
-        return start(request_id, **kwargs)
+        return process
 
     monkeypatch.setattr(executor, "start", observe_start)
 

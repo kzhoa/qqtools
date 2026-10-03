@@ -7,6 +7,7 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 
 from ...progress_format import format_progress_compact, format_progress_details, select_progress_observation
+from ...progress_selection import selected_progress_observation
 from .core import OutputContract, OutputKind
 from .primitives import (
     _details,
@@ -22,6 +23,8 @@ from .primitives import (
     _task_summary,
     _value,
 )
+from .task_list import render_task_list as _render_selected_task_list
+from .task_list import render_task_page as _render_selected_task_page
 
 
 def _task_rows(tasks: Sequence[Mapping[str, Any]]) -> list[tuple[Any, ...]]:
@@ -74,11 +77,15 @@ def _render_task_table(tasks: Sequence[Mapping[str, Any]]) -> str:
     return _table(headers, _task_rows(tasks), empty_message="No Tasks.")
 
 
-def _render_task_list(result: Any, _presentation: Mapping[str, object]) -> str:
+def _render_task_list(result: Any, presentation: Mapping[str, object]) -> str:
+    if isinstance(presentation.get("fields"), tuple):
+        return _render_selected_task_list(result, presentation)
     return _render_task_table(result)
 
 
 def _render_task_page(result: Mapping[str, Any], presentation: Mapping[str, object]) -> str:
+    if isinstance(presentation.get("fields"), tuple):
+        return _render_selected_task_page(result, presentation)
     if not result["items"] and result.get("next_cursor") is not None:
         rendered = "No matches in this page; more candidates remain."
     else:
@@ -99,6 +106,32 @@ def _task_progress(result: Mapping[str, Any]) -> tuple[Mapping[str, Any] | None,
     """Resolve the whole progress candidate shared by one-shot and watch output."""
     progress = result.get("progress")
     progress_extended = result.get("progress_extended")
+    progress_scoped = result.get("progress_scoped")
+    if "selected_progress_protocol_version" in result:
+        selected_protocol = result.get("selected_progress_protocol_version")
+        if type(selected_protocol) is not int or selected_protocol not in {1, 2, 3}:
+            selected_protocol = None
+        selected_attempt = result.get("selected_attempt")
+        if not isinstance(selected_attempt, Mapping):
+            task = result.get("task")
+            selected_attempt = task.get("attempt_control", {}) if isinstance(task, Mapping) else {}
+        attempt_id = selected_attempt.get("attempt_id", selected_attempt.get("current_attempt_id"))
+        if not isinstance(attempt_id, str):
+            attempt_id = None
+        attempt_number = selected_attempt.get("attempt_number", selected_attempt.get("current_attempt_number"))
+        if type(attempt_number) is not int:
+            attempt_number = None
+        return (
+            selected_progress_observation(
+                progress if isinstance(progress, Mapping) else None,
+                progress_extended if isinstance(progress_extended, Mapping) else None,
+                progress_scoped if isinstance(progress_scoped, Mapping) else None,
+                selected_protocol,
+                attempt_id=attempt_id,
+                attempt_number=attempt_number,
+            ),
+            selected_protocol,
+        )
     selected_version = result.get("selected_progress_version")
     if "selected_progress_version" not in result:
         selected_version = 1 if isinstance(progress, Mapping) and progress.get("status") == "available" else None
@@ -112,6 +145,27 @@ def _task_progress(result: Mapping[str, Any]) -> tuple[Mapping[str, Any] | None,
         ),
         selected_version,
     )
+
+
+def _progress_diagnostics(result: Mapping[str, Any]) -> tuple[tuple[str, object], ...]:
+    """Return frozen policy and bounded per-channel reasons for details output."""
+    fields: list[tuple[str, object]] = []
+    policy = result.get("reporting_policy")
+    if isinstance(policy, Mapping):
+        fields.extend(
+            (
+                ("Reporting policy", policy.get("state")),
+                ("Reporting policy reason", policy.get("reason")),
+            )
+        )
+    for label, key in (("v1", "progress"), ("v2", "progress_extended"), ("v3", "progress_scoped")):
+        observation = result.get(key)
+        if not isinstance(observation, Mapping) or observation.get("status") == "available":
+            continue
+        reason = observation.get("reason")
+        if reason is not None:
+            fields.append((f"Progress {label} reason", reason))
+    return tuple(fields)
 
 
 def _render_task_show(result: Mapping[str, Any], presentation: Mapping[str, object]) -> str:
@@ -159,6 +213,7 @@ def _render_task_show(result: Mapping[str, Any], presentation: Mapping[str, obje
             progress_observation,
             progress_version=progress_version,
         )
+    diagnostics = _progress_diagnostics(result) if presentation.get("details") else ()
     return _details(
         (
             ("Task ID", task.get("task_id")),
@@ -184,6 +239,7 @@ def _render_task_show(result: Mapping[str, Any], presentation: Mapping[str, obje
             ("Exit code", current_attempt.get("exit_code") if terminal else None),
         ),
         progress_fields,
+        diagnostics,
     )
 
 
@@ -216,6 +272,7 @@ def _render_task_watch(result: Mapping[str, Any], presentation: Mapping[str, obj
             progress_observation,
             progress_version=progress_version,
         )
+    diagnostics = _progress_diagnostics(result) if presentation.get("details") else ()
     project_line = presentation.get("project_line")
     project_value = None
     if isinstance(project_line, str):
@@ -231,6 +288,7 @@ def _render_task_watch(result: Mapping[str, Any], presentation: Mapping[str, obj
         attempt_values,
         (("Observation", observation),),
         progress_fields,
+        diagnostics,
     )
 
 
@@ -322,11 +380,11 @@ def _validate_task_items(items: Sequence[Any], label: str) -> None:
             "queue_scope",
             "current_attempt_id",
             "claim_machine",
-            "depends_on_task_ids",
-            "dependency_state",
         ):
             _required(task, key, f"{label}[{index}]")
-        _sequence(task["depends_on_task_ids"], f"{label}[{index}].depends_on_task_ids")
+        if "depends_on_task_ids" in task or "dependency_state" in task:
+            _required(task, "dependency_state", f"{label}[{index}]")
+            _required_sequence(task, "depends_on_task_ids", f"{label}[{index}]")
 
 
 def _validate_task_list(result: Any) -> None:
@@ -366,11 +424,20 @@ def _validate_task_show(result: Any) -> None:
     _required_mapping(value, "progress", "task-show payload")
     if "progress_extended" in value:
         _mapping(value["progress_extended"], "task-show payload.progress_extended")
+    if "progress_scoped" in value:
+        _mapping(value["progress_scoped"], "task-show payload.progress_scoped")
     selected_progress_version = value.get("selected_progress_version")
     if selected_progress_version is not None and (
         type(selected_progress_version) is not int or selected_progress_version not in {1, 2}
     ):
         raise ValueError("task-show payload.selected_progress_version must be 1, 2, or null")
+    selected_progress_protocol_version = value.get("selected_progress_protocol_version")
+    if selected_progress_protocol_version is not None and (
+        type(selected_progress_protocol_version) is not int or selected_progress_protocol_version not in {1, 2, 3}
+    ):
+        raise ValueError("task-show payload.selected_progress_protocol_version must be 1, 2, 3, or null")
+    if "reporting_policy" in value:
+        _mapping(value["reporting_policy"], "task-show payload.reporting_policy")
     observation = _required_mapping(value, "observation", "task-show payload")
     override = _required(observation, "tmux_override", "task-show payload.observation")
     if override not in {"enabled", "disabled", "inherit"}:
@@ -393,11 +460,20 @@ def _validate_task_watch(result: Any) -> None:
     _required_mapping(value, "progress", "task-watch payload")
     if "progress_extended" in value:
         _mapping(value["progress_extended"], "task-watch payload.progress_extended")
+    if "progress_scoped" in value:
+        _mapping(value["progress_scoped"], "task-watch payload.progress_scoped")
     selected_progress_version = value.get("selected_progress_version")
     if selected_progress_version is not None and (
         type(selected_progress_version) is not int or selected_progress_version not in {1, 2}
     ):
         raise ValueError("task-watch payload.selected_progress_version must be 1, 2, or null")
+    selected_progress_protocol_version = value.get("selected_progress_protocol_version")
+    if selected_progress_protocol_version is not None and (
+        type(selected_progress_protocol_version) is not int or selected_progress_protocol_version not in {1, 2, 3}
+    ):
+        raise ValueError("task-watch payload.selected_progress_protocol_version must be 1, 2, 3, or null")
+    if "reporting_policy" in value:
+        _mapping(value["reporting_policy"], "task-watch payload.reporting_policy")
     attempt = _required(value, "selected_attempt", "task-watch payload")
     if attempt is not None:
         attempt_value = _mapping(attempt, "task-watch payload.selected_attempt")

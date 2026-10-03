@@ -1586,7 +1586,7 @@ does not start the former shared-I/O maintenance thread. Possible partial writes
 remain `outcome_unknown` until worker absence permits a journal-backed retry;
 restarting loses only disposable traversal progress, never the canonical proof.
 
-`progress_projection` observes or publishes exactly one captured v1/v2 producer
+`progress_projection` observes or publishes exactly one captured v1/v2/v3 producer
 context through common background admission. Context discovery, payload sampling,
 local accepted observations, diagnostics, retirement, and cadence remain in the
 MachineRuntime coordinator; it never resolves shared identity inline. At most 64
@@ -3668,6 +3668,25 @@ Before claiming new work, an agent:
 6. publishes fresh agent and GPU snapshots
 7. starts normal claim scanning
 
+Released protocol-1 registrations remain immutable even when they omit
+`reservation_id`. A bounded machine-local scan visits at most eight records per
+active/released GPU/CPU lane per turn. It may restore the locator in an agent-owned
+manifest only when Project, shared root, machine, Task, Attempt, fence, registration,
+process identity, and recorded resources agree. Explicit locators are never replaced.
+Paths for immutable registrations that already contain a locator may remain in a
+bounded 1,024-entry ignore cache; eviction only causes the record to be checked again.
+CPU registrations may omit the CPU count; the exact reservation ledger retains it.
+This is permanent retained-format support, not a Project migration or a new authority
+source. Shared renewal and terminal transactions still require their existing exact
+reservation, process, generation, and revision proofs before effects.
+
+Completed healthy termination observations do not pin startup readiness, and later
+cancellation remains discoverable. A matching immutable process registration suppresses
+new launch-authorization offers for that incumbent without suppressing unresolved request
+reconciliation. Preferred progress continuations retain the ordinary background rotation
+position, so continuous reporting cannot starve upgrade discovery or other service families.
+These rules preserve the protected lifecycle-independence workflow across package upgrades.
+
 Before step 7, every start, restart, and foreground run obtains raw GPU inventory and validates an
 explicit persisted or inherited allowlist. Configured IDs absent from a successful inventory do
 not prevent startup: only the discovered intersection is visible, and a durable
@@ -4134,8 +4153,8 @@ snapshot participates in submission recovery. Supported old writers must retain
 this additive namespace when updating an Operation; mixed versions may lose
 richer observation but cannot change training eligibility.
 
-Frozen-enabled Tasks alone may receive a separate optional v2 context and
-mailbox outside authoritative launch locks. Channel failure or delay cannot
+Frozen-enabled Tasks alone may receive separate optional v2 and v3 contexts and
+mailboxes outside authoritative launch locks. Channel failure or delay cannot
 block valid training launch. Provisioning must not wait synchronously for
 observation I/O, and viewer/window creation cannot delay heartbeat, lease, or
 dispatch. Off Tasks add no extended runtime context, callbacks, scan, or viewer.
@@ -4146,7 +4165,7 @@ never execution truth.
 
 The local progress coordinator keeps at most 64 cached Project owners, samples
 at most 16 bindings per pass, and counts at most eight local directory entries
-per sampled binding, alternating the v1 and v2 context directories. Names that
+per sampled binding, rotating the v1, v2 and v3 context directories. Names that
 are invalid, irrelevant, or have no mailbox still consume this budget. Evicting
 an idle owner parks its directory cookies, protocol alternation, and retry time
 in atomic advisory JSON at `<project-runtime>/progress-coordinator/scan.json`.
@@ -4246,3 +4265,50 @@ generation. A malformed authoritative source remains degraded until repaired;
 doctor requests a new build without completing a history scan inside a page query.
 Performance qualification, including dependency reads and shared-storage costs,
 is separate from these structural protocol bounds.
+
+## Scoped progress v3 and bounded list observations
+
+Progress v3 is an independent advisory channel enabled by frozen live-progress
+selection. It uses QEXP_PROGRESS_V3_PATH, local progress/<attempt>/latest-v3.json,
+progress-v3-contexts/, progress-v3-observed/, shared progress-v3/<task>/<attempt>.json,
+and progress-coordinator/v3/<attempt>.json. No Task/Attempt schema changes.
+Context and snapshot envelopes retain exact v2 identity fields with version 3.
+Payload keys are exactly protocol_version, update_id, activity, overall, metrics,
+completeness. Activity has exactly stage/current/total/unit/message. Nullable
+overall has exactly current/total/unit/label. Snapshot progress excludes update_id.
+V2 text, metric, completeness, 8 KiB payload and 16 KiB snapshot bounds apply.
+Semantic deduplication includes all values; advanced_at changes only for
+activity stage/counter/unit or overall counter/unit, not label/message/metrics.
+Independent channel retries retain one source update ID and cannot block
+execution or another channel. Rotate three protocols within existing budgets.
+Cleanup shares the Task progress lock without renumbering durable cursor stages.
+
+Observation policy resolution is distinct from safe-off launch resolution.
+Use the already-read Task submission_operation_id, validate Operation identity,
+ordered resolved task_ids and strict live_progress_selection including digest
+and Group identity. Return enabled, disabled or unknown. Unknown reasons are
+policy_reference_missing, policy_operation_missing, policy_selection_missing,
+policy_identity_mismatch, policy_invalid, policy_oversized, policy_read_failed.
+Read at most 8 MiB plus one byte before decode; cache success/failure once per
+Operation per command, retaining only returned Task selections. No Group reads.
+Disabled skips v2/v3; unknown keeps authorized channels eligible.
+
+List enrichment shares one Attempt read, at most three snapshot reads, two
+registration reads around active collection and one final Task reread. Across
+N rows and U referenced Operations this is at most 7N+U <= 8N record reads beyond
+initial query and separately requested dependency checks. Basic/location-only
+views do no Operation reads. Cleanup/no-Attempt truth skips unnecessary reads.
+Final Task selection signature includes revision, projection, submission
+Operation, Attempt ID/number, claim identity/token/machine and cleanup. Any
+change marks all enrichment changed_during_read. Required Task reread failure
+remains a command error. Registration changes invalidate progress identity.
+Task-wide identity/cleanup errors override candidates. Otherwise available
+candidates win; absent any, unavailable precedence is identity_mismatch,
+invalid_snapshot, read_failed. Pure renderers do no domain I/O.
+
+V1/v2 remain permanently supported. L1 rollout installs the package and restarts
+the global agent machine by machine without interrupting running training,
+Project migration or a fleet barrier. Existing producers retain original
+channels; only newly launched enabled Attempts receive v3. Released-source
+coexistence must cover old cleanup/writers, supervision, scheduling and final
+outcome recovery separately from new-Attempt activation.

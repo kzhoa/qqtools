@@ -62,6 +62,11 @@ def _progress(state: str = "no_report", reason: str = "no_snapshot") -> dict[str
     return {"status": "unavailable", "observation_state": state, "reason": reason}
 
 
+def _progress_candidates(state="no_report", reason="no_snapshot"):
+    observation = _progress(state, reason)
+    return observation, observation, None, observation, None, {"state": "unknown", "reason": "operation_missing"}
+
+
 def _follow_payload(path: Path, *, terminal: bool, attempt: int = 1) -> dict[str, object]:
     phase = "succeeded" if terminal else "running"
     return {
@@ -88,7 +93,7 @@ def test_current_observation_selects_exact_running_attempt(tmp_path: Path, monke
     task, attempt = _records(tmp_path)
     monkeypatch.setattr(observer, "load_task", lambda *_args: task)
     monkeypatch.setattr(observer, "read_json", lambda *_args: attempt.to_dict())
-    monkeypatch.setattr(observer, "inspect_progress", lambda *_args: _progress())
+    monkeypatch.setattr(observer, "_inspect_progress_candidates", lambda *_args, **_kwargs: _progress_candidates())
 
     view = observer.inspect_current_task(_cfg(tmp_path), task.task_id)
 
@@ -113,7 +118,11 @@ def test_queued_retry_never_selects_retained_attempt_number(tmp_path: Path, monk
         "read_json",
         lambda *_args: (_ for _ in ()).throw(AssertionError("queued retry must not read historical Attempt")),
     )
-    monkeypatch.setattr(observer, "inspect_progress", lambda *_args: _progress("pending", "not_started"))
+    monkeypatch.setattr(
+        observer,
+        "_inspect_progress_candidates",
+        lambda *_args, **_kwargs: _progress_candidates("pending", "not_started"),
+    )
 
     view = observer.inspect_current_task(_cfg(tmp_path), task.task_id)
 
@@ -131,7 +140,7 @@ def test_terminal_selection_uses_preserved_number_with_cleared_id(
     attempt.phase = "succeeded"
     monkeypatch.setattr(observer, "load_task", lambda *_args: task)
     monkeypatch.setattr(observer, "read_json", lambda *_args: attempt.to_dict())
-    monkeypatch.setattr(observer, "inspect_progress", lambda *_args: _progress())
+    monkeypatch.setattr(observer, "_inspect_progress_candidates", lambda *_args, **_kwargs: _progress_candidates())
 
     view = observer.inspect_current_task(_cfg(tmp_path), task.task_id)
 
@@ -151,7 +160,11 @@ def test_blocked_orphan_selection_requires_exact_orphan_evidence(
     attempt.phase = "orphaned"
     monkeypatch.setattr(observer, "load_task", lambda *_args: task)
     monkeypatch.setattr(observer, "read_json", lambda *_args: attempt.to_dict())
-    monkeypatch.setattr(observer, "inspect_progress", lambda *_args: _progress("unavailable", "identity_mismatch"))
+    monkeypatch.setattr(
+        observer,
+        "_inspect_progress_candidates",
+        lambda *_args, **_kwargs: _progress_candidates("unavailable", "identity_mismatch"),
+    )
 
     view = observer.inspect_current_task(_cfg(tmp_path), task.task_id)
 
@@ -173,8 +186,10 @@ def test_selection_discards_candidate_when_task_changes_during_read(
     monkeypatch.setattr(observer, "read_json", lambda *_args: attempt.to_dict())
     monkeypatch.setattr(
         observer,
-        "inspect_progress",
-        lambda *_args: (_ for _ in ()).throw(AssertionError("transition frame must not inspect old progress")),
+        "_inspect_progress_candidates",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("transition frame must not inspect old progress")
+        ),
     )
 
     view = observer.inspect_current_task(_cfg(tmp_path), first.task_id)

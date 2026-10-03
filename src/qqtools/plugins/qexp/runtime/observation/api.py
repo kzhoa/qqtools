@@ -241,6 +241,7 @@ def list_tasks_page(
     name: str | None = None,
     page_size: int = 50,
     cursor: str | None = None,
+    fields: tuple[str, ...] | None = None,
 ) -> dict[str, Any]:
     """Return one live, indexed page of Task views.
 
@@ -298,6 +299,7 @@ def list_tasks_page(
     from ..tasks import load_task
 
     items: list[dict[str, Any]] = []
+    tasks: list[Any] = []
     last_inspected = after
     previous_key = after
     stop_reason: str | None = None
@@ -324,11 +326,13 @@ def list_tasks_page(
                 continue
             if name is not None and view["name"] != name:
                 continue
-            gate = dependency_gate(cfg, task)
-            view["depends_on_task_ids"] = task.depends_on_task_ids
-            view["dependency_state"] = gate.state
-            view["dependency_reasons"] = list(gate.reasons)
+            if fields is None or "dependency" in set(fields):
+                view["depends_on_task_ids"] = task.depends_on_task_ids
+                gate = dependency_gate(cfg, task)
+                view["dependency_state"] = gate.state
+                view["dependency_reasons"] = list(gate.reasons)
             items.append(view)
+            tasks.append(task)
         except (OSError, KeyError, TypeError, ValueError) as exc:
             raise _index_unavailable(f"Task truth for candidate {candidate_key!r} is unreadable.", exc) from exc
         if len(items) >= page_size:
@@ -349,6 +353,11 @@ def list_tasks_page(
         raise
     except (OSError, KeyError, TypeError, ValueError) as exc:
         raise _index_unavailable("Task index changed while the page was being read.", exc) from exc
+
+    if fields is not None and set(fields) & {"location", "overall-progress", "activity", "report-age"}:
+        from ...task_list_observation import enrich_task_rows
+
+        items = enrich_task_rows(cfg, tasks, items, fields)
 
     next_cursor = None
     if stop_reason != "exhausted":

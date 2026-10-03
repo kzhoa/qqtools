@@ -20,6 +20,7 @@ from qqtools.plugins.qexp.agent.setup import initialize_machine
 from qqtools.plugins.qexp.runtime.paths import attempt_path
 from qqtools.plugins.qexp.runtime.progress import prepare_progress_channel, shared_progress_path
 from qqtools.plugins.qexp.runtime.progress_v2 import prepare_progress_v2_channel
+from qqtools.plugins.qexp.runtime.progress_v3 import prepare_progress_v3_channel
 from qqtools.plugins.qexp.runtime.records import AttemptRecord
 from qqtools.plugins.qexp.runtime.store import atomic_replace, read_json
 from qqtools.plugins.qexp.runtime.tasks import load_task, save_task
@@ -52,9 +53,10 @@ def _case(tmp_path, runtime, name, version):
         directory = "progress-contexts"
         shared = shared_progress_path(cfg.shared_root, task.task_id, attempt.attempt_id)
     else:
-        channel = prepare_progress_v2_channel(cfg, task, attempt, wrapper_start_time_ticks=777, interval_seconds=1)
-        directory = "progress-v2-contexts"
-        shared = cfg.shared_root / "progress-v2" / task.task_id / f"{attempt.attempt_id}.json"
+        prepare = prepare_progress_v2_channel if version == 2 else prepare_progress_v3_channel
+        channel = prepare(cfg, task, attempt, wrapper_start_time_ticks=777, interval_seconds=1)
+        directory = f"progress-v{version}-contexts"
+        shared = cfg.shared_root / f"progress-v{version}" / task.task_id / f"{attempt.attempt_id}.json"
     assert channel is not None
     context_path = cfg.runtime_root / directory / f"{attempt.attempt_id}.json"
     context = read_advisory_snapshot(context_path)
@@ -67,10 +69,13 @@ def _case(tmp_path, runtime, name, version):
         "unit": "step",
         "message": "first",
     }
-    if version == 2:
+    if version in {2, 3}:
         payload.update(
             {"metrics": {"loss": 0.5}, "completeness": {"complete": True, "omitted_metrics": 0, "reasons": []}}
         )
+    if version == 3:
+        activity = {key: payload.pop(key) for key in ("stage", "current", "total", "unit", "message")}
+        payload.update(activity=activity, overall={"current": 8, "total": 10, "unit": "step", "label": "Training"})
     replace_advisory_snapshot(Path(channel), payload)
     return cfg, binding, task, attempt, context, context_path, Path(channel), shared
 
@@ -128,7 +133,7 @@ def _pump(controller, runtime, predicate, *, timeout=8, shared_roots=()):
     )
 
 
-@pytest.mark.parametrize("version", [1, 2])
+@pytest.mark.parametrize("version", [1, 2, 3])
 def test_progress_real_worker_observes_without_machine_guards_or_local_writes(tmp_path, monkeypatch, version):
     runtime = MachineRuntime(tmp_path / "machine")
     initialize_machine(runtime, "gpu-1")
@@ -163,7 +168,7 @@ def test_progress_real_worker_observes_without_machine_guards_or_local_writes(tm
         executor.shutdown()
 
 
-@pytest.mark.parametrize("version", [1, 2])
+@pytest.mark.parametrize("version", [1, 2, 3])
 def test_progress_coordinator_preserves_cadence_and_consumes_exact_publication(tmp_path, monkeypatch, version):
     runtime = MachineRuntime(tmp_path / "machine")
     initialize_machine(runtime, "gpu-1")
@@ -198,7 +203,8 @@ def test_progress_coordinator_preserves_cadence_and_consumes_exact_publication(t
         deadline = projector._entries[attempt.attempt_id]["cache_next_due"]
         assert deadline >= 1
         payload = read_advisory_snapshot(mailbox)
-        payload.update({"update_id": "update-2", "current": 2})
+        payload["update_id"] = "update-2"
+        (payload["activity"] if version == 3 else payload)["current"] = 2
         replace_advisory_snapshot(mailbox, payload)
         clock[0] = 0.5
         for _ in range(30):
@@ -217,13 +223,13 @@ def test_progress_coordinator_preserves_cadence_and_consumes_exact_publication(t
         )
         second = read_advisory_snapshot(shared)
         assert second["sequence"] == first["sequence"] + 1
-        assert second["progress"]["current"] == 2
+        assert (second["progress"]["activity"] if version == 3 else second["progress"])["current"] == 2
     finally:
         controller.progress.close()
         executor.shutdown()
 
 
-@pytest.mark.parametrize("version", [1, 2])
+@pytest.mark.parametrize("version", [1, 2, 3])
 def test_two_blocked_progress_workers_do_not_delay_peer_or_bounded_stop(tmp_path, monkeypatch, version):
     runtime = MachineRuntime(tmp_path / "machine")
     initialize_machine(runtime, "gpu-1")
@@ -235,7 +241,7 @@ def test_two_blocked_progress_workers_do_not_delay_peer_or_bounded_stop(tmp_path
         blocked_cfg = init_shared_root(tmp_path / f"blocked-{index}" / ".qexp", "gpu-1")
         blocked_binding = runtime.add_binding(blocked_cfg.shared_root, "gpu-1")
         root = runtime.project_paths(blocked_binding.project_id)["root"]
-        directory = "progress-contexts" if version == 1 else "progress-v2-contexts"
+        directory = "progress-contexts" if version == 1 else f"progress-v{version}-contexts"
         (root / directory).mkdir(parents=True, exist_ok=True)
         replace_advisory_snapshot(root / directory / f"{context['attempt_id']}.json", context)
         local_mailbox = root / "progress" / context["attempt_id"] / mailbox.name
@@ -269,7 +275,11 @@ def test_two_blocked_progress_workers_do_not_delay_peer_or_bounded_stop(tmp_path
             controller, runtime, shared.exists, shared_roots=[cfg.shared_root, *(item[0].shared_root for item in held)]
         )
         assert time.monotonic() - started < 8
-        assert read_advisory_snapshot(shared)["progress"]["current"] == 1
+        assert (
+            read_advisory_snapshot(shared)["progress"]["activity"]
+            if version == 3
+            else read_advisory_snapshot(shared)["progress"]
+        )["current"] == 1
         assert executor.status_view()["active_worker_count"] <= 4
         assert sum(item.project_id != binding.project_id for item in executor.unresolved_requests()) == 2
         started = time.monotonic()
@@ -296,7 +306,7 @@ def _desired_projection(controller, runtime, binding):
     return dict(controller.progress._entries[controller.progress._key(binding)].parameters["projection"])
 
 
-@pytest.mark.parametrize("version", [1, 2])
+@pytest.mark.parametrize("version", [1, 2, 3])
 def test_progress_publication_replay_is_idempotent_and_worker_cannot_write_local_cache(tmp_path, version):
     runtime = MachineRuntime(tmp_path / "machine")
     initialize_machine(runtime, "gpu-1")
@@ -336,7 +346,7 @@ def test_progress_publication_replay_is_idempotent_and_worker_cannot_write_local
         executor.shutdown()
 
 
-@pytest.mark.parametrize("version", [1, 2])
+@pytest.mark.parametrize("version", [1, 2, 3])
 def test_progress_raw_replace_rechecks_epoch_without_acknowledging_local_cadence(tmp_path, monkeypatch, version):
     from qqtools.plugins.qexp.runtime import progress_projection
 
@@ -382,7 +392,7 @@ def test_progress_raw_replace_rechecks_epoch_without_acknowledging_local_cadence
         executor.shutdown()
 
 
-@pytest.mark.parametrize("version", [1, 2])
+@pytest.mark.parametrize("version", [1, 2, 3])
 def test_disabled_owned_attempt_finishes_terminal_progress_and_retires_only_after_consumption(tmp_path, version):
     runtime = MachineRuntime(tmp_path / "machine")
     initialize_machine(runtime, "gpu-1")
@@ -396,7 +406,7 @@ def test_disabled_owned_attempt_finishes_terminal_progress_and_retires_only_afte
         _pump(controller, runtime, lambda: shared.exists() and not context_path.exists())
         observed = read_advisory_snapshot(shared)
         assert observed["attempt_id"] == attempt.attempt_id
-        assert observed["progress"]["current"] == 1
+        assert (observed["progress"]["activity"] if version == 3 else observed["progress"])["current"] == 1
         assert load_task(cfg, task.task_id).state["projection"] == "failed"
         assert load_task(cfg, task.task_id).attempt_control["current_attempt_number"] == attempt.attempt_number
         assert not (cfg.runtime_root / "progress-coordinator" / f"v{version}" / f"{attempt.attempt_id}.json").exists()
@@ -411,7 +421,7 @@ def _add_idle_peers(tmp_path, runtime, count):
         runtime.add_binding(cfg.shared_root, cfg.machine_name)
 
 
-@pytest.mark.parametrize("version", [1, 2])
+@pytest.mark.parametrize("version", [1, 2, 3])
 def test_progress_scan_reaches_directory_tail_across_65_binding_evictions(tmp_path, version):
     runtime = MachineRuntime(tmp_path / "machine")
     initialize_machine(runtime, "gpu-1")
@@ -464,7 +474,7 @@ def test_progress_scan_reaches_directory_tail_across_65_binding_evictions(tmp_pa
         executor.shutdown()
 
 
-@pytest.mark.parametrize("version", [1, 2])
+@pytest.mark.parametrize("version", [1, 2, 3])
 def test_progress_sampling_deadline_survives_65_binding_eviction(tmp_path, version):
     runtime = MachineRuntime(tmp_path / "machine")
     initialize_machine(runtime, "gpu-1")
@@ -488,7 +498,8 @@ def test_progress_sampling_deadline_survives_65_binding_eviction(tmp_path, versi
         clock[0] = 0.5
         _pump(controller, runtime, lambda: controller.progress._entries.get(key) is not owner)
         payload = read_advisory_snapshot(mailbox)
-        payload.update({"update_id": "update-2", "current": 2})
+        payload["update_id"] = "update-2"
+        (payload["activity"] if version == 3 else payload)["current"] = 2
         replace_advisory_snapshot(mailbox, payload)
 
         def restored():
@@ -512,7 +523,7 @@ def test_progress_sampling_deadline_survives_65_binding_eviction(tmp_path, versi
         executor.shutdown()
 
 
-@pytest.mark.parametrize("version", [1, 2])
+@pytest.mark.parametrize("version", [1, 2, 3])
 @pytest.mark.parametrize("invalid_checkpoint", ["clock_scope", "generation", "context", "deadline", "flag"])
 def test_progress_eviction_rejects_foreign_or_malformed_cadence(tmp_path, version, invalid_checkpoint):
     runtime = MachineRuntime(tmp_path / "machine")
@@ -562,7 +573,7 @@ def test_progress_eviction_rejects_foreign_or_malformed_cadence(tmp_path, versio
         executor.shutdown()
 
 
-@pytest.mark.parametrize("version", [1, 2])
+@pytest.mark.parametrize("version", [1, 2, 3])
 def test_progress_failed_cadence_checkpoint_retains_owner_until_storage_recovers(tmp_path, version):
     runtime = MachineRuntime(tmp_path / "machine")
     initialize_machine(runtime, "gpu-1")
@@ -637,7 +648,7 @@ def test_progress_failed_scan_checkpoint_does_not_block_other_eviction_candidate
         executor.shutdown()
 
 
-@pytest.mark.parametrize("version", [1, 2])
+@pytest.mark.parametrize("version", [1, 2, 3])
 def test_progress_local_cleanup_removes_parked_cadence_without_context(tmp_path, version):
     from qqtools.plugins.qexp.runtime.progress import cleanup_local_progress
     from qqtools.plugins.qexp.runtime.progress_v2 import cleanup_local_progress_v2
@@ -651,7 +662,9 @@ def test_progress_local_cleanup_removes_parked_cadence_without_context(tmp_path,
     path = cfg.runtime_root / "progress-coordinator" / f"v{version}" / f"{attempt.attempt_id}.json"
     path.parent.mkdir(parents=True, exist_ok=True)
     replace_advisory_snapshot(path, {"cadence": {}})
-    cleanup = cleanup_local_progress if version == 1 else cleanup_local_progress_v2
+    from qqtools.plugins.qexp.runtime.progress_cleanup_v3 import cleanup_local_progress_v3
+
+    cleanup = {1: cleanup_local_progress, 2: cleanup_local_progress_v2, 3: cleanup_local_progress_v3}[version]
     removed = cleanup(cfg, task.task_id, {attempt.attempt_id})
     assert str(path) in removed
     assert not path.exists()

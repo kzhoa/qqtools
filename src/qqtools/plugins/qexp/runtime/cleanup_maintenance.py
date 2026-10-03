@@ -19,6 +19,7 @@ from .locks import exclusive, group_lock, schema_writer_lock, task_lock
 from .operation_store import archive_operation, locate_operation_path, write_active_operation
 from .paths import attempt_path, local_paths, shared_paths, task_path
 from .progress import cleanup_shared_progress
+from .progress_cleanup_v3 import cleanup_shared_progress_v3
 from .progress_v2 import cleanup_shared_progress_v2
 from .ready import assert_ready_writer_compatible
 from .records import AttemptRecord, TaskRecord, utc_now, validate_identifier
@@ -229,6 +230,7 @@ def _finalize_cleanup_operation(
             removed.append(str(logs_dir))
         removed.extend(cleanup_shared_progress(cfg, task_id))
         removed.extend(cleanup_shared_progress_v2(cfg, task_id))
+        removed.extend(cleanup_shared_progress_v3(cfg, task_id))
         write_event(
             cfg,
             "task_cleaned",
@@ -559,10 +561,22 @@ def _advance_cleanup_local_step(
 
     if stage in {"local_progress_v1", "local_progress_v2"}:
         version2 = stage == "local_progress_v2"
-        directory = cfg.runtime_root / ("progress-v2-contexts" if version2 else "progress-contexts")
+        extended_version = cursor.get("extended_progress_version", 2) if version2 else None
+        if version2 and (type(extended_version) is not int or extended_version not in {2, 3}):
+            return {"state": "intervention", "reason": "local_progress_cursor_invalid"}
+        directory = (
+            cfg.runtime_root / f"progress-v{extended_version}-contexts"
+            if version2
+            else cfg.runtime_root / "progress-contexts"
+        )
         name, next_offset = _read_cleanup_child(directory, offset)
         if name is None:
-            cursor.update({"stage": "local_progress_v2" if not version2 else "ack_local", "offset": 0})
+            if version2 and extended_version == 2:
+                cursor.update({"extended_progress_version": 3, "offset": 0})
+            else:
+                cursor.update({"stage": "local_progress_v2" if not version2 else "ack_local", "offset": 0})
+                if version2:
+                    cursor.pop("extended_progress_version", None)
             return {"state": "in_progress"}
         cursor["offset"] = next_offset
         if not name.endswith(".json"):
@@ -584,6 +598,8 @@ def _advance_cleanup_local_step(
                 "progress_mailbox_offset": 0,
             }
         )
+        if version2:
+            cursor["extended_progress_version"] = extended_version
         return {"state": "in_progress"}
 
     if stage == "local_progress_artifacts":
@@ -597,6 +613,31 @@ def _advance_cleanup_local_step(
             return {"state": "intervention", "reason": "local_progress_identity_invalid"}
         if attempt_id in {".", ".."}:
             return {"state": "intervention", "reason": "local_progress_identity_invalid"}
+        extended_version = cursor.get("extended_progress_version", 2) if version == 2 else 1
+        if version == 2 and (type(extended_version) is not int or extended_version not in {2, 3}):
+            return {"state": "intervention", "reason": "local_progress_cursor_invalid"}
+        roots = (
+            (f"progress-v{extended_version}-contexts", f"progress-v{extended_version}-observed")
+            if version == 2
+            else (
+                "progress-contexts",
+                "progress-observed",
+                "progress-diagnostics",
+            )
+        )
+        artifacts = [cfg.runtime_root / name / f"{attempt_id}.json" for name in roots]
+        artifact_index = cursor.get("progress_artifact", 0)
+        if type(artifact_index) is not int or not 0 <= artifact_index <= len(artifacts):
+            return {"state": "intervention", "reason": "local_progress_cursor_invalid"}
+        if version == 2 and artifact_index == 0:
+            # Retire the context before reading mailbox children. Replaying this
+            # idempotent unlink after a crash preserves the existing index.
+            (cfg.runtime_root / "progress-coordinator" / f"v{extended_version}" / f"{attempt_id}.json").unlink(
+                missing_ok=True
+            )
+            artifacts[0].unlink(missing_ok=True)
+            cursor["progress_artifact"] = 1
+            return {"state": "in_progress"}
         mailbox = cfg.runtime_root / "progress" / attempt_id
         mailbox_name, mailbox_next = _read_cleanup_child(mailbox, cursor.get("progress_mailbox_offset", 0))
         if mailbox_name is not None:
@@ -609,24 +650,11 @@ def _advance_cleanup_local_step(
         if mailbox.exists():
             mailbox.rmdir()
             return {"state": "in_progress"}
-        roots = (
-            ("progress-v2-contexts", "progress-v2-observed")
-            if version == 2
-            else (
-                "progress-contexts",
-                "progress-observed",
-                "progress-diagnostics",
-            )
-        )
-        artifacts = [cfg.runtime_root / name / f"{attempt_id}.json" for name in roots]
-        artifact_index = cursor.get("progress_artifact", 0)
-        if type(artifact_index) is not int or not 0 <= artifact_index <= len(artifacts):
-            return {"state": "intervention", "reason": "local_progress_cursor_invalid"}
         if artifact_index < len(artifacts):
             if artifact_index == 0:
                 # Optional cadence follows its context without changing the
                 # persisted cleanup cursor's existing artifact numbering.
-                (cfg.runtime_root / "progress-coordinator" / f"v{version}" / f"{attempt_id}.json").unlink(
+                (cfg.runtime_root / "progress-coordinator" / f"v{extended_version}" / f"{attempt_id}.json").unlink(
                     missing_ok=True
                 )
             artifacts[artifact_index].unlink(missing_ok=True)
@@ -748,10 +776,14 @@ def _advance_cleanup_finalization_step(
         with exclusive(_progress_lock_path(cfg.shared_root, task_id), blocking=False) as acquired:
             if not acquired:
                 return {"state": "waiting", "reason": "progress_lock_busy", "cursor": cursor}
+            if stage == "progress_v2_delete":
+                extended_version = cursor.get("extended_progress_version", 2)
+                if type(extended_version) is not int or extended_version not in {2, 3}:
+                    return {"state": "intervention", "reason": "cleanup_shared_cursor_invalid", "cursor": cursor}
             directory = (
                 Path(cfg.shared_root) / "progress" / task_id
                 if stage == "progress_delete"
-                else Path(cfg.shared_root) / "progress-v2" / task_id
+                else Path(cfg.shared_root) / f"progress-v{extended_version}" / task_id
             )
             name, next_offset = _read_cleanup_child(directory, offset)
             if name is not None:
@@ -763,8 +795,18 @@ def _advance_cleanup_finalization_step(
                 return {"state": "in_progress", "cursor": cursor}
             if directory.exists():
                 directory.rmdir()
-            next_stage = "progress_v2_delete" if stage == "progress_delete" else "deadline_index"
-            cursor.update({"stage": next_stage, "offset": 0})
+            if stage == "progress_delete":
+                cursor.pop("extended_progress_version", None)
+                cursor.update({"stage": "progress_v2_delete", "offset": 0})
+            else:
+                extended_version = cursor.get("extended_progress_version", 2)
+                if type(extended_version) is not int or extended_version not in {2, 3}:
+                    return {"state": "intervention", "reason": "cleanup_shared_cursor_invalid", "cursor": cursor}
+                if extended_version == 2:
+                    cursor.update({"extended_progress_version": 3, "offset": 0})
+                else:
+                    cursor.pop("extended_progress_version", None)
+                    cursor.update({"stage": "deadline_index", "offset": 0})
             return {"state": "in_progress", "cursor": cursor}
 
     if stage in {"attempts_delete", "logs_delete", "progress_delete", "progress_v2_delete"}:

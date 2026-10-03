@@ -36,10 +36,13 @@ def _snapshot(context):
         )
     }
     progress = {"stage": "train", "current": 1, "total": 10, "unit": "step", "message": None}
-    if context["protocol_version"] == 2:
+    if context["protocol_version"] in {2, 3}:
         progress.update(
             {"metrics": {"loss": 0.5}, "completeness": {"complete": True, "omitted_metrics": 0, "reasons": []}}
         )
+    if context["protocol_version"] == 3:
+        activity = {key: progress.pop(key) for key in ("stage", "current", "total", "unit", "message")}
+        progress.update(activity=activity, overall={"current": 8, "total": 10, "unit": "step", "label": "Training"})
     return {
         "protocol_version": context["protocol_version"],
         **identity,
@@ -72,7 +75,7 @@ def _request(tmp_path, version, *, publish=False):
     )
 
 
-@pytest.mark.parametrize("version", [1, 2])
+@pytest.mark.parametrize("version", [1, 2, 3])
 @pytest.mark.parametrize("publish", [False, True])
 def test_progress_protocol_round_trip_exact_identity_and_snapshot(tmp_path, version, publish):
     request = _request(tmp_path, version, publish=publish)
@@ -89,7 +92,7 @@ def test_progress_protocol_round_trip_exact_identity_and_snapshot(tmp_path, vers
     assert ProjectIOResult.from_dict(result.to_dict()) == result
 
 
-@pytest.mark.parametrize("version", [1, 2])
+@pytest.mark.parametrize("version", [1, 2, 3])
 @pytest.mark.parametrize(
     "field,value",
     [
@@ -113,7 +116,7 @@ def test_progress_cannot_transport_authority_or_resource_offer(tmp_path, changes
         replace(_request(tmp_path, 1), **changes)
 
 
-@pytest.mark.parametrize("version", [1, 2])
+@pytest.mark.parametrize("version", [1, 2, 3])
 def test_progress_success_cannot_acknowledge_a_different_publication(tmp_path, version):
     request = _request(tmp_path, version, publish=True)
     snapshot = _snapshot(request.parameters["context"])

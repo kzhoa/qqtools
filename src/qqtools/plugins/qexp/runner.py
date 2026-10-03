@@ -19,6 +19,7 @@ from .runtime.authority_lock import authority_locks
 from .runtime.paths import attempt_path, local_paths
 from .runtime.progress import prepare_progress_channel, record_progress_diagnostic
 from .runtime.progress_v2 import prepare_progress_v2_channel
+from .runtime.progress_v3 import prepare_progress_v3_channel
 from .runtime.records import AttemptRecord, utc_now
 from .runtime.responsibility import require_launch_responsibility
 from .runtime.store import atomic_replace, create_if_absent, read_json
@@ -224,12 +225,17 @@ def run_attempt(
         record_progress_diagnostic(cfg, attempt.attempt_id, progress_policy["diagnostic_reason"])
 
     progress_v2_channel = None
+    progress_v3_channel = None
+    live_progress_enabled = False
     if progress_channel is not None:
         try:
             # The executor records malformed or historical selection diagnostics;
             # a stalled optional Operation read must not delay the child launch.
             live_progress_enabled = _read_live_progress_bounded(cfg, task_id)
-            if live_progress_enabled:
+        except Exception:
+            pass
+        if live_progress_enabled:
+            try:
                 progress_v2_channel = prepare_progress_v2_channel(
                     cfg,
                     task,
@@ -237,13 +243,24 @@ def run_attempt(
                     wrapper_start_time_ticks=wrapper_start_time_ticks,
                     interval_seconds=progress_channel.interval_seconds,
                 )
-        except Exception:
-            pass
+            except Exception:
+                pass
+            try:
+                progress_v3_channel = prepare_progress_v3_channel(
+                    cfg,
+                    task,
+                    attempt,
+                    wrapper_start_time_ticks=wrapper_start_time_ticks,
+                    interval_seconds=progress_channel.interval_seconds,
+                )
+            except Exception:
+                pass
 
     environment = os.environ.copy()
     # Never let a nested submission inherit another Attempt's channel.
     environment.pop("QEXP_PROGRESS_PATH", None)
     environment.pop("QEXP_PROGRESS_V2_PATH", None)
+    environment.pop("QEXP_PROGRESS_V3_PATH", None)
     environment.pop("QEXP_PROGRESS_FD", None)
     environment.pop("QEXP_PROGRESS_INTERVAL_SECONDS", None)
     if progress_channel is not None:
@@ -254,6 +271,8 @@ def run_attempt(
             )
         if progress_v2_channel is not None:
             environment["QEXP_PROGRESS_V2_PATH"] = progress_v2_channel
+        if progress_v3_channel is not None:
+            environment["QEXP_PROGRESS_V3_PATH"] = progress_v3_channel
     if task.spec.is_cpu_only:
         environment["CUDA_VISIBLE_DEVICES"] = ""
     elif attempt.assigned_gpus:

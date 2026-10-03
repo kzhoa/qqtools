@@ -355,7 +355,7 @@ automatic cancellation, speed, or ETA is included in Phase 1.
 A rank-zero best-effort observation plugin consumes committed runner facts. It
 shares the process-level reporter used by `qqtools.qexp.progress.update()` calls
 from user code. There is no qPipeline-owned Reporter and no second mailbox writer.
-Only an active `QEXP_PROGRESS_PATH` channel on rank zero creates this connector.
+Only a configured v1, v2 or v3 channel on rank zero creates this connector.
 
 `train_runner(..., *, observation_plugins=None)` selects the explicit default
 integration providers. An empty sequence disables optional connectors; a
@@ -384,7 +384,7 @@ loader name or zero-based fallback index, and standard/EMA model variant. The
 adapter reports counts per loader and emits no invented completion for an empty
 loader. After evaluation it restores the latest known training context. The
 adapter never reads Rich/Tqdm renderer state, and external producers continue to
-use only the framework-neutral five-field application payload.
+use the framework-neutral progress API with optional declared overall scope.
 
 `evaluation_batch_committed` is a rank-local fact emitted after each successfully
 processed evaluation loader iteration, including a dedup padding iteration. It
@@ -489,5 +489,148 @@ Attempt-scoped snapshot with refreshed relative ages. It does not change reporti
 infer completion, or provide a structured event stream, and therefore rejects `--format`.
 `qexp task logs` and `task logs --follow` preserve raw application bytes on stdout while qexp
 diagnostics and stream boundaries use stderr. Continuous JSON/events, FD transport,
-metrics, history, ETA, list progress columns, multiple streams, stale policy, stdout parsers,
+history, ETA, multiple streams, stale policy, stdout parsers,
 and third-party framework adapters remain deferred.
+
+## Scoped progress and Task lists
+
+```bash
+qexp task list --group experiment --view progress
+qexp task list --group experiment --view placement
+qexp task list --fields state,reason,dependency
+qexp task list --view overall
+```
+
+`--view` and `--fields` are alternatives for human output, and cannot accompany
+`--format=json`. `default` keeps the existing table. Explicit field lists are
+ordered, with `task` inserted first. Progress includes Task, State, Overall,
+Activity, Report age and Location. Placement includes Task, State, GPUs, Home,
+Queue and Location. Overall includes Task, State, Overall and Location.
+`task list --help` lists all available fields. Continuation commands preserve
+the normalized presentation; changing fields does not invalidate a cursor.
+
+New views preserve all selected fields at narrow widths by wrapping or using
+labeled blocks. IDs remain complete and copyable. Names are limited to 32
+display cells, messages and reasons to 48; an ellipsis and a Project-aware
+`task show TASK_ID --details` action expose shortened content. Redirected tables
+are deterministic and unwrapped. Numbered legends distinguish unavailable
+observations from failed Tasks, deduplicate the reason and provide a read-only
+next action. Existing blocked/failed Task reasons need no log reads.
+
+Location is the selected current Attempt's physical machine/GPU allocation,
+with an orphaned suffix when appropriate. A claim machine is not allocation
+evidence; terminal placement is historical and is omitted. Missing evidence
+never causes history fallback. Only explicitly requested dependencies are read.
+Enriched views require a limit from 1 through 1000 or pagination.
+
+### Producer integration
+
+Select `--live-progress` for a new submission, or configure the Group default
+before submission, and report explicit overall counters from the application:
+
+```python
+from qqtools.qexp.progress import Counter, update, validate_update
+
+training = Counter(current=33574, total=42000, unit="step", label="Training")
+errors = validate_update(stage="train", current=33574, total=42000,
+                         unit="step", overall=training)
+assert not errors
+update(stage="train", current=33574, total=42000, unit="step", overall=training)
+update(stage="validation", current=184, total=256, unit="batch", overall=training)
+update(stage="test", current=8, total=10, unit="batch")
+```
+
+Use validation while integrating, rather than on every step. Errors identify
+invalid fields; an empty tuple proves input validity only. Next check launch
+configuration and `task show TASK_ID --details`. `update` returning True means
+accepted in process, not durable publication. No channel, rejected offers and
+invalid inputs return False. Metric omission remains valid input.
+
+Each offer replaces the whole report. The last example clears overall scope.
+Carry a known training counter explicitly during validation; standalone
+evaluation needs no training counter. Counts represent completed work, so an
+active first epoch is not one completed epoch. Counter construction stores
+fields without validation; malformed values safely reject at offer time.
+
+Overall and Activity remain separate even if their numbers match. Counters
+show percentages first, with comma-grouped counts. Rounding incomplete work
+to 100 displays `<100%`; only positive exact completion displays `100%`. Zero
+and unknown totals produce no percentage. Training at 100% can coexist with
+validation and a running Task. No counter controls Task outcome.
+
+Report age uses agent acceptance time, never refresh/publication time or
+producer time. It is not a heartbeat or stall detector. Future timestamps
+show Clock difference. A selected v1/v2 or activity-only v3 report shows
+Not provided for Overall. A validated frozen opt-out shows Not enabled; missing
+legacy policy means unknown, with a diagnostic rather than an opt-out claim.
+Queued Tasks show Not started, active Attempts No report yet, and terminal
+Tasks without reports No report recorded. Existing processes cannot gain a
+channel by changing policy or restarting an agent.
+
+### V3 storage and whole-report selection
+
+V3 retains the exact v2 context/snapshot identity envelope with version 3.
+The producer payload has protocol_version/update_id/activity/overall/metrics/
+completeness. Activity has the existing stage/current/total/unit/message fields;
+nullable overall has current/total/unit/label. Every key is required, unknown
+keys reject, and metrics retain v2 omission semantics and bounds. Payloads
+are limited to 8 KiB, snapshots to 16 KiB, metrics to 32. The local environment
+variable is QEXP_PROGRESS_V3_PATH; mailbox progress/<attempt>/latest-v3.json,
+context progress-v3-contexts/, cache progress-v3-observed/, shared snapshot
+progress-v3/<task>/<attempt>.json and cadence progress-coordinator/v3/.
+
+All configured channels share an offer ID and retry independently. Overall-only
+changes advance semantic observation; label/message/metric-only changes retain
+advanced_at. V3 shares the v2 cadence state machine and the coordinator's
+unchanged total work budget. Cleanup uses the existing Task progress lock and
+retains existing durable cursor stages and artifact positions.
+
+Human views select the newest authorized complete report by reported_at, with
+higher version winning ties. They then prefer a higher version proven to be
+the same update by full Attempt/process identity, fencing token, registration
+generation, nonempty source ID and equal activity. The selected report retains
+its original timestamp. Matching numbers alone are insufficient. A distinct
+newer v1/v2 report replaces the older v3 report, including its overall/metrics.
+Legacy JSON selectors remain v1/v2-only; additive progress_scoped and
+selected_progress_protocol_version expose v3 without changing list JSON.
+
+V1/v2 remain permanent formats. The required normal upgrade is L1: install the package
+and restart the global agent one machine at a time while workloads continue.
+Newly launched enabled Attempts receive v3; already running producers keep
+their existing channels. Package rollout and availability of overall reports
+are separate milestones. No Project migration, backfill or fleet barrier is
+required by the progress channel.
+
+
+### Scoped-progress qualification status
+
+The executable [released-source fixture](../../tests/fixtures/qexp_progress_rollout.py)
+extracts a named release with `git archive`, verifies subprocess imports, records
+source digests, and isolates its Project, machine runtime, home, temporary files
+and tmux sockets. It uses deterministic injected GPU discovery and a bounded
+`chronyc` provider fixture; it does not exercise physical accelerators or remote
+filesystems. Run the two scenarios in fresh, short directories:
+
+```sh
+python tests/fixtures/qexp_progress_rollout.py --ref v1.3.22 --scenario new-attempt --output /tmp/qexp-v3-new
+python tests/fixtures/qexp_progress_rollout.py --ref v1.3.22 --scenario rollout --output /tmp/qexp-v3-rollout
+```
+
+The 2026-10-03 `rollout` and `new-attempt` scenarios passed against released v1.3.22
+(`fbb73594a2c502a3f3234c376f178ae7a3c5a8cb`) with candidate source SHA-256
+`dec64f2d2438b4f333c4278d18770f35b14def0b61b7ec99fca82d33f7d6b4a1`
+and fixture SHA-256
+`e6729504943c1e14a50111fbae1efaaf07155a2a9fc415da26678bd0d59d701b`.
+The source digest covers sorted Python source paths and bytes, as defined by the
+fixture. Evidence includes the same PID and Attempt across agent restart,
+continued v1/v2 reports accepted after restart, new v3 activation while the old
+producer remains running, released-client reads and cleanup, frozen opt-out,
+and convergence of offline completion after a second agent restart.
+
+Qualification exposed existing restart defects: released manifests omitted their
+reservation locator, healthy termination probes remained pending, and continuous
+progress reset background fairness ahead of upgrade discovery. The delivery repairs
+these while preserving strict shared authority checks and immutable registrations;
+see [startup reconciliation](qexp_runtime_spec.md#173-agent-startup-reconciliation).
+No compatibility break or manual recovery step is required for the protected
+lifecycle-independence workflow.

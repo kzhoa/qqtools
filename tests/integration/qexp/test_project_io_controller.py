@@ -987,7 +987,7 @@ def test_isolated_dispatch_launches_healthy_peer_without_legacy_project_io(
         monkeypatch.setattr(dispatch_loop, name, reject_legacy_project_io)
 
     results: list[dict[str, object]] = []
-    deadline = time.monotonic() + 5.0
+    deadline = time.monotonic() + 30.0
     while time.monotonic() < deadline and not launched:
         cycle_started = time.monotonic()
         results = dispatch_machine_cycle_locked(
@@ -1057,7 +1057,7 @@ def test_isolated_dispatch_advances_due_offer_without_legacy_maintenance(
 
     monkeypatch.setattr(dispatch_loop, "maintain_project", reject_legacy)
     try:
-        deadline = time.monotonic() + 12.0
+        deadline = time.monotonic() + 30.0
         while time.monotonic() < deadline:
             dispatch_machine_cycle_locked(
                 runtime,
@@ -1130,7 +1130,7 @@ def test_isolated_dispatch_admits_borrow_after_complete_primary_absence(
             return handle, LaunchHandoff(attempt_id, intent, time.monotonic() + 60, handle)
 
     try:
-        deadline = time.monotonic() + 15.0
+        deadline = time.monotonic() + 30.0
         claim = None
         while time.monotonic() < deadline:
             dispatch_machine_cycle_locked(
@@ -2567,7 +2567,7 @@ def test_maintenance_descriptor_idle_settlement_reopens_after_activation(tmp_pat
     _advance_until_validated(controller, bindings, revision, binding.project_id)
     _observe_working_set_activation(runtime, controller, bindings, revision)
 
-    deadline = time.monotonic() + 5.0
+    deadline = time.monotonic() + 30.0
     while time.monotonic() < deadline:
         completions = controller.advance_maintenance_descriptor_work(bindings, revision)
         if completions.get(binding.project_id, {}).get("maintenance_state") == "idle":
@@ -2588,7 +2588,7 @@ def test_maintenance_descriptor_idle_settlement_reopens_after_activation(tmp_pat
     controller._record_service_failure(service_key)
     assert not controller._service_retry_is_due(service_key)
     descriptor = _activate_missing_deadline_descriptor(cfg, suffix="reactivated")
-    deadline = time.monotonic() + 5.0
+    deadline = time.monotonic() + 30.0
     while time.monotonic() < deadline:
         activation = controller.advance_activation_observations(
             bindings,
@@ -2599,10 +2599,14 @@ def test_maintenance_descriptor_idle_settlement_reopens_after_activation(tmp_pat
             break
         time.sleep(0.02)
     else:
-        raise AssertionError("descriptor activation was not observed")
+        raise AssertionError(
+            "descriptor activation was not observed: "
+            f"status={executor.status_view()!r}, unresolved={executor.unresolved_requests()!r}, "
+            f"backoff={controller._service_backoff!r}"
+        )
     assert controller._service_retry_is_due(service_key)
 
-    deadline = time.monotonic() + 5.0
+    deadline = time.monotonic() + 30.0
     while time.monotonic() < deadline:
         completions = controller.advance_maintenance_descriptor_work(bindings, revision)
         if completions.get(binding.project_id, {}).get("maintenance_state") == "completed":

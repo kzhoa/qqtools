@@ -9,6 +9,7 @@ from qqtools.qexp._progress_protocol import identifier
 from ..runtime.progress import _IDENTITY, _context_interval
 from ..runtime.progress_projection import validate_progress_snapshot
 from ..runtime.progress_v2 import _validate_context
+from ..runtime.progress_v3 import _validate_context as _validate_context_v3
 
 
 def progress_context(value: Mapping[str, Any]) -> dict[str, Any]:
@@ -17,11 +18,13 @@ def progress_context(value: Mapping[str, Any]) -> dict[str, Any]:
         raise ValueError("progress context must be an object")
     context = dict(value)
     version = context.get("protocol_version")
-    if type(version) is not int or version not in {1, 2}:
+    if type(version) is not int or version not in {1, 2, 3}:
         raise ValueError("progress context version is invalid")
     attempt_id = identifier(context.get("attempt_id"))
     if version == 2:
         return _validate_context(context, attempt_id)
+    if version == 3:
+        return _validate_context_v3(context, attempt_id)
     required = {"protocol_version", *_IDENTITY}
     policy = {"reporting_policy_version", "interval_seconds"}
     if set(context) not in (required, required | policy):

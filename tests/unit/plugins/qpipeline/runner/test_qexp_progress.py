@@ -98,7 +98,14 @@ def test_fact_adapter_preserves_training_and_loader_local_evaluation(monkeypatch
     assert "table_update" not in callbacks
 
     callbacks["epoch_started"](EpochStartedFact(global_step=7300, epoch=3, total_batches=100, max_epochs=10))
-    assert sink.updates[-1] == dict(stage="train", current=7300, total=15000, unit="step", message="Epoch 4/10")
+    assert sink.updates[-1] == dict(
+        stage="train",
+        current=7300,
+        total=15000,
+        unit="step",
+        message="Epoch 4/10",
+        overall=progress_api.Counter(current=7300, total=15000, unit="step", label="Training"),
+    )
     callbacks["train_boundary"](
         TrainBoundaryCommittedFact(
             global_step=7340,
@@ -128,6 +135,7 @@ def test_fact_adapter_preserves_training_and_loader_local_evaluation(monkeypatch
         total=20,
         unit="batch",
         message="Dataset B · Standard · Epoch 4/10",
+        overall=progress_api.Counter(current=7340, total=15000, unit="step", label="Training"),
     )
     callbacks["evaluation_batch_committed"](
         EvaluationBatchCommittedFact(stage=Stage.VAL, epoch=3, global_step=7340, batch_index=9, total_batches=20)
@@ -230,11 +238,18 @@ def test_empty_evaluation_and_unmatched_start_fallback(monkeypatch):
             model_variant="ema",
         )
     )
-    assert sink.updates[-1] == dict(stage="test", current=None, total=None, unit="batch", message="EMA · Epoch 2/4")
+    assert sink.updates[-1] == dict(
+        stage="test",
+        current=None,
+        total=None,
+        unit="batch",
+        message="EMA · Epoch 2/4",
+        overall=progress_api.Counter(current=5, total=20, unit="step", label="Training"),
+    )
     callbacks["evaluation_batch_committed"](
         EvaluationBatchCommittedFact(stage=Stage.VAL, epoch=1, global_step=5, batch_index=2, total_batches=5)
     )
-    assert sink.updates[-1] == dict(stage="validation", current=3, total=5, unit="batch", message=None)
+    assert sink.updates[-1] == dict(stage="validation", current=3, total=5, unit="batch", message=None, overall=None)
 
 
 @pytest.mark.parametrize("batch_index,total_batches", [(-1, 5), (5, 5), (0, 0)])
@@ -248,3 +263,51 @@ def test_invalid_counts_do_not_claim_batch_completion(monkeypatch, batch_index, 
         )
     )
     assert sink.updates[-1]["current"] is None
+
+
+@pytest.mark.parametrize("max_steps", [None, 0, -1, True, 4, 2**63])
+def test_overall_unknown_limits_do_not_reject_activity(monkeypatch, max_steps):
+    sink = Sink()
+    monkeypatch.setattr(progress_api, "_offer_managed_progress", sink.offer)
+    observer = _observer(monkeypatch, max_steps=max_steps)
+    observer.on_epoch_start(EpochStartedFact(global_step=5, epoch=0, total_batches=10, max_epochs=2))
+    offer = sink.updates[-1]
+    assert offer["total"] is None
+    assert offer["overall"] == progress_api.Counter(current=5, unit="step", label="Training")
+    assert progress_api.validate_update(**offer) == ()
+
+
+def test_evaluation_carries_committed_step_but_new_run_does_not(monkeypatch):
+    sink = Sink()
+    monkeypatch.setattr(progress_api, "_offer_managed_progress", sink.offer)
+    observer = _observer(monkeypatch, max_steps=10)
+    observer.on_epoch_start(EpochStartedFact(global_step=5, epoch=0, total_batches=10, max_epochs=2))
+    start = EvaluationStartedFact(
+        epoch=0,
+        global_step=None,
+        total_batches=4,
+        evaluation_stage="val",
+        loader_name=None,
+        loader_index=0,
+        model_variant="standard",
+    )
+    observer.on_evaluation_started(start)
+    assert sink.updates[-1]["overall"].current == 5
+    observer.on_evaluation_batch_committed(
+        EvaluationBatchCommittedFact(stage=Stage.VAL, epoch=0, global_step=99, batch_index=1, total_batches=4)
+    )
+    assert sink.updates[-1]["current"] == 2
+    assert sink.updates[-1]["overall"].current == 5
+    fresh = _observer(monkeypatch, max_steps=10)
+    fresh.on_evaluation_started(start)
+    assert sink.updates[-1]["overall"] is None
+
+
+def test_epoch_ordinal_is_message_not_completed_epoch_counter(monkeypatch):
+    sink = Sink()
+    monkeypatch.setattr(progress_api, "_offer_managed_progress", sink.offer)
+    observer = _observer(monkeypatch, max_steps=10)
+    observer.on_epoch_start(EpochStartedFact(global_step=0, epoch=0, total_batches=10, max_epochs=2))
+    assert sink.updates[-1]["overall"].current == 0
+    assert "Epoch 1" in sink.updates[-1]["message"]
+    assert sink.updates[-1]["overall"].unit == "step"

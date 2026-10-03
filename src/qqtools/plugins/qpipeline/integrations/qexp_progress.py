@@ -9,6 +9,8 @@ from itertools import islice
 from types import MappingProxyType
 from typing import Any
 
+from qqtools.qexp.progress import Counter
+
 from ..runner.contracts import (
     EpochCommittedFact,
     EpochStartedFact,
@@ -180,9 +182,10 @@ class QexpProgressObserver:
 
     def __init__(self, progress_api: Any, context: ObservationContext) -> None:
         self._progress_api = progress_api
-        self._has_v2_channel = bool(os.environ.get("QEXP_PROGRESS_V2_PATH"))
+        self._has_v2_channel = bool(os.environ.get("QEXP_PROGRESS_V2_PATH") or os.environ.get("QEXP_PROGRESS_V3_PATH"))
         self._max_epochs = _as_int(context.max_epochs)
         self._max_steps = _as_int(context.max_steps)
+        self._last_committed_training_step: int | None = None
         self._training_context: _TrainingContext | None = None
         self._evaluation_context: _EvaluationContext | None = None
         self.subscriptions = (
@@ -193,6 +196,21 @@ class QexpProgressObserver:
             ("evaluation_committed", self.on_evaluation_committed),
             ("epoch_committed", self.on_epoch_committed),
         )
+
+    def _activity_total(self, current: int | None) -> int | None:
+        total = self._max_steps
+        if total is None or total <= 0 or (current is not None and current > total):
+            return None
+        return total
+
+    def _overall_counter(self, step: object) -> Counter | None:
+        current = _as_int(step)
+        if current is None:
+            return None
+        total = self._max_steps
+        if total is None or total <= 0 or total < current:
+            total = None
+        return Counter(current=current, unit="step", total=total, label="Training")
 
     def _training_parts(self, context: _TrainingContext) -> tuple[str | int | None, ...]:
         return (
@@ -210,14 +228,16 @@ class QexpProgressObserver:
         context = self._training_context
         if context is None:
             return
+        step = context.global_step if context.global_step is not None else self._last_committed_training_step
         metrics_kwargs = (
             {"metrics": metrics, "_metrics_source_count": metrics_source_count} if self._has_v2_channel else {}
         )
         self._progress_api._offer_managed_progress(
             stage="train",
             current=context.global_step,
-            total=self._max_steps,
+            total=self._activity_total(context.global_step),
             unit="step",
+            overall=self._overall_counter(step),
             message_parts=self._training_parts(context),
             render_message=_render_message,
             **metrics_kwargs,
@@ -244,6 +264,7 @@ class QexpProgressObserver:
             current=current,
             total=total,
             unit="batch",
+            overall=self._overall_counter(context.global_step),
             message_parts=self._evaluation_parts(context),
             render_message=_render_message,
         )
@@ -254,9 +275,12 @@ class QexpProgressObserver:
         max_epochs = _as_int(fact.max_epochs)
         if max_epochs is not None:
             self._max_epochs = max_epochs
+        global_step = _as_int(fact.global_step)
+        if global_step is not None:
+            self._last_committed_training_step = global_step
         self._training_context = _TrainingContext(
             epoch=_as_position(fact.epoch),
-            global_step=_as_int(fact.global_step),
+            global_step=global_step,
             batch_index=None,
             total_batches=_as_int(fact.total_batches),
         )
@@ -266,9 +290,12 @@ class QexpProgressObserver:
         if type(fact) is not TrainBoundaryCommittedFact:
             return
         metrics, source_count = _progress_metrics(fact.batch_metrics, fact.lr) if self._has_v2_channel else (None, None)
+        global_step = _as_int(fact.global_step)
+        if global_step is not None:
+            self._last_committed_training_step = global_step
         self._training_context = _TrainingContext(
             epoch=_as_position(fact.epoch),
-            global_step=_as_int(fact.global_step),
+            global_step=global_step,
             batch_index=_as_position(fact.batch_index),
             total_batches=_as_int(fact.total_batches),
         )
@@ -282,6 +309,8 @@ class QexpProgressObserver:
         if completed_epoch is None and self._training_context is not None:
             completed_epoch = self._training_context.epoch
         global_step = _as_int(fact.global_step)
+        if global_step is not None:
+            self._last_committed_training_step = global_step
         if global_step is None and self._training_context is not None:
             global_step = self._training_context.global_step
         self._training_context = _TrainingContext(
@@ -297,10 +326,13 @@ class QexpProgressObserver:
         if type(fact) is not EvaluationStartedFact:
             return
         model_variant = fact.model_variant if type(fact.model_variant) is str else None
+        global_step = _as_int(fact.global_step)
+        if global_step is None:
+            global_step = self._last_committed_training_step
         self._evaluation_context = _EvaluationContext(
             stage=_stage_value(fact.evaluation_stage),
             epoch=_as_position(fact.epoch),
-            global_step=_as_int(fact.global_step),
+            global_step=global_step,
             total_batches=_as_total(fact.total_batches),
             loader_name=_safe_text(fact.loader_name),
             loader_index=_as_position(fact.loader_index),
@@ -318,9 +350,11 @@ class QexpProgressObserver:
         if context is not None and context.stage == stage:
             total = context.total_batches
             message_parts = self._evaluation_parts(context)
+            overall = self._overall_counter(context.global_step)
         else:
             total = _as_total(fact.total_batches)
             message_parts = ()
+            overall = self._overall_counter(self._last_committed_training_step)
         batch_index = _as_position(fact.batch_index)
         current = batch_index + 1 if batch_index is not None else None
         if total is not None and (total <= 0 or (current is not None and current > total)):
@@ -330,6 +364,7 @@ class QexpProgressObserver:
             current=current,
             total=total,
             unit="batch",
+            overall=overall,
             message_parts=message_parts,
             render_message=_render_message,
         )
@@ -346,7 +381,13 @@ class QexpProgressObserver:
 
 def qexp_progress_factory(context: ObservationContext) -> QexpProgressObserver | None:
     """Create the connector only for a configured primary-rank progress channel."""
-    if not os.environ.get("QEXP_PROGRESS_PATH") or type(context.rank) is not int or context.rank != 0:
+    if (
+        not any(
+            os.environ.get(name) for name in ("QEXP_PROGRESS_PATH", "QEXP_PROGRESS_V2_PATH", "QEXP_PROGRESS_V3_PATH")
+        )
+        or type(context.rank) is not int
+        or context.rank != 0
+    ):
         return None
     from qqtools.qexp import progress as progress_api
 

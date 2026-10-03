@@ -433,13 +433,51 @@ def build_parser() -> argparse.ArgumentParser:
         modes=OutputMode.FINITE,
         output_kinds=OutputKind.AVAILABILITY,
     )
-    listing = task_sub.add_parser("list", help="List Tasks with bounded filters and pagination.")
+    listing = task_sub.add_parser(
+        "list",
+        help="List Tasks with bounded filters and pagination.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description=(
+            "Examples:\n"
+            "  qexp task list --group GROUP --view progress\n"
+            "  qexp task list --group GROUP --view placement\n"
+            "  qexp task list --phase blocked --fields state,reason,dependency\n"
+            "  qexp task list --group GROUP --view overall\n\n"
+            "Views (human output only):\n"
+            "  progress  daily progress, activity, report age, and location\n"
+            "  placement requested resources and current allocation\n"
+            "  overall   declared overall counters without activity fallback\n"
+            "  default   existing dynamic Task table\n\n"
+            "Fields are ordered by the comma-separated --fields value; task is automatically inserted first.\n\n"
+            "Fields — identity/state:\n"
+            "  task             stable Task identity (name and complete ID)\n"
+            "  name             Task name\n"
+            "  state            Task projection\n"
+            "  dependency       dependency gate and IDs\n"
+            "  reason           Task-truth reason\n"
+            "Fields — placement:\n"
+            "  requested-gpus   requested GPU count\n"
+            "  group            Group name\n"
+            "  home             home machine\n"
+            "  queue            queue scope\n"
+            "  claimed-machine  active claim machine\n"
+            "  location         selected current Attempt allocation\n"
+            "Fields — progress:\n"
+            "  overall-progress declared overall counter\n"
+            "  activity         current stage, counter, and message\n"
+            "  report-age       age since agent acceptance\n\n"
+            "Views and --fields are human-only and cannot be combined with --format=json. New submissions can "
+            "opt into live progress with --live-progress; this does not retrofit an existing process."
+        ),
+    )
     listing.add_argument("--phase")
     listing.add_argument("--group")
     listing.add_argument("--name", help="Exact, case-sensitive Task name filter.")
     listing.add_argument("--limit", type=int, default=None)
     listing.add_argument("--page-size", default=None)
     listing.add_argument("--cursor", default=None)
+    listing.add_argument("--view", choices=("default", "progress", "placement", "overall"), default=None)
+    listing.add_argument("--fields", default=None, help="Comma-separated human fields; task is inserted first.")
     _add_output_format(listing)
     bind_command(
         listing,

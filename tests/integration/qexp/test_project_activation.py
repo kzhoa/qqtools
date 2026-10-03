@@ -11,8 +11,8 @@ import pytest
 from qqtools.plugins.qexp import init_shared_root
 from qqtools.plugins.qexp.commands.group import create_group
 from qqtools.plugins.qexp.commands.task import submit
-from qqtools.plugins.qexp.runtime import maintenance as maintenance_module
 from qqtools.plugins.qexp.runtime import maintenance_outbox as maintenance_outbox_module
+from qqtools.plugins.qexp.runtime import maintenance_service as maintenance_module
 from qqtools.plugins.qexp.runtime.availability import offer_deadlines as offer_deadline_module
 from qqtools.plugins.qexp.runtime.availability.offer_deadlines import remove_deadline_index
 from qqtools.plugins.qexp.runtime.group_discovery import locator

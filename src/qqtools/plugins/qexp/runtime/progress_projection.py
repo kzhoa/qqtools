@@ -6,23 +6,30 @@ from pathlib import Path
 from typing import Any, Callable
 
 from qqtools.qexp._progress_protocol import MAX_SNAPSHOT_BYTES, read_advisory_snapshot, replace_advisory_snapshot
+from qqtools.qexp._progress_protocol_v3 import MAX_SNAPSHOT_V3_BYTES
 
 from .locks import exclusive
 from .progress import _progress_lock_path, _validate_projection, resolve_progress_binding, shared_progress_path
 from .progress_v2 import _validate_projection_v2
+from .progress_v3 import _validate_projection_v3
 
 
 def _snapshot_path(cfg: Any, context: dict[str, Any]) -> Path:
-    directory = "progress" if context["protocol_version"] == 1 else "progress-v2"
+    version = context["protocol_version"]
+    directory = "progress" if version == 1 else f"progress-v{version}"
     return Path(cfg.shared_root) / directory / context["task_id"] / f"{context['attempt_id']}.json"
 
 
 def validate_progress_snapshot(
     value: Any, binding: dict[str, Any], version: int, *, require_token: bool = False
 ) -> dict:
-    if type(version) is not int or version not in {1, 2}:
+    if type(version) is not int or version not in {1, 2, 3}:
         raise ValueError("progress snapshot version is invalid")
-    validate = _validate_projection if version == 1 else _validate_projection_v2
+    validate = {
+        1: _validate_projection,
+        2: _validate_projection_v2,
+        3: _validate_projection_v3,
+    }[version]
     return validate(value, binding, require_token=require_token, require_generation=True)
 
 
@@ -35,7 +42,10 @@ def observe_progress_snapshot(cfg: Any, context: dict[str, Any], registration_ge
     snapshot = None
     try:
         snapshot = validate_progress_snapshot(
-            read_advisory_snapshot(_snapshot_path(cfg, context), max_bytes=MAX_SNAPSHOT_BYTES),
+            read_advisory_snapshot(
+                _snapshot_path(cfg, context),
+                max_bytes=MAX_SNAPSHOT_V3_BYTES if context["protocol_version"] == 3 else MAX_SNAPSHOT_BYTES,
+            ),
             binding,
             context["protocol_version"],
         )
@@ -74,7 +84,10 @@ def publish_progress_snapshot(
         existing = None
         try:
             existing = validate_progress_snapshot(
-                read_advisory_snapshot(path, max_bytes=MAX_SNAPSHOT_BYTES),
+                read_advisory_snapshot(
+                    path,
+                    max_bytes=MAX_SNAPSHOT_V3_BYTES if context["protocol_version"] == 3 else MAX_SNAPSHOT_BYTES,
+                ),
                 current,
                 context["protocol_version"],
                 require_token=True,
@@ -88,11 +101,15 @@ def publish_progress_snapshot(
         if before_replace is not None:
             before_replace()
         path.parent.mkdir(parents=True, exist_ok=True)
-        kwargs = {"max_bytes": MAX_SNAPSHOT_BYTES} if context["protocol_version"] == 2 else {}
+        kwargs = (
+            {"max_bytes": MAX_SNAPSHOT_V3_BYTES if context["protocol_version"] == 3 else MAX_SNAPSHOT_BYTES}
+            if context["protocol_version"] in {2, 3}
+            else {}
+        )
         if before_replace is not None:
             kwargs["before_replace"] = before_replace
         writer(path, validated, **kwargs)
-        if context["protocol_version"] == 2 and not context_alive():
+        if context["protocol_version"] in {2, 3} and not context_alive():
             if before_replace is not None:
                 before_replace()
             path.unlink(missing_ok=True)

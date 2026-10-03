@@ -2743,7 +2743,9 @@ def _progress_projection(
     context = dict(parameters["context"])
     cfg = load_root_config(Path(request.canonical_shared_root), parameters["machine_name"])
     project_root = machine_project_paths(runtime_root, request.project_id)["root"]
-    directory = "progress-contexts" if context["protocol_version"] == 1 else "progress-v2-contexts"
+    directory = (
+        "progress-contexts" if context["protocol_version"] == 1 else f"progress-v{context['protocol_version']}-contexts"
+    )
     context_path = project_root / directory / f"{context['attempt_id']}.json"
 
     def context_alive() -> bool:

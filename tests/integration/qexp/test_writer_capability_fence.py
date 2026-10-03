@@ -113,7 +113,7 @@ def test_group_control_rejects_before_group_truth_mutation(cfg, gate):
 
 @pytest.mark.parametrize("gate", ["required", "ready"])
 def test_interrupted_cleanup_with_missing_task_cannot_delete_attempts_after_gate(cfg, monkeypatch, gate):
-    from qqtools.plugins.qexp.commands import cleanup
+    from qqtools.plugins.qexp.runtime import cleanup_maintenance as cleanup
 
     task = submit(cfg, ["true"])
     attempt = claim_task(cfg, task.task_id, [0])

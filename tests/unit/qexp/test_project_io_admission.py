@@ -900,3 +900,22 @@ def test_state_guards_reject_nested_collection_and_draining_reentry():
     admission.offer(intent, action)
     admission.finish()
     assert not admission.active
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_continuous_progress_cannot_rewind_ordinary_background_rotation(reverse):
+    admission = ProjectIOAdmission()
+    owner = _intent("a").owner
+    kinds = ["recovery_admission", "upgrade_service", "activation_observe", "machine_snapshot_publish"]
+    ordinary = [ServiceIntent(owner, "background", kind, ()) for kind in kinds]
+    executed = []
+    for turn in range(3 * len(ordinary) * 2):
+        phase = "observe" if turn % 2 == 0 else "publish"
+        progress = ServiceIntent(owner, "background", "progress_projection", ("epoch", "progress", "attempt", phase))
+        intents = [progress, *ordinary]
+        admission.begin([owner], blocked=(), free_slots=1)
+        _offer_all(admission, list(reversed(intents)) if reverse else intents, executed)
+        admission.finish()
+    # Every continuously waiting family gets two full turns despite an endless
+    # producer stream. In particular upgrade cannot remain unknown after restart.
+    assert [item for item in executed if item.operation_kind != "progress_projection"] == ordinary * 2

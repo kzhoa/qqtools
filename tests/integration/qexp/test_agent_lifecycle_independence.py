@@ -539,17 +539,29 @@ run_machine_agent_loop(root, available_gpus=[0])
 
 
 @pytest.mark.parametrize(
-    "binding_count",
-    [1, 2, 8, pytest.param(65, marks=pytest.mark.slow)],
+    ("binding_count", "intent_window"),
+    [
+        pytest.param(1, 64, id="1"),
+        pytest.param(2, 64, id="2"),
+        pytest.param(3, 2, id="3-window-2"),
+        pytest.param(8, 64, marks=pytest.mark.stress, id="8"),
+        pytest.param(65, 64, marks=pytest.mark.stress, id="65"),
+    ],
 )
 def test_real_agent_healthy_binding_scale_preserves_incumbent_progress(
     tmp_path: Path,
     binding_count: int,
+    intent_window: int,
 ) -> None:
     """Qualify mixed scheduling, supervision, and background progress at scale."""
     from qqtools.plugins.qexp.lease import LeasePolicy, save_lease_policy
 
     runtime = MachineRuntime(tmp_path / "machine-runtime")
+    case_deadline = time.monotonic() + 600
+
+    def remaining_seconds():
+        return max(0.0, case_deadline - time.monotonic())
+
     configs = []
     first_markers = []
     for index in range(binding_count):
@@ -568,15 +580,29 @@ def test_real_agent_healthy_binding_scale_preserves_incumbent_progress(
         runtime.ensure_binding(cfg.shared_root, "gpu-1")
         configs.append(cfg)
     set_cpu_lane_capacity(runtime.root, capacity=min(4, binding_count))
-    process = start_machine_agent(runtime, available_gpus=[], loop_interval=0.05)
+    if intent_window == 64:
+        process = start_machine_agent(runtime, available_gpus=[], loop_interval=0.05)
+    else:
+        # Exercise a real agent, worker processes, runners, and durable state
+        # across the same bounded-window boundary without 130 training launches.
+        agent_script = """
+import sys
+from qqtools.plugins.qexp.agent import project_io_admission, project_io_controller
+from qqtools.plugins.qexp.agent.lifecycle import run_machine_agent_loop
+project_io_admission._MAX_PENDING_INTENTS = int(sys.argv[2])
+project_io_controller._MAX_RETAINED_SCHEDULER_INTENTS = int(sys.argv[2])
+run_machine_agent_loop(sys.argv[1], available_gpus=[], loop_interval=0.05)
+"""
+        process = subprocess.Popen(
+            [sys.executable, "-c", agent_script, str(runtime.root), str(intent_window)], start_new_session=True
+        )
     first_tasks = []
     second_tasks = []
     try:
         expected = {binding.project_id for binding in runtime.load_registry()[1]}
-        background_timeout = 3600 if binding_count == 65 else 600
         _wait_for(
             lambda: expected.issubset(set(get_machine_agent_status(runtime)["reconciled_project_ids"])),
-            timeout=background_timeout,
+            timeout=remaining_seconds(),
             description=f"real-agent recovery for every one of {binding_count} bindings",
         )
         first_entries = list(enumerate(configs))
@@ -598,12 +624,12 @@ def test_real_agent_healthy_binding_scale_preserves_incumbent_progress(
             first_markers.append(marker)
         # Add a second attempt-bearing Task while the first roster still
         # contains continuously eligible incumbents. Repeating every owner,
-        # including the one initially outside the 64-intent window, proves that
+        # including the one initially outside the configured intent window, proves that
         # a continuing arrival wave cannot strand an incumbent after its first
         # scheduling/supervision cycle.
         _wait_for(
             lambda: any(marker.exists() for marker in first_markers),
-            timeout=background_timeout,
+            timeout=remaining_seconds(),
             description=f"first scheduling result across {binding_count} bindings",
         )
         second_entries = list(enumerate(configs))
@@ -623,8 +649,6 @@ def test_real_agent_healthy_binding_scale_preserves_incumbent_progress(
                 )
             )
 
-        timeout = 3600 if binding_count == 65 else 600
-
         def every_task_succeeded() -> bool:
             return all(
                 load_task(cfg, task.task_id).state["projection"] == "succeeded" for cfg, task, _marker in first_tasks
@@ -632,7 +656,7 @@ def test_real_agent_healthy_binding_scale_preserves_incumbent_progress(
 
         _wait_for(
             every_task_succeeded,
-            timeout=timeout,
+            timeout=remaining_seconds(),
             description=f"scale-{binding_count} scheduling and supervision results",
         )
         assert all(marker.exists() for marker in first_markers)
@@ -643,7 +667,7 @@ def test_real_agent_healthy_binding_scale_preserves_incumbent_progress(
         # supervision waves share the bounded executor.
         _wait_for(
             lambda: all(machine_state_path(cfg, "agent.json").exists() for cfg in configs),
-            timeout=background_timeout,
+            timeout=remaining_seconds(),
             description=f"background snapshots for activated bindings at scale {binding_count}",
         )
 
@@ -654,7 +678,7 @@ def test_real_agent_healthy_binding_scale_preserves_incumbent_progress(
             lambda: (
                 not any(record.get("shared_root") in selected_roots for record in active_reservations(runtime.root))
             ),
-            timeout=30,
+            timeout=min(30, remaining_seconds()),
             description="scale qualification target reservation cleanup",
         )
     finally:
@@ -811,7 +835,8 @@ def test_agent_projects_both_progress_versions_through_isolated_transactions(tmp
             "from pathlib import Path\nimport time\nfrom qqtools.qexp import progress\n"
             "def report(number):\n"
             "    assert progress.update(stage='train' if number==1 else 'done', current=number, total=2, "
-            "unit='step', metrics={'loss':1/number})\n"
+            "unit='step', metrics={'loss':1/number}, "
+            "overall=progress.Counter(current=number,total=2,unit='step',label='Training'))\n"
             "    progress.flush(timeout=1)\n"
             f"marker=Path({str(marker)!r})\nreport(1)\nmarker.write_text('1')\n"
             "deadline=time.monotonic()+120\n"
@@ -826,33 +851,44 @@ def test_agent_projects_both_progress_versions_through_isolated_transactions(tmp
     try:
         _wait_running(cfg, task.task_id, marker)
 
-        def both_reports(current: int) -> bool:
+        def all_reports(current: int) -> bool:
             view = inspect_task(cfg, task.task_id)
             return (
                 view["progress"].get("progress", {}).get("current") == current
                 and view["progress_extended"].get("progress", {}).get("current") == current
+                and view["progress_scoped"].get("progress", {}).get("overall", {}).get("current") == current
             )
 
-        # Both protocols share the binding slot with registration, scheduling,
+        # All three protocols share the binding slot with registration, scheduling,
         # supervision and maintenance. Their full cold-start chain is not the
         # single-peer primary/renewal 15-second qualification.
         _wait_for(
-            lambda: both_reports(1),
+            lambda: all_reports(1),
             timeout=45,
-            description="both live progress projections",
+            description="all three live progress projections",
             on_timeout=lambda: inspect_task(cfg, task.task_id),
         )
         view = inspect_task(cfg, task.task_id)
         assert view["progress_extended"]["progress"]["metrics"] == {"loss": 1.0}
-        assert view["selected_progress_version"] == 2
+        from datetime import datetime
+
+        accepted_v1 = datetime.fromisoformat(view["progress"]["reported_at"].replace("Z", "+00:00"))
+        accepted_v2 = datetime.fromisoformat(view["progress_extended"]["reported_at"].replace("Z", "+00:00"))
+        # Legacy JSON remains timestamp-only even when the richer same-source
+        # report was accepted first by the fair three-channel rotation.
+        assert view["selected_progress_version"] == (2 if accepted_v2 >= accepted_v1 else 1)
+        assert view["selected_progress_protocol_version"] == 3
+        assert len({view[key]["source_update_id"] for key in ("progress", "progress_extended", "progress_scoped")}) == 1
+        assert view["progress_scoped"]["progress"]["activity"] == view["progress"]["progress"]
+        assert view["progress_scoped"]["progress"]["overall"]["label"] == "Training"
         assert marker.read_text() == "1"
         marker.with_suffix(".finish").touch()
         terminal = _wait_terminal(cfg, task.task_id)
         assert terminal.state["projection"] == "succeeded"
         _wait_for(
-            lambda: both_reports(2),
+            lambda: all_reports(2),
             timeout=75,
-            description="both terminal progress projections",
+            description="all three terminal progress projections",
             on_timeout=lambda: inspect_task(cfg, task.task_id),
         )
         assert load_task(cfg, task.task_id).attempt_control["next_attempt_number"] == 2
@@ -861,6 +897,7 @@ def test_agent_projects_both_progress_versions_through_isolated_transactions(tmp
             lambda: (
                 not any((local_root / "progress-contexts").glob("*.json"))
                 and not any((local_root / "progress-v2-contexts").glob("*.json"))
+                and not any((local_root / "progress-v3-contexts").glob("*.json"))
             ),
             timeout=15,
         )

@@ -271,6 +271,66 @@ class ProgressV2Projector:
         self._entries: OrderedDict[str, dict[str, Any]] = OrderedDict()
         self._scan = None
 
+    def _context_path(self, attempt_id: str) -> Path:
+        return _context_path(self.cfg, attempt_id)
+
+    def _observed_path(self, attempt_id: str) -> Path:
+        return _observed_path(self.cfg, attempt_id)
+
+    def _shared_path(self, task_id: str, attempt_id: str) -> Path:
+        return _shared_path(self.cfg, task_id, attempt_id)
+
+    def _mailbox_path(self, attempt_id: str) -> Path:
+        return _local_mailbox_path(self.cfg.runtime_root, attempt_id)
+
+    def _context_directory(self) -> str:
+        return "progress-v2-contexts"
+
+    def _observed_directory(self) -> str:
+        return "progress-v2-observed"
+
+    def _mailbox_name(self) -> str:
+        return _LOCAL_MAILBOX_NAME
+
+    def _coordinator_directory(self) -> str:
+        return "v2"
+
+    def _validate_context(self, value: Any, attempt_id: str) -> dict[str, Any]:
+        return _validate_context(value, attempt_id)
+
+    def _validate_payload(self, value: Any) -> dict[str, Any]:
+        return validate_payload_v2(value)
+
+    def _validate_projection(
+        self,
+        value: Any,
+        identity: dict[str, Any],
+        *,
+        require_token: bool = False,
+        require_generation: bool = False,
+    ) -> dict[str, Any]:
+        return _validate_projection_v2(
+            value,
+            identity,
+            require_token=require_token,
+            require_generation=require_generation,
+        )
+
+    def _same_content(self, payload: dict[str, Any], projection: dict[str, Any]) -> bool:
+        return _same_content(payload, projection)
+
+    def _protocol_version(self) -> int:
+        return 2
+
+    def _advanced_content_key(self, payload: dict[str, Any]) -> tuple[Any, ...]:
+        return tuple(payload.get(key) for key in _ADVANCED_FIELDS)
+
+    def _payload_max_bytes(self) -> int:
+        return MAX_PAYLOAD_V2_BYTES
+
+    def _snapshot_max_bytes(self) -> int:
+        return MAX_SNAPSHOT_BYTES
+
     def close(self) -> None:
         if self._scan is not None:
             self._scan.close()
@@ -286,7 +346,7 @@ class ProgressV2Projector:
         """Observe no more than a bounded number of v2 contexts per call."""
         try:
             if self._scan is None:
-                self._scan = os.scandir(Path(self.cfg.runtime_root) / "progress-v2-contexts")
+                self._scan = os.scandir(Path(self.cfg.runtime_root) / self._context_directory())
             for _ in range(max(1, min(budget, _MAX_SCAN_BUDGET))):
                 try:
                     entry = next(self._scan)
@@ -323,16 +383,16 @@ class ProgressV2Projector:
         local_latest = None
         shared_latest = None
         try:
-            local_latest = _validate_projection_v2(
-                read_advisory_snapshot(_observed_path(self.cfg, attempt_id), max_bytes=MAX_SNAPSHOT_BYTES),
+            local_latest = self._validate_projection(
+                read_advisory_snapshot(self._observed_path(attempt_id), max_bytes=self._snapshot_max_bytes()),
                 binding,
             )
         except (OSError, ValueError, TypeError, KeyError, RecursionError):
             pass
         try:
-            shared_latest = _validate_projection_v2(
+            shared_latest = self._validate_projection(
                 read_advisory_snapshot(
-                    _shared_path(self.cfg, binding["task_id"], attempt_id), max_bytes=MAX_SNAPSHOT_BYTES
+                    self._shared_path(binding["task_id"], attempt_id), max_bytes=self._snapshot_max_bytes()
                 )
                 if self._shared_snapshot is None
                 else self._shared_snapshot(binding),
@@ -363,23 +423,28 @@ class ProgressV2Projector:
     def _retire(self, attempt_id: str) -> None:
         self._entries.pop(attempt_id, None)
         try:
-            _context_path(self.cfg, attempt_id).unlink(missing_ok=True)
+            self._context_path(attempt_id).unlink(missing_ok=True)
         except OSError:
             pass
         try:
-            _local_mailbox_path(self.cfg.runtime_root, attempt_id).unlink(missing_ok=True)
+            self._mailbox_path(attempt_id).unlink(missing_ok=True)
         except OSError:
             pass
         try:
-            _local_mailbox_path(self.cfg.runtime_root, attempt_id).parent.rmdir()
+            self._mailbox_path(attempt_id).parent.rmdir()
         except OSError:
             pass
         try:
-            _observed_path(self.cfg, attempt_id).unlink(missing_ok=True)
+            self._observed_path(attempt_id).unlink(missing_ok=True)
         except OSError:
             pass
         try:
-            (Path(self.cfg.runtime_root) / "progress-coordinator" / "v2" / f"{attempt_id}.json").unlink(missing_ok=True)
+            (
+                Path(self.cfg.runtime_root)
+                / "progress-coordinator"
+                / self._coordinator_directory()
+                / f"{attempt_id}.json"
+            ).unlink(missing_ok=True)
         except OSError:
             pass
 
@@ -390,11 +455,11 @@ class ProgressV2Projector:
         binding: dict[str, Any],
     ) -> dict[str, Any]:
         now = self._wall_clock()
-        advanced = latest is None or tuple(payload.get(key) for key in _ADVANCED_FIELDS) != tuple(
-            latest["progress"].get(key) for key in _ADVANCED_FIELDS
+        advanced = latest is None or self._advanced_content_key(payload) != self._advanced_content_key(
+            latest["progress"]
         )
         return {
-            "protocol_version": 2,
+            "protocol_version": self._protocol_version(),
             **{key: binding[key] for key in _IDENTITY},
             "registration_generation": binding["registration_generation"],
             "fencing_token": binding["fencing_token"],
@@ -458,11 +523,11 @@ class ProgressV2Projector:
         state: dict[str, Any],
     ) -> None:
         interval = state["interval"]
-        mailbox = _local_mailbox_path(self.cfg.runtime_root, attempt_id)
+        mailbox = self._mailbox_path(attempt_id)
         signature = _mailbox_signature(mailbox)
         if signature is None or signature != state.get("mailbox_signature"):
             try:
-                payload = validate_payload_v2(read_advisory_snapshot(mailbox, max_bytes=MAX_PAYLOAD_V2_BYTES))
+                payload = self._validate_payload(read_advisory_snapshot(mailbox, max_bytes=self._payload_max_bytes()))
             except FileNotFoundError:
                 payload = None
             except (OSError, ValueError, TypeError, RecursionError):
@@ -474,7 +539,7 @@ class ProgressV2Projector:
                 latest = state["latest"]
                 if latest is None:
                     state["candidate"] = payload
-                elif payload["update_id"] == latest["source_update_id"] or _same_content(payload, latest):
+                elif payload["update_id"] == latest["source_update_id"] or self._same_content(payload, latest):
                     state["candidate"] = None
                 else:
                     state["candidate"] = payload
@@ -482,7 +547,7 @@ class ProgressV2Projector:
         candidate = state.get("candidate")
         latest = state["latest"]
         if candidate is not None and latest is not None:
-            if candidate["update_id"] == latest["source_update_id"] or _same_content(candidate, latest):
+            if candidate["update_id"] == latest["source_update_id"] or self._same_content(candidate, latest):
                 state["candidate"] = None
                 candidate = None
 
@@ -496,7 +561,7 @@ class ProgressV2Projector:
             if due:
                 accepted = self._projection_for_payload(candidate, latest, binding)
                 try:
-                    if not self._write_local(context_path, "progress-v2-observed", attempt_id, accepted):
+                    if not self._write_local(context_path, self._observed_directory(), attempt_id, accepted):
                         self._retire(attempt_id)
                         return
                 except OSError:
@@ -545,9 +610,9 @@ class ProgressV2Projector:
             self.acknowledge_publication(attempt_id, latest, terminal=outcome == "final" or binding["terminal"])
 
     def _observe(self, attempt_id: str) -> None:
-        context_path = _context_path(self.cfg, attempt_id)
-        context = _validate_context(
-            read_advisory_snapshot(context_path, max_bytes=MAX_SNAPSHOT_BYTES),
+        context_path = self._context_path(attempt_id)
+        context = self._validate_context(
+            read_advisory_snapshot(context_path, max_bytes=self._snapshot_max_bytes()),
             attempt_id,
         )
         interval = _context_interval(context)

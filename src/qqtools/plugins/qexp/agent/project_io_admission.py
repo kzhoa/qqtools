@@ -576,7 +576,9 @@ class ProjectIOAdmission:
                     and intent.deadline is not None
                     and intent.deadline <= self._pass_time
                 )
-                if is_urgent:
+                if is_urgent or self._can_prefer_progress_chain(intent):
+                    # Continuations may finish a report, but cannot rewind the
+                    # ordinary cursor past pending upgrade/recovery families.
                     self._urgent_families[key] = family
                 else:
                     self._urgent_families.pop(key, None)

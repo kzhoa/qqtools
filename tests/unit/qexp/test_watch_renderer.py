@@ -71,3 +71,22 @@ def test_rich_runtime_failure_falls_back_to_append_and_reports_once(monkeypatch)
     first = output.getvalue()
     renderer.render(payload, "Stage: train")
     assert output.getvalue() == first
+
+
+def test_append_viewer_redraws_overall_only_changes(monkeypatch):
+    monkeypatch.setattr(watch_renderer, "_terminal_size", lambda: (80, 12))
+    output = StringIO()
+    renderer = watch_renderer.WatchRenderer(output)
+    first = {
+        "phase": "running",
+        "selected_progress_protocol_version": 3,
+        "progress_scoped": {"progress": {"overall": {"current": 1}}},
+    }
+    renderer.render(first, "Overall: 1 step")
+    second = {**first, "progress_scoped": {"progress": {"overall": {"current": 2}}}}
+    renderer.render(second, "Overall: 2 step")
+    assert "Overall: 1 step" in output.getvalue()
+    assert "Overall: 2 step" in output.getvalue()
+    before = output.getvalue()
+    renderer.render(second, "Overall: 2 step")
+    assert output.getvalue() == before

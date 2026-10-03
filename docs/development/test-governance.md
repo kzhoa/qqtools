@@ -196,6 +196,14 @@ Progress retry tests use short per-reporter retry delays while preserving retry,
 backoff, cap, reset, and bounded shutdown assertions. Production timing defaults
 are unchanged.
 
+The real-agent lifecycle matrix keeps 1/2-Project cases and a three-Project case
+with a two-intent window in normal validation. The reduced-window case retains both
+Task waves, terminal outcomes, reservation cleanup, and background publication for
+every owner; the full lifecycle gate explicitly requires it. The unchanged 8-Project
+and 65-Project workloads are opt-in `stress` capacity qualifications with one shared
+ten-minute deadline per case. Moving those capacity experiments does not remove the
+cross-window real-process correctness boundary from the normal gate.
+
 The JSON scanner keeps a three-block fragmentation case in normal validation;
 the two 8 MiB memory qualifications are `stress`. Authority overload coverage
 keeps a small saturated-cache/backlog scenario with a reduced test work budget;

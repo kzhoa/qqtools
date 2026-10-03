@@ -372,3 +372,54 @@ def test_termination_coordinator_never_signals_from_stale_shared_identity(tmp_pa
         if child.poll() is None:
             child.kill()
         child.wait(timeout=5)
+
+
+def test_healthy_termination_observation_does_not_pin_restart_readiness(tmp_path: Path) -> None:
+    runtime, cfg, binding, revision, task, attempt, child, paths, manifest, _ = _running_case(tmp_path, trigger="none")
+    executor = ProjectIOExecutor(runtime)
+    executor.begin_epoch()
+    coordinator = AttemptSupervisionCoordinator(runtime, ProjectIOController(runtime, executor))
+    try:
+        _until(lambda: coordinator.controller.advance_binding_validation([binding], revision), bool)
+
+        # Production collects all lanes before granting a request. Calling each
+        # lane as a separate turn can keep readiness artificially occupied.
+        def advance():
+            with coordinator.controller.admission_turn():
+                coordinator.advance_all([binding], revision)
+            return coordinator.initially_reconciled(binding, revision)
+
+        _until(advance, bool)
+        assert child.poll() is None
+        assert load_task(cfg, task.task_id).state["projection"] == "running"
+        assert read_json(manifest)["process"]["observed_state"] == "running"
+        assert len(reservation_snapshot(runtime.root).active) == 1
+        assert not iter_json(paths["termination_decisions"] / attempt.attempt_id)
+        # A later cancellation must still be discovered after the healthy probe
+        # was retired; readiness cannot disable subsequent supervision.
+        running = load_task(cfg, task.task_id)
+        running.control["terminate_running"] = True
+        running.meta["revision"] += 1
+        save_task(cfg, running)
+
+        def cancellation_snapshot():
+            # Keep draining every lane started during recovery, as the machine
+            # loop does; completed requests otherwise retain executor capacity.
+            advance()
+            return (
+                load_task(cfg, task.task_id).state["projection"],
+                child.poll(),
+                read_json(manifest)["process"].get("observed_state"),
+                len(reservation_snapshot(runtime.root).active),
+            )
+
+        _until(
+            cancellation_snapshot,
+            lambda value: value == ("cancelled", child.returncode, "exited", 0),
+        )
+    finally:
+        coordinator.close()
+        executor.shutdown()
+        if child.poll() is None:
+            child.kill()
+        child.wait(timeout=5)

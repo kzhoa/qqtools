@@ -568,8 +568,10 @@ def test_terminal_coordinator_rereads_exact_local_evidence_before_effects(
             lambda: coordinator.advance_terminal_completions([binding], revision),
             lambda _value: load_task(cfg, task.task_id).state["projection"] == "succeeded",
         )
-        for _ in range(8):
-            coordinator.advance_terminal_completions([binding], revision)
+        _until(
+            lambda: coordinator.advance_terminal_completions([binding], revision),
+            lambda _value: mutated,
+        )
         assert mutated
         assert read_json(manifest)["process"]["observed_state"] == "running"
         # The mutation is injected only after the earlier exact observation

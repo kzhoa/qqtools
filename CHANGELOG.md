@@ -2,8 +2,15 @@
 
 ## Unreleased
 
+- fix: recover released qexp runner reservation identity after agent upgrade, preserve restart
+  readiness and new-Task admission, and prevent continuous progress from starving upgrade discovery.
+
 - fix: record SIGHUP as an orderly qexp agent shutdown with signal diagnostics and a private log
   entry, preserving running training processes and restoring signal handlers after cleanup.
+- feat: add selectable human qexp Task list fields and progress, placement, and overall views,
+  with bounded observation reads and width-aware output.
+- feat: add independent overall/activity progress counters and v3 transport while retaining
+  v1/v2 producers and readers; qPipeline reports committed training progress during evaluation.
 
 ## v1.3.22
 

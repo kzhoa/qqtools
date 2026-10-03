@@ -16,6 +16,7 @@ from ..config_types import RootConfig
 from ..runtime.directory_capture import read_directory_entry
 from ..runtime.progress import ProgressProjector, _mailbox_signature
 from ..runtime.progress_v2 import ProgressV2Projector
+from ..runtime.progress_v3 import ProgressV3Projector
 from .bindings import ProjectBinding
 from .progress_transport import progress_context
 
@@ -35,14 +36,14 @@ _CADENCE_FLAGS = (
 class _ProjectProgress:
     binding: ProjectBinding
     projectors: dict[int, Any] = field(default_factory=dict)
-    offsets: dict[int, int] = field(default_factory=lambda: {1: 0, 2: 0})
+    offsets: dict[int, int] = field(default_factory=lambda: {1: 0, 2: 0, 3: 0})
     next_version: int = 1
     parameters: dict[str, Any] | None = None
     observed_binding: dict[str, Any] | None = None
     snapshot: dict[str, Any] | None = None
     retry_at: float = 0.0
     can_evict: bool = True
-    scan_checkpoint: tuple[int, int, int, float] = (0, 0, 1, 0.0)
+    scan_checkpoint: tuple[int, int, int, int, float] = (0, 0, 0, 1, 0.0)
     parking_retry_at: float = 0.0
 
     def close(self) -> None:
@@ -81,16 +82,16 @@ class ProgressObservationCoordinator:
                 or saved["generation"] != entry.binding.registration_generation
                 or saved["shared_root"] != str(entry.binding.shared_root)
                 or type(saved["next_version"]) is not int
-                or saved["next_version"] not in (1, 2)
+                or saved["next_version"] not in (1, 2, 3)
                 or not isinstance(offsets, dict)
-                or set(offsets) != {"1", "2"}
+                or set(offsets) != {"1", "2", "3"}
                 or any(type(value) is not int or not 0 <= value < (1 << 63) for value in offsets.values())
                 or type(saved["retry_at"]) not in (int, float)
                 or not math.isfinite(saved["retry_at"])
                 or saved["retry_at"] < 0
             ):
                 return
-            entry.offsets = {version: offsets[str(version)] for version in (1, 2)}
+            entry.offsets = {version: offsets[str(version)] for version in (1, 2, 3)}
             entry.next_version = saved["next_version"]
             entry.retry_at = saved["retry_at"]
             entry.scan_checkpoint = self._scan_signature(entry)
@@ -98,8 +99,8 @@ class ProgressObservationCoordinator:
             pass
 
     @staticmethod
-    def _scan_signature(entry: _ProjectProgress) -> tuple[int, int, int, float]:
-        return entry.offsets[1], entry.offsets[2], entry.next_version, entry.retry_at
+    def _scan_signature(entry: _ProjectProgress) -> tuple[int, int, int, int, float]:
+        return entry.offsets[1], entry.offsets[2], entry.offsets[3], entry.next_version, entry.retry_at
 
     def _park(self, entry: _ProjectProgress) -> bool:
         if not entry.can_evict or entry.parking_retry_at > self._clock():
@@ -109,7 +110,7 @@ class ProgressObservationCoordinator:
             entry.close()
             return True
         try:
-            self._checkpoint_root(entry).mkdir(exist_ok=True)
+            self._checkpoint_root(entry).mkdir(parents=True, exist_ok=True)
             replace_advisory_snapshot(
                 self._checkpoint_root(entry) / "scan.json",
                 {
@@ -202,8 +203,8 @@ class ProgressObservationCoordinator:
         # close on each entry, so neither idle projects nor eviction retain FDs.
         for _ in range(_MAX_LOCAL_ENTRIES_PER_SLICE):
             version = entry.next_version
-            entry.next_version = 3 - version
-            directory = Path(root) / ("progress-contexts" if version == 1 else "progress-v2-contexts")
+            entry.next_version = version % 3 + 1
+            directory = Path(root) / ("progress-contexts" if version == 1 else f"progress-v{version}-contexts")
             try:
                 name, offset = read_directory_entry(directory, entry.offsets[version])
             except FileNotFoundError:
@@ -222,7 +223,7 @@ class ProgressObservationCoordinator:
                     Path(root)
                     / "progress"
                     / context["attempt_id"]
-                    / ("latest.json" if version == 1 else "latest-v2.json")
+                    / ("latest.json" if version == 1 else f"latest-v{version}.json")
                 )
                 if _mailbox_signature(mailbox) is None:
                     continue
@@ -248,7 +249,11 @@ class ProgressObservationCoordinator:
             entry.parameters = {"context": dict(context), "projection": dict(latest)}
             return "deferred"
 
-        cls = ProgressProjector if version == 1 else ProgressV2Projector
+        cls = {
+            1: ProgressProjector,
+            2: ProgressV2Projector,
+            3: ProgressV3Projector,
+        }[version]
         cfg = RootConfig.from_canonical_paths(
             entry.binding.shared_root,
             entry.binding.shared_root.parent,
@@ -273,7 +278,7 @@ class ProgressObservationCoordinator:
         context = parameters["context"]
         version = context["protocol_version"]
         root = self.runtime.project_paths(entry.binding.project_id)["root"]
-        directory = "progress-contexts" if version == 1 else "progress-v2-contexts"
+        directory = "progress-contexts" if version == 1 else f"progress-v{version}-contexts"
         try:
             if read_advisory_snapshot(Path(root) / directory / f"{context['attempt_id']}.json") != context:
                 entry.parameters = None
@@ -351,7 +356,7 @@ class ProgressObservationCoordinator:
                 try:
                     self._capture(entry)
                 except (OSError, RuntimeError, ValueError, TypeError):
-                    entry.offsets = {1: 0, 2: 0}
+                    entry.offsets = {1: 0, 2: 0, 3: 0}
             self._entries.move_to_end(key)
         if count:
             self._cursor = (self._cursor + min(_MAX_PROJECTS_PER_SLICE, count)) % count

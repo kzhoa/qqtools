@@ -129,6 +129,7 @@ class _LifecycleGate:
     )
     full_names = representative_names | frozenset(
         {
+            "test_real_agent_healthy_binding_scale_preserves_incumbent_progress[3-window-2]",
             "test_li03_expired_claim_recovers_same_attempt_without_relaunch",
             "test_li03_real_peer_observes_natural_lease_expiry[False]",
             "test_li03_real_peer_observes_natural_lease_expiry[True]",
@@ -150,9 +151,9 @@ class _LifecycleGate:
             "test_global_idle_policy_considers_every_binding[modes0]",
             "test_global_idle_policy_considers_every_binding[modes1]",
             "test_global_idle_policy_considers_every_binding[modes2]",
-            "test_finished_process_releases_capacity_while_publication_is_unavailable[_finalize]",
-            "test_finished_process_releases_capacity_while_publication_is_unavailable[_materialize_registrations]",
-            "test_finished_process_releases_capacity_while_publication_is_unavailable[binding]",
+            "test_finished_process_releases_capacity_while_publication_is_unavailable[terminal_observe]",
+            "test_finished_process_releases_capacity_while_publication_is_unavailable[terminal_publish]",
+            "test_finished_process_releases_capacity_while_publication_is_unavailable[worker_start]",
             "test_global_idle_waits_for_unresolved_demand",
             "test_failed_binding_is_not_consumed_for_idle_exit",
             "test_global_idle_does_not_reenter_registration_wait",

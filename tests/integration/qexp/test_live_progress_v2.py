@@ -16,6 +16,7 @@ from qqtools.plugins.qexp.runtime import submission as submission_runtime
 from qqtools.plugins.qexp.runtime.paths import attempt_path
 from qqtools.plugins.qexp.runtime.progress import ProgressProjector, shared_progress_path
 from qqtools.plugins.qexp.runtime.progress_v2 import ProgressV2Projector
+from qqtools.plugins.qexp.runtime.progress_v3 import ProgressV3Projector
 from qqtools.plugins.qexp.runtime.store import read_json
 from qqtools.plugins.qexp.scheduler import authorize_launch, claim_task
 from qqtools.qexp._progress_protocol import replace_advisory_snapshot
@@ -23,7 +24,8 @@ from qqtools.qexp._progress_protocol import replace_advisory_snapshot
 pytestmark = [pytest.mark.integration, pytest.mark.qexp_fast_io]
 
 
-def test_selected_third_party_producer_projects_both_versions_and_details(tmp_path, monkeypatch):
+@pytest.mark.parametrize("scoped", [False, True])
+def test_selected_third_party_producer_projects_both_versions_and_details(tmp_path, monkeypatch, scoped):
     source_root = str(Path(__file__).resolve().parents[3] / "src")
     monkeypatch.setenv("PYTHONPATH", source_root + os.pathsep + os.environ.get("PYTHONPATH", ""))
     monkeypatch.setenv("QEXP_PROGRESS_V2_PATH", "/must-not-be-inherited")
@@ -36,6 +38,11 @@ def test_selected_third_party_producer_projects_both_versions_and_details(tmp_pa
         "message='ready',metrics={'loss':0.25,'lr':0.001})\n"
         "progress.flush(timeout=1)\n"
     )
+    if scoped:
+        code = code.replace(
+            "metrics={'loss':0.25,'lr':0.001})",
+            "metrics={'loss':0.25,'lr':0.001},overall=progress.Counter(current=8,total=10,unit='step',label='Training'))",
+        )
     task = submission_runtime.submit_specs(
         cfg,
         [{"command": [sys.executable, "-c", code], "working_directory": str(tmp_path), "live_progress": True}],
@@ -82,6 +89,11 @@ def test_selected_third_party_producer_projects_both_versions_and_details(tmp_pa
     extended_projector.tick()
     extended_projector.close()
 
+    if scoped:
+        scoped_projector = ProgressV3Projector(cfg, registration_generation="test-generation")
+        scoped_projector.tick()
+        scoped_projector.close()
+
     view = inspect_task(cfg, task.task_id)
     assert view["task"]["state"]["projection"] == "succeeded"
     assert view["progress"]["progress"]["stage"] == "custom-stage"
@@ -89,6 +101,10 @@ def test_selected_third_party_producer_projects_both_versions_and_details(tmp_pa
     assert view["progress_extended"]["progress"]["metrics"] == {"loss": 0.25, "lr": 0.001}
     assert view["progress_extended"]["progress"]["completeness"]["complete"] is True
     assert view["selected_progress_version"] == 2
+    if scoped:
+        assert view["selected_progress_protocol_version"] == 3
+        assert view["progress_scoped"]["progress"]["overall"]["current"] == 8
+        assert "Training: 80%" in render(CliOutput(OutputKind.TASK_SHOW, view, {"details": True}), "human")
     assert "Task ID" in render(CliOutput(OutputKind.TASK_SHOW, view), "human")
     assert "Metric loss" in render(CliOutput(OutputKind.TASK_SHOW, view, {"details": True}), "human")
 
@@ -107,7 +123,11 @@ def test_selected_third_party_producer_projects_both_versions_and_details(tmp_pa
     assert fallback["progress_extended"]["reason"] == "invalid_snapshot"
     assert fallback["selected_progress_version"] == 1
     assert fallback["progress"]["reported_at"] == original_v1_timestamp
-    assert "Metric loss" not in render(CliOutput(OutputKind.TASK_SHOW, fallback, {"details": True}), "human")
+    if scoped:
+        assert fallback["selected_progress_protocol_version"] == 3
+        assert "Metric loss" in render(CliOutput(OutputKind.TASK_SHOW, fallback, {"details": True}), "human")
+    else:
+        assert "Metric loss" not in render(CliOutput(OutputKind.TASK_SHOW, fallback, {"details": True}), "human")
 
     cleanup_result = clean(cfg, task_id=task.task_id, reservation_runtime_root=cfg.runtime_root)
     assert cleanup_result["operations"][task.task_id]["state"] == "completed", (
@@ -116,3 +136,7 @@ def test_selected_third_party_producer_projects_both_versions_and_details(tmp_pa
     )
     assert not shared_progress_path(cfg.shared_root, task.task_id, attempt.attempt_id).exists()
     assert not (cfg.shared_root / "progress-v2" / task.task_id).exists()
+
+    assert not (cfg.shared_root / "progress-v3" / task.task_id).exists()
+    assert not (cfg.runtime_root / "progress-v3-contexts" / f"{attempt.attempt_id}.json").exists()
+    assert not (cfg.runtime_root / "progress-v3-observed" / f"{attempt.attempt_id}.json").exists()

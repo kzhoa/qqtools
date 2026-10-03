@@ -19,7 +19,8 @@ from functools import partial, wraps
 from typing import Any, Iterator
 
 from ..config_types import RootConfig
-from ..runtime.paths import local_paths
+from ..runtime.authority_scan import validate_evidence_path
+from ..runtime.paths import local_paths, machine_project_paths
 from ..runtime.records import validate_identifier
 from ..runtime.resources.cpu_lane import cpu_reservation_snapshot, reserve_cpu, retag_cpu_if_matches
 from ..runtime.resources.reservations import (
@@ -34,12 +35,14 @@ from ..runtime.resources.reservations import (
     reserve_admitted,
     retag_if_matches,
 )
+from ..runtime.store import read_json_limited
 from ..runtime.submission_control_continuation import submission_control_continuation
 from .bindings import ProjectBinding
 from .context import MachineRuntime
 from .dispatch_probe import PrimaryProbeSession
 from .group_service_coordinator import GroupServiceCoordinator, GroupServiceOffer
 from .primary_probe_transport import encode_probe_session
+from .process_reservation_recovery import registration_reservation
 from .progress_coordinator import ProgressObservationCoordinator
 from .project_io_admission import ProjectIOAdmission, ServiceIntent
 from .project_io_executor import ProjectIOExecutor, ProjectIOProtocolError
@@ -2734,6 +2737,8 @@ class ProjectIOController:
             if claim_identity is None:
                 continue
             service_key = self._launch_service_key(identity)
+            if self._reservation_has_registered_process(binding, reservation):
+                continue
             if not self._service_retry_is_due(service_key):
                 continue
             try:
@@ -2756,6 +2761,34 @@ class ProjectIOController:
                 reservation.attempt_id or reservation.reservation_id,
             )
         return completions
+
+    def _reservation_has_registered_process(self, binding: ProjectBinding, reservation: ReservationIdentity) -> bool:
+        """Do not reoffer launch work for an immutable matching registration.
+
+        This suppresses duplicate launch requests only; it grants no authority and
+        leaves renewal, completion, and reservation reconciliation to their lanes.
+        """
+        if reservation.attempt_id is None:
+            return False
+        paths = machine_project_paths(self.runtime.root, binding.project_id)
+        path = paths["registrations"] / f"{reservation.attempt_id}.json"
+        try:
+            if not validate_evidence_path(path, paths["root"]):
+                return False
+            record = read_json_limited(path, max_bytes=65_536, record_type="registration").get("process_registration")
+            return (
+                isinstance(record, dict)
+                and type(record.get("protocol_version")) is int
+                and record["protocol_version"] == 1
+                and record.get("task_id") == reservation.task_id
+                and record.get("attempt_id") == reservation.attempt_id
+                and type(record.get("fencing_token")) is int
+                and record["fencing_token"] == reservation.fencing_token
+                and record.get("machine_name") == binding.machine_name
+                and registration_reservation(record, paths["root"]) == reservation.reservation_id
+            )
+        except (OSError, RuntimeError, ValueError, TypeError, KeyError):
+            return False
 
     def _prepare_scheduler_launch_authorization_request(
         self,

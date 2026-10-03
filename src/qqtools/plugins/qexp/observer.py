@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from .config_types import RootConfig
+from .progress_selection import select_progress_protocol, selected_progress_observation
 from .runtime.dependencies import dependency_gate
 from .runtime.group_namespace import iter_published_groups, read_group
 from .runtime.locks import schema_reader_lock
@@ -20,13 +21,12 @@ from .runtime.paths import (
     submission_path,
     task_path,
 )
-from .runtime.progress import inspect_progress
 from .runtime.progress_types import ProgressObservation
-from .runtime.progress_v2 import inspect_progress_v2
 from .runtime.records import AttemptRecord, TaskRecord, normalize_group_record
 from .runtime.resources.reservations import reservation_snapshot
 from .runtime.store import iter_json, read_json
 from .runtime.tasks import load_task
+from .task_list_observation import enrich_task_rows
 from .task_observation import task_tmux_observation_label
 
 _TERMINAL_PHASES = frozenset({"succeeded", "failed", "cancelled"})
@@ -74,6 +74,11 @@ def _unavailable_current_view(task: TaskRecord, reason: str) -> dict[str, Any]:
         "observation_state": "unavailable",
         "reason": "identity_mismatch",
     }
+    progress_scoped = {
+        "status": "unavailable",
+        "observation_state": "unavailable",
+        "reason": "identity_mismatch",
+    }
     return {
         "task_id": task.task_id,
         "name": task.name,
@@ -86,7 +91,10 @@ def _unavailable_current_view(task: TaskRecord, reason: str) -> dict[str, Any]:
         "selected_attempt": None,
         "progress": progress,
         "progress_extended": progress_extended,
+        "progress_scoped": progress_scoped,
         "selected_progress_version": None,
+        "selected_progress_protocol_version": None,
+        "reporting_policy": {"state": "unknown", "reason": "policy_not_collected"},
     }
 
 
@@ -154,19 +162,48 @@ def _inspect_progress_candidates(
     task: TaskRecord,
     *,
     attempt: AttemptRecord | None = None,
-) -> tuple[ProgressObservation, dict[str, Any], int | None]:
-    """Read each protocol independently, then select one complete observation."""
-    progress: ProgressObservation = inspect_progress(cfg, task)
-    progress_extended = inspect_progress_v2(cfg, task)
-    selected_version = _selected_progress_version(
+) -> tuple[ProgressObservation, dict[str, Any], int | None, dict[str, Any], int | None, dict[str, Any]]:
+    """Collect one bounded progress row and select whole v1/v2/v3 observations."""
+    row = _task_view(task)
+    enriched = enrich_task_rows(cfg, (task,), (row,), ("overall-progress", "activity"))[0]
+    progress = enriched.get("progress")
+    progress_extended = enriched.get("progress_extended")
+    progress_scoped = enriched.get("progress_scoped")
+    if not isinstance(progress, dict):
+        progress = {"status": "unavailable", "observation_state": "unavailable", "reason": "unknown"}
+    if not isinstance(progress_extended, dict):
+        progress_extended = {
+            "status": "unavailable",
+            "observation_state": "unavailable",
+            "reason": "unknown",
+        }
+    if not isinstance(progress_scoped, dict):
+        progress_scoped = {
+            "status": "unavailable",
+            "observation_state": "unavailable",
+            "reason": "unknown",
+        }
+    expected_attempt_id = attempt.attempt_id if attempt is not None else task.attempt_control.get("current_attempt_id")
+    expected_attempt_number = (
+        attempt.attempt_number if attempt is not None else task.attempt_control.get("current_attempt_number")
+    )
+    legacy_version = _selected_progress_version(
         progress,
         progress_extended,
-        attempt_id=attempt.attempt_id if attempt is not None else task.attempt_control.get("current_attempt_id"),
-        attempt_number=attempt.attempt_number
-        if attempt is not None
-        else task.attempt_control.get("current_attempt_number"),
+        attempt_id=expected_attempt_id,
+        attempt_number=expected_attempt_number,
     )
-    return progress, progress_extended, selected_version
+    selected_version = select_progress_protocol(
+        progress,
+        progress_extended,
+        progress_scoped,
+        attempt_id=expected_attempt_id,
+        attempt_number=expected_attempt_number,
+    )
+    policy = enriched.get("reporting_policy")
+    if not isinstance(policy, dict):
+        policy = {"state": "unknown", "reason": "policy_not_collected"}
+    return progress, progress_extended, legacy_version, progress_scoped, selected_version, policy
 
 
 def _read_current_attempt(cfg: RootConfig, task: TaskRecord) -> tuple[AttemptRecord | None, str | None]:
@@ -291,10 +328,33 @@ def inspect_current_task(cfg: RootConfig, task_id: str) -> dict[str, Any]:
                 "observation_state": "unavailable",
                 "reason": "identity_mismatch",
             }
+            progress_scoped = {
+                "status": "unavailable",
+                "observation_state": "unavailable",
+                "reason": "identity_mismatch",
+            }
+            legacy_version = None
             selected_version = None
+            policy = {"state": "unknown", "reason": "policy_not_collected"}
         else:
-            progress, progress_extended, selected_version = _inspect_progress_candidates(cfg, latest_task)
-        observation = progress_extended if selected_version == 2 else progress
+            (
+                progress,
+                progress_extended,
+                legacy_version,
+                progress_scoped,
+                selected_version,
+                policy,
+            ) = _inspect_progress_candidates(cfg, latest_task)
+        observation = selected_progress_observation(
+            progress,
+            progress_extended,
+            progress_scoped,
+            selected_version,
+            attempt_id=latest_task.attempt_control.get("current_attempt_id"),
+            attempt_number=latest_task.attempt_control.get("current_attempt_number"),
+        )
+        if observation is None:
+            observation = {"observation_state": "unavailable", "reason": "unknown"}
         return {
             "task_id": latest_task.task_id,
             "name": latest_task.name,
@@ -307,12 +367,31 @@ def inspect_current_task(cfg: RootConfig, task_id: str) -> dict[str, Any]:
             "selected_attempt": None,
             "progress": progress,
             "progress_extended": progress_extended,
-            "selected_progress_version": selected_version,
+            "progress_scoped": progress_scoped,
+            "selected_progress_version": legacy_version,
+            "selected_progress_protocol_version": selected_version,
+            "reporting_policy": policy,
         }
 
     selected = _selected_attempt_view(cfg, latest_task, attempt)
-    progress, progress_extended, selected_version = _inspect_progress_candidates(cfg, latest_task, attempt=attempt)
-    observation = progress_extended if selected_version == 2 else progress
+    (
+        progress,
+        progress_extended,
+        legacy_version,
+        progress_scoped,
+        selected_version,
+        policy,
+    ) = _inspect_progress_candidates(cfg, latest_task, attempt=attempt)
+    observation = selected_progress_observation(
+        progress,
+        progress_extended,
+        progress_scoped,
+        selected_version,
+        attempt_id=attempt.attempt_id,
+        attempt_number=attempt.attempt_number,
+    )
+    if observation is None:
+        observation = {"observation_state": "unavailable", "reason": "unknown"}
     return {
         "task_id": latest_task.task_id,
         "name": latest_task.name,
@@ -325,7 +404,10 @@ def inspect_current_task(cfg: RootConfig, task_id: str) -> dict[str, Any]:
         "selected_attempt": selected,
         "progress": progress,
         "progress_extended": progress_extended,
-        "selected_progress_version": selected_version,
+        "progress_scoped": progress_scoped,
+        "selected_progress_version": legacy_version,
+        "selected_progress_protocol_version": selected_version,
+        "reporting_policy": policy,
     }
 
 
@@ -346,12 +428,23 @@ def _task_view(task: TaskRecord) -> dict[str, Any]:
 
 
 def list_tasks(
-    cfg: RootConfig, *, phase: str | None = None, group: str | None = None, limit: int = 50
+    cfg: RootConfig,
+    *,
+    phase: str | None = None,
+    group: str | None = None,
+    limit: int = 50,
+    fields: tuple[str, ...] | None = None,
 ) -> list[dict[str, Any]]:
     """Return the first matching Task views without scanning past a positive limit."""
+    selected_fields = set(fields or ())
+    if fields is not None and selected_fields & {"location", "overall-progress", "activity", "report-age"}:
+        if type(limit) is not int or not 1 <= limit <= 1000:
+            raise ValueError("enriched Task list selections require a limit from 1 through 1000.")
     if limit == 0:
         return []
-    result = []
+    result: list[dict[str, Any]] = []
+    tasks: list[TaskRecord] = []
+    dependency_requested = fields is None or "dependency" in selected_fields
     for path in iter_json(shared_paths(cfg.shared_root)["tasks"]):
         task = TaskRecord.from_dict(read_json(path))
         view = _task_view(task)
@@ -359,14 +452,22 @@ def list_tasks(
             continue
         if group and view["group"] != group:
             continue
-        gate = dependency_gate(cfg, task)
-        view["depends_on_task_ids"] = task.depends_on_task_ids
-        view["dependency_state"] = gate.state
-        view["dependency_reasons"] = list(gate.reasons)
+        if dependency_requested:
+            view["depends_on_task_ids"] = task.depends_on_task_ids
+            gate = dependency_gate(cfg, task)
+            view["dependency_state"] = gate.state
+            view["dependency_reasons"] = list(gate.reasons)
         result.append(view)
+        tasks.append(task)
         if limit > 0 and len(result) >= limit:
             break
-    return result[:limit]
+    result = result[:limit]
+    tasks = tasks[:limit]
+    if fields is not None and selected_fields & {"location", "overall-progress", "activity", "report-age"}:
+        from .task_list_observation import enrich_task_rows
+
+        return enrich_task_rows(cfg, tasks, result, fields)
+    return result
 
 
 def list_tasks_page(
@@ -377,21 +478,40 @@ def list_tasks_page(
     name: str | None = None,
     page_size: int = 50,
     cursor: str | None = None,
+    fields: tuple[str, ...] | None = None,
 ) -> dict[str, Any]:
     """Return one live, indexed page of Task views."""
     from .runtime.observation.api import list_tasks_page as _list_tasks_page
 
-    return _list_tasks_page(cfg, phase=phase, group=group, name=name, page_size=page_size, cursor=cursor)
+    return _list_tasks_page(
+        cfg,
+        phase=phase,
+        group=group,
+        name=name,
+        page_size=page_size,
+        cursor=cursor,
+        fields=fields,
+    )
 
 
 def inspect_task(cfg: RootConfig, task_id: str) -> dict[str, Any]:
     task = load_task(cfg, task_id)
     result = task.to_dict()
     result["observation"] = {"tmux_override": task_tmux_observation_label(cfg, task_id)}
-    progress, progress_extended, selected_version = _inspect_progress_candidates(cfg, task)
+    (
+        progress,
+        progress_extended,
+        legacy_version,
+        progress_scoped,
+        selected_version,
+        policy,
+    ) = _inspect_progress_candidates(cfg, task)
     result["progress"] = progress
     result["progress_extended"] = progress_extended
-    result["selected_progress_version"] = selected_version
+    result["progress_scoped"] = progress_scoped
+    result["selected_progress_version"] = legacy_version
+    result["selected_progress_protocol_version"] = selected_version
+    result["reporting_policy"] = policy
     gate = dependency_gate(cfg, task)
     result["dependency_gate"] = {"state": gate.state, "reasons": list(gate.reasons)}
     attempts_dir = shared_paths(cfg.shared_root)["attempts"] / task_id

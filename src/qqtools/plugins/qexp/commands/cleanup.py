@@ -32,6 +32,7 @@ from ..runtime.operation_store import (
 )
 from ..runtime.paths import local_paths, shared_paths, task_path
 from ..runtime.progress import cleanup_local_progress
+from ..runtime.progress_cleanup_v3 import cleanup_local_progress_v3
 from ..runtime.progress_v2 import cleanup_local_progress_v2
 from ..runtime.ready import retire_current_ready_generation
 from ..runtime.records import SCHEMA_VERSION, AttemptRecord, TaskRecord, new_id, utc_now
@@ -212,6 +213,7 @@ def _cleanup_local_resources_guarded(
     for log_path in sorted((cfg.runtime_root / "logs").glob(f"{task_id}-*.log")):
         log_path.unlink(missing_ok=True)
         removed.append(str(log_path))
+    removed.extend(cleanup_local_progress_v3(cfg, task_id, attempt_ids))
     removed.extend(cleanup_local_progress_v2(cfg, task_id, attempt_ids))
     removed.extend(cleanup_local_progress(cfg, task_id, attempt_ids))
     return removed, []

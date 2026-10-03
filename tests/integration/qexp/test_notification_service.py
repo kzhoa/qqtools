@@ -384,7 +384,9 @@ def test_notification_roster_beyond_intent_window_progresses_with_new_arrivals(t
                 raise AssertionError("the qualification did not establish both held workers")
         arrivals_added = False
         ready_ids = set()
-        deadline = time.monotonic() + 45.0
+        # This finite many-Project fairness scenario has no 15-second latency
+        # contract; retain a bounded guard for concurrent subprocess startup.
+        deadline = time.monotonic() + 90.0
         while time.monotonic() < deadline:
             controller.advance_notification_maintenance(bindings, revision)
             observed = {identity.project_id for identity in controller._notification_due}
@@ -405,7 +407,10 @@ def test_notification_roster_beyond_intent_window_progresses_with_new_arrivals(t
                 break
             time.sleep(0.01)
         else:
-            raise AssertionError("notification incumbents beyond the intent window were starved")
+            raise AssertionError(
+                f"notification convergence timed out: {len(ready_ids)}/{len(healthy)} ready; "
+                f"workers={executor.status_view()}"
+            )
         for binding in healthy:
             assert load_policy(runtime.root, "project", binding.project_id)["legacy"]["status"] == "ready"
         live = executor.unresolved_requests()
