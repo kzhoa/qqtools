@@ -32,22 +32,8 @@ def group_service_probe_evidence(value: object) -> dict[str, Any]:
     state = value["state"]
     if state not in {"quiescent", "active", "pending"}:
         raise ValueError("Group-service probe state is invalid.")
-    candidate = value["candidate"]
-    if candidate is not None:
-        if not isinstance(candidate, Mapping) or set(candidate) != {"group", "lane", "generation"}:
-            raise ValueError("Group-service probe candidate is invalid.")
-        group = candidate["group"]
-        validate_group_name(group)
-        lane = candidate["lane"]
-        if lane not in {"legacy", "control", "membership", "maintenance"}:
-            raise ValueError("Group-service probe candidate lane is invalid.")
-        generation = candidate["generation"]
-        if lane == "legacy":
-            if generation is not None:
-                raise ValueError("legacy Group-service candidate cannot carry a generation.")
-        elif type(generation) is not int or generation < 1:
-            raise ValueError("locator Group-service candidate requires a positive generation.")
-        candidate = {"group": group, "lane": lane, "generation": generation}
+    candidate_value = value["candidate"]
+    candidate = None if candidate_value is None else group_service_candidate(candidate_value)
     if (state == "active") != (candidate is not None):
         raise ValueError("Group-service active evidence must name exactly one candidate.")
     return {
@@ -59,20 +45,20 @@ def group_service_probe_evidence(value: object) -> dict[str, Any]:
 
 def group_service_candidate(value: object) -> dict[str, Any]:
     """Validate one exact candidate captured by the census."""
-
-    evidence = group_service_probe_evidence(
-        {
-            "state": "active",
-            "probe_state": validate_group_service_probe_state(
-                {"mode": "start", "revision": None, "offset": 0, "lane_index": 0, "shard": 0}
-            ),
-            "candidate": value,
-        }
-    )
-    candidate = evidence["candidate"]
-    if candidate is None:
-        raise ValueError("Group-service candidate is required.")
-    return candidate
+    if not isinstance(value, Mapping) or set(value) != {"group", "lane", "generation"}:
+        raise ValueError("Group-service candidate is invalid.")
+    group = value["group"]
+    validate_group_name(group)
+    lane = value["lane"]
+    if lane not in {"legacy", "control", "membership", "maintenance"}:
+        raise ValueError("Group-service candidate lane is invalid.")
+    generation = value["generation"]
+    if lane == "legacy":
+        if generation is not None:
+            raise ValueError("legacy Group-service candidate cannot carry a generation.")
+    elif type(generation) is not int or generation < 1:
+        raise ValueError("locator Group-service candidate requires a positive generation.")
+    return {"group": group, "lane": lane, "generation": generation}
 
 
 def _continuation_for(candidate: Mapping[str, Any], value: object) -> dict[str, Any] | None:

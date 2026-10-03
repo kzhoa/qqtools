@@ -12,10 +12,10 @@ from typing import Any, Iterator
 
 from ...config_types import RootConfig
 from ..directory_capture import read_directory_entry
-from ..locks import schema_lock
-from ..paths import local_paths, shared_paths
+from ..locks import schema_lock, task_lock
+from ..paths import local_paths, shared_paths, task_path
 from ..project_activation import project_activation_transaction
-from ..records import TaskRecord
+from ..records import TaskRecord, validate_identifier
 from ..store import atomic_replace, check_mutation_fence, iter_json, read_json, read_json_limited
 
 _MAX_REBUILD_TASK_BYTES = 1_048_576
@@ -258,6 +258,34 @@ def sync_deadline_index(cfg: RootConfig, task: TaskRecord) -> None:
         )
 
 
+def reconcile_deadline_index(cfg: RootConfig, task_id: str, *, blocking: bool = True) -> tuple[bool, bool]:
+    """Synchronize one deadline index from Task truth under its authority lock."""
+    validate_identifier(task_id, "deadline index task_id")
+    if task_id in {".", ".."}:
+        raise ValueError("deadline index task_id must be a safe path component.")
+    with task_lock(cfg.shared_root, task_id, blocking=blocking) as has_task_lock:
+        if not has_task_lock:
+            return False, False
+        stable = _deadline_index_path(cfg, task_id)
+        before = stable.exists() or stable.is_symlink()
+        try:
+            task = TaskRecord.from_dict(
+                read_json_limited(
+                    task_path(cfg.shared_root, task_id),
+                    max_bytes=_MAX_REBUILD_TASK_BYTES,
+                    record_type="deadline_rebuild_task",
+                )
+            )
+        except FileNotFoundError:
+            remove_deadline_index(cfg, task_id)
+        else:
+            if task.task_id != task_id:
+                raise ValueError("deadline rebuild Task identity does not match its filename.")
+            sync_deadline_index(cfg, task)
+        after = stable.exists() or stable.is_symlink()
+        return True, before != after or after
+
+
 def iter_due_deadline_paths(cfg: RootConfig, *, limit: int = 64) -> Iterator[Path]:
     """Yield bounded due records for this home machine from time buckets only."""
     if limit <= 0:
@@ -386,18 +414,14 @@ def rebuild_deadline_indexes(cfg: RootConfig) -> int:
     rebuilt = 0
     indexed: set[str] = set()
     for task_file in iter_json(shared_paths(cfg.shared_root)["tasks"]):
-        task = TaskRecord.from_dict(read_json(task_file))
-        before = _deadline_index_path(cfg, task.task_id).exists()
-        sync_deadline_index(cfg, task)
-        after = _deadline_index_path(cfg, task.task_id).exists()
-        if after:
-            indexed.add(task.task_id)
-        if before != after or after:
-            rebuilt += 1
+        task_id = validate_identifier(task_file.stem, "deadline rebuild task_id")
+        indexed.add(task_id)
+        _, changed = reconcile_deadline_index(cfg, task_id)
+        rebuilt += int(changed)
     for index_file in iter_json(shared_paths(cfg.shared_root)["offer_deadlines"]):
         if index_file.stem not in indexed:
-            remove_deadline_index(cfg, index_file.stem)
-            rebuilt += 1
+            _, changed = reconcile_deadline_index(cfg, index_file.stem)
+            rebuilt += int(changed)
     return rebuilt
 
 
@@ -443,23 +467,16 @@ def advance_deadline_index_rebuild_step(
     if current["side"] == "tasks":
         if not name.endswith(".json"):
             return {"state": "building", "cursor": next_cursor, "processed": 0, "rebuilt": 0, "examined": True}
-        task_pathname = source / name
-        task = TaskRecord.from_dict(
-            read_json_limited(
-                task_pathname,
-                max_bytes=_MAX_REBUILD_TASK_BYTES,
-                record_type="deadline_rebuild_task",
-            )
-        )
-        before = _deadline_index_path(cfg, task.task_id).exists()
-        sync_deadline_index(cfg, task)
-        after = _deadline_index_path(cfg, task.task_id).exists()
+        task_id = validate_identifier(Path(name).stem, "deadline rebuild task_id")
+        acquired, changed = reconcile_deadline_index(cfg, task_id, blocking=False)
+        if not acquired:
+            return {"state": "waiting", "cursor": current, "processed": 0, "rebuilt": 0, "task_id": task_id}
         return {
             "state": "building",
             "cursor": next_cursor,
             "processed": 1,
-            "rebuilt": int(before != after or after),
-            "task_id": task.task_id,
+            "rebuilt": int(changed),
+            "task_id": task_id,
         }
 
     if name == "layout-v1.json" or not name.endswith(".json"):
@@ -467,8 +484,14 @@ def advance_deadline_index_rebuild_step(
     index_path = source / name
     if index_path.is_dir():
         return {"state": "building", "cursor": next_cursor, "processed": 0, "rebuilt": 0, "examined": True}
-    task_id = index_path.stem
-    if not paths["tasks"].joinpath(f"{task_id}.json").exists():
-        remove_deadline_index(cfg, task_id)
-        return {"state": "building", "cursor": next_cursor, "processed": 1, "rebuilt": 1, "task_id": task_id}
-    return {"state": "building", "cursor": next_cursor, "processed": 1, "rebuilt": 0, "task_id": task_id}
+    task_id = validate_identifier(index_path.stem, "deadline rebuild task_id")
+    acquired, changed = reconcile_deadline_index(cfg, task_id, blocking=False)
+    if not acquired:
+        return {"state": "waiting", "cursor": current, "processed": 0, "rebuilt": 0, "task_id": task_id}
+    return {
+        "state": "building",
+        "cursor": next_cursor,
+        "processed": 1,
+        "rebuilt": int(changed),
+        "task_id": task_id,
+    }

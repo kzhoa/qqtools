@@ -6,7 +6,7 @@ import pytest
 
 from qqtools.plugins.qexp import batch_submit, init_shared_root, submit
 from qqtools.plugins.qexp.commands import task as task_commands
-from qqtools.plugins.qexp.commands.cleanup import clean, reconcile_cleanup_operations
+from qqtools.plugins.qexp.commands.cleanup import _advance_cleanup_local_step, clean, reconcile_cleanup_operations
 from qqtools.plugins.qexp.commands.group import create_group, group_control, reconcile_group_cancel_operations
 from qqtools.plugins.qexp.commands.task import offer, retry
 from qqtools.plugins.qexp.config_types import RootConfig
@@ -155,6 +155,36 @@ def test_clean_removes_timed_offer_deadline_index(tmp_path: Path):
 
     assert not task_path(cfg.shared_root, task.task_id).exists()
     assert not index_path.exists()
+
+
+@pytest.mark.parametrize("attempt_id", ["absolute", ".", ".."])
+def test_cleanup_rejects_untrusted_progress_attempt_path_on_resume(tmp_path: Path, attempt_id: str):
+    cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")
+    outside = tmp_path / "outside-progress"
+    outside.mkdir()
+    if attempt_id == "absolute":
+        progress_attempt_id = str(outside)
+        victim = outside / "keep.json"
+    elif attempt_id == ".":
+        progress_attempt_id = attempt_id
+        victim = cfg.runtime_root / "progress" / "keep.json"
+    else:
+        progress_attempt_id = attempt_id
+        victim = cfg.runtime_root / "keep.json"
+    victim.parent.mkdir(parents=True, exist_ok=True)
+    victim.write_text("keep", encoding="utf-8")
+    cursor = {
+        "stage": "local_progress_artifacts",
+        "progress_version": 1,
+        "progress_attempt_id": progress_attempt_id,
+        "progress_artifact": 0,
+        "progress_mailbox_offset": 0,
+    }
+
+    result = _advance_cleanup_local_step(cfg, {"task_id": "task"}, cursor, reservation_runtime_root=cfg.runtime_root)
+
+    assert result == {"state": "intervention", "reason": "local_progress_identity_invalid"}
+    assert victim.read_text(encoding="utf-8") == "keep"
 
 
 def test_submission_finalizer_failure_preserves_task_and_deadline_index(tmp_path: Path, monkeypatch):

@@ -70,10 +70,12 @@ PYTHONPATH=src ~/.cache/qqtools/tox/unit/bin/python \
 ```
 
 The profile creates isolated Project identities and real activation consumers,
-retires every binding through all five service lanes, and then measures the
+retires every binding through all six service lanes, and then measures the
 production dormant roster. It asserts four checkpoint reads per cycle, 64 lease
 renewals per heartbeat, a `ceil(N / 4)` wake bound, and a 100 ms steady-cycle p95.
-Setup and retirement are reported separately. The accelerated soak records its
+The reported checkpoint count is the logical production probe count; the timing
+captures the bounded observer's internal reads. Setup and retirement are reported
+separately. The accelerated soak records its
 actual wall duration and is not long-duration uptime evidence.
 
 ## Released writer gate qualification

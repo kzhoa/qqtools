@@ -5,6 +5,7 @@ import pytest
 from qqtools.plugins.qexp.agent.group_service_transport import (
     group_service_advance_evidence,
     group_service_advance_parameters,
+    group_service_candidate,
     group_service_probe_evidence,
     group_service_probe_parameters,
     initial_group_service_continuation,
@@ -44,6 +45,14 @@ def test_group_service_probe_contract_round_trips_closed_state():
 def test_group_service_probe_contract_rejects_inconsistent_candidate(value):
     with pytest.raises(ValueError):
         group_service_probe_evidence(value)
+
+
+def test_group_candidate_validates_directly_without_probe_state() -> None:
+    candidate = {"group": "experiment", "lane": "control", "generation": 2}
+    assert group_service_candidate(candidate) == candidate
+
+    with pytest.raises(ValueError, match="positive generation"):
+        group_service_candidate({**candidate, "generation": None})
 
 
 def test_group_advance_contract_round_trips_discovery_continuation():

@@ -1334,7 +1334,12 @@ def _advance_phase(
         repaired = []
         if outcome.get("rebuilt"):
             repaired.append(f"offer_deadline_indexes:{outcome['rebuilt']}")
-        return outcome["cursor"], outcome.get("state") == "completed", repaired, [], None, None
+        phase_result = (
+            {"state": "waiting", "reason": "deadline_index_task_lock_busy"}
+            if outcome.get("state") == "waiting"
+            else None
+        )
+        return outcome["cursor"], outcome.get("state") == "completed", repaired, [], None, phase_result
     if phase == "orphan_recovery":
         cursor, done, repaired, blocked, failure = _advance_orphan_phase(cfg, record, reservation_runtime_root)
         return cursor, done, repaired, blocked, failure, None
@@ -1590,16 +1595,11 @@ def _advance_projection_work(
         }
     if kind == "deadline_index":
         task_id = descriptor["identity"]["target_id"]
-        from ..runtime.availability.offer_deadlines import remove_deadline_index, sync_deadline_index
+        from ..runtime.availability.offer_deadlines import reconcile_deadline_index
 
-        try:
-            task = TaskRecord.from_dict(
-                read_json_limited(task_path(cfg.shared_root, task_id), max_bytes=_MAX_SOURCE_RECORD_BYTES)
-            )
-        except FileNotFoundError:
-            remove_deadline_index(cfg, task_id)
-        else:
-            sync_deadline_index(cfg, task)
+        acquired, _ = reconcile_deadline_index(cfg, task_id, blocking=False)
+        if not acquired:
+            return {"state": "waiting", "reason": "deadline_index_task_lock_busy"}
         return {"state": "completed", "proof": {"source": "deadline_index_task", "task_id": task_id}}
     if kind == "orphan_recovery":
         cursor = descriptor["cursor"]

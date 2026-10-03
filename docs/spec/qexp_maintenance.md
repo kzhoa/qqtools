@@ -94,9 +94,14 @@ queue result. Queue metadata persists rotation, the remaining entries in the
 current cycle, and the earliest delayed due time, so retired history does not
 increase selection cost.
 
-Descriptor preparation allocates its queue position, writes immutable JSON
-reconstruction evidence, registers the derived active slot, writes the active
-descriptor, and publishes its identity index before the authoritative mutation.
+Descriptor preparation atomically allocates its queue position and provisional
+derived slot, writes immutable JSON reconstruction evidence, confirms the
+derived slot, writes the active descriptor, and publishes its identity index
+before the authoritative mutation. A retry after any interrupted preparation
+reattaches to that exact identity and queue position; it does not allocate a
+duplicate slot. If the derived database is missing, preparation advances at
+most 64 authoritative reconstruction entries and refuses a new allocation until
+that bounded reconstruction is complete.
 A prepared descriptor is not executable until the matching truth mutation is
 provable. After truth commits, activation publishes a recoverable Project wake
 transaction before advancing the descriptor revision. Its bounded reason is
@@ -143,6 +148,16 @@ Transient failure k uses a capped exponential base
 Meaningful committed progress resets k. Malformed authority, incompatible
 schema, ambiguous ownership, and unrecoverable storage evidence enter
 intervention instead of retrying forever.
+
+An ordinary rerun attaches to the same intervention descriptor and remains
+blocked. This is especially important after a schema-1 full-audit descriptor is
+migrated without a trustworthy source-capture identity: it reports
+`legacy_capture_identity_unknown` and cannot safely resume that generation.
+After inspecting the intervention evidence, the operator may run
+`qexp --project PATH admin repair --retry-intervention` to leave that descriptor
+as terminal evidence and create a fresh full-audit generation with a new source
+capture. The flag does not reinterpret the legacy cursor or discard Task and
+Attempt truth.
 
 The full phase set covers Submission, cleanup, availability, Group cancellation,
 deadline indexes, orphan recovery, ready audit/build, group-ready members, Task

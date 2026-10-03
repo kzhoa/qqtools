@@ -61,12 +61,12 @@ re-fences the same generation and preserves only same-epoch progress. A new
 registration generation starts without an acknowledgement. Retired generations
 cannot register or acknowledge again.
 
-Five service lanes participate in the handoff: `scheduler`, `authority`, `group`,
-`observation`, and `submission`. A lane acknowledges quiescence only after its
-bounded reconciliation has persisted any active or waiting obligation. A binding
-becomes dormant only after all five lanes acknowledge the same checkpoint and
-the shared consumer cursor is durably advanced. A checkpoint change during the
-final handoff rejects dormancy.
+Six service lanes participate in the handoff: `scheduler`, `authority`, `group`,
+`observation`, `submission`, and `maintenance`. A lane acknowledges quiescence
+only after its bounded reconciliation has persisted any active or waiting
+obligation. A binding becomes dormant only after all six lanes acknowledge the
+same checkpoint and the shared consumer cursor is durably advanced. A checkpoint
+change during the final handoff rejects dormancy.
 
 Local handoff state is stored in
 `<machine-runtime>/projects/<project-id>/working-set-v1.json`. It is disposable
@@ -84,9 +84,12 @@ the intent for retry.
 
 `snapshot.json` declares a retention floor, the checkpoint sequence captured for
 that pass, the activation epoch, the consumer-membership revision, and coverage
-of all five authoritative active/waiting index lanes. `membership.json` advances
-when an exact consumer is created or retired. Consumer membership mutation and
-snapshot creation use the same activation lock.
+of the five authoritative active/waiting business-index lanes: `scheduler`,
+`authority`, `group`, `observation`, and `submission`. This persisted snapshot
+coverage is distinct from the six process-local handoff lanes.
+`membership.json` advances when an exact consumer is created or retired.
+Consumer membership mutation and snapshot creation use the same activation
+lock.
 
 Compaction advances by at most 256 events. It writes and syncs the new snapshot
 before deleting the covered prefix, records the previous floor until deletion is
@@ -95,19 +98,22 @@ bounded compaction pass when the retained suffix reaches 256 events. A corrupt o
 mismatched snapshot fails closed.
 
 A consumer below the floor cannot acknowledge the current tail directly. After
-all five lanes durably reconcile the authoritative indexes, it reconstructs at
-the exact snapshot floor, replays the retained suffix in batches of at most 256,
-and then acknowledges. This applies to offline, new, and locally damaged
-consumers. Repeated compaction does not retire an offline consumer by age or
-timeout.
+the five business-index sources are durably reconstructed at the exact snapshot
+floor, it replays the retained suffix in batches of at most 256. The consumer
+acknowledges only after those sources are reconciled and the maintenance lane
+has durably classified its current outbox turn, so all six local handoff lanes
+are quiescent against the same checkpoint. This applies to offline, new, and
+locally damaged consumers. Repeated compaction does not retire an offline
+consumer by age or timeout.
 
-The durable maintenance descriptor protocol is owned by the separate resumable
-index-maintenance design. No descriptor producer is introduced by this feature.
-When such producers are added, their prepare, identity, progress revision,
-retirement, and successor-generation records must be committed through this same
-activation transaction and remain covered by the snapshot's active/waiting index
-reconstruction. An activation acknowledgement transfers discovery responsibility;
-it does not complete or retire maintenance work.
+The current durable maintenance descriptor protocol is specified in
+[qexp resumable maintenance](qexp_maintenance.md). Descriptor preparation,
+progress, retirement, and successor generations publish through the Project
+activation transaction. The maintenance lane discovers outstanding work from
+the descriptor outbox's authoritative JSON identity, queue-slot, and lifecycle
+evidence; that evidence remains durable independently of the snapshot's fixed
+five-lane business-index coverage. An activation acknowledgement transfers
+discovery responsibility; it does not complete or retire maintenance work.
 
 ## Running, startup, and stopped guarantees
 

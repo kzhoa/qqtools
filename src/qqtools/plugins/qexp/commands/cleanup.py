@@ -816,6 +816,12 @@ def _advance_cleanup_local_step(
         version = cursor.get("progress_version")
         if not isinstance(attempt_id, str) or version not in {1, 2}:
             return {"state": "intervention", "reason": "local_progress_cursor_invalid"}
+        try:
+            validate_identifier(attempt_id, "progress_attempt_id")
+        except (TypeError, ValueError):
+            return {"state": "intervention", "reason": "local_progress_identity_invalid"}
+        if attempt_id in {".", ".."}:
+            return {"state": "intervention", "reason": "local_progress_identity_invalid"}
         mailbox = cfg.runtime_root / "progress" / attempt_id
         mailbox_name, mailbox_next = _read_cleanup_child(mailbox, cursor.get("progress_mailbox_offset", 0))
         if mailbox_name is not None:

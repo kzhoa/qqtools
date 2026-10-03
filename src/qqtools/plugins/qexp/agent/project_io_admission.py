@@ -14,6 +14,9 @@ _SERVICE_CLASSES: tuple[ServiceClass, ...] = ("authority", "primary", "backgroun
 _MAX_PENDING_INTENTS = 64
 _MAX_CRITICAL_CHAIN_GRANTS = 3
 _MAX_DUE_AUTHORITY_GRANTS = 3
+_FAMILY_TIER_CONTINUATION = -1
+_FAMILY_TIER_DUE = 0
+_FAMILY_TIER_ORDINARY = 1
 _CRITICAL_CHAIN_OPERATIONS = frozenset(
     {"scheduler_claim", "scheduler_launch_authorize", "scheduler_reservation_reconcile"}
 )
@@ -361,16 +364,17 @@ class ProjectIOAdmission:
         return True
 
     def _family_rank(self, key: tuple[BindingOwner, ServiceClass], intent: ServiceIntent) -> tuple:
+        """Rank continuations, one urgent deadline, then cursor-rotated ordinary work."""
         family = (intent.operation_kind, intent.work_family)
         cursor = self._work_cursors.get(key)
         previous_urgent = self._urgent_families.get(key)
         is_due = intent.deadline is not None and intent.deadline <= self._pass_time
         if previous_urgent is None and is_due:
-            return (0, intent.deadline, family)
+            return (_FAMILY_TIER_DUE, intent.deadline, family)
         if self._can_prioritize_critical_chain(intent):
-            return (-1, cursor is not None and family <= cursor, family)
+            return (_FAMILY_TIER_CONTINUATION, cursor is not None and family <= cursor, family)
         if self._can_prefer_progress_chain(intent):
-            return (-1, cursor is not None and family <= cursor, family)
+            return (_FAMILY_TIER_CONTINUATION, cursor is not None and family <= cursor, family)
         # Finish finite activation and service-lane closure before periodic
         # metadata. The cursor still visits every waiting family before a
         # continuously eligible prerequisite or closure family can repeat.
@@ -378,7 +382,9 @@ class ProjectIOAdmission:
         cursor_order = None if cursor is None else self._ordinary_family_order(intent.service_class, cursor)
         # An urgent override cannot reset the ordinary family cursor or take
         # consecutive opportunities away from an already waiting finite set.
-        return (1, family == previous_urgent, cursor_order is not None and family_order <= cursor_order, family_order)
+        is_previous_urgent = family == previous_urgent
+        is_at_or_before_cursor = cursor_order is not None and family_order <= cursor_order
+        return (_FAMILY_TIER_ORDINARY, is_previous_urgent, is_at_or_before_cursor, family_order)
 
     @staticmethod
     def _is_progress_chain(intent: ServiceIntent) -> bool:

@@ -21,6 +21,9 @@ DESCRIPTOR_SCHEMA_VERSION = 1
 DESCRIPTOR_MAX_BYTES = 64 * 1024
 _QUEUE_SLOT_SCHEMA_VERSION = 1
 _QUEUE_SLOT_MAX_BYTES = DESCRIPTOR_MAX_BYTES + 4096
+_RECONSTRUCTION_SCAN_SLOTS = 0
+_RECONSTRUCTION_SCAN_LEGACY_ACTIVE = 1
+_RECONSTRUCTION_COMPLETE = 2
 _ACTIVE_STATES = frozenset({"prepared", "pending", "running", "waiting"})
 _TERMINAL_STATES = frozenset({"completed", "intervention", "superseded"})
 _IDENTITY_FIELDS = frozenset({"project_id", "kind", "target_id", "work_generation"})
@@ -324,7 +327,8 @@ def _queue_connection(cfg: object) -> sqlite3.Connection:
                 if added_active_count:
                     connection.execute("DELETE FROM queue_slots")
                     connection.execute(
-                        "UPDATE queue_meta SET active_count = 0, migration_phase = 0, migration_offset = 0"
+                        "UPDATE queue_meta SET active_count = 0, migration_phase = ?, migration_offset = 0",
+                        (_RECONSTRUCTION_SCAN_SLOTS,),
                     )
                 connection.execute("COMMIT")
             except BaseException:
@@ -334,9 +338,9 @@ def _queue_connection(cfg: object) -> sqlite3.Connection:
         if row is None:
             legacy = _queue_state(cfg)
             if _slot_root(cfg).is_dir() or _active_root(cfg).is_dir() or legacy["next_position"] > 1:
-                migration_phase = 0
+                migration_phase = _RECONSTRUCTION_SCAN_SLOTS
             else:
-                migration_phase = 2
+                migration_phase = _RECONSTRUCTION_COMPLETE
             connection.execute("BEGIN IMMEDIATE")
             connection.execute(
                 """INSERT INTO queue_meta(
@@ -419,15 +423,47 @@ def _queue_allocate(
         if row is None:
             raise RuntimeError("maintenance queue metadata is missing.")
         position = int(row[0])
-        restore_completed_migration = int(row[1]) == 2
+        restore_completed_migration = int(row[1]) == _RECONSTRUCTION_COMPLETE
         record = _new_record(identity, position, now, phase, cursor)
         filename = f"{position:020d}-{_identity_key(identity)}.json"
+        require_json_size(record, max_bytes=DESCRIPTOR_MAX_BYTES, record_type="maintenance_descriptor")
+        require_json_size(
+            {
+                "maintenance_queue_slot": {
+                    "schema_version": _QUEUE_SLOT_SCHEMA_VERSION,
+                    "identity": identity,
+                    "queue_position": position,
+                    "filename": filename,
+                    "initial_record": record,
+                }
+            },
+            max_bytes=_QUEUE_SLOT_MAX_BYTES,
+            record_type="maintenance_queue_slot",
+        )
+        connection.execute(
+            """INSERT INTO queue_slots(
+                queue_position, identity_key, identity_json, filename, initial_record_json
+            ) VALUES (?, ?, ?, ?, ?)""",
+            (
+                position,
+                _identity_key(identity),
+                json.dumps(identity, sort_keys=True, separators=(",", ":")),
+                filename,
+                json.dumps(record, sort_keys=True, separators=(",", ":")),
+            ),
+        )
         connection.execute(
             """UPDATE queue_meta SET next_position = ?, revision = revision + 1,
-                   migration_phase = CASE WHEN migration_phase = 2 THEN 0 ELSE migration_phase END,
-                   migration_offset = CASE WHEN migration_phase = 2 THEN 0 ELSE migration_offset END
+                   active_count = active_count + 1,
+                   migration_phase = CASE WHEN migration_phase = ? THEN ? ELSE migration_phase END,
+                   migration_offset = CASE WHEN migration_phase = ? THEN 0 ELSE migration_offset END
                WHERE singleton = 1""",
-            (position + 1,),
+            (
+                position + 1,
+                _RECONSTRUCTION_COMPLETE,
+                _RECONSTRUCTION_SCAN_SLOTS,
+                _RECONSTRUCTION_COMPLETE,
+            ),
         )
         connection.execute("COMMIT")
     except BaseException:
@@ -439,7 +475,10 @@ def _queue_allocate(
 def _finish_queue_allocation(connection: sqlite3.Connection, restore_migration: bool) -> None:
     if not restore_migration:
         return
-    connection.execute("UPDATE queue_meta SET migration_phase = 2, migration_offset = 0 WHERE singleton = 1")
+    connection.execute(
+        "UPDATE queue_meta SET migration_phase = ?, migration_offset = 0 WHERE singleton = 1",
+        (_RECONSTRUCTION_COMPLETE,),
+    )
 
 
 def _queue_remove(connection: sqlite3.Connection, identity: dict[str, str], position: int) -> None:
@@ -543,6 +582,34 @@ def _prepare_locked(
         connection.close()
 
 
+def _recover_queued_prepare(
+    cfg: object,
+    connection: sqlite3.Connection,
+    identity: dict[str, str],
+    index_path: Path,
+) -> dict[str, Any] | None:
+    key = _identity_key(identity)
+    queued = connection.execute(
+        """SELECT queue_position, filename, initial_record_json FROM queue_slots
+           WHERE identity_key = ?""",
+        (key,),
+    ).fetchone()
+    if queued is None:
+        return None
+    position, filename, initial_json = queued
+    record = _validate_record(json.loads(initial_json), identity)
+    if record["queue_position"] != position:
+        raise ValueError("maintenance active-slot position is invalid.")
+    _write_slot(cfg, record, filename)
+    active_path = _active_root(cfg) / filename
+    if not active_path.exists():
+        _write_record(active_path, record)
+    check_mutation_fence(_index_root(cfg))
+    _index_root(cfg).mkdir(parents=True, exist_ok=True)
+    atomic_replace(index_path, {"identity": identity, "location": "active", "filename": filename})
+    return _read_record(active_path, identity)
+
+
 def _prepare_with_queue(
     cfg: object,
     identity: dict[str, str],
@@ -605,24 +672,15 @@ def _prepare_with_queue(
     retired = _retired_root(cfg) / f"{key}.json"
     if retired.exists():
         return _read_record(retired, identity)
-    queued = connection.execute(
-        """SELECT queue_position, filename, initial_record_json FROM queue_slots
-           WHERE identity_key = ?""",
-        (key,),
-    ).fetchone()
-    if queued is not None:
-        position, filename, initial_json = queued
-        record = _validate_record(json.loads(initial_json), identity)
-        if record["queue_position"] != position:
-            raise ValueError("maintenance active-slot position is invalid.")
-        _write_slot(cfg, record, filename)
-        active_path = _active_root(cfg) / filename
-        if not active_path.exists():
-            _write_record(active_path, record)
-        check_mutation_fence(_index_root(cfg))
-        _index_root(cfg).mkdir(parents=True, exist_ok=True)
-        atomic_replace(index_path, {"identity": identity, "location": "active", "filename": filename})
-        return _read_record(active_path, identity)
+    queued_record = _recover_queued_prepare(cfg, connection, identity, index_path)
+    if queued_record is not None:
+        return queued_record
+    reconstruction_complete = _advance_reconstruction(cfg, connection, 64)
+    queued_record = _recover_queued_prepare(cfg, connection, identity, index_path)
+    if queued_record is not None:
+        return queued_record
+    if not reconstruction_complete:
+        raise RuntimeError("maintenance queue reconstruction is in progress; retry preparation.")
     record, filename, restore_migration = _queue_allocate(connection, identity, now, phase, cursor)
     path = _active_root(cfg) / filename
     check_mutation_fence(_index_root(cfg))
@@ -638,9 +696,10 @@ def _prepare_with_queue(
             }
         },
     )
-    # Keep a reconstructable copy before the active-slot DB commit. The DB
-    # migration marker remains incomplete across this window so a crash can
-    # rediscover the JSON slot without scanning operation history.
+    # The allocation transaction already owns this identity and its initial
+    # record. Persist the authoritative reconstruction slot before completing
+    # the prepare, so deleting the derived DB after a successful return cannot
+    # lose the obligation.
     _write_slot(cfg, record, filename)
     _queue_register(connection, record, filename)
     _finish_queue_allocation(connection, restore_migration)
@@ -1006,8 +1065,8 @@ def _advance_reconstruction(cfg: object, connection: sqlite3.Connection, max_sca
         raise RuntimeError("maintenance queue reconstruction metadata is missing.")
     phase, offset = int(row[0]), int(row[1])
     scanned = 0
-    while phase < 2 and scanned < max_scan:
-        root = _slot_root(cfg) if phase == 0 else _active_root(cfg)
+    while phase < _RECONSTRUCTION_COMPLETE and scanned < max_scan:
+        root = _slot_root(cfg) if phase == _RECONSTRUCTION_SCAN_SLOTS else _active_root(cfg)
         if not root.is_dir():
             name, next_offset = None, 0
         else:
@@ -1017,8 +1076,10 @@ def _advance_reconstruction(cfg: object, connection: sqlite3.Connection, max_sca
             offset = 0
             continue
         scanned += 1
-        if phase == 0:
+        if phase == _RECONSTRUCTION_SCAN_SLOTS:
             _migrate_slot_entry(cfg, connection, name)
+        elif phase == _RECONSTRUCTION_SCAN_LEGACY_ACTIVE:
+            _migrate_active_entry(cfg, connection, name)
         else:
             _migrate_active_entry(cfg, connection, name)
         offset = next_offset
@@ -1032,7 +1093,7 @@ def _advance_reconstruction(cfg: object, connection: sqlite3.Connection, max_sca
     except BaseException:
         connection.execute("ROLLBACK")
         raise
-    return phase >= 2
+    return phase >= _RECONSTRUCTION_COMPLETE
 
 
 def _candidate_record(

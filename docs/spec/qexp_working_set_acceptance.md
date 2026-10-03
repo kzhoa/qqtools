@@ -1,6 +1,6 @@
 # qexp working-set delivery acceptance
 
-Qualification snapshot: 2026-09-25.
+Qualification snapshot: 2026-10-03.
 
 The qualification used Linux, Python 3.13, the source checkout and isolated
 runtime roots under `/tmp`. Filesystem caches were warm and uncontrolled. The
@@ -9,7 +9,7 @@ lease eligibility itself was recorded by an in-process stub so the measurement
 isolated roster selection from registration storage latency.
 
 The declared running-agent thresholds were a maximum of four dormant checkpoint
-reads per scheduler cycle, 64 dormant registration renewals per heartbeat,
+probes per scheduler cycle, 64 dormant registration renewals per heartbeat,
 `ceil(N / 4)` checkpoint-poll rounds for a continuously running agent to observe
 a wake, and a 100 ms p95 for one unchanged steady cycle. Startup and handoff are
 reported separately because they intentionally perform O(N) work.
@@ -25,21 +25,23 @@ PYTHONPATH=src ~/.cache/qqtools/tox/unit/bin/python \
   --projects 1 100 1000 --cycles 200 --soak-cycles 10000
 ```
 
-| Registered Projects | Startup (s) | Five-lane retirement (s) | Steady mean / p95 (ms) | Project truth reads | Lease renewals | Wake rounds / bound | FD delta | RSS delta |
+| Registered Projects | Startup (s) | Six-lane retirement (s) | Steady mean / p95 (ms) | Project truth probes | Lease renewals | Wake rounds / bound | FD delta | RSS delta |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1 | 0.004 | 0.008 | 0.198 / 0.220 | 200 | 200 | 1 / 1 | 0 | 0 B |
-| 100 | 0.470 | 1.245 | 0.822 / 1.028 | 800 | 12,800 | 25 / 25 | 0 | 0 B |
-| 1,000 | 5.252 | 13.030 | 0.842 / 1.021 | 800 | 12,800 | 50 / 250 | 0 | 8,192 B |
+| 1 | 0.001 | 0.016 | 0.251 / 0.384 | 200 | 200 | 1 / 1 | 0 | 0 B |
+| 100 | 0.106 | 2.181 | 0.872 / 1.334 | 800 | 12,800 | 18 / 25 | 0 | 0 B |
+| 1,000 | 1.074 | 22.183 | 1.065 / 1.866 | 800 | 12,800 | 22 / 250 | 0 | 8,192 B |
 
-Project truth reads stayed fixed between 100 and 1,000 dormant bindings. The
+Project truth probes stayed fixed between 100 and 1,000 dormant bindings. Each
+probe uses the production bounded replay observer; the latency measurement,
+rather than this logical probe count, captures its internal filesystem reads. The
 process retained one compact state record per registration, as allowed by the
 protocol, while resident contexts fell to zero before the wake. Traced steady
-memory deltas were 7,087, 43,287 and 1,266,903 bytes for 1, 100 and 1,000
-registrations. The 1,000-project accelerated soak ran 10,000 cycles in 1.836
+memory deltas were 16,651, 52,427 and 290,011 bytes for 1, 100 and 1,000
+registrations. The 1,000-project accelerated soak ran 10,000 cycles in 3.278
 seconds. This is churn evidence and is not months of uptime evidence.
 
 The wake-roster cursor had already advanced during the 200 steady cycles, so the
-1,000-project wake was observed in 50 rounds; the enforced worst-case bound was
+1,000-project wake was observed in 22 rounds; the enforced worst-case bound was
 250 rounds. The normal running-agent latency envelope is that round bound times
 the configured scheduler interval plus filesystem latency. A stopped on-demand
 agent retains evidence but has no wall-clock wake promise.

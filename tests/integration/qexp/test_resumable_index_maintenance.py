@@ -3,11 +3,15 @@ from pathlib import Path
 
 import pytest
 
-from qqtools.plugins.qexp import init_shared_root
+from qqtools.plugins.qexp import init_shared_root, submit
 from qqtools.plugins.qexp.agent.context import MachineRuntime
 from qqtools.plugins.qexp.cli.entrypoint import main
+from qqtools.plugins.qexp.commands import task as task_commands
+from qqtools.plugins.qexp.commands.group import create_group
 from qqtools.plugins.qexp.config_types import RootConfig
 from qqtools.plugins.qexp.doctor import repair_metadata
+from qqtools.plugins.qexp.runtime import maintenance as maintenance_runtime
+from qqtools.plugins.qexp.runtime.locks import task_lock
 from qqtools.plugins.qexp.runtime.maintenance import advance_maintenance_work
 from qqtools.plugins.qexp.runtime.maintenance_outbox import (
     activate_work,
@@ -17,6 +21,7 @@ from qqtools.plugins.qexp.runtime.maintenance_outbox import (
     select_due_work,
     update_work,
 )
+from qqtools.plugins.qexp.runtime.paths import shared_paths
 from qqtools.plugins.qexp.runtime.project_activation import read_project_activation
 from qqtools.plugins.qexp.runtime.ready import rebuild as ready_rebuild
 from qqtools.plugins.qexp.runtime.ready import state as ready_state
@@ -83,6 +88,101 @@ def test_full_repair_resumes_one_shared_budget_item_at_a_time(tmp_path: Path) ->
         max_work_items=1,
     )
     assert successor["scope"]["work_generation"] != generation
+
+
+def test_full_audit_deadline_rebuild_backs_off_on_task_lock(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")
+    create_group(cfg, "exp")
+    task = submit(cfg, ["echo", "ok"], group="exp")
+    task_commands.share(cfg, task.task_id, after_seconds=30)
+    index_path = shared_paths(cfg.shared_root)["offer_deadlines"] / f"{task.task_id}.json"
+
+    for _ in range(128):
+        progress = repair_metadata(cfg, reservation_runtime_root=cfg.runtime_root, max_work_items=1)
+        if progress["phase"] == "deadline_index" and not progress["cursor"]:
+            break
+    else:
+        pytest.fail("full audit did not reach deadline-index maintenance")
+
+    with task_lock(cfg.shared_root, task.task_id):
+        waiting = repair_metadata(cfg, reservation_runtime_root=cfg.runtime_root, max_work_items=1)
+
+    assert waiting["outcome"] == "partial"
+    assert waiting["phase"] == "deadline_index"
+    assert waiting["cursor"] == {"side": "tasks", "offset": 0}
+    assert waiting["failure"]["code"] == "deadline_index_task_lock_busy"
+    assert waiting["retry_count"] == 1
+
+    index_path.unlink()
+    monkeypatch.setattr(maintenance_runtime, "_retry_due", lambda *_args, **_kwargs: True)
+    resumed = repair_metadata(cfg, reservation_runtime_root=cfg.runtime_root, max_work_items=1)
+
+    assert resumed["outcome"] == "partial"
+    assert resumed["cursor"]["side"] == "tasks"
+    assert resumed["cursor"]["offset"] > 0
+    assert index_path.exists()
+
+
+def test_deadline_descriptor_retries_task_lock_before_retirement(tmp_path: Path) -> None:
+    cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")
+    create_group(cfg, "exp")
+    task = submit(cfg, ["echo", "ok"], group="exp")
+    task_commands.share(cfg, task.task_id, after_seconds=30)
+    index_path = shared_paths(cfg.shared_root)["offer_deadlines"] / f"{task.task_id}.json"
+    descriptor = prepare_work(
+        cfg,
+        kind="deadline_index",
+        target_id=task.task_id,
+        work_generation="deadline-lock-test",
+        phase="sync",
+    )
+    descriptor = activate_work(cfg, descriptor)
+
+    with task_lock(cfg.shared_root, task.task_id):
+        for _ in range(16):
+            waiting = advance_maintenance_work(cfg, reservation_runtime_root=cfg.runtime_root)
+            if waiting.get("descriptor_identity") == descriptor["identity"]:
+                break
+        else:
+            pytest.fail("deadline descriptor was not selected")
+
+    assert waiting["maintenance_state"] == "waiting", waiting
+    persisted = read_work(
+        cfg,
+        kind="deadline_index",
+        target_id=task.task_id,
+        work_generation=descriptor["identity"]["work_generation"],
+    )
+    assert persisted is not None
+    assert persisted["state"] == "waiting"
+    assert persisted["failure"]["code"] == "deadline_index_task_lock_busy"
+
+    index_path.unlink()
+    update_work(
+        cfg,
+        kind="deadline_index",
+        target_id=task.task_id,
+        work_generation=descriptor["identity"]["work_generation"],
+        state="waiting",
+        due_at="2000-01-01T00:00:00+00:00",
+    )
+    for _ in range(16):
+        completed = advance_maintenance_work(cfg, reservation_runtime_root=cfg.runtime_root)
+        if completed.get("descriptor_identity") == descriptor["identity"]:
+            break
+    else:
+        pytest.fail("deadline descriptor did not resume")
+
+    assert completed["maintenance_state"] == "completed"
+    assert index_path.exists()
+    retired = read_work(
+        cfg,
+        kind="deadline_index",
+        target_id=task.task_id,
+        work_generation=descriptor["identity"]["work_generation"],
+    )
+    assert retired is not None
+    assert retired["state"] == "completed"
 
 
 def test_partial_repair_json_and_strict_exit_contract(tmp_path: Path, capsys) -> None:
@@ -351,6 +451,162 @@ def test_queue_reconstruction_does_not_reset_lost_progress(tmp_path: Path) -> No
     assert persisted is not None
     assert persisted["state"] == "intervention"
     assert persisted["retirement_proof"]["code"] == "maintenance_progress_lost"
+
+
+def test_queue_reconstruction_preserves_healthy_current_progress(tmp_path: Path) -> None:
+    cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")
+    records = [
+        activate_work(
+            cfg,
+            prepare_work(
+                cfg,
+                kind="ready",
+                target_id=f"healthy-{index}",
+                work_generation=f"generation-{index}",
+                cursor={"step": 0},
+            ),
+        )
+        for index in range(3)
+    ]
+    records[1] = update_work(
+        cfg,
+        kind="ready",
+        target_id="healthy-1",
+        work_generation="generation-1",
+        cursor={"step": 1},
+        publish_activation=False,
+    )
+    root = cfg.shared_root / "operations" / "maintenance-v1"
+    (root / "queue-index.sqlite3").unlink()
+
+    selected = {}
+    for _ in range(32):
+        result = select_due_work(cfg, max_scan=1)
+        descriptor = result["descriptor"]
+        if descriptor is not None:
+            selected[descriptor["identity"]["target_id"]] = descriptor
+        if len(selected) == 3:
+            break
+
+    assert set(selected) == {"healthy-0", "healthy-1", "healthy-2"}
+    for record in records:
+        recovered = selected[record["identity"]["target_id"]]
+        assert recovered["identity"] == record["identity"]
+        assert recovered["cursor"] == record["cursor"]
+        assert recovered["progress_revision"] == record["progress_revision"]
+
+
+def test_prepare_retry_recovers_crash_after_json_slot_before_queue_confirmation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")
+    from qqtools.plugins.qexp.runtime import maintenance_outbox
+
+    register = maintenance_outbox._queue_register
+    crashed = False
+
+    def crash_once(connection, record, filename, **kwargs):
+        nonlocal crashed
+        if not crashed:
+            crashed = True
+            raise OSError("crash after JSON slot")
+        return register(connection, record, filename, **kwargs)
+
+    with monkeypatch.context() as crash:
+        crash.setattr(maintenance_outbox, "_queue_register", crash_once)
+        with pytest.raises(OSError, match="crash after JSON slot"):
+            prepare_work(
+                cfg,
+                kind="ready",
+                target_id="interrupted-prepare",
+                work_generation="generation",
+                cursor={"step": 0},
+            )
+
+    recovered = prepare_work(
+        cfg,
+        kind="ready",
+        target_id="interrupted-prepare",
+        work_generation="generation",
+        cursor={"step": 0},
+    )
+    root = cfg.shared_root / "operations" / "maintenance-v1"
+
+    assert recovered["queue_position"] == 1
+    assert len(list((root / "queue" / "slots").glob("*.json"))) == 1
+    assert len(list((root / "active").glob("*.json"))) == 1
+    assert select_due_work(cfg)["descriptor"]["identity"] == recovered["identity"]
+
+
+def test_prepare_retry_recovers_interrupted_slot_after_derived_db_loss(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")
+    from qqtools.plugins.qexp.runtime import maintenance_outbox
+
+    register = maintenance_outbox._queue_register
+    crashed = False
+
+    def crash_once(connection, record, filename, **kwargs):
+        nonlocal crashed
+        if not crashed:
+            crashed = True
+            raise OSError("crash after JSON slot")
+        return register(connection, record, filename, **kwargs)
+
+    with monkeypatch.context() as crash:
+        crash.setattr(maintenance_outbox, "_queue_register", crash_once)
+        with pytest.raises(OSError, match="crash after JSON slot"):
+            prepare_work(
+                cfg,
+                kind="ready",
+                target_id="interrupted-db-loss",
+                work_generation="generation",
+                cursor={"step": 0},
+            )
+
+    root = cfg.shared_root / "operations" / "maintenance-v1"
+    (root / "queue-index.sqlite3").unlink()
+    recovered = prepare_work(
+        cfg,
+        kind="ready",
+        target_id="interrupted-db-loss",
+        work_generation="generation",
+        cursor={"step": 0},
+    )
+
+    assert recovered["queue_position"] == 1
+    assert len(list((root / "queue" / "slots").glob("*.json"))) == 1
+    assert len(list((root / "active").glob("*.json"))) == 1
+
+
+def test_oversized_prepare_does_not_leave_a_live_queue_entry(tmp_path: Path) -> None:
+    cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")
+
+    with pytest.raises(ValueError, match="maintenance_descriptor"):
+        prepare_work(
+            cfg,
+            kind="ready",
+            target_id="oversized",
+            work_generation="generation",
+            cursor={"payload": "x" * 100_000},
+        )
+
+    healthy = activate_work(
+        cfg,
+        prepare_work(
+            cfg,
+            kind="ready",
+            target_id="healthy-after-oversized",
+            work_generation="generation",
+        ),
+    )
+    selected = select_due_work(cfg)
+
+    assert selected["descriptor"] is not None
+    assert selected["descriptor"]["identity"] == healthy["identity"]
 
 
 def test_stale_activation_cannot_reopen_retired_generation(tmp_path: Path) -> None:

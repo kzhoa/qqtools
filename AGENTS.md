@@ -101,6 +101,12 @@ actual results. Add or update effective regression coverage for executable
 behavior defects fixed in the task; use applicable static checks for documents.
 Record unrelated defects without expanding scope automatically.
 
+Before validation, run `ruff check --fix` and `ruff format` on the files changed
+for the current task. Review the resulting diff and resolve remaining findings.
+Keep automatic fixes scoped to those files, preserve unrelated user edits, and
+do not enable `--unsafe-fixes`. Final validation and CI checks must remain
+read-only; automatic fixes do not replace the full-repository checks below.
+
 Before requesting integration, run governance, `ruff check src tests scripts`,
 `ruff format --check src tests scripts`, and relevant focused tests locally.
 Running `./scripts/dev preflight` locally is recommended, and may be required by

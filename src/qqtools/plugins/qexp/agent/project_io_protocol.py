@@ -25,6 +25,7 @@ from .group_service_transport import (
 )
 from .primary_probe_transport import validate_probe_state
 from .progress_transport import progress_context, progress_evidence, progress_projection
+from .ready_cursor_validation import validate_ready_cursor_transition
 from .recovery_transport import (
     legacy_capture_evidence,
     legacy_capture_parameters,
@@ -626,24 +627,6 @@ def _validate_candidate(value: object) -> dict[str, Any]:
     return candidate
 
 
-def _validate_cursor_position(value: object, label: str) -> dict[str, Any]:
-    position = dict(_require_mapping(value, label))
-    _require_exact_keys(position, frozenset({"catalog_page", "partition", "after_name", "revision"}), label)
-    page = position["catalog_page"]
-    if page is not None:
-        page = _require_nonnegative_int(page, f"{label}.catalog_page")
-        if page > 1_000_000_000_000_000:
-            raise ValueError(f"{label}.catalog_page is too large.")
-    partition = position["partition"]
-    if partition is not None:
-        partition = _require_identifier(partition, f"{label}.partition", maximum=256)
-    after_name = position["after_name"]
-    if after_name is not None:
-        after_name = _require_text(after_name, f"{label}.after_name", maximum=256)
-    revision = _require_nonnegative_int(position["revision"], f"{label}.revision")
-    return {"catalog_page": page, "partition": partition, "after_name": after_name, "revision": revision}
-
-
 def _validate_observation_cursor(value: object, request: ProjectIORequest | None = None) -> dict[str, Any]:
     cursor = dict(_require_mapping(value, "scheduler_observe cursor"))
     _require_exact_keys(cursor, frozenset({"namespace", "routes"}), "scheduler_observe cursor")
@@ -662,16 +645,9 @@ def _validate_observation_cursor(value: object, request: ProjectIORequest | None
     for scope in ("home", "shared"):
         positions = dict(_require_mapping(routes_value[scope], f"cursor.routes.{scope}"))
         _require_exact_keys(positions, frozenset({"observed", "next"}), f"cursor.routes.{scope}")
-        observed = _validate_cursor_position(positions["observed"], f"cursor.routes.{scope}.observed")
-        next_position = _validate_cursor_position(positions["next"], f"cursor.routes.{scope}.next")
-        if next_position["revision"] < observed["revision"]:
-            raise ValueError(f"cursor.routes.{scope}.next revision precedes observed revision.")
-        position_fields = ("catalog_page", "partition", "after_name")
-        if (
-            any(next_position[field] != observed[field] for field in position_fields)
-            and next_position["revision"] <= observed["revision"]
-        ):
-            raise ValueError(f"cursor.routes.{scope}.next position changed without advancing its revision.")
+        observed, next_position = validate_ready_cursor_transition(
+            positions["observed"], positions["next"], f"cursor.routes.{scope}"
+        )
         routes[scope] = {"observed": observed, "next": next_position}
     return {"namespace": namespace, "routes": routes}
 
@@ -884,28 +860,9 @@ def _request_parameters(operation_kind: str, value: object) -> dict[str, Any]:
             parameters["reservation_id"] = _require_identifier(reservation_id, "reservation_id")
         if parameters["attempt_id"] != f"{parameters['task_id']}-attempt-{parameters['attempt_number']}":
             raise ValueError("authority_service Attempt identity is inconsistent.")
-        process_identity = dict(_require_mapping(parameters["process_identity"], "process_identity"))
-        _require_exact_keys(
-            process_identity,
-            frozenset(
-                {
-                    "wrapper_pid",
-                    "wrapper_start_time_ticks",
-                    "process_group_id",
-                    "process_group_start_time_ticks",
-                }
-            ),
-            "authority_service process_identity",
+        parameters["process_identity"] = _validate_supervised_process_identity(
+            parameters["process_identity"], "authority_service process_identity"
         )
-        for field in ("wrapper_pid", "process_group_id"):
-            value = process_identity[field]
-            if value is not None:
-                process_identity[field] = _require_nonnegative_int(value, f"process_identity.{field}", positive=True)
-        for field in ("wrapper_start_time_ticks", "process_group_start_time_ticks"):
-            value = process_identity[field]
-            if value is not None:
-                process_identity[field] = _require_nonnegative_int(value, f"process_identity.{field}")
-        parameters["process_identity"] = process_identity
     elif operation_kind == "authority_renewal":
         _require_exact_keys(
             parameters,
@@ -936,28 +893,9 @@ def _request_parameters(operation_kind: str, value: object) -> dict[str, Any]:
         reservation_id = parameters["reservation_id"]
         if reservation_id is not None:
             parameters["reservation_id"] = _require_identifier(reservation_id, "reservation_id")
-        process_identity = dict(_require_mapping(parameters["process_identity"], "process_identity"))
-        _require_exact_keys(
-            process_identity,
-            frozenset(
-                {
-                    "wrapper_pid",
-                    "wrapper_start_time_ticks",
-                    "process_group_id",
-                    "process_group_start_time_ticks",
-                }
-            ),
-            "authority_renewal process_identity",
+        parameters["process_identity"] = _validate_supervised_process_identity(
+            parameters["process_identity"], "authority_renewal process_identity"
         )
-        for field in ("wrapper_pid", "process_group_id"):
-            value = process_identity[field]
-            if value is not None:
-                process_identity[field] = _require_nonnegative_int(value, f"process_identity.{field}", positive=True)
-        for field in ("wrapper_start_time_ticks", "process_group_start_time_ticks"):
-            value = process_identity[field]
-            if value is not None:
-                process_identity[field] = _require_nonnegative_int(value, f"process_identity.{field}")
-        parameters["process_identity"] = process_identity
     elif operation_kind == "authority_orphan_recovery":
         parameters.setdefault("replay_only", False)
         _require_exact_keys(

@@ -394,6 +394,60 @@ def read_project_activation(root: Path) -> dict[str, Any] | None:
     return checkpoint
 
 
+def observe_project_activation(
+    root: Path,
+    *,
+    replay_epoch: str | None,
+    replay_sequence: int,
+) -> dict[str, Any]:
+    """Observe one bounded activation suffix from an exact consumer cursor."""
+    root = Path(root)
+    checkpoint = read_project_activation(root)
+    if checkpoint is None:
+        return {"outcome": "observed", "checkpoint": None, "replay": None}
+    value = checkpoint["project_activation"]
+    epoch = value["epoch"]
+    current_sequence = value["sequence"]
+    if replay_epoch != epoch:
+        replay_sequence = 0
+    if replay_sequence > current_sequence:
+        raise ValueError("activation replay cursor exceeds the current checkpoint")
+
+    reconstructed_floor = None
+    snapshot = read_project_activation_snapshot(root)
+    if snapshot is not None:
+        snapshot_record = snapshot["project_activation_snapshot"]
+        if snapshot_record["epoch"] == epoch and snapshot_record["floor_sequence"] > 0:
+            reconstructed_floor = snapshot_record["floor_sequence"]
+            if replay_sequence < reconstructed_floor:
+                replay_sequence = reconstructed_floor
+    if replay_sequence > current_sequence:
+        raise RuntimeError("activation checkpoint changed during replay observation")
+    if replay_sequence < current_sequence:
+        batch = read_project_activation_events(
+            root,
+            epoch=epoch,
+            after_sequence=replay_sequence,
+            limit=min(_MAX_EVENT_BATCH, current_sequence - replay_sequence),
+        )
+        if not batch:
+            raise ValueError("activation replay made no progress")
+        replay_sequence += len(batch)
+    final_checkpoint = read_project_activation(root)
+    if final_checkpoint != checkpoint:
+        raise RuntimeError("activation checkpoint changed during replay observation")
+    return {
+        "outcome": "observed",
+        "checkpoint": {"epoch": epoch, "sequence": current_sequence},
+        "replay": {
+            "epoch": epoch,
+            "sequence": replay_sequence,
+            "reconstructed_floor": reconstructed_floor,
+            "complete": replay_sequence == current_sequence,
+        },
+    }
+
+
 def _validate_checkpoint_directories(root: Path) -> None:
     for directory in (root / "operations", root / "operations" / "project-activation-v1"):
         try:

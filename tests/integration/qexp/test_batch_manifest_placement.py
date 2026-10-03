@@ -1,17 +1,22 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
 
 from qqtools.plugins.qexp import batch_submit, init_shared_root
+from qqtools.plugins.qexp.commands import task as task_commands
 from qqtools.plugins.qexp.commands.group import change_worker, create_group, group_control
 from qqtools.plugins.qexp.config_types import RootConfig
 from qqtools.plugins.qexp.runtime import submission as submission_runtime
 from qqtools.plugins.qexp.runtime import submission_plan
 from qqtools.plugins.qexp.runtime.paths import group_path, submission_path, task_path
+from qqtools.plugins.qexp.runtime.ready.primary_candidates import candidate_path, route_key
+from qqtools.plugins.qexp.runtime.ready.routes import reference_for_generation
 from qqtools.plugins.qexp.runtime.store import read_json
-from qqtools.plugins.qexp.runtime.submission import SubmissionFinalizationError
+from qqtools.plugins.qexp.runtime.submission import SubmissionFinalizationError, advance_submission_cleanup_step
+from qqtools.plugins.qexp.runtime.tasks import load_task
 
 pytestmark = [pytest.mark.integration, pytest.mark.qexp_fast_io]
 
@@ -500,6 +505,55 @@ tasks:
     operation_files = list((cfg.shared_root / "operations" / "submissions").glob("*.json"))
     assert len(operation_files) == 1
     assert read_json(operation_files[0])["submission"]["state"] == "aborted"
+
+
+def test_resumable_worker_rollback_removes_primary_candidates(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
+    init_shared_root(cfg.shared_root, "g2", runtime_root=tmp_path / "g2-rt")
+    create_group(cfg, "exp", workers=["g1"])
+    seed = batch_submit(cfg, _manifest(tmp_path, "tasks:\n  - command: [echo, seed]\n"), group="exp")[0]
+    task_commands.share(cfg, seed.task_id)
+    seed = load_task(cfg, seed.task_id)
+    reference = reference_for_generation(cfg, seed.task_id, seed.ready_generation)
+    assert reference is not None
+    candidate = candidate_path(cfg, route_key("shared", "g2"), reference.identity)
+    original_task_locks = submission_runtime.task_locks
+
+    class SimulatedCrash(BaseException):
+        pass
+
+    @contextmanager
+    def crash_before_task_stage(*_args, **_kwargs):
+        raise SimulatedCrash
+        yield
+
+    manifest = _manifest(
+        tmp_path,
+        """
+group:
+  workers:
+    primary:
+      g2: null
+tasks:
+  - command: [echo, new]
+""",
+    )
+    monkeypatch.setattr(submission_runtime, "task_locks", crash_before_task_stage)
+    with pytest.raises(SimulatedCrash):
+        batch_submit(cfg, manifest, group="exp", idempotency_key="worker-rollback")
+    monkeypatch.setattr(submission_runtime, "task_locks", original_task_locks)
+
+    group = read_json(group_path(cfg.shared_root, "exp"))
+    operation_id = group["group"]["pending_submission_commit"]["operation_id"]
+    assert candidate.exists()
+
+    for _ in range(4):
+        advance_submission_cleanup_step(cfg, operation_id)
+        if "g2" not in read_json(group_path(cfg.shared_root, "exp"))["group"]["worker_set"]:
+            break
+
+    assert "g2" not in read_json(group_path(cfg.shared_root, "exp"))["group"]["worker_set"]
+    assert not candidate.exists()
 
 
 def test_committed_operation_keeps_group_pending_when_finalizer_fails(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):

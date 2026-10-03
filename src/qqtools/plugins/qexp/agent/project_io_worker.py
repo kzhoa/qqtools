@@ -1401,58 +1401,13 @@ def _registration_renew(
 
 
 def _activation_checkpoint_observe(request: ProjectIORequest) -> dict[str, Any]:
-    from ..runtime.project_activation import (
-        read_project_activation,
-        read_project_activation_events,
-        read_project_activation_snapshot,
+    from ..runtime.project_activation import observe_project_activation
+
+    return observe_project_activation(
+        Path(request.canonical_shared_root),
+        replay_epoch=request.parameters["replay_epoch"],
+        replay_sequence=request.parameters["replay_sequence"],
     )
-
-    root = Path(request.canonical_shared_root)
-    checkpoint = read_project_activation(root)
-    if checkpoint is None:
-        return {"outcome": "observed", "checkpoint": None, "replay": None}
-    value = checkpoint["project_activation"]
-    epoch = value["epoch"]
-    current_sequence = value["sequence"]
-    replay_sequence = request.parameters["replay_sequence"]
-    if request.parameters["replay_epoch"] != epoch:
-        replay_sequence = 0
-    if replay_sequence > current_sequence:
-        raise ValueError("activation replay cursor exceeds the current checkpoint")
-
-    reconstructed_floor = None
-    snapshot = read_project_activation_snapshot(root)
-    if snapshot is not None:
-        snapshot_record = snapshot["project_activation_snapshot"]
-        if snapshot_record["epoch"] == epoch and snapshot_record["floor_sequence"] > 0:
-            reconstructed_floor = snapshot_record["floor_sequence"]
-            if replay_sequence < reconstructed_floor:
-                replay_sequence = reconstructed_floor
-    if replay_sequence > current_sequence:
-        raise RuntimeError("activation checkpoint changed during replay observation")
-    if replay_sequence < current_sequence:
-        batch = read_project_activation_events(
-            root,
-            epoch=epoch,
-            after_sequence=replay_sequence,
-            limit=min(256, current_sequence - replay_sequence),
-        )
-        if not batch:
-            raise ValueError("activation replay made no progress")
-        replay_sequence += len(batch)
-    final_checkpoint = read_project_activation(root)
-    if final_checkpoint != checkpoint:
-        raise RuntimeError("activation checkpoint changed during replay observation")
-    return {
-        "outcome": "observed",
-        "checkpoint": {"epoch": epoch, "sequence": current_sequence},
-        "replay": {
-            "epoch": epoch,
-            "sequence": replay_sequence,
-            "reconstructed_floor": reconstructed_floor,
-            "complete": replay_sequence == current_sequence,
-        },
-    }
 
 
 def _activation_consumer_mutation(

@@ -42,6 +42,10 @@ from .project_io_process import binding_prefix as _authority_due_binding_prefix
 from .project_io_process import binding_signature as _authority_binding_signature
 from .project_io_process import read_process_manifest as _read_process_manifest
 from .project_io_protocol import PROJECT_IO_CAPACITY, ProjectIORequest, authority_terminal_transition_digest
+from .project_io_terminal_proof import build_terminal_transition as _construct_terminal_transition
+from .project_io_terminal_proof import has_exact_terminal_revisions as _has_exact_terminal_revisions
+from .project_io_terminal_proof import matches_terminal_lifecycle_event, matches_terminal_observation_identity
+from .project_io_terminal_proof import terminal_transition_target as _select_terminal_transition_target
 from .working_set import BindingTurn
 
 _MAX_AUTHORITY_DUE_KEYS = 256
@@ -832,20 +836,6 @@ def _record_terminal_observation_problem(
         state.reconciler.record_diagnostic(process.record, "exit_observation_missing")
 
 
-def _has_exact_terminal_revisions(value: object) -> bool:
-    if not isinstance(value, Mapping) or set(value) != {"task", "attempt_digest"}:
-        return False
-    task_revision = value.get("task")
-    attempt_digest = value.get("attempt_digest")
-    return (
-        type(task_revision) is int
-        and task_revision >= 0
-        and isinstance(attempt_digest, str)
-        and len(attempt_digest) == 64
-        and all(character in "0123456789abcdef" for character in attempt_digest)
-    )
-
-
 def _read_termination_process_record(
     path: Path,
     project_root: Path,
@@ -1208,21 +1198,13 @@ def _termination_publication_proof(
     )
     if transition.get("transition_digest") != digest:
         return False
-    committed = evidence.get("committed_revisions")
-    event = evidence.get("lifecycle_event")
-    if not _has_exact_terminal_revisions(committed) or not isinstance(event, Mapping):
-        return False
-    return all(
-        event.get(field) == value
-        for field, value in (
-            ("task_id", parameters["task_id"]),
-            ("attempt_id", parameters["attempt_id"]),
-            ("attempt_number", parameters["attempt_number"]),
-            ("phase", phase),
-            ("reason", reason),
-            ("exit_code", None),
-            ("task_revision", committed["task"]),
-        )
+    return matches_terminal_lifecycle_event(
+        evidence.get("lifecycle_event"),
+        evidence.get("committed_revisions"),
+        parameters,
+        phase=phase,
+        reason=reason,
+        exit_code=None,
     )
 
 
@@ -1251,26 +1233,10 @@ def _terminal_observation_matches_candidate(
     evidence: Mapping[str, Any],
     candidate: _TerminalCandidate,
 ) -> bool:
-    parameters = candidate.parameters
-    return (
-        evidence.get("machine_name") == candidate.binding.machine_name
-        and all(
-            evidence.get(field) == parameters[field]
-            for field in (
-                "task_id",
-                "attempt_id",
-                "attempt_number",
-                "fencing_token",
-                "reservation_id",
-                "process_identity",
-                "mode",
-            )
-        )
-        and evidence.get("authority_granted") is False
-        and isinstance(evidence.get("local_effects"), (list, tuple))
-        and not evidence["local_effects"]
-        and _has_exact_terminal_revisions(evidence.get("source_revisions"))
-        and type(evidence.get("cancel_requested")) is bool
+    return matches_terminal_observation_identity(
+        evidence,
+        candidate.parameters,
+        candidate.binding.machine_name,
     )
 
 
@@ -1279,22 +1245,11 @@ def _terminal_transition_target(
     cancel_requested: bool,
 ) -> tuple[str, str, str | None] | None:
     """Return the exact terminal result allowed by this supervision mode."""
-    if type(cancel_requested) is not bool:
-        return None
-    mode = candidate.parameters.get("mode")
-    if mode == "active":
-        if cancel_requested and candidate.exit_code != 0:
-            return "cancelled", "termination_process_already_exited", "already_exited"
-        phase = "succeeded" if candidate.exit_code == 0 else "failed"
-        reason = "completed" if candidate.exit_code == 0 else "nonzero_exit"
-        return phase, reason, "already_exited" if cancel_requested else None
-    if mode == "detached_orphan":
-        if cancel_requested:
-            return "cancelled", "termination_process_already_exited", "already_exited"
-        phase = "succeeded" if candidate.exit_code == 0 else "failed"
-        reason = "completed" if candidate.exit_code == 0 else "nonzero_exit"
-        return phase, reason, None
-    return None
+    return _select_terminal_transition_target(
+        mode=candidate.parameters.get("mode"),
+        exit_code=candidate.exit_code,
+        cancel_requested=cancel_requested,
+    )
 
 
 def _build_terminal_transition(
@@ -1322,35 +1277,13 @@ def _build_terminal_transition(
         or evidence.get("reservation_machine_name") != candidate.binding.machine_name
     ):
         return None
-    target = _terminal_transition_target(candidate, evidence["cancel_requested"])
-    if target is None:
-        return None
-    phase, reason, termination_result = target
-    parameters = candidate.parameters
-    revisions = dict(evidence["source_revisions"])
-    digest = authority_terminal_transition_digest(
-        mode=parameters["mode"],
-        task_id=parameters["task_id"],
-        attempt_id=parameters["attempt_id"],
-        attempt_number=parameters["attempt_number"],
-        fencing_token=parameters["fencing_token"],
+    return _construct_terminal_transition(
+        parameters=candidate.parameters,
         machine_name=candidate.binding.machine_name,
-        reservation_id=parameters["reservation_id"],
-        process_identity=parameters["process_identity"],
-        phase=phase,
-        reason=reason,
         exit_code=candidate.exit_code,
-        termination_result=termination_result,
+        source_revisions=evidence["source_revisions"],
+        cancel_requested=evidence["cancel_requested"],
     )
-    return {
-        **parameters,
-        "phase": phase,
-        "reason": reason,
-        "exit_code": candidate.exit_code,
-        "termination_result": termination_result,
-        "source_revisions": revisions,
-        "transition_digest": digest,
-    }
 
 
 def _recover_terminal_transition(
@@ -1558,26 +1491,18 @@ def _is_terminal_publication_proof(
     )
     if transition.get("transition_digest") != expected_digest:
         return False
-    committed = evidence.get("committed_revisions")
-    event = evidence.get("lifecycle_event")
-    if not _has_exact_terminal_revisions(committed) or not isinstance(event, Mapping):
-        return False
     reservation_machine = evidence.get("reservation_machine_name")
     if reservation_machine not in {None, candidate.binding.machine_name} or (
         parameters["reservation_id"] is not None and reservation_machine != candidate.binding.machine_name
     ):
         return False
-    return all(
-        event.get(field) == value
-        for field, value in (
-            ("task_id", parameters["task_id"]),
-            ("attempt_id", parameters["attempt_id"]),
-            ("attempt_number", parameters["attempt_number"]),
-            ("phase", phase),
-            ("reason", reason),
-            ("exit_code", candidate.exit_code),
-            ("task_revision", committed["task"]),
-        )
+    return matches_terminal_lifecycle_event(
+        evidence.get("lifecycle_event"),
+        evidence.get("committed_revisions"),
+        parameters,
+        phase=phase,
+        reason=reason,
+        exit_code=candidate.exit_code,
     )
 
 

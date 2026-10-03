@@ -33,8 +33,35 @@ from qqtools.plugins.qexp.runtime.project_activation import (
 )
 from qqtools.plugins.qexp.runtime.project_activation_consumers import ack_consumer, read_consumer_progress
 from qqtools.plugins.qexp.runtime.store import atomic_replace
+from scripts.qualification import profile_qexp_working_set as working_set_profile
 
 pytestmark = [pytest.mark.integration, pytest.mark.qexp_fast_io]
+
+
+def test_working_set_qualification_uses_current_activation_protocol(tmp_path: Path) -> None:
+    result = working_set_profile._profile(tmp_path / "qualification", 5, 2, 0)
+
+    assert result["registered_projects"] == 5
+    assert result["project_truth_probes_before_wake"] == 8
+    assert result["lease_renewals_before_wake"] == 10
+    assert result["wake_rounds"] <= 2
+    assert result["resident_after_wake"] >= 1
+
+
+def test_working_set_qualification_rejects_a_missing_wake_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        working_set_profile,
+        "publish_project_activation",
+        lambda *_args, **_kwargs: {
+            "project_activation": {"epoch": uuid.uuid4().hex, "sequence": 1},
+        },
+    )
+
+    with pytest.raises(RuntimeError, match="wake discovery exceeded"):
+        working_set_profile._profile(tmp_path / "qualification", 5, 1, 0)
 
 
 def test_missing_evidence_watch_ignores_sibling_and_detects_exact_target(tmp_path: Path) -> None:

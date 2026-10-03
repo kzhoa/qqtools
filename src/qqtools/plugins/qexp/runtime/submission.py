@@ -645,11 +645,21 @@ def advance_submission_cleanup_step(cfg: Any, operation_id: str) -> dict[str, An
                             machine = workers[index]
                             worker = group_control.get("worker_set", {}).get(machine)
                             if worker and worker.get("added_by_operation") == operation_id:
+                                previous_workers = {
+                                    worker_name: dict(worker_record)
+                                    for worker_name, worker_record in group_control["worker_set"].items()
+                                }
                                 del group_control["worker_set"][machine]
                                 group_control["worker_set_epoch"] += 1
                                 group["meta"]["revision"] += 1
                                 group["meta"]["updated_at"] = utc_now()
-                                _write_group_record(cfg, group_file, group)
+                                _persist_group_after_submission_rollback(
+                                    cfg,
+                                    group_file,
+                                    group,
+                                    previous_workers,
+                                    workers_changed=True,
+                                )
                             progress["worker_offset"] = index + 1
                             if progress["worker_offset"] >= len(workers):
                                 progress["stage"] = "group_finalize"

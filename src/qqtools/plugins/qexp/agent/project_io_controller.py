@@ -45,6 +45,7 @@ from .progress_coordinator import ProgressObservationCoordinator
 from .project_io_admission import ProjectIOAdmission, ServiceIntent
 from .project_io_executor import ProjectIOExecutor, ProjectIOProtocolError
 from .project_io_protocol import ProjectIORequest
+from .ready_cursor_validation import validate_ready_cursor_transition
 from .working_set import BindingTurn
 
 _INITIAL_BACKOFF_SECONDS = 5.0
@@ -1792,17 +1793,10 @@ class ProjectIOController:
                 raise ValueError("scheduler observation cursor is malformed.")
             if set(cursor["routes"]) != {"home", "shared"}:
                 raise ValueError("scheduler observation cursor routes are malformed.")
-            for route in cursor["routes"].values():
+            for scope, route in cursor["routes"].items():
                 if not isinstance(route, Mapping) or set(route) != {"observed", "next"}:
                     raise ValueError("scheduler observation cursor route is malformed.")
-                for position in route.values():
-                    if (
-                        not isinstance(position, Mapping)
-                        or set(position) != {"catalog_page", "partition", "after_name", "revision"}
-                        or type(position["revision"]) is not int
-                        or position["revision"] < 0
-                    ):
-                        raise ValueError("scheduler observation cursor position is malformed.")
+                validate_ready_cursor_transition(route["observed"], route["next"], f"cursor.routes.{scope}")
             if not isinstance(evidence["outcome"], str) or evidence["outcome"] not in {"candidate", "none"}:
                 raise ValueError("scheduler observation outcome is invalid.")
             candidate = evidence["candidate"]
@@ -5725,37 +5719,7 @@ class ProjectIOController:
             route = cursor["routes"][scope]
             if not isinstance(route, Mapping) or set(route) != {"observed", "next"}:
                 raise ValueError("empty scheduler observation cursor route is malformed.")
-            positions: list[Mapping[str, Any]] = []
-            for position_name in ("observed", "next"):
-                position = route[position_name]
-                if not isinstance(position, Mapping) or set(position) != {
-                    "catalog_page",
-                    "partition",
-                    "after_name",
-                    "revision",
-                }:
-                    raise ValueError("empty scheduler observation cursor position is malformed.")
-                page = position["catalog_page"]
-                partition = position["partition"]
-                after_name = position["after_name"]
-                revision = position["revision"]
-                if page is not None and (type(page) is not int or page < 0):
-                    raise ValueError("empty scheduler observation cursor catalog page is invalid.")
-                if partition is not None and (not isinstance(partition, str) or not partition):
-                    raise ValueError("empty scheduler observation cursor partition is invalid.")
-                if after_name is not None and not isinstance(after_name, str):
-                    raise ValueError("empty scheduler observation cursor marker is invalid.")
-                if type(revision) is not int or revision < 0:
-                    raise ValueError("empty scheduler observation cursor revision is invalid.")
-                positions.append(position)
-            observed, next_position = positions
-            if next_position["revision"] < observed["revision"]:
-                raise ValueError("empty scheduler observation cursor revision moved backwards.")
-            if (
-                any(next_position[field] != observed[field] for field in ("catalog_page", "partition", "after_name"))
-                and next_position["revision"] <= observed["revision"]
-            ):
-                raise ValueError("empty scheduler observation cursor advanced without a new revision.")
+            validate_ready_cursor_transition(route["observed"], route["next"], f"cursor.routes.{scope}")
 
     @staticmethod
     def _validate_cursor_commit_result(evidence: object) -> None:

@@ -2198,7 +2198,8 @@ retry. It performs direct bounded Task, selected-Attempt, and dependency reads. 
 - `qexp agent config gpus set --visible <ids> | --none [--expected-revision <revision>]`
 - `qexp agent config gpus reset [--expected-revision <revision>]`
 - `qexp admin migrate agent --project PATH --machine NAME`
-- `qexp admin {check|repair} --project PATH`
+- `qexp admin check --project PATH`
+- `qexp admin repair --project PATH [--retry-intervention]`
 - `qexp admin clean --project PATH`
 - `qexp admin operation show REFERENCE --project PATH`
 - `qexp admin upgrade status | advance [--project PATH]`
@@ -2214,6 +2215,12 @@ successfully for compatibility while reporting `complete=false` and requiring a
 rerun; strict mode and genuinely blocked work exit unsuccessfully. Routine
 resident recovery is active-obligation scoped and does not inherit the explicit
 full audit's retained-history traversal.
+
+`--retry-intervention` applies only to `admin repair`: after the operator
+inspects a blocked full-audit intervention, it preserves that terminal
+descriptor and starts a successor generation from a fresh source capture.
+Ordinary reruns remain attached to the blocked generation. The flag never
+reinterprets an untrusted legacy cursor or discards Task and Attempt truth.
 
 `agent run` is a foreground debugging stream with no `--format` or finite startup record.
 `agent restart` reports process replacement and current readiness evidence without waiting for

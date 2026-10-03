@@ -457,6 +457,13 @@ stops new claims intentionally rather than scheduling potentially wrong work.
 Task or Attempt truth. If repair reports `blocked`, resolve the listed operation or execution
 evidence first; do not force-delete it.
 
+If an upgraded schema-1 full-audit descriptor reports
+`legacy_capture_identity_unknown`, repeating the ordinary command deliberately
+remains attached to that blocked generation. Inspect the intervention evidence,
+then use `qexp --project PROJECT_ROOT admin repair --retry-intervention` to
+create a successor audit with a fresh source capture. This preserves the blocked
+legacy descriptor as evidence and does not discard Task or Attempt truth.
+
 ## Upgrade an existing schema-6 root to qqtools 1.3.15
 
 Perform these steps one project at a time. `MACHINE_RUNTIME_ROOT` is required only when the

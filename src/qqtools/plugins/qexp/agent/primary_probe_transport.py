@@ -6,8 +6,8 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 
 from ..runtime.ready import ReadyCursor
-from ..runtime.records import validate_identifier
 from .dispatch_probe import DependencyRecheck, PrimaryProbeRoute, PrimaryProbeSession
+from .ready_cursor_validation import validate_ready_cursor_position
 
 SCOPES = ("shared", "home")
 
@@ -27,31 +27,12 @@ def _revision(value: object) -> int:
 def _cursor(value: object) -> dict[str, Any] | None:
     if value is None:
         return None
-    record = _object(value, {"catalog_page", "partition", "after_name", "revision"})
-    page = None if record["catalog_page"] is None else _revision(record["catalog_page"])
-    if page is not None and page > 1_000_000_000_000_000:
-        raise ValueError("primary probe cursor catalog page is too large.")
-    partition = record["partition"]
-    after_name = record["after_name"]
-    if partition is not None:
-        if not isinstance(partition, str) or len(partition) > 256:
-            raise ValueError("primary probe cursor partition is invalid.")
-        validate_identifier(partition, "primary probe partition")
-    if after_name is not None and (
-        not isinstance(after_name, str)
-        or not after_name
-        or len(after_name) > 256
-        or "/" in after_name
-        or "\\" in after_name
-        or after_name in {".", ".."}
-    ):
-        raise ValueError("primary probe cursor marker name is invalid.")
-    return {
-        "catalog_page": page,
-        "partition": partition,
-        "after_name": after_name,
-        "revision": _revision(record["revision"]),
-    }
+    return validate_ready_cursor_position(
+        value,
+        "primary probe cursor",
+        require_safe_marker_name=True,
+        reject_marker_nul=False,
+    )
 
 
 def validate_probe_state(value: object) -> dict[str, Any]:

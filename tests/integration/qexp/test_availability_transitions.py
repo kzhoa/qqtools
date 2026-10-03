@@ -21,6 +21,7 @@ from qqtools.plugins.qexp.project_maintenance import offer_due_tasks
 from qqtools.plugins.qexp.runtime.availability import offer_deadlines
 from qqtools.plugins.qexp.runtime.availability import transitions as availability_runtime
 from qqtools.plugins.qexp.runtime.availability.offer_deadlines import rebuild_deadline_indexes
+from qqtools.plugins.qexp.runtime.locks import task_lock
 from qqtools.plugins.qexp.runtime.maintenance import advance_maintenance_work
 from qqtools.plugins.qexp.runtime.maintenance_outbox import read_work
 from qqtools.plugins.qexp.runtime.operation_store import active_operation_path, write_active_operation
@@ -302,6 +303,78 @@ def test_share_after_writes_and_repairs_deadline_index(tmp_path: Path, monkeypat
     repaired = _finish_repair(cfg)
     assert repaired["complete"] is True
     assert index_path.exists()
+
+
+def test_deadline_rebuild_serializes_with_concurrent_timed_offer(tmp_path: Path, monkeypatch):
+    cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
+    _existing_group(cfg)
+    task = submit(cfg, ["echo", "ok"], group="exp")
+    task_file = shared_paths(cfg.shared_root)["tasks"] / f"{task.task_id}.json"
+    has_read_task = Event()
+    release_rebuild = Event()
+    has_started_share = Event()
+    has_finished_share = Event()
+    original_read = offer_deadlines.read_json_limited
+
+    def pause_after_task_read(path, *args, **kwargs):
+        value = original_read(path, *args, **kwargs)
+        if path == task_file and not has_read_task.is_set():
+            has_read_task.set()
+            assert release_rebuild.wait(5)
+        return value
+
+    def share_after_read():
+        has_started_share.set()
+        try:
+            return task_commands.share(cfg, task.task_id, after_seconds=30)
+        finally:
+            has_finished_share.set()
+
+    monkeypatch.setattr(offer_deadlines, "read_json_limited", pause_after_task_read)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        rebuild = pool.submit(offer_deadlines.advance_deadline_index_rebuild_step, cfg)
+        assert has_read_task.wait(5)
+        share = pool.submit(share_after_read)
+        assert has_started_share.wait(5)
+        try:
+            assert not has_finished_share.wait(0.25)
+        finally:
+            release_rebuild.set()
+        rebuild.result(timeout=5)
+        result = share.result(timeout=5)
+
+    index_path = shared_paths(cfg.shared_root)["offer_deadlines"] / f"{task.task_id}.json"
+    assert index_path.exists()
+    assert read_json(index_path)["offer_deadline"]["operation_id"] == result.operation_id
+
+
+def test_deadline_index_pruning_waits_for_task_lock_and_rechecks_current_offer(tmp_path: Path) -> None:
+    cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
+    _existing_group(cfg)
+    task = submit(cfg, ["echo", "ok"], group="exp")
+    task_commands.share(cfg, task.task_id, after_seconds=30)
+    index_path = shared_paths(cfg.shared_root)["offer_deadlines"] / f"{task.task_id}.json"
+    cursor = {"side": "indexes", "offset": 0}
+
+    with task_lock(cfg.shared_root, task.task_id):
+        for _ in range(4):
+            waiting = offer_deadlines.advance_deadline_index_rebuild_step(cfg, cursor=cursor)
+            if waiting["state"] == "waiting":
+                break
+            cursor = waiting["cursor"]
+        else:
+            pytest.fail("deadline-index pruning did not reach the locked Task")
+
+    assert waiting["cursor"] == cursor
+    assert index_path.exists()
+
+    current = task_commands.share(cfg, task.task_id, after_seconds=60)
+    resumed = offer_deadlines.advance_deadline_index_rebuild_step(cfg, cursor=cursor)
+
+    assert resumed["state"] == "building"
+    assert resumed["cursor"] != cursor
+    assert index_path.exists()
+    assert read_json(index_path)["offer_deadline"]["operation_id"] == current.operation_id
 
 
 def test_doctor_replays_prepared_availability_operation(tmp_path: Path):
