@@ -28,6 +28,7 @@ from ..runtime.resources.reservations import (
     release_executor_offer,
 )
 from ..runtime.store import atomic_replace, read_json_limited, require_json_size
+from .group_service_transport import GroupServiceRequestSpec
 from .project_io_protocol import (
     PROJECT_IO_CAPACITY,
     PROJECT_IO_MAX_RECORD_BYTES,
@@ -105,6 +106,7 @@ _RETRYABLE_ON_WORKER_EXIT = frozenset(
         "authority_terminal_observe",
     }
 )
+_REPLAYABLE_REQUEST_OPERATION_KINDS = frozenset({"group_service_advance"})
 if (
     _OUTCOME_UNKNOWN_ON_WORKER_EXIT & _RETRYABLE_ON_WORKER_EXIT
     or _OUTCOME_UNKNOWN_ON_WORKER_EXIT | _RETRYABLE_ON_WORKER_EXIT != PROJECT_IO_OPERATIONS
@@ -910,59 +912,6 @@ class ProjectIOExecutor:
             {"machine_name": getattr(binding, "machine_name", None)},
             source_revisions=None,
         )
-
-    def prepare_group_service_probe(
-        self,
-        binding: object,
-        registry_revision: int,
-        *,
-        probe_state: Mapping[str, Any],
-    ) -> ProjectIORequest:
-        """Persist one read-only bounded Group-service retirement census."""
-        return self._prepare_request(
-            binding,
-            registry_revision,
-            "group_service_probe",
-            {"machine_name": getattr(binding, "machine_name", None), "probe_state": probe_state},
-            source_revisions=None,
-        )
-
-    def prepare_group_service_advance(
-        self,
-        binding: object,
-        registry_revision: int,
-        *,
-        candidate: Mapping[str, Any],
-        continuation: Mapping[str, Any] | None,
-        probe_state: Mapping[str, Any],
-    ) -> ProjectIORequest:
-        """Persist one exact, bounded Group-service transaction."""
-
-        return self._prepare_request(
-            binding,
-            registry_revision,
-            "group_service_advance",
-            {
-                "machine_name": getattr(binding, "machine_name", None),
-                "candidate": candidate,
-                "continuation": continuation,
-                "probe_state": probe_state,
-            },
-            source_revisions=None,
-        )
-
-    def resolve_stale_group_service_probe(self, request_id: str, request: ProjectIORequest) -> bool:
-        """Archive a Group-service census that no longer matches a binding."""
-        if request.operation_kind != "group_service_probe":
-            raise ValueError("stale Group-service resolution requires group_service_probe.")
-        return self._resolve_stale_request(request_id, request)
-
-    def resolve_stale_group_service_advance(self, request_id: str, request: ProjectIORequest) -> bool:
-        """Archive Group work that no longer matches a binding."""
-
-        if request.operation_kind != "group_service_advance":
-            raise ValueError("stale Group-service resolution requires group_service_advance.")
-        return self._resolve_stale_request(request_id, request)
 
     def reset_ambiguous_notification_service_for_retry(self, request_id: str, request: ProjectIORequest) -> bool:
         return self._reset_ambiguous_request_for_retry(request_id, request, operation_kind="notification_service")
@@ -1953,6 +1902,23 @@ class ProjectIOExecutor:
             return False
         return self._resolve_stale_request(request_id, current_request)
 
+    def prepare_closed_request(
+        self,
+        binding: object,
+        registry_revision: int,
+        request_spec: GroupServiceRequestSpec,
+    ) -> ProjectIORequest:
+        """Persist one validated request specification from a closed service boundary."""
+        if not isinstance(request_spec, GroupServiceRequestSpec):
+            raise ValueError("closed request preparation requires a GroupServiceRequestSpec.")
+        return self._prepare_request(
+            binding,
+            registry_revision,
+            request_spec.operation_kind,
+            request_spec.parameters,
+            source_revisions=None,
+        )
+
     def _prepare_request(
         self,
         binding: object,
@@ -2376,16 +2342,21 @@ class ProjectIOExecutor:
             operation_kind="scheduler_cursor_commit",
         )
 
-    def reset_ambiguous_group_service_advance_for_retry(
+    def reset_ambiguous_replayable_request_for_retry(
         self,
         request_id: str,
         current_request: ProjectIORequest,
     ) -> bool:
-        """Make one exact fenced Group transaction replayable."""
+        """Replay one explicitly authorized request after exact worker absence."""
+        if not isinstance(current_request, ProjectIORequest) or current_request.request_id != request_id:
+            raise ValueError("retry requires the exact ProjectIORequest identity.")
+        operation_kind = current_request.operation_kind
+        if operation_kind not in _REPLAYABLE_REQUEST_OPERATION_KINDS:
+            raise ValueError(f"operation {operation_kind!r} is not replayable through this entry.")
         return self._reset_ambiguous_request_for_retry(
             request_id,
             current_request,
-            operation_kind="group_service_advance",
+            operation_kind=operation_kind,
         )
 
     def reset_ambiguous_scheduler_due_offer_for_retry(
@@ -2479,6 +2450,10 @@ class ProjectIOExecutor:
         """Archive an obsolete cursor intent only after proving process absence."""
         if current_request.operation_kind != "scheduler_cursor_commit":
             raise ValueError("stale cursor resolution requires scheduler_cursor_commit.")
+        return self._resolve_stale_request(request_id, current_request)
+
+    def resolve_stale_request(self, request_id: str, current_request: ProjectIORequest) -> bool:
+        """Archive an exact stale request after the private process-absence checks."""
         return self._resolve_stale_request(request_id, current_request)
 
     def _resolve_stale_request(self, request_id: str, current_request: ProjectIORequest) -> bool:

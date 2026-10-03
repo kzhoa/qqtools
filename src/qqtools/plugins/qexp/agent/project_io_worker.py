@@ -10,13 +10,14 @@ import re
 import stat
 import sys
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from contextlib import contextmanager
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
+from ..config_types import RootConfig
 from ..domain.policies import task_machine_matches
 from ..events import flush_local_event
 from ..layout import (
@@ -47,6 +48,7 @@ from ..runtime.store import atomic_replace, fenced_mutations, read_json, read_js
 from ..runtime.tasks import load_task
 from ..runtime.work_budget import SliceBudget, WorkBudgetPolicy
 from .bindings import ProjectBinding, decode_registry
+from .group_service_worker import handle_group_service_request
 from .primary_demand import probe_primary_demand
 from .primary_probe_transport import decode_probe_session, encode_probe_session
 from .project_io_executor import ProjectIOProtocolError, _process_start_time_ticks, _resolve_runtime_id
@@ -1870,27 +1872,15 @@ def _scheduler_quiescence_probe(request: ProjectIORequest) -> dict[str, Any]:
     return result("quiescent")
 
 
-def _group_service_probe(request: ProjectIORequest) -> dict[str, Any]:
-    """Run one closed read-only Group-service retirement census."""
-    from ..runtime.group_discovery.probe import probe_group_service
-
-    load_root_config(Path(request.canonical_shared_root), request.parameters["machine_name"])
-    return probe_group_service(Path(request.canonical_shared_root), request.parameters["probe_state"])
-
-
-def _group_service_advance(
+def _group_service_mutation_fence(
     request: ProjectIORequest,
     runtime_root: Path,
     paths: dict[str, Path],
     write_possible: list[bool],
-) -> dict[str, Any]:
-    """Advance one exact Group candidate under executor and binding fences."""
+) -> Callable[[RootConfig], None]:
+    """Build the existing executor and binding fence for Group mutations."""
 
-    from ..runtime.group_discovery.advance import advance_group_service
-
-    cfg = load_root_config(Path(request.canonical_shared_root), request.parameters["machine_name"])
-
-    def before_shared_mutation() -> None:
+    def before_shared_mutation(cfg: RootConfig) -> None:
         epoch = _read_epoch(paths)
         if not epoch.active or epoch.runtime_id != request.runtime_id or epoch.executor_epoch != request.executor_epoch:
             raise _ExecutorEpochFenced
@@ -1898,14 +1888,7 @@ def _group_service_advance(
             raise _BindingAuthorityChanged
         write_possible[0] = True
 
-    cfg = replace(cfg, runtime_root=machine_project_paths(runtime_root, request.project_id)["root"])
-    with fenced_mutations(cfg.shared_root, before_shared_mutation):
-        return advance_group_service(
-            cfg,
-            request.parameters["candidate"],
-            request.parameters["continuation"],
-            request.parameters["probe_state"],
-        )
+    return before_shared_mutation
 
 
 def _scheduler_primary_probe(request: ProjectIORequest) -> dict[str, Any]:
@@ -3202,10 +3185,13 @@ def _run(
                 evidence = _observation_service(request, root, paths, upgrade_write_possible)
             elif request.operation_kind == "notification_service":
                 evidence = _notification_service(request, root, paths, upgrade_write_possible)
-            elif request.operation_kind == "group_service_probe":
-                evidence = _group_service_probe(request)
-            elif request.operation_kind == "group_service_advance":
-                evidence = _group_service_advance(request, root, paths, upgrade_write_possible)
+            elif request.operation_kind in {"group_service_probe", "group_service_advance"}:
+                before_shared_mutation = (
+                    _group_service_mutation_fence(request, root, paths, upgrade_write_possible)
+                    if request.operation_kind == "group_service_advance"
+                    else None
+                )
+                evidence = handle_group_service_request(request, root, before_shared_mutation)
             elif request.operation_kind == "progress_projection":
                 evidence = _progress_projection(request, root, paths, upgrade_write_possible)
             elif request.operation_kind in {"legacy_capture_read", "legacy_capture_scan"}:

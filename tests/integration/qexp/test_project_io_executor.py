@@ -5,6 +5,7 @@ import os
 import threading
 import time
 import uuid
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -91,8 +92,12 @@ def _project_snapshot(root: Path) -> dict[str, tuple[int, int]]:
     }
 
 
-def test_group_service_probe_and_advance_run_in_fresh_workers(tmp_path: Path) -> None:
-    from qqtools.plugins.qexp.agent.group_service_transport import initial_group_service_continuation
+def test_group_service_probe_and_advance_run_in_fresh_workers(tmp_path: Path, monkeypatch) -> None:
+    from qqtools.plugins.qexp.agent.group_service_transport import (
+        group_service_advance_request,
+        group_service_probe_request,
+        initial_group_service_continuation,
+    )
     from qqtools.plugins.qexp.runtime.group_discovery.coverage import GroupCoverage
     from qqtools.plugins.qexp.runtime.group_discovery.probe import initial_group_service_probe_state
     from qqtools.plugins.qexp.runtime.paths import submission_path
@@ -107,10 +112,10 @@ def test_group_service_probe_and_advance_run_in_fresh_workers(tmp_path: Path) ->
     executor = ProjectIOExecutor(runtime)
     executor.begin_epoch()
     try:
-        probe = executor.prepare_group_service_probe(
+        probe = executor.prepare_closed_request(
             binding,
             revision,
-            probe_state=initial_group_service_probe_state(),
+            group_service_probe_request(binding.machine_name, initial_group_service_probe_state()),
         )
         executor.start(probe.request_id)
         observed = _wait_for_consumed(executor, probe)
@@ -122,22 +127,38 @@ def test_group_service_probe_and_advance_run_in_fresh_workers(tmp_path: Path) ->
         # A killed worker may have committed part of the fenced Group
         # transaction before result publication. Preserve the exact intent,
         # clear only the proven-dead execution image, and replay it.
-        interrupted = executor.prepare_group_service_advance(
+        interrupted = executor.prepare_closed_request(
             binding,
             revision,
-            candidate=candidate,
-            continuation=continuation,
-            probe_state=observed.evidence["probe_state"],
+            group_service_advance_request(
+                binding.machine_name,
+                candidate,
+                continuation,
+                observed.evidence["probe_state"],
+            ),
         )
         dead_process = ProjectIOProcess(interrupted, 2_000_000_000, 1, interrupted.prepared_at, "running")
         atomic_replace(
             executor.paths["project_io_processes"] / f"{interrupted.request_id}.json",
             dead_process.to_dict(),
         )
+        with pytest.raises(ValueError, match="replay"):
+            executor.reset_ambiguous_replayable_request_for_retry(probe.request_id, probe)
+        inspect_process_identity = project_io_executor_module.inspect_process_identity
+        for process_state in ("same_live_process", "unverified"):
+            monkeypatch.setattr(
+                project_io_executor_module,
+                "inspect_process_identity",
+                lambda *_args, process_state=process_state: process_state,
+            )
+            assert not executor.reset_ambiguous_replayable_request_for_retry(interrupted.request_id, interrupted)
+        monkeypatch.setattr(project_io_executor_module, "inspect_process_identity", inspect_process_identity)
         executor.poll()
         ambiguous = executor.load_result(interrupted.request_id)
         assert ambiguous is not None and ambiguous.status == "outcome_unknown"
-        assert executor.reset_ambiguous_group_service_advance_for_retry(interrupted.request_id, interrupted)
+        mismatched = replace(interrupted, registry_revision=interrupted.registry_revision + 1)
+        assert not executor.reset_ambiguous_replayable_request_for_retry(interrupted.request_id, mismatched)
+        assert executor.reset_ambiguous_replayable_request_for_retry(interrupted.request_id, interrupted)
         assert executor.start(interrupted.request_id) is not None
         replayed = _wait_for_consumed(executor, interrupted)
         assert replayed.status == "completed"
@@ -147,12 +168,15 @@ def test_group_service_probe_and_advance_run_in_fresh_workers(tmp_path: Path) ->
             return
 
         for _ in range(100):
-            request = executor.prepare_group_service_advance(
+            request = executor.prepare_closed_request(
                 binding,
                 revision,
-                candidate=candidate,
-                continuation=continuation,
-                probe_state=observed.evidence["probe_state"],
+                group_service_advance_request(
+                    binding.machine_name,
+                    candidate,
+                    continuation,
+                    observed.evidence["probe_state"],
+                ),
             )
             executor.start(request.request_id)
             result = _wait_for_consumed(executor, request)

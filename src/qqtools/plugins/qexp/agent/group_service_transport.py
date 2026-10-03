@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import dataclass
 from typing import Any
 
 from ..runtime.group_discovery.advance import (
@@ -14,6 +15,26 @@ from ..runtime.group_discovery.advance import (
 from ..runtime.group_discovery.probe import validate_group_service_probe_state
 from ..runtime.records import validate_group_name
 
+_GROUP_SERVICE_OPERATION_KINDS = frozenset({"group_service_probe", "group_service_advance"})
+
+
+@dataclass(frozen=True, slots=True)
+class GroupServiceRequestSpec:
+    """Closed, validated request parameters for one Group-service operation."""
+
+    operation_kind: str
+    parameters: Mapping[str, Any]
+
+    def __post_init__(self) -> None:
+        if type(self.operation_kind) is not str or self.operation_kind not in _GROUP_SERVICE_OPERATION_KINDS:
+            raise ValueError(f"unsupported Group-service request operation: {self.operation_kind!r}")
+        validator = (
+            group_service_probe_parameters
+            if self.operation_kind == "group_service_probe"
+            else group_service_advance_parameters
+        )
+        object.__setattr__(self, "parameters", validator(self.parameters))
+
 
 def group_service_probe_parameters(value: object) -> dict[str, Any]:
     """Validate one Group-service census parameter object."""
@@ -23,6 +44,14 @@ def group_service_probe_parameters(value: object) -> dict[str, Any]:
     if not isinstance(machine_name, str) or not machine_name:
         raise ValueError("Group-service probe machine_name is invalid.")
     return {"machine_name": machine_name, "probe_state": validate_group_service_probe_state(value["probe_state"])}
+
+
+def group_service_probe_request(machine_name: str, probe_state: Mapping[str, Any]) -> GroupServiceRequestSpec:
+    """Build one closed Group-service probe request specification."""
+    return GroupServiceRequestSpec(
+        operation_kind="group_service_probe",
+        parameters=group_service_probe_parameters({"machine_name": machine_name, "probe_state": probe_state}),
+    )
 
 
 def group_service_probe_evidence(value: object) -> dict[str, Any]:
@@ -103,6 +132,26 @@ def group_service_advance_parameters(value: object) -> dict[str, Any]:
     }
 
 
+def group_service_advance_request(
+    machine_name: str,
+    candidate: Mapping[str, Any],
+    continuation: Mapping[str, Any] | None,
+    probe_state: Mapping[str, Any],
+) -> GroupServiceRequestSpec:
+    """Build one closed Group-service advance request specification."""
+    return GroupServiceRequestSpec(
+        operation_kind="group_service_advance",
+        parameters=group_service_advance_parameters(
+            {
+                "machine_name": machine_name,
+                "candidate": candidate,
+                "continuation": continuation,
+                "probe_state": probe_state,
+            }
+        ),
+    )
+
+
 def group_service_advance_evidence(value: object, candidate: Mapping[str, Any]) -> dict[str, Any]:
     """Validate one bounded Group transaction result."""
 
@@ -120,10 +169,13 @@ def group_service_advance_evidence(value: object, candidate: Mapping[str, Any]) 
 
 
 __all__ = [
+    "GroupServiceRequestSpec",
     "group_service_advance_evidence",
     "group_service_advance_parameters",
+    "group_service_advance_request",
     "group_service_candidate",
     "group_service_probe_evidence",
     "group_service_probe_parameters",
+    "group_service_probe_request",
     "initial_group_service_continuation",
 ]

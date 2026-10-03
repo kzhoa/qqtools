@@ -13,13 +13,12 @@ import uuid
 from bisect import bisect_right
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from functools import partial, wraps
 from typing import Any, Iterator
 
 from ..config_types import RootConfig
-from ..runtime.group_discovery.probe import initial_group_service_probe_state
 from ..runtime.paths import local_paths
 from ..runtime.records import validate_identifier
 from ..runtime.resources.cpu_lane import cpu_reservation_snapshot, reserve_cpu, retag_cpu_if_matches
@@ -39,7 +38,7 @@ from ..runtime.submission_control_continuation import submission_control_continu
 from .bindings import ProjectBinding
 from .context import MachineRuntime
 from .dispatch_probe import PrimaryProbeSession
-from .group_service_transport import initial_group_service_continuation
+from .group_service_coordinator import GroupServiceCoordinator, GroupServiceOffer
 from .primary_probe_transport import encode_probe_session
 from .progress_coordinator import ProgressObservationCoordinator
 from .project_io_admission import ProjectIOAdmission, ServiceIntent
@@ -195,17 +194,6 @@ class _SchedulerQuiescenceRound:
     retry_at: float = 0.0
 
 
-@dataclass(slots=True)
-class _GroupServiceProbeRound:
-    turn: BindingTurn
-    probe_state: Mapping[str, Any]
-    is_quiescent: bool = False
-    candidate: Mapping[str, Any] | None = None
-    continuation: Mapping[str, Any] | None = None
-    settled_legacy: set[str] = field(default_factory=set)
-    retry_at: float = 0.0
-
-
 @dataclass(frozen=True, slots=True)
 class _PendingClaimOffer:
     identity: _ValidationIdentity
@@ -260,8 +248,7 @@ class ProjectIOController:
         self._primary_rounds: dict[str, _PrimaryProbeRound] = {}
         self._scheduler_quiescence_rounds: dict[_ValidationIdentity, _SchedulerQuiescenceRound] = {}
         self._scheduler_quiescence_requests: dict[str, _SchedulerQuiescenceRound] = {}
-        self._group_service_rounds: dict[_ValidationIdentity, _GroupServiceProbeRound] = {}
-        self._group_service_requests: dict[str, _GroupServiceProbeRound] = {}
+        self._group_service = GroupServiceCoordinator(monotonic=monotonic)
         self._borrow_grants: dict[str, BorrowAdmissionGrant] = {}
         self._pending_claim_offers: dict[str, _PendingClaimOffer] = {}
         self._offer_recovery_cursor: str | None = None
@@ -1218,12 +1205,7 @@ class ProjectIOController:
             raise ValueError("registry_revision must be a nonnegative integer.")
         epoch = self._observed_executor_epoch
         identity = None if epoch is None else self._binding_identity(binding, registry_revision, epoch)
-        round_state = self._group_service_rounds.get(identity)
-        return bool(
-            round_state is not None
-            and round_state.is_quiescent
-            and self.runtime.working_set.is_current_turn(round_state.turn)
-        )
+        return self._group_service.is_quiescent(identity, self.runtime.working_set)
 
     @_admission_operation
     def advance_group_service_probes(self, bindings: Sequence[ProjectBinding], registry_revision: int) -> None:
@@ -1240,22 +1222,9 @@ class ProjectIOController:
             and (identity := self._binding_identity(binding, registry_revision, epoch)) is not None
             and identity in self._validated
         }
-        self._group_service_rounds = {
-            identity: round_state
-            for identity, round_state in self._group_service_rounds.items()
-            if identity in current
-            and (
-                self.runtime.working_set.is_current_turn(round_state.turn)
-                or self.runtime.working_set.is_turn_observation_pending(round_state.turn)
-            )
-        }
         unresolved = self.executor.unresolved_requests()
         unresolved_ids = {request.request_id for request in unresolved}
-        self._group_service_requests = {
-            request_id: round_state
-            for request_id, round_state in self._group_service_requests.items()
-            if request_id in unresolved_ids
-        }
+        self._group_service.reconcile(current, unresolved_ids, self.runtime.working_set)
         for request in unresolved:
             if request.operation_kind not in {"group_service_probe", "group_service_advance"}:
                 continue
@@ -1267,14 +1236,9 @@ class ProjectIOController:
                 "census" if request.operation_kind.endswith("probe") else "advance",
             )
             if identity not in current:
-                resolver = (
-                    self.executor.resolve_stale_group_service_probe
-                    if request.operation_kind == "group_service_probe"
-                    else self.executor.resolve_stale_group_service_advance
-                )
-                if resolver(request.request_id, request):
+                if self.executor.resolve_stale_request(request.request_id, request):
                     self._started_requests.discard(request.request_id)
-                    self._group_service_requests.pop(request.request_id, None)
+                    self._group_service.discard_request(request.request_id)
                 continue
             pending_result = self.executor.load_result(request.request_id)
             if (
@@ -1283,7 +1247,7 @@ class ProjectIOController:
                 and pending_result.status == "outcome_unknown"
             ):
                 try:
-                    reset = self.executor.reset_ambiguous_group_service_advance_for_retry(
+                    reset = self.executor.reset_ambiguous_replayable_request_for_retry(
                         request.request_id,
                         request,
                     )
@@ -1301,124 +1265,61 @@ class ProjectIOController:
                     self._start_observation_request(request, key)
                 continue
             self._started_requests.discard(request.request_id)
-            round_state = self._group_service_requests.pop(request.request_id, None)
             if result.request != request:
                 raise ProjectIOProtocolError("Group-service probe result differs from its exact request.")
-            if round_state is None or self._group_service_rounds.get(identity) is not round_state:
-                continue
             if result.status != "completed":
-                if request.operation_kind == "group_service_advance":
-                    self._restart_group_service_turn(round_state, current[identity])
-                self._record_service_failure(key)
-                continue
-            self._service_backoff.pop(key, None)
-            evidence = result.evidence
-            if request.operation_kind == "group_service_probe":
-                round_state.probe_state = _json_copy(evidence["probe_state"])
-                round_state.is_quiescent = evidence["state"] == "quiescent"
-                candidate = _json_copy(evidence["candidate"])
-                if (
-                    candidate is not None
-                    and candidate["lane"] == "legacy"
-                    and candidate["group"] in round_state.settled_legacy
+                if self._group_service.apply_failure(
+                    identity,
+                    request.request_id,
+                    current[identity],
+                    request.operation_kind,
+                    self.runtime.working_set,
                 ):
-                    candidate = None
-                round_state.candidate = candidate
-                round_state.continuation = None if candidate is None else initial_group_service_continuation(candidate)
-                if round_state.is_quiescent and self.runtime.working_set.is_current_turn(round_state.turn):
-                    self.runtime.working_set.acknowledge(round_state.turn, quiescent=True)
-                round_state.retry_at = 0.0
-            else:
-                candidate = round_state.candidate
-                state = evidence["state"]
-                follow_up = evidence["probe"]
-                if state == "quiescent" and candidate is not None and candidate["lane"] == "legacy":
-                    round_state.settled_legacy.add(candidate["group"])
-                if state in {"quiescent", "stale"}:
-                    round_state.candidate = None
-                    round_state.continuation = None
-                else:
-                    round_state.continuation = _json_copy(evidence["continuation"])
-                if follow_up is not None:
-                    round_state.probe_state = _json_copy(follow_up["probe_state"])
-                    round_state.is_quiescent = follow_up["state"] == "quiescent"
-                    next_candidate = _json_copy(follow_up["candidate"])
-                    if next_candidate is not None:
-                        round_state.candidate = next_candidate
-                        round_state.continuation = initial_group_service_continuation(next_candidate)
-                    if round_state.is_quiescent and self.runtime.working_set.is_current_turn(round_state.turn):
-                        self.runtime.working_set.acknowledge(round_state.turn, quiescent=True)
-                elif candidate is None or candidate["lane"] != "legacy":
-                    self._restart_group_service_turn(round_state, current[identity])
-                round_state.retry_at = self._monotonic() + 1.0 if state == "blocked" else 0.0
+                    self._record_service_failure(key)
+                continue
+            if self._group_service.apply_result(
+                identity,
+                request.request_id,
+                current[identity],
+                request.operation_kind,
+                result.evidence,
+                self.runtime.working_set,
+            ):
+                self._service_backoff.pop(key, None)
         for identity, binding in current.items():
-            if self.runtime.working_set.is_lane_quiescent(binding, "group"):
+            offer = self._group_service.next_offer(identity, binding, self.runtime.working_set)
+            if offer is None:
                 continue
-            round_state = self._group_service_rounds.get(identity)
-            if round_state is not None and round_state.is_quiescent:
-                if self.runtime.working_set.is_current_turn(round_state.turn):
-                    self.runtime.working_set.acknowledge(round_state.turn, quiescent=True)
-                    continue
-                if self.runtime.working_set.is_turn_observation_pending(round_state.turn):
-                    continue
-                # Registration or an activation observation can finish after a
-                # read-only census captured an unknown turn. Reprove from a
-                # fresh known turn instead of leaving the lane permanently
-                # parked on evidence that can never become current.
-                round_state.turn = self.runtime.working_set.begin_turn(binding, "group")
-                round_state.probe_state = initial_group_service_probe_state()
-                round_state.is_quiescent = False
-            operation_kind = (
-                "group_service_advance" if round_state is not None and round_state.candidate else "group_service_probe"
-            )
+            operation_kind = offer.operation_kind
             key = (identity, operation_kind, "group", "advance" if operation_kind.endswith("advance") else "census")
-            if round_state is not None and (round_state.is_quiescent or round_state.retry_at > self._monotonic()):
-                continue
             if not self._service_retry_is_due(key):
                 continue
             self._offer_new_request(
                 identity,
                 operation_kind,
-                partial(self._prepare_group_service_request, identity, binding, registry_revision, round_state, key),
+                partial(self._prepare_group_service_request, offer, binding, registry_revision, key),
             )
-
-    def _restart_group_service_turn(self, round_state: _GroupServiceProbeRound, binding: ProjectBinding) -> None:
-        if self.runtime.working_set.is_current_turn(round_state.turn):
-            self.runtime.working_set.acknowledge(round_state.turn, quiescent=False)
-        round_state.turn = self.runtime.working_set.begin_turn(binding, "group")
-        round_state.probe_state = initial_group_service_probe_state()
-        round_state.is_quiescent = False
 
     def _prepare_group_service_request(
         self,
-        identity: _ValidationIdentity,
+        offer: GroupServiceOffer,
         binding: ProjectBinding,
         registry_revision: int,
-        round_state: _GroupServiceProbeRound | None,
         key: tuple[_ValidationIdentity, str, str, str],
     ) -> None:
-        if self._group_service_rounds.get(identity) is not round_state:
-            return
         try:
-            if round_state is not None and round_state.candidate is not None:
-                request = self.executor.prepare_group_service_advance(
-                    binding,
-                    registry_revision,
-                    candidate=round_state.candidate,
-                    continuation=round_state.continuation,
-                    probe_state=round_state.probe_state,
-                )
-            else:
-                state = initial_group_service_probe_state() if round_state is None else round_state.probe_state
-                request = self.executor.prepare_group_service_probe(binding, registry_revision, probe_state=state)
+            request = self._group_service.prepare_request(
+                offer,
+                binding,
+                registry_revision,
+                self.executor,
+                self.runtime.working_set,
+            )
         except (OSError, RuntimeError, ValueError):
             self._record_service_failure(key)
             return
-        if round_state is None:
-            state = initial_group_service_probe_state()
-            round_state = _GroupServiceProbeRound(self.runtime.working_set.begin_turn(binding, "group"), state)
-            self._group_service_rounds[identity] = round_state
-        self._group_service_requests[request.request_id] = round_state
+        if request is None:
+            return
         self._start_observation_request(request, key)
 
     @_admission_operation
