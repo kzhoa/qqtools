@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import base64
 import binascii
-import hashlib
 import json
 import os
 import re
@@ -22,6 +21,15 @@ from ..runtime.paths import machine_runtime_paths
 from ..runtime.records import utc_now
 from ..runtime.store import JSONRecordSizeError, atomic_replace, json_encoded_size, read_json_limited
 from .context import MachineRuntime
+from .scheduler_diagnostic_policy import (
+    FindingObservationOmission,
+    IgnoredFindingObservation,
+    canonicalize_diagnostic_identity,
+    diagnostic_identity_digest,
+    iter_publication_probes,
+    resolution_queries,
+    select_resolution_candidate,
+)
 
 SCHEMA_VERSION = 1
 
@@ -79,32 +87,6 @@ _EXCEPTION_TYPES = frozenset(
         "TypeError",
         "UnicodeDecodeError",
         "ValueError",
-    }
-)
-_BASE_IDENTITY_FIELDS = ("producer", "reason_code", "component", "stage", "check", "scope_type")
-_IDENTITY_FIELDS = frozenset(
-    {
-        *_BASE_IDENTITY_FIELDS,
-        "runtime_id",
-        "project_id",
-        "registration_generation",
-        "task_id",
-        "task_generation",
-        "resource_lane",
-        "route_scope",
-        "admission_role",
-        "projection_kind",
-        "projection_target",
-        "projection_generation",
-        "build_id",
-        "work_generation",
-        "maintenance_kind",
-        "target_id",
-        "wake_epoch",
-        "sequence_start",
-        "sequence_end",
-        "registry_revision",
-        "ready_revision",
     }
 )
 _DETAIL_FIELDS = frozenset(
@@ -408,14 +390,14 @@ class SchedulerDiagnosticStore:
         summary: dict[str, Any],
         budget: _WriteBudget,
     ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any] | None]:
-        safe_identity, identity_incomplete = _sanitize_identity(identity)
+        safe_identity, identity_incomplete = canonicalize_diagnostic_identity(identity)
         safe_revision, revision_omitted = _sanitize_revision(source_revision)
         safe_details, details_omitted = _sanitize_details(details)
         details_omitted = details_omitted or revision_omitted or identity_incomplete
         safe_severity = severity if severity in {"fault", "warning", "info"} else "fault"
         if severity not in {"fault", "warning", "info"}:
             details_omitted = True
-        digest = _identity_digest(safe_identity)
+        digest = diagnostic_identity_digest(safe_identity)
         active_path = self.paths["scheduler_diagnostics_active"] / f"{digest}.json"
         previous: dict[str, Any] | None = None
         if _is_regular_file(active_path):
@@ -550,8 +532,8 @@ class SchedulerDiagnosticStore:
         summary: dict[str, Any],
         budget: _WriteBudget,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
-        safe_identity, identity_incomplete = _sanitize_identity(identity)
-        digest = _identity_digest(safe_identity)
+        safe_identity, identity_incomplete = canonicalize_diagnostic_identity(identity)
+        digest = diagnostic_identity_digest(safe_identity)
         safe_revision, revision_omitted = _sanitize_revision(source_revision or {})
         safe_details, details_omitted = _sanitize_details(details)
         safe_capacity, capacity_omitted = _sanitize_facts(capacity_context)
@@ -561,7 +543,7 @@ class SchedulerDiagnosticStore:
             if not isinstance(blocker, Mapping):
                 blockers_omitted = True
                 continue
-            sanitized, incomplete = _sanitize_identity(blocker)
+            sanitized, incomplete = canonicalize_diagnostic_identity(blocker)
             safe_blockers.append(sanitized)
             blockers_omitted = blockers_omitted or incomplete
         if len(blocker_identities or ()) > 16:
@@ -682,8 +664,8 @@ class SchedulerDiagnosticStore:
             budget = self._new_budget()
             metadata = self._ensure_initialized(budget, safe_time)
             summary = self._read_summary_locked(metadata["epoch"])
-            safe_identity, _incomplete = _sanitize_identity(identity)
-            digest = _identity_digest(safe_identity)
+            safe_identity, _incomplete = canonicalize_diagnostic_identity(identity)
+            digest = diagnostic_identity_digest(safe_identity)
             path = self.paths["scheduler_diagnostics_decisions"] / f"{digest}.json"
             metadata, summary = self._record_decision_locked(
                 identity=identity,
@@ -728,7 +710,7 @@ class SchedulerDiagnosticStore:
             raise ValueError("episode must be a 32-character lowercase UUID token")
         if type(observation_revision) is not int or observation_revision < 0:
             raise ValueError("observation_revision must be a nonnegative integer")
-        safe_identity, identity_incomplete = _sanitize_identity(identity)
+        safe_identity, identity_incomplete = canonicalize_diagnostic_identity(identity)
         safe_revision, revision_omitted = _sanitize_revision(source_revision)
         revisionless_unknown_registry = (
             safe_identity.get("producer") == "enablement_reconciliation"
@@ -737,7 +719,7 @@ class SchedulerDiagnosticStore:
         if identity_incomplete or revision_omitted or (not safe_revision and not revisionless_unknown_registry):
             return False
         safe_time = _validated_timestamp(resolved_at)
-        digest = _identity_digest(safe_identity)
+        digest = diagnostic_identity_digest(safe_identity)
         with self._writer_lock():
             metadata_path = self.paths["scheduler_diagnostics_metadata"]
             if not _is_regular_file(metadata_path):
@@ -919,7 +901,7 @@ class SchedulerDiagnosticStore:
                     if (
                         not isinstance(identity, dict)
                         or digest != path.stem
-                        or _identity_digest(identity) != digest
+                        or diagnostic_identity_digest(identity) != digest
                         or not _valid_active_record(record)
                     ):
                         raise _StoreReadError("store_corrupt")
@@ -1240,45 +1222,32 @@ class SchedulerDiagnosticStore:
                 summary["timings"], timings_omitted = _sanitize_timings(timings)
                 summary["working_set"], working_omitted = _sanitize_numeric_map(working_set)
 
-                normalized_probes = _normalize_probes(probes)
                 next_metadata = dict(metadata)
                 next_summary = dict(summary)
                 findings_written = 0
                 decisions_written = 0
-                complete = bool(normalized_probes)
-                reason = None if normalized_probes else "probe_data_unavailable"
-                for probe in normalized_probes:
-                    if probe.get("coverage") != "complete":
+                complete = False
+                reason = "probe_data_unavailable"
+                saw_probe = False
+                for probe in iter_publication_probes(probes):
+                    if not saw_probe:
+                        complete = True
+                        reason = None
+                        saw_probe = True
+                    if not probe.coverage_complete:
                         complete = False
                         reason = "probe_coverage_incomplete"
-                    decision_identity = probe.get("identity")
-                    if isinstance(decision_identity, Mapping) and decisions_written < 3:
+                    decision = probe.decision
+                    if decision is not None and decisions_written < 3:
                         try:
                             next_metadata, next_summary = self._record_decision_locked(
-                                identity=decision_identity,
-                                outcome=probe.get("outcome")
-                                if isinstance(probe.get("outcome"), str)
-                                else "unknown_error",
-                                capacity_context=(
-                                    probe.get("capacity_context")
-                                    if isinstance(probe.get("capacity_context"), Mapping)
-                                    else None
-                                ),
-                                blocker_identities=(
-                                    probe.get("blocker_identities")
-                                    if isinstance(probe.get("blocker_identities"), Sequence)
-                                    and not isinstance(probe.get("blocker_identities"), (str, bytes))
-                                    else None
-                                ),
-                                coverage=(
-                                    probe.get("coverage") if isinstance(probe.get("coverage"), str) else "unknown"
-                                ),
-                                source_revision=(
-                                    probe.get("source_revision")
-                                    if isinstance(probe.get("source_revision"), Mapping)
-                                    else None
-                                ),
-                                details=(probe.get("details") if isinstance(probe.get("details"), Mapping) else None),
+                                identity=decision.identity,
+                                outcome=decision.outcome,
+                                capacity_context=decision.capacity_context,
+                                blocker_identities=decision.blocker_identities,
+                                coverage=decision.coverage,
+                                source_revision=decision.source_revision,
+                                details=decision.details,
                                 observed_at=safe_time,
                                 metadata=next_metadata,
                                 summary=next_summary,
@@ -1288,41 +1257,35 @@ class SchedulerDiagnosticStore:
                         except _StoreCapacityError:
                             complete = False
                             reason = "publication_budget_exhausted"
-                    raw_findings = probe.get("findings", ())
-                    if isinstance(raw_findings, Sequence) and not isinstance(raw_findings, (str, bytes)):
-                        for finding in raw_findings:
-                            if findings_written >= 6:
-                                complete = False
-                                reason = "publication_budget_exhausted"
+                    for finding in probe.findings:
+                        if findings_written >= 6:
+                            complete = False
+                            reason = "publication_budget_exhausted"
+                            break
+                        if isinstance(finding, FindingObservationOmission):
+                            complete = False
+                            reason = "identity_incomplete"
+                            continue
+                        if isinstance(finding, IgnoredFindingObservation):
+                            continue
+                        try:
+                            next_metadata, next_summary, record = self._observe_finding_locked(
+                                identity=finding.identity,
+                                severity=finding.severity,
+                                source_revision=finding.source_revision,
+                                details=finding.details,
+                                observed_at=safe_time,
+                                metadata=next_metadata,
+                                summary=next_summary,
+                                budget=budget,
+                            )
+                            if record is None:
                                 break
-                            if not isinstance(finding, Mapping):
-                                continue
-                            finding_identity = finding.get("identity")
-                            source_revision = finding.get("source_revision")
-                            if not isinstance(finding_identity, Mapping) or not isinstance(source_revision, Mapping):
-                                complete = False
-                                reason = "identity_incomplete"
-                                continue
-                            try:
-                                next_metadata, next_summary, _record = self._observe_finding_locked(
-                                    identity=finding_identity,
-                                    severity=(
-                                        finding.get("severity") if isinstance(finding.get("severity"), str) else "fault"
-                                    ),
-                                    source_revision=source_revision,
-                                    details=(
-                                        finding.get("details") if isinstance(finding.get("details"), Mapping) else None
-                                    ),
-                                    observed_at=safe_time,
-                                    metadata=next_metadata,
-                                    summary=next_summary,
-                                    budget=budget,
-                                )
-                                findings_written += 1
-                            except _StoreCapacityError:
-                                complete = False
-                                reason = "publication_budget_exhausted"
-                                break
+                            findings_written += 1
+                        except _StoreCapacityError:
+                            complete = False
+                            reason = "publication_budget_exhausted"
+                            break
                 if next_metadata["overflow_count"]:
                     complete = False
                     reason = "active_overflow"
@@ -1357,120 +1320,16 @@ class SchedulerDiagnosticStore:
     ) -> bool:
         """Resolve at most one stale finding with complete current scope evidence."""
         safe_time = _validated_timestamp(resolved_at)
-        normalized = _normalize_probes(probes)
-        complete_lanes: dict[str, Mapping[str, object]] = {}
-        complete_enablement: list[Mapping[str, object]] = []
-        current_digests: set[str] = set()
-        for probe in normalized:
-            identity = probe.get("identity")
-            if not isinstance(identity, Mapping) or probe.get("coverage") != "complete":
-                continue
-            lane = identity.get("resource_lane")
-            runtime_id = identity.get("runtime_id")
-            source_revision = probe.get("source_revision")
-            if isinstance(lane, str) and isinstance(runtime_id, str) and isinstance(source_revision, Mapping):
-                complete_lanes[lane] = probe
-            if (
-                identity.get("producer") == "enablement_reconciliation"
-                and isinstance(runtime_id, str)
-                and isinstance(source_revision, Mapping)
-            ):
-                complete_enablement.append(probe)
-            findings = probe.get("findings")
-            if isinstance(findings, Sequence) and not isinstance(findings, (str, bytes)):
-                for finding in findings:
-                    finding_identity = finding.get("identity") if isinstance(finding, Mapping) else None
-                    if isinstance(finding_identity, Mapping):
-                        safe_identity, incomplete = _sanitize_identity(finding_identity)
-                        if not incomplete:
-                            current_digests.add(_identity_digest(safe_identity))
-        if complete_enablement:
-            active_enablement = self.active_view(producer="enablement_reconciliation", limit=MAX_QUERY_LIMIT)
-            if active_enablement.get("coverage") in {"complete", "incomplete"}:
-                for item in active_enablement.get("items", ()):
-                    if not isinstance(item, Mapping):
-                        continue
-                    identity = item.get("identity")
-                    if not isinstance(identity, Mapping) or _identity_digest(identity) in current_digests:
-                        continue
-                    for complete_probe in complete_enablement:
-                        decision_identity = complete_probe.get("identity")
-                        if not isinstance(decision_identity, Mapping):
-                            continue
-                        if identity.get("runtime_id") != decision_identity.get("runtime_id"):
-                            continue
-                        source_revision = item.get("source_revision")
-                        covered_revision = complete_probe.get("source_revision")
-                        if not _revision_covers(covered_revision, source_revision):
-                            continue
-                        project_id = identity.get("project_id")
-                        if isinstance(project_id, str) and not _probe_covers_binding(
-                            complete_probe,
-                            project_id=project_id,
-                            registration_generation=identity.get("registration_generation"),
-                        ):
-                            continue
-                        episode = item.get("episode")
-                        observation_revision = item.get("observation_revision")
-                        if (
-                            not isinstance(episode, str)
-                            or type(observation_revision) is not int
-                            or not isinstance(source_revision, Mapping)
-                        ):
-                            continue
-                        return self.resolve_finding(
-                            identity=identity,
-                            episode=episode,
-                            observation_revision=observation_revision,
-                            source_revision=source_revision,
-                            resolved_at=safe_time,
-                        )
-        if not complete_lanes:
-            return False
-
-        active = self.active_view(producer="primary_probe", limit=MAX_QUERY_LIMIT)
-        if active.get("coverage") not in {"complete", "incomplete"}:
-            return False
-        for item in active.get("items", ()):
-            if not isinstance(item, Mapping):
-                continue
-            identity = item.get("identity")
-            if not isinstance(identity, Mapping):
-                continue
-            digest = _identity_digest(identity)
-            if digest in current_digests:
-                continue
-            lane = identity.get("resource_lane")
-            probe = complete_lanes.get(lane) if isinstance(lane, str) else None
-            decision_identity = probe.get("identity") if isinstance(probe, Mapping) else None
-            if not isinstance(decision_identity, Mapping):
-                continue
-            if identity.get("runtime_id") != decision_identity.get("runtime_id"):
-                continue
-            source_revision = item.get("source_revision")
-            covered_revision = probe.get("source_revision")
-            if not _revision_covers(covered_revision, source_revision):
-                continue
-            project_id = identity.get("project_id")
-            if isinstance(project_id, str) and not _probe_covers_binding(
-                probe,
-                project_id=project_id,
-                registration_generation=identity.get("registration_generation"),
-            ):
-                continue
-            episode = item.get("episode")
-            observation_revision = item.get("observation_revision")
-            if (
-                not isinstance(episode, str)
-                or type(observation_revision) is not int
-                or not isinstance(source_revision, Mapping)
-            ):
+        for query in resolution_queries(probes):
+            active = self.active_view(producer=query.producer, limit=MAX_QUERY_LIMIT)
+            candidate = select_resolution_candidate(query, active)
+            if candidate is None:
                 continue
             return self.resolve_finding(
-                identity=identity,
-                episode=episode,
-                observation_revision=observation_revision,
-                source_revision=source_revision,
+                identity=candidate.identity,
+                episode=candidate.episode,
+                observation_revision=candidate.observation_revision,
+                source_revision=candidate.source_revision,
                 resolved_at=safe_time,
             )
         return False
@@ -1512,7 +1371,7 @@ class SchedulerDiagnosticStore:
                     or not isinstance(episode, str)
                     or not _EPOCH_RE.fullmatch(episode)
                     or not isinstance(identity, dict)
-                    or _identity_digest(identity) != digest
+                    or diagnostic_identity_digest(identity) != digest
                 ):
                     raise _StoreReadError("pending_record_invalid")
                 segment_path = self.paths["scheduler_diagnostics_history_segments"] / segment_name
@@ -1881,39 +1740,6 @@ def _safe_identifier(value: object) -> str | None:
     return value if isinstance(value, str) and _IDENTIFIER_RE.fullmatch(value) else None
 
 
-def _sanitize_identity(value: Mapping[str, object]) -> tuple[dict[str, Any], bool]:
-    safe: dict[str, Any] = {}
-    omitted = False
-    numeric_keys = {"sequence_start", "sequence_end", "registry_revision", "ready_revision", "task_generation"}
-    token_keys = set(_BASE_IDENTITY_FIELDS) | {
-        "resource_lane",
-        "route_scope",
-        "admission_role",
-        "projection_kind",
-        "maintenance_kind",
-    }
-    for key, raw in value.items():
-        if key not in _IDENTITY_FIELDS:
-            omitted = True
-            continue
-        if key in numeric_keys:
-            if type(raw) is int and 0 <= raw <= _MAX_INTEGER:
-                safe[key] = raw
-            else:
-                omitted = True
-            continue
-        sanitized = _safe_token(raw) if key in token_keys else _safe_identifier(raw)
-        if sanitized is None:
-            omitted = True
-        else:
-            safe[key] = sanitized
-    for key in _BASE_IDENTITY_FIELDS:
-        if key not in safe:
-            safe[key] = "identity_incomplete"
-            omitted = True
-    return dict(sorted(safe.items())), omitted
-
-
 def _sanitize_facts(value: Mapping[str, object] | None) -> tuple[dict[str, Any], bool]:
     if value is None:
         return {}, False
@@ -1950,11 +1776,6 @@ def _sanitize_details(value: Mapping[str, object] | None) -> tuple[dict[str, Any
 
 def _sanitize_revision(value: Mapping[str, object]) -> tuple[dict[str, Any], bool]:
     return _sanitize_facts(value)
-
-
-def _identity_digest(identity: Mapping[str, Any]) -> str:
-    encoded = json.dumps(identity, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
 
 
 def _validated_timestamp(value: str | None) -> str:
@@ -2137,7 +1958,7 @@ def _active_sort_key(item: Mapping[str, Any]) -> tuple[int, str, str]:
     return (
         order.get(str(item.get("severity")), 3),
         str(item.get("first_observed_at", "")),
-        _identity_digest(item.get("identity", {})),
+        diagnostic_identity_digest(item.get("identity", {})),
     )
 
 
@@ -2154,7 +1975,7 @@ def _valid_active_record(record: Mapping[str, Any]) -> bool:
     return (
         isinstance(identity, dict)
         and isinstance(record.get("identity_digest"), str)
-        and _identity_digest(identity) == record["identity_digest"]
+        and diagnostic_identity_digest(identity) == record["identity_digest"]
         and isinstance(record.get("episode"), str)
         and bool(_EPOCH_RE.fullmatch(record["episode"]))
         and record.get("severity") in {"fault", "warning", "info"}
@@ -2389,49 +2210,6 @@ def _sanitize_timings(value: Mapping[str, object] | None) -> tuple[dict[str, Any
         else:
             omitted = True
     return result, omitted
-
-
-def _normalize_probes(
-    probes: Sequence[Mapping[str, object]] | Mapping[str, object] | None,
-) -> list[Mapping[str, object]]:
-    if probes is None:
-        return []
-    if isinstance(probes, Mapping):
-        return [value for value in probes.values() if isinstance(value, Mapping)][:3]
-    return [value for value in probes if isinstance(value, Mapping)][:3]
-
-
-def _revision_covers(
-    covered: object,
-    observed: object,
-) -> bool:
-    if not isinstance(covered, Mapping) or not isinstance(observed, Mapping):
-        return False
-    for key, observed_value in observed.items():
-        covered_value = covered.get(key)
-        if type(observed_value) is int:
-            if type(covered_value) is not int or covered_value < observed_value:
-                return False
-        elif covered_value != observed_value:
-            return False
-    return True
-
-
-def _probe_covers_binding(
-    probe: Mapping[str, object],
-    *,
-    project_id: str,
-    registration_generation: object,
-) -> bool:
-    covered = probe.get("covered_bindings")
-    if not isinstance(covered, Sequence) or isinstance(covered, (str, bytes)):
-        return False
-    return any(
-        isinstance(binding, Mapping)
-        and binding.get("project_id") == project_id
-        and binding.get("registration_generation") == registration_generation
-        for binding in covered
-    )
 
 
 def unavailable_summary(runtime_root: str | Path, reason: str) -> dict[str, object]:

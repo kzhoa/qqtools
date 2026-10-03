@@ -480,6 +480,122 @@ def test_cycle_publication_materializes_bounded_decision_and_finding(tmp_path: P
     assert len(summary["decision_samples"]) == 1
 
 
+def test_cycle_publication_keeps_selecting_after_a_failed_finding_admission(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = SchedulerDiagnosticStore(MachineRuntime(tmp_path / "machine-runtime"))
+    first = {
+        "identity": _identity(1, project_id="project-a"),
+        "source_revision": {"registry_revision": 1},
+    }
+    second = {
+        "identity": _identity(2, project_id="project-b"),
+        "source_revision": {"registry_revision": 2},
+    }
+    probes = (
+        {"coverage": "complete", "findings": (first,)},
+        {"coverage": "complete", "findings": (second,)},
+    )
+    original_observe = store._observe_finding_locked
+    calls = 0
+
+    def reject_first_finding(**kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise diagnostic_module._StoreCapacityError("publication_operation_limit")
+        return original_observe(**kwargs)
+
+    monkeypatch.setattr(store, "_observe_finding_locked", reject_first_finding)
+
+    store.publish_cycle({}, {}, probes, {}, observed_at="2026-09-28T00:00:00Z")
+
+    active = store.active_view()
+    summary = store.summary_view()
+    assert [item["identity"]["project_id"] for item in active["items"]] == ["project-b"]
+    assert summary["coverage"] == "incomplete"
+    assert summary["reason"] == "publication_budget_exhausted"
+    metadata = json.loads((store.runtime_root / "diagnostics" / "scheduler-v1" / "metadata.json").read_text())[
+        "diagnostics"
+    ]
+    assert metadata["cycle_findings_written"] == 1
+
+
+def test_cycle_publication_marks_malformed_finding_incomplete_without_dropping_later_valid_input(
+    tmp_path: Path,
+) -> None:
+    store = SchedulerDiagnosticStore(MachineRuntime(tmp_path / "machine-runtime"))
+    probe = {
+        "coverage": "complete",
+        "findings": (
+            {"identity": _identity(), "source_revision": None},
+            {"identity": _identity(2), "source_revision": {"registry_revision": 2}},
+        ),
+    }
+
+    store.publish_cycle({}, {}, (probe,), {}, observed_at="2026-09-28T00:00:00Z")
+
+    active = store.active_view()
+    assert active["coverage"] == "incomplete"
+    assert active["reason"] == "identity_incomplete"
+    assert [item["identity"] for item in active["items"]] == [_identity(2)]
+
+
+def test_cycle_publication_checks_cap_before_ignoring_a_trailing_non_mapping_finding(tmp_path: Path) -> None:
+    store = SchedulerDiagnosticStore(MachineRuntime(tmp_path / "machine-runtime"))
+    findings = tuple(
+        {"identity": _identity(index), "source_revision": {"registry_revision": index}} for index in range(1, 7)
+    ) + ("ignored",)
+
+    store.publish_cycle(
+        {},
+        {},
+        ({"coverage": "complete", "findings": findings},),
+        {},
+        observed_at="2026-09-28T00:00:00Z",
+    )
+
+    summary = store.summary_view()
+    assert summary["coverage"] == "incomplete"
+    assert summary["reason"] == "publication_budget_exhausted"
+
+
+def test_cycle_publication_stops_overflowed_probe_and_counts_later_persisted_finding(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = SchedulerDiagnosticStore(MachineRuntime(tmp_path / "machine-runtime"))
+    retained = _observe(store)
+    monkeypatch.setattr(diagnostic_module, "MAX_ACTIVE_RECORDS", 1)
+    overflowing_probe = {
+        "coverage": "complete",
+        "findings": (
+            {"identity": _identity(2), "source_revision": {"registry_revision": 2}},
+            {"identity": _identity(3), "source_revision": {"registry_revision": 3}},
+        ),
+    }
+    retained_probe = {
+        "coverage": "complete",
+        "findings": ({"identity": _identity(), "source_revision": {"registry_revision": 4}},),
+    }
+
+    store.publish_cycle(
+        {},
+        {},
+        (overflowing_probe, retained_probe),
+        {},
+        observed_at="2026-09-28T00:00:00Z",
+    )
+
+    metadata = json.loads((store.runtime_root / "diagnostics" / "scheduler-v1" / "metadata.json").read_text())[
+        "diagnostics"
+    ]
+    assert metadata["omitted_observations"] == 1
+    assert metadata["cycle_findings_written"] == 1
+    active = store.active_view()
+    assert active["total"] == 1
+    assert active["items"][0]["observation_revision"] == retained["observation_revision"] + 1
+
+
 def test_decision_retention_evicts_at_sixty_five_identities(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     # Retention is a record-count contract, not a host filesystem speed test.
     # Deadline enforcement has a separate deterministic boundary test below.
@@ -635,3 +751,46 @@ def test_complete_cycle_resolves_only_the_same_binding_and_lane(tmp_path: Path) 
     assert store.active_view()["items"] == []
     history = store.history_view()
     assert history["items"][0]["episode"] == finding["episode"]
+
+
+def test_reconcile_cycle_rejects_candidate_updated_after_bounded_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = SchedulerDiagnosticStore(MachineRuntime(tmp_path / "machine-runtime"))
+    first = _observe(store)
+    complete_probe = {
+        "identity": {
+            "producer": "primary_probe",
+            "reason_code": "primary_demand",
+            "component": "scheduler",
+            "stage": "admission",
+            "check": "primary_demand",
+            "scope_type": "machine_lane",
+            "runtime_id": "a" * 64,
+            "resource_lane": "gpu",
+        },
+        "outcome": "no_primary_demand",
+        "coverage": "complete",
+        "source_revision": {"registry_revision": 2},
+        "covered_bindings": [
+            {
+                "project_id": "project-a",
+                "registration_generation": "registration-1",
+            }
+        ],
+        "findings": [],
+    }
+    original_resolve = store.resolve_finding
+
+    def update_then_resolve(**kwargs):
+        newer = _observe(store)
+        assert newer["episode"] == first["episode"]
+        assert newer["observation_revision"] == first["observation_revision"] + 1
+        return original_resolve(**kwargs)
+
+    monkeypatch.setattr(store, "resolve_finding", update_then_resolve)
+
+    assert not store.reconcile_cycle((complete_probe,), resolved_at="2026-09-28T00:02:00Z")
+    active = store.active_view()
+    assert active["total"] == 1
+    assert active["items"][0]["observation_revision"] == first["observation_revision"] + 1
