@@ -755,7 +755,51 @@ def test_binding_validation_drains_cross_epoch_terminal_replay(tmp_path: Path) -
         restarted.shutdown()
 
 
-def test_detached_terminal_publish_cross_epoch_replays_attempt_first_write(tmp_path: Path) -> None:
+def test_cross_epoch_terminal_intent_without_committed_marker_cannot_publish(tmp_path: Path) -> None:
+    running = _running_attempt(tmp_path)
+    executor = ProjectIOExecutor(running.runtime)
+    executor.begin_epoch()
+    parameters = _terminal_publish_parameters(running)
+    request = executor.prepare_authority_terminal_publish(
+        running.binding,
+        running.registry_revision,
+        **_attempt_parameters(running),
+        mode="active",
+        phase="succeeded",
+        reason="completed",
+        exit_code=0,
+        termination_result=None,
+        source_revisions=running.source_revisions,
+        transition_digest=parameters["transition_digest"],
+    )
+    task_file = running.cfg.shared_root / "tasks" / f"{running.task_id}.json"
+    original_task, original_attempt = task_file.read_bytes(), running.attempt_file.read_bytes()
+    restarted = ProjectIOExecutor(running.runtime)
+    restarted.begin_epoch()
+    assert request in restarted.unresolved_requests()
+    try:
+        assert not restarted.resolve_stale_authority_terminal_publish(request.request_id, request)
+        deadline = time.monotonic() + 5
+        result = None
+        while time.monotonic() < deadline:
+            restarted.poll()
+            result = restarted.load_result(request.request_id)
+            if result is not None:
+                break
+            time.sleep(0.02)
+        assert result is not None
+        assert result.status == "completed"
+        assert result.evidence["outcome"] == "stale"
+        assert task_file.read_bytes() == original_task
+        assert running.attempt_file.read_bytes() == original_attempt
+    finally:
+        restarted.shutdown()
+
+
+@pytest.mark.parametrize("crash_after_retry_reset", [False, True])
+def test_detached_terminal_publish_cross_epoch_replays_attempt_first_write(
+    tmp_path: Path, crash_after_retry_reset: bool
+) -> None:
     running = _running_attempt(tmp_path)
     task = load_task(running.cfg, running.task_id)
     task.claim_control["active_claim"].update(
@@ -826,6 +870,12 @@ def test_detached_terminal_publish_cross_epoch_replays_attempt_first_write(tmp_p
         ).to_dict(),
         "project_io_process",
     )
+    if crash_after_retry_reset:
+        executor.poll()
+        assert executor.reset_ambiguous_authority_terminal_publish_for_retry(request.request_id, request)
+        assert executor.load_result(request.request_id) is None
+        assert not executor._record_path("processes", request.request_id).exists()
+
     restarted = ProjectIOExecutor(running.runtime)
     restarted.begin_epoch()
     assert request in restarted.unresolved_requests()

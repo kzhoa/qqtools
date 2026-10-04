@@ -1880,7 +1880,10 @@ uses the durable build state. The completed result contains only the durable sta
 plus build ID and closed phase while state is `building`; it grants no scheduling or local-capacity
 authority. Disabled, replaced, upgrade-blocked, and capacity-ineligible bindings start no request.
 The isolated production route never performs synchronous ready-index construction before candidate
-observation; `building` results are continued by later fair controller turns.
+observation; `building` results are continued by later fair controller turns. Within one binding's
+ordinary background rotation, activation prerequisites precede ready-index build slices, and those
+finite slices precede resumable periodic services so scheduler discovery becomes available without
+letting the build bypass the existing family cursor.
 
 Durable Project maintenance uses the closed `maintenance_descriptor_advance` operation. A request
 names only the exact enabled, validated binding, carries no source revision or provisional offer,
@@ -2167,7 +2170,11 @@ uses it to distinguish `already_exited` cancellation acknowledgement from ordina
 Termination commitments bind the decision identity, process identity,
 outcome, reason, and source revisions. Terminal publication records its request identity in Attempt
 and Task truth so a partial write can be resumed by that exact request, including after executor
-restart. Matching terminal phases alone cannot authorize a different request to replay the commit.
+restart. Retry preparation may remove an ambiguous result before restarting its worker;
+an epoch change in that gap must retain the exact authority mutation request for replay-only
+reconciliation. Missing results do not prove that no write committed. Replay without a matching
+committed marker cannot initiate a stale mutation. Matching terminal phases alone cannot authorize
+a different request to replay the commit.
 Epoch checks also cover nested claim archival, projection, and maintenance mutations; revocation
 preserves existing recovery evidence instead of continuing later writes in the old request.
 

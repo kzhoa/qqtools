@@ -43,6 +43,7 @@ def test_capture_and_upgrade_prerequisites_do_not_starve_periodic_metadata():
         "upgrade_service",
         "activation_consumer_register",
         "activation_observe",
+        "scheduler_ready_index_build",
         "machine_snapshot_publish",
         "submission_control_service",
     ]
@@ -52,7 +53,7 @@ def test_capture_and_upgrade_prerequisites_do_not_starve_periodic_metadata():
         admission.begin([owner], blocked=(), free_slots=1)
         _offer_all(admission, list(reversed(intents)), executed)
         admission.finish()
-    expected = [*intents[:4], intents[5], intents[4]]
+    expected = [*intents[:5], intents[6], intents[5]]
     assert executed == expected * 2
 
 

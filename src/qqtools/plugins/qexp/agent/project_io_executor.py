@@ -2188,32 +2188,16 @@ class ProjectIOExecutor:
                     if request.executor_epoch == epoch.executor_epoch:
                         continue
                     result = results.get(request_id)
-                    if (
-                        request.operation_kind == "authority_renewal"
-                        and result is not None
-                        and result.status in {"outcome_unknown", "retryable_error"}
-                    ):
-                        # Preserve the exact replay identity across executor restart.
-                        # The replay-only worker will verify the Task marker and either
-                        # finish that commit or return a stale result without writing.
-                        continue
-                    if (
-                        request.operation_kind == "authority_orphan_recovery"
-                        and result is not None
-                        and result.status in {"outcome_unknown", "retryable_error"}
-                    ):
-                        continue
-                    if (
-                        request.operation_kind
-                        in {
-                            "authority_termination_commit",
-                            "authority_orphan_recovery",
-                            "authority_terminal_publish",
-                        }
-                        and result is not None
-                        and result.status in {"outcome_unknown", "retryable_error"}
-                    ):
-                        # Preserve the exact intent for replay-only reconciliation.
+                    if request.operation_kind in {
+                        "authority_renewal",
+                        "authority_termination_commit",
+                        "authority_orphan_recovery",
+                        "authority_terminal_publish",
+                    } and (result is None or result.status in {"outcome_unknown", "retryable_error"}):
+                        # Retry reset removes the ambiguous result before the next
+                        # worker starts. A crash in that gap must retain the exact
+                        # intent too. Replay-only workers verify committed markers;
+                        # an intent that never committed cannot begin a stale write.
                         continue
                     if request.operation_kind == "scheduler_claim" and classify_executor_offer(
                         self.runtime.root, _claim_offer_identity(request)
