@@ -83,6 +83,13 @@ pitch or delivery change description, with explicit approval.
 
 ## Protected workflows
 
+- Machine-rolling upgrade observation: `qexp admin upgrade status` observes locally
+  registered Projects and `qexp admin upgrade advance` attempts bounded shared
+  Project work. Optional progress is observational and never a prerequisite for
+  activation, compatible admission, or running-workload continuity. A slice can
+  inventory one entry, advance part of a large source, or change a stage; it does
+  not promise one completed record.
+
 - Agent lifecycle independence: submit and launch a Task, stop or crash only the machine agent,
   allow the real runner to finish, then start the agent and observe the original Task/Attempt
   terminal outcome without manual repair or a successor launch.
@@ -2251,6 +2258,38 @@ operations. No temporary compatibility implementation is retained for these spel
 have no compatibility-registry lifecycle. Legacy Batch inspection and retry commands remain
 owned by the submission cutover. The target CLI also does not promise aliases for the old flat
 `list`, `inspect`, `retry`, `cancel`, or hyphenated Group command spellings.
+
+### Upgrade progress and contention
+
+Upgrade progress describes shared Project metadata for all participating machines.
+The invoking machine's registry determines discovery scope, not a private shard of
+migration work. Status reads committed metadata without enumerating source history.
+
+The optional version-1 `progress` envelope reports a stage, scan epoch, completed
+sources, inventoried entries, nullable total, remaining stages, and the time of
+last committed semantic progress. Inventory counts are separate from completed
+work. Only `total_kind=snapshot_exact` permits a percentage, and an empty exact
+stage displays `0/0` without a percentage. An exact total describes the last
+committed revision-bound snapshot; status does not detect subsequent source changes.
+The next advancing slice checks the binding. Directory changes or cursor restarts
+start a new epoch and discard the old numerator and denominator. During bounded
+ordinal reconstruction the completed count is unavailable.
+
+Large Submission sources may report validated byte checkpoints. Several byte
+slices count as one source only after validation and required locator publication.
+Source replacement restarts byte progress. Inventory and reconstruction never
+refresh `progress.last_progress_at`; the existing top-level journal-update time
+retains its diagnostic meaning. Missing, old, or invalid progress displays
+`Progress: unavailable` while ordinary state, blockers, and next actions remain.
+
+Advance adds an invocation result separate from durable state. It identifies
+whether this invocation committed a slice, an upgrade or schema lock miss, a
+probe deadline, and any own semantic delta. Lock contention is waiting, and does
+not identify a holder or prove progress. Only comparable snapshots captured by
+that invocation can establish that another coordinator advanced shared Project
+work. Unchanged or unavailable evidence means progress is unconfirmed. A single
+status read cannot prove a stall. Repair-required, paused, inaccessible,
+validation-failed and admission-blocked states retain precedence and next actions.
 
 ## 17. Acceptance Checklist
 

@@ -142,6 +142,18 @@ def _accessible_nested_upgrade(item: object) -> dict[str, object] | None:
     return status
 
 
+def _is_transient_lock_contention(status: dict[str, object]) -> bool:
+    """Return whether lock blockers describe healthy retryable contention only."""
+    blockers = status.get("blockers")
+    if not isinstance(blockers, (list, tuple)) or not blockers:
+        return False
+    if any(blocker not in {"schema_lock_busy", "upgrade_lock_busy"} for blocker in blockers):
+        return False
+    if status.get("state") not in {"waiting", "runnable"}:
+        return False
+    return not any(status.get(key) for key in ("admission_blocked", "migration_blocked", "validation_failed", "error"))
+
+
 def _upgrade_payload(
     result: dict[str, object],
     action: str,
@@ -159,7 +171,9 @@ def _upgrade_payload(
     aggregate_state = payload.get("aggregate_state")
     state = payload.get("state")
     nested_blocked = False
+    nested_waiting = False
     nested_reason: str | None = None
+    nested_waiting_reason: str | None = None
     projects = payload.get("projects")
     if isinstance(projects, (list, tuple)):
         for project in projects:
@@ -167,13 +181,38 @@ def _upgrade_payload(
             if status is None:
                 continue
             child_blockers = status.get("blockers")
+            lock_only = _is_transient_lock_contention(status)
             child_blocked = (
-                status.get("state") in {"repair_required", "paused", "pause_pending", "blocked"}
+                status.get("state")
+                in {"repair_required", "paused", "pause_pending", "blocked", "validation_failed", "inaccessible"}
                 or bool(status.get("migration_blocked"))
                 or bool(status.get("admission_blocked"))
-                or bool(child_blockers)
+                or bool(status.get("error"))
+                or (bool(child_blockers) and not lock_only)
             )
             if not child_blocked:
+                invocation = status.get("invocation")
+                invocation_waiting = (
+                    isinstance(invocation, dict)
+                    and invocation.get("slice_committed") is not True
+                    and invocation.get("contended_lock") in {"upgrade", "schema"}
+                    and status.get("state") in {"waiting", "runnable"}
+                    and not any(
+                        status.get(key)
+                        for key in ("admission_blocked", "migration_blocked", "validation_failed", "error")
+                    )
+                )
+                if lock_only or invocation_waiting:
+                    nested_waiting = True
+                    if nested_waiting_reason is None and lock_only:
+                        lock = next(
+                            (item for item in child_blockers if item in {"upgrade_lock_busy", "schema_lock_busy"}),
+                            None,
+                        )
+                        if lock is not None:
+                            nested_waiting_reason = (
+                                f"waiting for Project {'upgrade' if lock == 'upgrade_lock_busy' else 'schema'} lock"
+                            )
                 continue
             nested_blocked = True
             if nested_reason is None:
@@ -185,17 +224,30 @@ def _upgrade_payload(
                     nested_reason = str(child_reason)
                 else:
                     nested_reason = "registered project upgrade is blocked"
+    invocation = payload.get("invocation")
+    invocation_waiting = (
+        isinstance(invocation, dict)
+        and invocation.get("slice_committed") is not True
+        and invocation.get("contended_lock") in {"upgrade", "schema"}
+        and state in {"waiting", "runnable"}
+        and not any(
+            payload.get(key) for key in ("admission_blocked", "migration_blocked", "validation_failed", "error")
+        )
+    )
+    lock_only = _is_transient_lock_contention(payload)
+    waiting = nested_waiting or invocation_waiting or lock_only
     if payload.get("error") or state == "validation_failed":
         outcome = "failed"
     elif aggregate_state == "inaccessible" or inaccessible_values:
         outcome = "blocked"
     elif (
         nested_blocked
-        or state in {"repair_required", "paused", "pause_pending", "blocked"}
+        or state in {"repair_required", "paused", "pause_pending", "blocked", "inaccessible"}
         or payload.get("admission_blocked")
+        or payload.get("migration_blocked")
     ):
         outcome = "blocked"
-    elif pending:
+    elif pending or waiting:
         outcome = "waiting"
     else:
         outcome = "completed"
@@ -204,7 +256,17 @@ def _upgrade_payload(
     reason = payload.get("reason")
     if not isinstance(reason, str) or not reason:
         if blocker_values:
-            reason = str(blocker_values[0])
+            if lock_only:
+                lock = next(
+                    (item for item in blocker_values if item in {"upgrade_lock_busy", "schema_lock_busy"}), None
+                )
+                reason = (
+                    f"waiting for Project {'upgrade' if lock == 'upgrade_lock_busy' else 'schema'} lock"
+                    if lock is not None
+                    else str(blocker_values[0])
+                )
+            else:
+                reason = str(blocker_values[0])
         elif inaccessible_values:
             first = inaccessible_values[0]
             if isinstance(first, dict):
@@ -213,6 +275,11 @@ def _upgrade_payload(
                 reason = "registered project is inaccessible"
         elif nested_reason is not None:
             reason = nested_reason
+        elif nested_waiting_reason is not None:
+            reason = nested_waiting_reason
+        elif invocation_waiting and isinstance(invocation, dict):
+            lock = invocation.get("contended_lock")
+            reason = f"waiting for Project {lock} lock"
         elif isinstance(payload.get("pause"), dict) and payload["pause"].get("reason"):
             reason = str(payload["pause"]["reason"])
         elif isinstance(payload.get("repair"), dict) and payload["repair"].get("error"):
@@ -231,7 +298,7 @@ def _upgrade_payload(
             f"qexp admin upgrade plan --project {shlex.quote(str(project_root))} "
             f"--target {shlex.quote(str(payload['target']))}"
         )
-    elif pending or inaccessible_values or outcome in {"blocked", "failed"}:
+    elif pending or waiting or inaccessible_values or outcome in {"blocked", "failed"}:
         if project_root is None:
             follow_up = "qexp admin upgrade status"
         else:

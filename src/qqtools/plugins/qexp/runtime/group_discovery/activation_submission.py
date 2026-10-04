@@ -71,6 +71,11 @@ class ActivationSubmissionStep:
     state: Literal["progressed", "complete"]
     submission_state: str | None = None
     target_group: str | None = None
+    completed_bytes: int | None = None
+    total_bytes: int | None = None
+    source_revision: dict[str, int] | None = None
+    restarted: bool = False
+    previous_completed_bytes: int | None = None
 
     def __post_init__(self) -> None:
         if self.state not in {"progressed", "complete"}:
@@ -79,6 +84,26 @@ class ActivationSubmissionStep:
             raise ValueError("an incomplete activation Submission step cannot contain completed metadata")
         if self.state == "complete" and self.submission_state not in _VALID_STATES:
             raise ValueError("a complete activation Submission step has an invalid state value")
+        if type(self.restarted) is not bool:
+            raise TypeError("activation Submission restart marker must be a boolean")
+        if self.state == "complete":
+            if self.completed_bytes is not None or self.total_bytes is not None or self.source_revision is not None:
+                raise ValueError("a complete activation Submission step cannot contain byte progress")
+            if self.restarted:
+                raise ValueError("a complete activation Submission step cannot be marked restarted")
+            return
+        if type(self.completed_bytes) is not int or self.completed_bytes < 0:
+            raise ValueError("activation Submission completed_bytes must be nonnegative")
+        if type(self.total_bytes) is not int or self.total_bytes < 0:
+            raise ValueError("activation Submission total_bytes must be nonnegative")
+        if self.completed_bytes > self.total_bytes:
+            raise ValueError("activation Submission completed_bytes exceeds total_bytes")
+        if type(self.source_revision) is not dict or frozenset(self.source_revision) != _REVISION_KEYS:
+            raise ValueError("activation Submission source revision is invalid")
+        if any(type(value) is not int or value < 0 for value in self.source_revision.values()):
+            raise ValueError("activation Submission source revision values are invalid")
+        if self.source_revision["size"] != self.total_bytes:
+            raise ValueError("activation Submission total_bytes does not match source revision")
 
 
 @dataclass(slots=True)
@@ -676,7 +701,13 @@ def advance_activation_submission_source(
                 projector.snapshot(),
             ),
         )
-        return ActivationSubmissionStep("progressed")
+        return ActivationSubmissionStep(
+            "progressed",
+            completed_bytes=0,
+            total_bytes=source_revision.size,
+            source_revision=source_revision.to_dict(),
+            restarted=True,
+        )
     else:
         data = read.data
         source_eof = read.eof
@@ -703,6 +734,7 @@ def advance_activation_submission_source(
         result = scanner.step(1)
     if not result.is_complete:
         scanner.flush_fragment()
+        scanner_snapshot = scanner.snapshot()
         _persist_checkpoint(
             storage,
             checkpoint,
@@ -711,11 +743,17 @@ def advance_activation_submission_source(
                 operation_id,
                 source,
                 source_revision,
-                scanner.snapshot(),
+                scanner_snapshot,
                 projector.snapshot(),
             ),
         )
-        return ActivationSubmissionStep("progressed")
+        return ActivationSubmissionStep(
+            "progressed",
+            completed_bytes=_snapshot_offset(scanner_snapshot),
+            total_bytes=source_revision.size,
+            source_revision=source_revision.to_dict(),
+            previous_completed_bytes=offset,
+        )
 
     submission_state, target_group = projector.finish()
     storage.unlink(checkpoint)

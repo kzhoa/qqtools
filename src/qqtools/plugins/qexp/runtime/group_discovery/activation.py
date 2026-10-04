@@ -15,10 +15,10 @@ from ...config_types import RootConfig
 from ...lease import parse_utc
 from ..directory_capture import read_directory_entry
 from ..group_namespace import group_authority_identity, group_directory
-from ..locks import group_lock, schema_lock
+from ..locks import exclusive, group_lock, schema_lock
 from ..paths import shared_paths
 from ..protocol_compatibility import GROUP_SERVICE_CAPABILITY, SUPPORTED_REQUIRED_CAPABILITIES
-from ..records import validate_group_name
+from ..records import validate_group_name, validate_identifier
 from ..store import atomic_replace, read_json, read_json_limited, require_json_size
 from . import locator
 from .activation_submission import advance_activation_submission_source
@@ -367,6 +367,18 @@ def _bootstrap_paths(cfg: RootConfig, *, storage: Any | None = None) -> dict[str
     }
 
 
+def is_bootstrap_source(name: object) -> bool:
+    """Return whether a directory entry is an eligible bootstrap source."""
+    return isinstance(name, str) and name.endswith(".json")
+
+
+def _safe_source_id(value: object) -> str | None:
+    try:
+        return validate_identifier(value, "bootstrap source identifier")
+    except (TypeError, ValueError):
+        return None
+
+
 def _cursor_phase(name: str) -> str:
     if name == "groups":
         return "groups"
@@ -387,8 +399,25 @@ def _publish_locked(
         locator.publish_group_locator_locked(cfg, group, lane, reason, storage=storage)
 
 
-def _process_entry(cfg: RootConfig, namespace: str, path: Path, name: str, *, storage: Any | None = None) -> bool:
-    if not name.endswith(".json"):
+def _process_entry(
+    cfg: RootConfig,
+    namespace: str,
+    path: Path,
+    name: str,
+    *,
+    storage: Any | None = None,
+    observation: dict[str, Any] | None = None,
+) -> bool:
+    if observation is not None:
+        observation.update(
+            {
+                "source_id": None,
+                "source_completed": False,
+                "current_item": None,
+                "source_checkpoint": None,
+            }
+        )
+    if not is_bootstrap_source(name):
         return True
     if namespace == "groups":
         group_name = name[:-5]
@@ -397,6 +426,8 @@ def _process_entry(cfg: RootConfig, namespace: str, path: Path, name: str, *, st
         _publish_locked(cfg, group_name, "membership", "bootstrap", storage=storage)
         _publish_locked(cfg, group_name, "control", "bootstrap", storage=storage)
         _publish_locked(cfg, group_name, "maintenance", "bootstrap", storage=storage)
+        if observation is not None:
+            observation["source_id"] = _safe_source_id(group_name)
         return True
     if namespace in {"submissions", "submission_control"}:
         source_path = path if namespace == "submissions" else shared_paths(cfg.shared_root)["submissions"] / name
@@ -423,10 +454,28 @@ def _process_entry(cfg: RootConfig, namespace: str, path: Path, name: str, *, st
                 namespace,
             )
             if step.state == "progressed":
+                if observation is not None:
+                    observation["source_id"] = _safe_source_id(operation_id)
+                    observation["previous_completed_bytes"] = step.previous_completed_bytes
+                    observation["current_item"] = {
+                        "kind": "submission",
+                        "id": operation_id,
+                        "completed_bytes": step.completed_bytes,
+                        "total_bytes": step.total_bytes,
+                        **({"restarted": True} if step.restarted else {}),
+                    }
+                    observation["source_checkpoint"] = {
+                        "namespace": namespace,
+                        "operation_id": operation_id,
+                        "source_path": str(source_path),
+                        "source_revision": dict(step.source_revision or {}),
+                    }
                 return False
             group_name = step.target_group
             if group_name is not None and step.submission_state in {"prepared", "committing", "blocked"}:
                 _publish_locked(cfg, group_name, "membership", "bootstrap", storage=storage)
+            if observation is not None:
+                observation["source_id"] = _safe_source_id(operation_id)
             return True
 
         operation = (
@@ -456,6 +505,8 @@ def _process_entry(cfg: RootConfig, namespace: str, path: Path, name: str, *, st
             raise RuntimeError(f"Submission target_group is invalid during activation bootstrap: {name}") from exc
         if group_name is not None and submission["state"] in {"prepared", "committing", "blocked"}:
             _publish_locked(cfg, group_name, "membership", "bootstrap", storage=storage)
+        if observation is not None:
+            observation["source_id"] = _safe_source_id(operation_id)
         return True
     if namespace == "group_control":
         record = storage.read_json_limited(path, max_bytes=MAX_RECORD_BYTES) if storage else read_json(path)
@@ -463,6 +514,8 @@ def _process_entry(cfg: RootConfig, namespace: str, path: Path, name: str, *, st
         group_name = operation.get("group_name") if isinstance(operation, dict) else None
         if isinstance(group_name, str):
             _publish_locked(cfg, group_name, "control", "bootstrap", storage=storage)
+        if observation is not None:
+            observation["source_id"] = _safe_source_id(name[:-5])
         return True
     if namespace == "cleanup":
         record = storage.read_json_limited(path, max_bytes=MAX_RECORD_BYTES) if storage else read_json(path)
@@ -471,7 +524,11 @@ def _process_entry(cfg: RootConfig, namespace: str, path: Path, name: str, *, st
         if isinstance(group_name, str):
             _publish_locked(cfg, group_name, "control", "bootstrap", storage=storage)
             _publish_locked(cfg, group_name, "maintenance", "bootstrap", storage=storage)
+        if observation is not None:
+            observation["source_id"] = _safe_source_id(name[:-5])
         return True
+    if observation is not None:
+        observation["source_id"] = _safe_source_id(name[:-5])
     return True
 
 
@@ -481,28 +538,66 @@ def _advance_cursor(
     namespace: str,
     *,
     storage: Any | None = None,
+    observation: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     path = _bootstrap_paths(cfg, storage=storage)[namespace]
     bootstrap = record["bootstrap"]
     cursor = dict(bootstrap["cursors"][namespace])
+    previous_cursor = dict(cursor)
+    cursor_restarted = False
+    source_eligible = False
+    source_completed = False
+    if observation is not None:
+        observation.clear()
+        observation.update(
+            {
+                "namespace": namespace,
+                "source_id": None,
+                "source_completed": False,
+                "cursor_restarted": False,
+                "current_item": None,
+                "source_checkpoint": None,
+            }
+        )
     current_revision = _revision(path)
     if cursor["directory_revision"] != current_revision:
         cursor.update(directory_revision=current_revision, cookie=0, complete=False)
+        cursor_restarted = not (
+            previous_cursor["directory_revision"] is None
+            and previous_cursor["cookie"] == 0
+            and current_revision is not None
+        )
     if current_revision is None:
         cursor.update(cookie=0, complete=True)
     elif not cursor["complete"]:
         name, next_cookie = read_directory_entry(path, cursor["cookie"])
         if _revision(path) != current_revision:
             cursor.update(directory_revision=_revision(path), cookie=0, complete=False)
+            cursor_restarted = True
         elif name is None:
             cursor.update(cookie=next_cookie, complete=True)
         else:
-            if _process_entry(cfg, namespace, path / name, name, storage=storage):
+            source_eligible = is_bootstrap_source(name)
+            if _process_entry(cfg, namespace, path / name, name, storage=storage, observation=observation):
                 cursor["cookie"] = next_cookie
+                source_completed = source_eligible
     bootstrap["cursors"][namespace] = cursor
     record["revision"] += 1
     record["updated_at"] = _utc_now()
-    return _write_record(cfg.shared_root, record, storage=storage)
+    persisted = _write_record(cfg.shared_root, record, storage=storage)
+    if observation is not None:
+        persisted_cursor = persisted["bootstrap"]["cursors"][namespace]
+        observation.update(
+            {
+                "cursor_restarted": cursor_restarted,
+                "cursor_before_cookie": previous_cursor["cookie"],
+                "cursor_before_complete": previous_cursor["complete"],
+                "cursor_after_cookie": persisted_cursor["cookie"],
+                "cursor_after_complete": persisted_cursor["complete"],
+                "source_completed": source_completed,
+            }
+        )
+    return persisted
 
 
 def _start_building(record: dict[str, Any]) -> dict[str, Any]:
@@ -595,15 +690,26 @@ def _transition_locked(
     return _write_record(cfg.shared_root, record, storage=storage)
 
 
+def _invalidate_upgrade_observation(cfg: RootConfig) -> None:
+    """Renew the journal revision before an out-of-band activation mutation."""
+    from ..upgrade.framework import _load_journal, _save_journal
+
+    journal = _load_journal(cfg)
+    if journal is not None:
+        _save_journal(cfg, journal)
+
+
 def transition_group_service_state(cfg: RootConfig, target: str) -> dict[str, Any]:
     """Apply one permitted activation transition under the schema fence."""
     if target not in _STATES:
         raise ValueError(f"unsupported Group service activation state: {target!r}")
-    with schema_lock(cfg.shared_root):
-        record = _read_record(cfg.shared_root)
-        if record is None:
-            raise RuntimeError("Group service activation transition has no preparing record")
-        return _transition_locked(cfg, record, target)
+    with exclusive(shared_paths(cfg.shared_root)["locks"] / "upgrade.lock"):
+        _invalidate_upgrade_observation(cfg)
+        with schema_lock(cfg.shared_root):
+            record = _read_record(cfg.shared_root)
+            if record is None:
+                raise RuntimeError("Group service activation transition has no preparing record")
+            return _transition_locked(cfg, record, target)
 
 
 def transition_group_service_state_locked(
@@ -685,8 +791,11 @@ def advance_group_service_activation_locked(
     *,
     storage: Any | None = None,
     layout_prevalidated: bool = False,
+    observation: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Advance one activation slice when the caller already owns the schema fence."""
+    if observation is not None:
+        observation.clear()
     record = _read_record(cfg.shared_root, storage=storage)
     if record is None:
         record = _record_preparing(cfg, storage=storage)
@@ -748,18 +857,18 @@ def advance_group_service_activation_locked(
             storage=storage,
             layout_prevalidated=layout_prevalidated,
         )
-    cursor_name = {
-        "groups": "groups",
-        "submissions": "submissions",
-        "active_namespaces": next(name for name in _CURSOR_NAMES[2:] if not bootstrap["cursors"][name]["complete"]),
-    }[bootstrap["phase"]]
-    return _advance_cursor(cfg, record, cursor_name, storage=storage)
+    cursor_name = bootstrap["phase"]
+    if cursor_name == "active_namespaces":
+        cursor_name = next(name for name in _CURSOR_NAMES[2:] if not bootstrap["cursors"][name]["complete"])
+    return _advance_cursor(cfg, record, cursor_name, storage=storage, observation=observation)
 
 
 def advance_group_service_activation(cfg: RootConfig) -> dict[str, Any]:
     """Advance activation by one bounded bootstrap entry or one phase change."""
-    with schema_lock(cfg.shared_root):
-        return advance_group_service_activation_locked(cfg)
+    with exclusive(shared_paths(cfg.shared_root)["locks"] / "upgrade.lock"):
+        _invalidate_upgrade_observation(cfg)
+        with schema_lock(cfg.shared_root):
+            return advance_group_service_activation_locked(cfg)
 
 
 def is_group_service_active(root: Path, *, storage: Any | None = None) -> bool:
@@ -797,6 +906,7 @@ __all__ = [
     "advance_group_service_activation",
     "advance_group_service_activation_locked",
     "group_service_registration_diagnostic",
+    "is_bootstrap_source",
     "is_group_service_active",
     "prepare_group_service_activation",
     "read_group_service_activation_record",

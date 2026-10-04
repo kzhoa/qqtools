@@ -108,6 +108,9 @@ class UpgradeJournalMigration(MigrationPlugin):
             return True
         return self._is_target_state_missing(manifest, schema)
 
+    def is_applicable_for_status(self, cfg, storage: UpgradeStorage) -> bool:
+        return self.is_applicable_with_storage(cfg, storage)
+
     def terminal_invariant_holds(self, cfg) -> bool:
         return not self.is_applicable(cfg)
 

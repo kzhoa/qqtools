@@ -146,6 +146,10 @@ class PhaseResult:
     cursor: str | None = None
     blocker: str | None = None
     detail: dict[str, Any] = field(default_factory=dict)
+    progress: dict[str, Any] | None = None
+    progress_evidence: dict[str, Any] | None = None
+    progress_state: dict[str, Any] | None = None
+    progress_before: dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
         if self.state not in {"progressed", "waiting", "complete", "blocked"}:
@@ -417,6 +421,11 @@ class MigrationPlugin:
         """Run applicability through budgeted storage when the check performs I/O."""
         del storage
         return self.is_applicable(cfg)
+
+    def is_applicable_for_status(self, cfg: RootConfig, storage: UpgradeStorage) -> bool:
+        """Return whether this migration may be advertised by journal-only status."""
+        del cfg, storage
+        return False
 
     def terminal_invariant_holds(self, cfg: RootConfig) -> bool:
         """Return whether a completed migration's durable target state still holds.

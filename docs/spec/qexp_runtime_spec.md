@@ -2852,6 +2852,71 @@ fence, and work evidence; the next ordinary slice re-reads or streams the source
 and must still validate its JSON and selected Submission fields. Other
 deterministic failures remain repair-required.
 
+#### Upgrade progress publication
+
+The optional upgrade-journal progress envelope is a permanent tolerant-reader
+contract, independent of activation truth and admission. It introduces no new
+required capability, fleet barrier, or temporary compatibility lifecycle. The
+normal deployment remains package installation and one-machine-at-a-time agent
+restart, with running Attempts preserved.
+
+The Group-service plugin owns namespace eligibility, inventory, ordinal recovery
+and byte evidence. The coordinator and CLI interpret only the generic version-1
+envelope. `completed_units` counts fully processed eligible sources in one scan
+epoch; `inventoried_units` counts matching entries in a separate bounded pass.
+Cookies, activation revisions, `work_items` and retry counts remain diagnostic
+values and are never interpreted as ordinals. No manifest of source names is
+retained. Inventory reads metadata only, shares the existing one-record,
+128-metadata-operation and 256-KiB slice limits, and may take at most one
+inventory-only turn between eligible activation turns.
+
+An epoch binds activation generation, namespace and canonical directory revision.
+A new binding discards previous counts and totals. Recovery at a nonzero cursor
+captures a fixed revision-bound target cookie and replays inventory from the
+beginning using equality, never numeric cookie ordering. A validated chain of
+later activation steps can reconcile that captured ordinal while activation
+continues. Unreachable targets, changed revisions or unprovable advancement keep
+the count unavailable. Activation completion never waits for inventory or starts
+extra inventory after completion. Byte evidence comes only from a validated,
+durable source checkpoint bound to source identity and regular-file revision.
+
+Publication follows three boundaries: save the existing in-flight journal first;
+commit authoritative activation/checkpoints under existing exclusions; publish
+the progress envelope and witnesses in the resulting journal save. Witnesses bind
+the containing journal revision, scan identity, authoritative activation revision
+and opaque cursor, and any source-checkpoint identity. Every save changes the
+containing revision; a save without revalidated progress cannot renew its binding.
+Status rejects malformed, stale-bound or in-flight observations without changing
+migration safety state. It does not inspect source checkpoints or directories to
+validate progress. A crash between commits leaves observation unavailable until
+bounded recovery reconciles authoritative truth; it never replays a missing count
+increment as migration work.
+
+`progress.last_progress_at` changes only for durable semantic advancement. Inventory,
+ordinal reconstruction, journal bookkeeping and lock probes cannot refresh it.
+When the original semantic time is unknown, recovery publishes null. Status still
+exposes the existing top-level journal-update timestamp for diagnostics.
+
+Supported released coordinator saves increment the journal revision even when
+they preserve unknown fields, invalidating earlier publications. Production
+Group-service advancement uses that coordinator boundary. Current direct activation
+helpers also acquire upgrade exclusion and invalidate an existing journal before
+mutation. These helpers are not an operator migration interface; any alternate
+writer that bypasses journal invalidation cannot share a published snapshot contract.
+Mixed-version observation must remain unavailable on such a path without blocking
+activation or admission.
+
+An advance invocation acquires Project upgrade exclusion before schema exclusion.
+Writable discovery uses the same nonblocking upgrade exclusion, including first
+journal creation, and rechecks durable state after acquisition. Busy discovery
+remains pending until a later bounded probe can establish applicable work.
+The upgrade-lock loser rereads the journal once and performs no journal save.
+Its separate invocation result contains `slice_committed`, `contended_lock`,
+`next_probe_at`, `observed_progress` and `delta`. A schema miss retains existing
+durable waiting behavior. Only matching semantic epochs and source identities can
+establish observed advancement; timestamps and journal revisions alone cannot.
+Invocation waiting never replaces durable intervention or admission-safety state.
+
 Large-source publication durably records pending responsibility before preparing
 the source. After the source temporary file is synchronized, its intended state
 and inode/size/mtime witness are synchronized in the pending record before rename.

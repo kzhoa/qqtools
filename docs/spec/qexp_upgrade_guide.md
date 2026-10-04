@@ -163,6 +163,63 @@ The output records the discovery boundary and lists inaccessible or omitted root
 interpreted as fleet-wide completeness. A project filter is available for diagnosis, but project
 filters are not part of the normal rolling workflow.
 
+### Read upgrade progress
+
+The `Progress` column describes work on the shared Project, including metadata
+for all participating machines. For an exact committed snapshot, output can show:
+
+```text
+Progress: submissions 183/237 (77.2%)
+Submission 96522abab62647c1, 49152/71234 bytes
+remaining stages: submission_control, group_control, cleanup, discovery_debt, stable_pass
+scope: shared Project
+```
+
+The numerator counts fully processed sources in this scan epoch. Byte checkpoints
+for one large Submission do not add extra sources. `Slices` counts bounded
+coordinator invocations, including inventory and partial-source work. It is not a
+record-completion count. Exact percentages describe the last committed snapshot;
+status does not scan the directory to discover changes since that snapshot.
+
+During inventory or source churn, a denominator may be unavailable:
+
+```text
+Progress: submissions 12 processed in scan 4; total pending
+Progress: submissions scan restarted; completed count unavailable; recounting
+```
+
+A new epoch resets counts after directory changes or a cursor restart. Inventory
+counts entries separately from completed work and cannot hold activation still
+to finish a recount. Empty exact stages show `0/0` without a percentage. Missing
+or invalid observations show `Progress: unavailable`; inspect the ordinary phase,
+state, blockers and next action. This does not itself mean migration failed.
+
+Two machines can invoke advance on the same Project. A losing invocation can
+report:
+
+```text
+waiting for Project upgrade lock; another coordinator advanced shared Project work
+```
+
+The additional clause is past advancement observed between two comparable
+snapshots. It does not identify the holder, its machine, or its current health.
+Without comparable evidence the command reports `progress unconfirmed`. A schema
+lock can instead belong to an ordinary Project writer and is reported as
+`waiting for Project schema lock`. Neither lock miss claims an own advancement
+delta. Repair-required, pause, validation failures, inaccessible storage and
+admission blocking retain their ordinary next actions.
+
+`progress.last_progress_at` records committed source/stage progress; inventory,
+recounting and lock probes do not refresh it. The top-level timestamp remains
+journal bookkeeping. Old progress alone does not prove a stall: compare later
+observations after the declared probe window and inspect blockers. Do not edit
+private progress fields or reset activation to obtain a percentage.
+
+This is a permanent optional observation format. Upgrade and restart agents one
+machine at a time as usual; older writers can make progress temporarily
+unavailable by saving a newer journal revision. No fleet barrier or new migration
+command is required.
+
 When a project reports `paused`, `repair_required`, or `pause_pending`, do not edit shared JSON
 files directly. Use the explicit project-scoped flow:
 

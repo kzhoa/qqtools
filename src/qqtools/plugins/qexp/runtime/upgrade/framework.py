@@ -14,6 +14,7 @@ from ...runtime.locks import exclusive, schema_lock
 from ...runtime.paths import shared_paths
 from ...runtime.records import utc_now
 from ...runtime.store import atomic_replace, migration_json_io_guard, read_json
+from ...upgrade_progress import _accepted_progress_pair, semantic_delta, validate_progress_evidence
 from .contracts import (
     DeterministicUpgradeError,
     MigrationPhase,
@@ -116,7 +117,7 @@ def register_migration(plugin: MigrationPlugin) -> None:
     DEFAULT_MIGRATIONS.register(plugin)
 
 
-def _is_applicable(plugin: MigrationPlugin, cfg: RootConfig) -> bool:
+def _is_applicable(plugin: MigrationPlugin, cfg: RootConfig, *, for_status: bool = False) -> bool:
     spec = plugin.spec
     budget = UpgradeSliceBudget(
         spec.max_records_per_slice,
@@ -124,6 +125,8 @@ def _is_applicable(plugin: MigrationPlugin, cfg: RootConfig) -> bool:
         spec.max_io_bytes_per_slice,
     )
     with migration_json_io_guard():
+        if for_status:
+            return plugin.is_applicable_for_status(cfg, UpgradeStorage(budget))
         return plugin.is_applicable_with_storage(cfg, UpgradeStorage(budget))
 
 
@@ -178,6 +181,58 @@ def _timestamp_after(seconds: float) -> str:
         .isoformat()
         .replace("+00:00", "Z")
     )
+
+
+def _invocation_result(
+    *,
+    slice_committed: bool = False,
+    contended_lock: str | None = None,
+    next_probe_at: str | None = None,
+    observed_progress: bool = False,
+    delta: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    return {
+        "slice_committed": slice_committed,
+        "contended_lock": contended_lock,
+        "next_probe_at": next_probe_at,
+        "observed_progress": observed_progress,
+        "delta": delta,
+    }
+
+
+def _with_invocation(
+    status: dict[str, Any],
+    *,
+    slice_committed: bool = False,
+    contended_lock: str | None = None,
+    next_probe_at: str | None = None,
+    observed_progress: bool = False,
+    delta: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    result = dict(status)
+    result["invocation"] = _invocation_result(
+        slice_committed=slice_committed,
+        contended_lock=contended_lock,
+        next_probe_at=next_probe_at,
+        observed_progress=observed_progress,
+        delta=delta,
+    )
+    return result
+
+
+def _invocation_probe_at(journal: dict[str, Any] | None) -> str | None:
+    if journal is None:
+        return None
+    migrations = journal.get("upgrade", {}).get("migrations")
+    if not isinstance(migrations, dict):
+        return None
+    active = next((item for item in migrations.values() if item.get("state") != "completed"), None)
+    if not isinstance(active, dict):
+        return None
+    interval = active.get("max_probe_interval_seconds")
+    if isinstance(interval, bool) or not isinstance(interval, (int, float)) or interval <= 0:
+        return None
+    return _timestamp_after(float(interval))
 
 
 def _probe_after(spec: MigrationSpec, project_id: str) -> str:
@@ -247,6 +302,24 @@ def _save_journal(cfg: RootConfig, journal: dict[str, Any]) -> None:
     atomic_replace(_journal_path(cfg), journal)
 
 
+def _validated_progress_publication(
+    result: PhaseResult, journal_revision: int
+) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    if result.progress is None or result.progress_evidence is None:
+        return None
+    try:
+        raw_evidence = deepcopy(result.progress_evidence)
+        if type(raw_evidence) is not dict:
+            return None
+        if "journal_revision" not in raw_evidence:
+            raw_evidence["journal_revision"] = journal_revision
+        progress, evidence = validate_progress_evidence(result.progress, raw_evidence)
+        evidence["journal_revision"] = journal_revision
+        return validate_progress_evidence(progress, evidence, journal_revision=journal_revision)
+    except (TypeError, ValueError):
+        return None
+
+
 def _status_from_journal(cfg: RootConfig, journal: dict[str, Any] | None) -> dict[str, Any]:
     protocol = _current_protocol(cfg)
     if journal is None:
@@ -266,9 +339,18 @@ def _status_from_journal(cfg: RootConfig, journal: dict[str, Any] | None) -> dic
             "blockers": [],
             "pause": None,
             "repair": None,
+            "progress": None,
+            "progress_evidence": None,
         }
     upgrade = journal["upgrade"]
-    migrations = list(upgrade["migrations"].values())
+    journal_revision = upgrade.get("revision")
+    migrations: list[dict[str, Any]] = []
+    for item in upgrade["migrations"].values():
+        snapshot = deepcopy(item)
+        accepted = _accepted_progress_pair(item, journal_revision)
+        snapshot["progress"] = accepted[0] if accepted is not None else None
+        snapshot["progress_evidence"] = accepted[1] if accepted is not None else None
+        migrations.append(snapshot)
     active = next(
         (item for item in migrations if item.get("state") not in {"completed", "idle"}),
         migrations[-1] if migrations else None,
@@ -313,6 +395,8 @@ def _status_from_journal(cfg: RootConfig, journal: dict[str, Any] | None) -> dic
         "blockers": blockers,
         "pause": pause,
         "repair": upgrade.get("repair"),
+        "progress": active.get("progress") if active else None,
+        "progress_evidence": active.get("progress_evidence") if active else None,
     }
 
 
@@ -385,7 +469,7 @@ class UpgradeCoordinator:
                     }
                     for plugin in self.registry.values()
                     if (protocol in plugin.spec.compatible_readers or protocol == plugin.spec.source_protocol)
-                    and _is_applicable(plugin, self.cfg)
+                    and _is_applicable(plugin, self.cfg, for_status=True)
                 ]
             return status
         except OSError as exc:
@@ -408,6 +492,8 @@ class UpgradeCoordinator:
                 "blockers": [f"registered_root_inaccessible:{exc}"],
                 "pause": None,
                 "repair": None,
+                "progress": None,
+                "progress_evidence": None,
             }
         except (KeyError, TypeError, ValueError, UpgradeError) as exc:
             return {
@@ -426,10 +512,20 @@ class UpgradeCoordinator:
                 "blockers": [f"journal_unreadable:{exc}"],
                 "pause": None,
                 "repair": None,
+                "progress": None,
+                "progress_evidence": None,
             }
 
     def discover(self) -> dict[str, Any]:
-        """Create a journal only when a registered plugin applies to this root."""
+        """Discover under nonblocking exclusion; a busy Project remains pending."""
+        before_status = _status_from_journal(self.cfg, _load_journal(self.cfg))
+        with exclusive(_upgrade_lock_path(self.cfg), blocking=False) as acquired:
+            if not acquired:
+                return self._upgrade_lock_missed(before_status)
+            return _status_from_journal(self.cfg, self._discover_locked())
+
+    def _discover_locked(self) -> dict[str, Any] | None:
+        """Recheck and discover while the caller holds Project upgrade exclusion."""
         current = _load_journal(self.cfg)
         if current is not None:
             current = self._reconcile_historical_terminal_state(current)
@@ -442,28 +538,19 @@ class UpgradeCoordinator:
                 if plugin.spec.name not in known_names and _is_applicable(plugin, self.cfg)
             ]
             if additions or drifted:
-                with exclusive(_upgrade_lock_path(self.cfg)) as acquired:
-                    if acquired:
-                        current = _load_journal(self.cfg) or current
-                        upgrade = current["upgrade"]
-                        current_names = set(upgrade["migrations"])
-                        for name in self._completed_migrations_with_drift(current):
-                            item = upgrade["migrations"][name]
-                            item.update(
-                                {
-                                    "state": "repair_required",
-                                    "error": "completed migration invariant no longer holds",
-                                    "admission_blocked": not self.registry.get(name).spec.safe_legacy_path,
-                                }
-                            )
-                        for plugin in additions:
-                            if plugin.spec.name in current_names:
-                                continue
-                            upgrade["migrations"][plugin.spec.name] = _new_migration_state(plugin.spec)
-                        _save_journal(self.cfg, current)
-                    else:
-                        return _status_from_journal(self.cfg, _load_journal(self.cfg))
-            return _status_from_journal(self.cfg, current)
+                for name in drifted:
+                    item = upgrade["migrations"][name]
+                    item.update(
+                        {
+                            "state": "repair_required",
+                            "error": "completed migration invariant no longer holds",
+                            "admission_blocked": not self.registry.get(name).spec.safe_legacy_path,
+                        }
+                    )
+                for plugin in additions:
+                    upgrade["migrations"][plugin.spec.name] = _new_migration_state(plugin.spec)
+                _save_journal(self.cfg, current)
+            return current
         protocol = _current_protocol(self.cfg)
         applicable: list[MigrationPlugin] = []
         for plugin in self.registry.values():
@@ -473,114 +560,131 @@ class UpgradeCoordinator:
             if _is_applicable(plugin, self.cfg):
                 applicable.append(plugin)
         if not applicable:
-            return _status_from_journal(self.cfg, None)
+            return None
         journal = _empty_journal(self.cfg)
         for plugin in applicable:
-            spec = plugin.spec
-            journal["upgrade"]["migrations"][spec.name] = _new_migration_state(spec)
-        with exclusive(_upgrade_lock_path(self.cfg)) as acquired:
-            if acquired:
-                _save_journal(self.cfg, journal)
-        return _status_from_journal(self.cfg, _load_journal(self.cfg))
+            journal["upgrade"]["migrations"][plugin.spec.name] = _new_migration_state(plugin.spec)
+        _save_journal(self.cfg, journal)
+        return journal
+
+    def _upgrade_lock_missed(self, before_status: dict[str, Any]) -> dict[str, Any]:
+        """Reread once without writing or claiming undiscovered work is complete."""
+        try:
+            reread = _load_journal(self.cfg)
+            after_status = _status_from_journal(self.cfg, reread)
+        except (OSError, KeyError, TypeError, ValueError, UpgradeError) as exc:
+            return _with_invocation(self._error_status_without_read(exc), contended_lock="upgrade")
+        if after_status["state"] in {"idle", "completed"}:
+            # Discovery could not confirm whether a new migration applies.  Keep
+            # it eligible for a later probe in the machine's bounded work queue.
+            after_status.update(state="waiting", pending=True, can_run=True)
+            after_status["blockers"] = [*after_status["blockers"], "upgrade_lock_busy"]
+        return _with_invocation(
+            after_status,
+            contended_lock="upgrade",
+            next_probe_at=_invocation_probe_at(reread),
+            observed_progress=semantic_delta(before_status, after_status) is not None,
+        )
 
     def _reconcile_historical_terminal_state(self, journal: dict[str, Any]) -> dict[str, Any]:
-        """Reconcile only a plugin-proven historical failure during writable discovery."""
+        """Reconcile a plugin-proven failure while Project upgrade exclusion is held."""
         active = self._next_active(journal["upgrade"])
         if active is None or active.get("state") != "repair_required":
             return journal
-        with exclusive(_upgrade_lock_path(self.cfg), blocking=False) as acquired:
-            if not acquired:
-                return journal
-            current = _load_journal(self.cfg)
-            if current is None:
-                return journal
-            upgrade = current["upgrade"]
-            active = self._next_active(upgrade)
-            if (
-                active is None
-                or active.get("state") != "repair_required"
-                or any(item.get("in_flight") for item in upgrade["migrations"].values())
-                or upgrade.get("repair") is not None
-                or upgrade["pause"].get("state") is not None
-                or _load_pause_intent(self.cfg) is not None
-            ):
+        current = _load_journal(self.cfg)
+        if current is None:
+            return journal
+        upgrade = current["upgrade"]
+        active = self._next_active(upgrade)
+        if (
+            active is None
+            or active.get("state") != "repair_required"
+            or any(item.get("in_flight") for item in upgrade["migrations"].values())
+            or upgrade.get("repair") is not None
+            or upgrade["pause"].get("state") is not None
+            or _load_pause_intent(self.cfg) is not None
+        ):
+            return current
+        plugin = self.registry.get(active["name"])
+        if not self._prerequisites_satisfied(upgrade, plugin.spec):
+            return current
+        with schema_lock(self.cfg.shared_root, blocking=False) as has_schema_lock:
+            if not has_schema_lock:
                 return current
-            plugin = self.registry.get(active["name"])
-            if not self._prerequisites_satisfied(upgrade, plugin.spec):
+            can_retry = False
+            try:
+                with migration_json_io_guard():
+                    context = self._context(current, active)
+                    can_retry = plugin.can_retry_historical_failure(context)
+                    if not can_retry:
+                        can_reconcile = plugin.can_reconcile_terminal_state(context)
+            except (OSError, RuntimeError, ValueError, KeyError, TypeError, UpgradeError):
                 return current
-            with schema_lock(self.cfg.shared_root, blocking=False) as has_schema_lock:
-                if not has_schema_lock:
-                    return current
-                can_retry = False
-                try:
-                    with migration_json_io_guard():
-                        context = self._context(current, active)
-                        can_retry = plugin.can_retry_historical_failure(context)
-                        if not can_retry:
-                            can_reconcile = plugin.can_reconcile_terminal_state(context)
-                except (OSError, RuntimeError, ValueError, KeyError, TypeError, UpgradeError):
-                    return current
-                if can_retry:
-                    if _load_pause_intent(self.cfg) is not None:
-                        return current
-                    previous_error = active.get("error")
-                    active.update(
-                        {
-                            "state": "runnable",
-                            "in_flight": False,
-                            "error": None,
-                            "blocker": None,
-                            "next_retry_at": None,
-                            "next_probe_at": None,
-                            "admission_blocked": False,
-                            "fence_token": int(active.get("fence_token", 0)) + 1,
-                            "holder_id": self.holder_id,
-                            "historical_retry": {
-                                "error": str(previous_error)[:512],
-                                "reconciled_at": utc_now(),
-                            },
-                        }
-                    )
-                    _save_journal(self.cfg, current)
-                    return current
-                if not can_reconcile or _load_pause_intent(self.cfg) is not None:
+            if can_retry:
+                if _load_pause_intent(self.cfg) is not None:
                     return current
                 previous_error = active.get("error")
                 active.update(
                     {
-                        "state": "completed",
-                        "phase": plugin.spec.phases[-1],
-                        "phase_index": len(plugin.spec.phases) - 1,
-                        "completed_at": utc_now(),
-                        "fence_token": int(active.get("fence_token", 0)) + 1,
-                        "holder_id": self.holder_id,
+                        "state": "runnable",
+                        "in_flight": False,
                         "error": None,
                         "blocker": None,
                         "next_retry_at": None,
                         "next_probe_at": None,
                         "admission_blocked": False,
-                        "detail": {"terminal_state_reconciled": True, "historical_error": previous_error},
+                        "fence_token": int(active.get("fence_token", 0)) + 1,
+                        "holder_id": self.holder_id,
+                        "historical_retry": {
+                            "error": str(previous_error)[:512],
+                            "reconciled_at": utc_now(),
+                        },
                     }
                 )
                 _save_journal(self.cfg, current)
-            return current
+                return current
+            if not can_reconcile or _load_pause_intent(self.cfg) is not None:
+                return current
+            previous_error = active.get("error")
+            active.update(
+                {
+                    "state": "completed",
+                    "phase": plugin.spec.phases[-1],
+                    "phase_index": len(plugin.spec.phases) - 1,
+                    "completed_at": utc_now(),
+                    "fence_token": int(active.get("fence_token", 0)) + 1,
+                    "holder_id": self.holder_id,
+                    "error": None,
+                    "blocker": None,
+                    "next_retry_at": None,
+                    "next_probe_at": None,
+                    "admission_blocked": False,
+                    "detail": {"terminal_state_reconciled": True, "historical_error": previous_error},
+                }
+            )
+            _save_journal(self.cfg, current)
+        return current
 
     def advance(self, *, force_retry: bool = False) -> dict[str, Any]:
         """Run at most one bounded phase slice and return durable project status."""
         try:
-            journal = self._discover_for_advance()
+            before_status = _status_from_journal(self.cfg, _load_journal(self.cfg))
         except (OSError, KeyError, TypeError, ValueError, UpgradeError) as exc:
-            return self._error_status(exc)
-        if journal is None:
-            return _status_from_journal(self.cfg, None)
+            return _with_invocation(self._error_status(exc))
         with exclusive(_upgrade_lock_path(self.cfg), blocking=False) as has_upgrade_lock:
             if not has_upgrade_lock:
-                return _status_from_journal(self.cfg, journal)
-            journal = _load_journal(self.cfg)
-            if journal is None:
-                return _status_from_journal(self.cfg, None)
+                return self._upgrade_lock_missed(before_status)
             try:
-                return self._advance_locked(journal, force_retry=force_retry)
+                journal = self._discover_locked()
+            except (OSError, KeyError, TypeError, ValueError, UpgradeError) as exc:
+                return _with_invocation(self._error_status(exc))
+            if journal is None:
+                return _with_invocation(_status_from_journal(self.cfg, None))
+            try:
+                status = self._advance_locked(journal, force_retry=force_retry)
+                if "invocation" not in status:
+                    return _with_invocation(status)
+                return status
             except (OSError, RuntimeError, ValueError, KeyError, TypeError) as exc:
                 active = next(
                     (item for item in journal["upgrade"]["migrations"].values() if item.get("state") != "completed"),
@@ -588,20 +692,30 @@ class UpgradeCoordinator:
                 )
                 if active is None:
                     raise
-                return self._record_failure(journal, active, str(exc), is_transient=False, safe_old_path=False)
+                return _with_invocation(
+                    self._record_failure(journal, active, str(exc), is_transient=False, safe_old_path=False)
+                )
 
     def request_pause(self, reason: str) -> dict[str, Any]:
         if not isinstance(reason, str) or not reason.strip():
             raise ValueError("pause reason must be a non-empty string")
-        journal = self._discover_for_advance()
-        if journal is None:
+        discovery = self.discover()
+        journal = _load_journal(self.cfg)
+        if journal is None and not discovery.get("pending"):
             raise ValueError("no migration is pending for this project")
         _save_pause_intent(self.cfg, reason=reason)
         with exclusive(_upgrade_lock_path(self.cfg), blocking=False) as acquired:
             if not acquired:
-                return self.status() | {"state": "pause_pending", "blockers": ["coordinator_busy"]}
-            journal = _load_journal(self.cfg)
+                return self.status() | {
+                    "state": "pause_pending",
+                    "pending": True,
+                    "can_run": False,
+                    "migration_blocked": True,
+                    "blockers": ["coordinator_busy"],
+                }
+            journal = _load_journal(self.cfg) or self._discover_locked()
             if journal is None:
+                _clear_pause_intent(self.cfg)
                 raise ValueError("no migration is pending for this project")
             upgrade = journal["upgrade"]
             pause = upgrade["pause"]
@@ -770,20 +884,13 @@ class UpgradeCoordinator:
             _save_journal(self.cfg, journal)
             return _status_from_journal(self.cfg, journal)
 
-    def _discover_for_advance(self) -> dict[str, Any] | None:
-        journal = _load_journal(self.cfg)
-        if journal is not None:
-            self.discover()
-            return _load_journal(self.cfg)
-        status = self.discover()
-        return _load_journal(self.cfg) if status.get("pending") else None
-
     def _advance_locked(self, journal: dict[str, Any], *, force_retry: bool) -> dict[str, Any]:
         upgrade = journal["upgrade"]
         pause = upgrade["pause"]
         active = self._next_active(upgrade)
         if active is None:
             return _status_from_journal(self.cfg, journal)
+        before_status = _status_from_journal(self.cfg, journal)
         if _load_pause_intent(self.cfg) is not None:
             pause.update(_load_pause_intent(self.cfg) or {})
         if pause.get("state") == "requested":
@@ -821,13 +928,19 @@ class UpgradeCoordinator:
             }
         )
         _save_journal(self.cfg, journal)
+        phase_invoked = False
         try:
             if phase == "activation":
                 with schema_lock(self.cfg.shared_root, blocking=False) as has_schema_lock:
                     if not has_schema_lock:
                         active["in_flight"] = False
                         active["state"] = "waiting"
-                        return self._save_waiting(journal, "schema_lock_busy")
+                        status = self._save_waiting(journal, "schema_lock_busy")
+                        return _with_invocation(
+                            status,
+                            contended_lock="schema",
+                            next_probe_at=_invocation_probe_at(journal),
+                        )
                     context = self._context(journal, active)
                     with migration_json_io_guard():
                         is_activation_ready = plugin.activation_ready(context)
@@ -844,10 +957,12 @@ class UpgradeCoordinator:
                         )
                     else:
                         with migration_json_io_guard():
+                            phase_invoked = True
                             result = plugin.phase(phase, context)
             else:
                 context = self._context(journal, active)
                 with migration_json_io_guard():
+                    phase_invoked = True
                     result = plugin.phase(phase, context)
             if not isinstance(result, PhaseResult):
                 raise DeterministicUpgradeError("migration phase must return PhaseResult")
@@ -894,8 +1009,34 @@ class UpgradeCoordinator:
                 active.update({"phase_index": index, "phase": spec.phases[index], "state": "runnable"})
         else:
             active["state"] = "runnable"
-        _save_journal(self.cfg, journal)
-        return _status_from_journal(self.cfg, journal)
+        missing = object()
+        previous_fields = {
+            key: deepcopy(active[key]) if key in active else missing
+            for key in ("progress", "progress_evidence", "progress_state")
+        }
+        publication = _validated_progress_publication(
+            result,
+            int(journal["upgrade"].get("revision", 0)) + 1,
+        )
+        if publication is not None:
+            active["progress"], active["progress_evidence"] = publication
+        if result.progress_state is not None:
+            active["progress_state"] = deepcopy(result.progress_state)
+        try:
+            _save_journal(self.cfg, journal)
+        except Exception:
+            for key, value in previous_fields.items():
+                if value is missing:
+                    active.pop(key, None)
+                else:
+                    active[key] = value
+            raise
+        after_status = _status_from_journal(self.cfg, journal)
+        return _with_invocation(
+            after_status,
+            slice_committed=phase_invoked,
+            delta=semantic_delta(result.progress_before or before_status, after_status) if phase_invoked else None,
+        )
 
     def _record_failure(
         self,
@@ -1027,6 +1168,28 @@ class UpgradeCoordinator:
         status["admission_blocked"] = True
         status["blockers"] = [str(exc)]
         return status
+
+    def _error_status_without_read(self, exc: Exception) -> dict[str, Any]:
+        state = "inaccessible" if isinstance(exc, OSError) else "repair_required"
+        return {
+            "project_id": _safe_project_id(self.cfg),
+            "shared_root": str(self.cfg.shared_root),
+            "state": state,
+            "phase": None,
+            "source_protocol": None,
+            "target_protocol": None,
+            "migrations": [],
+            "pending": True,
+            "can_run": False,
+            "admission_blocked": state == "repair_required",
+            "migration_blocked": True,
+            "last_progress_at": None,
+            "blockers": [str(exc)],
+            "pause": None,
+            "repair": None,
+            "progress": None,
+            "progress_evidence": None,
+        }
 
 
 def _new_migration_state(spec: MigrationSpec) -> dict[str, Any]:

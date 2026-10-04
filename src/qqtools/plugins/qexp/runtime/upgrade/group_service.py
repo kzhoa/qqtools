@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import stat
+from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -14,7 +15,6 @@ from ...runtime.group_discovery.activation import (
     MAX_RECORD_BYTES,
     SUBMISSION_SOURCE_MAX_BYTES,
     WRITER_FLOOR,
-    advance_group_service_activation_locked,
     group_service_registration_diagnostic,
     is_group_service_active,
     prepare_group_service_activation,
@@ -27,6 +27,7 @@ from ...runtime.group_namespace import group_directory, is_group_authority_isola
 from ...runtime.paths import shared_paths
 from ...runtime.records import validate_identifier
 from .contracts import DeterministicUpgradeError, MigrationPlugin, MigrationSpec, PhaseResult, UpgradeContext
+from .group_service_progress import advance_group_service_with_progress
 
 GROUP_SERVICE_TARGET_PROTOCOL = "metadata:group-service-v1"
 
@@ -61,6 +62,9 @@ def _phase_result(
     blocker: str | None = None,
     cursor: str | None = None,
     detail=None,
+    progress: dict[str, Any] | None = None,
+    progress_evidence: dict[str, Any] | None = None,
+    progress_state: dict[str, Any] | None = None,
 ) -> PhaseResult:
     spec = GroupServiceMigration.spec
     usage = context.slice_budget.used(
@@ -68,6 +72,19 @@ def _phase_result(
         max_metadata_ops=spec.max_metadata_ops_per_slice,
         max_io_bytes=spec.max_io_bytes_per_slice,
     )
+    # A byte slice validates its input checkpoint before advancing it. Inventory
+    # turns may omit current_item, so use that exact input for the invocation's
+    # own delta instead of depending on the preceding published observation.
+    progress_before = None
+    checkpoint = progress_evidence.get("source_checkpoint") if progress_evidence else None
+    previous_bytes = checkpoint.get("previous_completed_bytes") if checkpoint else None
+    if progress is not None and type(previous_bytes) is int and not progress.get("current_item", {}).get("restarted"):
+        before = deepcopy(progress)
+        before["current_item"]["completed_bytes"] = previous_bytes
+        evidence_before = deepcopy(progress_evidence)
+        evidence_before["source_checkpoint"]["completed_bytes"] = previous_bytes
+        evidence_before["journal_revision"] = context.journal["upgrade"]["revision"]
+        progress_before = {"progress": before, "progress_evidence": evidence_before}
     return PhaseResult(
         state,
         work_items=usage["records"],
@@ -76,6 +93,10 @@ def _phase_result(
         cursor=cursor,
         blocker=blocker,
         detail=detail or {},
+        progress=progress,
+        progress_evidence=progress_evidence,
+        progress_state=progress_state,
+        progress_before=progress_before,
     )
 
 
@@ -117,6 +138,17 @@ class GroupServiceMigration(MigrationPlugin):
         if not is_group_authority_isolated(cfg.shared_root, storage=storage) or not _has_group(
             cfg.shared_root, storage=storage
         ):
+            return False
+        try:
+            return not is_group_service_active(cfg.shared_root, storage=storage)
+        except (OSError, RuntimeError, ValueError, KeyError, TypeError):
+            return True
+
+    def is_applicable_for_status(self, cfg, storage) -> bool:
+        """Advertise a journal-free status hint without enumerating source history."""
+        if not writer_floor_satisfied():
+            return False
+        if not is_group_authority_isolated(cfg.shared_root, storage=storage):
             return False
         try:
             return not is_group_service_active(cfg.shared_root, storage=storage)
@@ -286,11 +318,7 @@ class GroupServiceMigration(MigrationPlugin):
                         "repair_layout_cursor": next_cursor,
                     },
                 )
-        record = advance_group_service_activation_locked(
-            context.cfg,
-            storage=context.storage,
-            layout_prevalidated=True,
-        )
+        record, progress, progress_evidence, progress_state = advance_group_service_with_progress(context, record)
         context.slice_budget.consume_records()
         if record["state"] == "preparing" and record.get("diagnostic") is not None:
             return _phase_result(
@@ -300,11 +328,21 @@ class GroupServiceMigration(MigrationPlugin):
                 detail={"diagnostic_code": record["diagnostic"]["code"], "next_probe_at": _next_probe_at()},
             )
         if record["state"] == "active":
-            return _phase_result(context, "complete", detail={"activation_revision": record["revision"]})
+            return _phase_result(
+                context,
+                "complete",
+                detail={"activation_revision": record["revision"]},
+                progress=progress,
+                progress_evidence=progress_evidence,
+                progress_state=progress_state,
+            )
         return _phase_result(
             context,
             "progressed",
             detail={"activation_state": record["state"], "activation_revision": record["revision"]},
+            progress=progress,
+            progress_evidence=progress_evidence,
+            progress_state=progress_state,
         )
 
     def plan_repair(self, context: UpgradeContext, target: str) -> dict[str, Any]:
