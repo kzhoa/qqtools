@@ -30,11 +30,11 @@ from qqtools.qexp._progress_protocol import read_advisory_snapshot, replace_advi
 pytestmark = [pytest.mark.integration, pytest.mark.qexp_fast_io]
 
 
-def _case(tmp_path, runtime, name, version):
+def _case(tmp_path, runtime, name, version, *, task_id=None):
     cfg = init_shared_root(tmp_path / name / ".qexp", "gpu-1")
-    binding = runtime.add_binding(cfg.shared_root, cfg.machine_name)
+    binding = runtime.ensure_binding(cfg.shared_root, cfg.machine_name)[0]
     cfg = replace(cfg, runtime_root=runtime.project_paths(binding.project_id)["root"])
-    task = submit(cfg, ["true"], working_dir=tmp_path)
+    task = submit(cfg, ["true"], working_dir=tmp_path, task_id=task_id)
     attempt = claim_task(cfg, task.task_id, [0])
     assert attempt is not None
     assert authorize_launch(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token)
@@ -425,39 +425,36 @@ def _add_idle_peers(tmp_path, runtime, count):
 def test_progress_scan_reaches_directory_tail_across_65_binding_evictions(tmp_path, version):
     runtime = MachineRuntime(tmp_path / "machine")
     initialize_machine(runtime, "gpu-1")
-    cfg, binding, _task, attempt, context, context_path, _mailbox, shared = _case(tmp_path, runtime, "project", version)
-    # Create an actual directory tail; every irrelevant name counts against the
-    # bounded slice. Eviction must not restart this finite census.
     from qqtools.plugins.qexp.runtime.directory_capture import read_directory_entry
 
-    context_path.parent.rename(context_path.parent.with_name("prepared-contexts"))
-    context_path.parent.mkdir(exist_ok=True)
-    replace_advisory_snapshot(context_path, context)
+    cfg = init_shared_root(tmp_path / "project" / ".qexp", "gpu-1")
+    binding = runtime.add_binding(cfg.shared_root, cfg.machine_name)
+    directory = "progress-contexts" if version == 1 else f"progress-v{version}-contexts"
+    context_root = runtime.project_paths(binding.project_id)["root"] / directory
+    context_root.mkdir(parents=True, exist_ok=True)
+    # Select the task from a real directory census instead of assuming that a
+    # fixed random task name moves toward the tail as more names are inserted.
+    for index in range(17):
+        replace_advisory_snapshot(context_root / f"tail-{index}-attempt-1.json", {})
 
     def directory_names():
         names = []
         offset = 0
         while True:
-            name, offset = read_directory_entry(context_path.parent, offset)
+            name, offset = read_directory_entry(context_root, offset)
             if name is None:
                 return names
             names.append(name)
 
-    # Linux directory order need not be insertion or filename order. Populate
-    # until the real channel is beyond four bounded visits, then keep that prefix.
-    for batch in range(32):
-        for index in range(batch * 40, (batch + 1) * 40):
-            replace_advisory_snapshot(context_path.parent / f"irrelevant-{index}.json", {})
-        names = directory_names()
-        if names.index(context_path.name) >= 16:
-            break
-    else:
-        raise AssertionError("could not construct a real directory tail")
-    prefix = set(names[:16]) | {context_path.name}
-    for name in names:
-        if name not in prefix:
-            (context_path.parent / name).unlink()
     names = directory_names()
+    selected = context_root / names[-1]
+    task_id = selected.name.removesuffix("-attempt-1.json")
+    selected.unlink()
+    cfg, binding, _task, attempt, _context, context_path, _mailbox, shared = _case(
+        tmp_path, runtime, "project", version, task_id=task_id
+    )
+    names = directory_names()
+    assert context_path == selected
     assert names.index(context_path.name) >= 16, names
     _add_idle_peers(tmp_path, runtime, 64)
     executor = ProjectIOExecutor(runtime)

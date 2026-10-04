@@ -491,14 +491,16 @@ class ProjectIOController:
             return status
         _registry_revision, bindings = self.runtime.load_registry_snapshot()
         retained_request_identities = {self._request_identity(request) for request in unresolved}
-        # Registry/epoch changes invalidate every service's old retry state.
+        # Only observed registry/epoch changes invalidate retry state. A busy
+        # worker lock yields an unknown epoch, not evidence of a new epoch.
         # A producer's resident/admission subset is not the registry and must
         # never erase another lane's still-current backoff.
         self._service_backoff = {
             key: state
             for key, state in self._service_backoff.items()
             if (
-                key[0].registry_revision == _registry_revision and key[0].executor_epoch == status.get("executor_epoch")
+                key[0].registry_revision == _registry_revision
+                and (status.get("executor_epoch") is None or key[0].executor_epoch == status["executor_epoch"])
             )
             or key[0] in retained_request_identities
         }

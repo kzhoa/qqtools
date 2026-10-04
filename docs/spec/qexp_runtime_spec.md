@@ -1705,7 +1705,10 @@ other eligible families. A completed `waiting` admission or Group-authority
 result defers only that exact binding and operation for one second before a
 fresh worker is eligible; productive local capture and healthy peers continue
 without sharing that retry deadline. Retryable failures retain their separate
-failure backoff. At most four bindings advance local capture per turn,
+failure backoff. A transient unknown executor poll (including a busy worker lock)
+does not prove an epoch change and must preserve pending retry deadlines; observed
+registry or executor epoch changes still invalidate stale retry state. At most four
+bindings advance local capture per turn,
 with 64 process entries or evidence units per binding. The coordinator retains
 at most 64 capture owners; unfinished process iterators cannot be evicted before
 EOF. Existing target capture/backfill/generation records reconstruct evicted or

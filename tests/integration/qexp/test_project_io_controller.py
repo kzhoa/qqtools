@@ -2273,6 +2273,40 @@ def test_scheduler_subset_preserves_other_service_backoff_until_identity_changes
         executor.shutdown()
 
 
+@pytest.mark.parametrize("invalidation", ["none", "registry", "epoch"])
+def test_unknown_executor_poll_preserves_backoff_until_identity_change_is_observed(tmp_path, monkeypatch, invalidation):
+    runtime = MachineRuntime(tmp_path / "machine")
+    initialize_machine(runtime, "gpu-1")
+    _cfg, binding, revision, _bindings = _registered(tmp_path, "waiting", runtime)
+    executor = ProjectIOExecutor(runtime)
+    executor.begin_epoch()
+    controller = ProjectIOController(runtime, executor, monotonic=lambda: 10.0)
+    try:
+        identity = controller._binding_identity(binding, revision, executor.status_view()["executor_epoch"])
+        key = controller._activation_service_key(identity, "recovery_admission")
+        controller._record_service_failure(key)
+        retained = dict(controller._service_backoff)
+        if invalidation == "registry":
+            _cfg, _binding, revision, _bindings = _registered(tmp_path, "new-peer", runtime)
+        elif invalidation == "epoch":
+            executor.fence_epoch()
+            executor.begin_epoch()
+        with monkeypatch.context() as patch:
+            patch.setattr(executor, "poll", executor._unknown_status)
+            assert controller.advance_recovery_admission([binding], revision, {binding.project_id: {}}) == {}
+            assert not executor.unresolved_requests()
+            assert controller._service_backoff == ({} if invalidation == "registry" else retained)
+        with controller.admission_turn():
+            controller._poll_admission_executor()
+        if invalidation == "none":
+            assert controller._service_backoff == retained
+            assert not controller._service_retry_is_due(key)
+        else:
+            assert not controller._service_backoff
+    finally:
+        executor.shutdown()
+
+
 def test_maintenance_idle_proof_waits_for_activation_without_restarting_workers(tmp_path: Path) -> None:
     runtime = MachineRuntime(tmp_path / "machine")
     initialize_machine(runtime, "gpu-1")
