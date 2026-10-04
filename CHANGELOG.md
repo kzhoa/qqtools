@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- compat: defer the final purge of the 1.3.22 machine-enrollment and notification
+  transitions to 1.3.25 so the urgent 1.3.24 repair keeps existing recovery paths.
 - fix: refresh each enabled qexp Project registration's `client_version` under
   the existing generation and write fences when a replacement agent starts,
   allowing machine-rolling upgrades to converge without re-registering Projects.
