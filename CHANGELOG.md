@@ -6,6 +6,10 @@
 
 - perf: reduce repeated qexp executor archive scans within each scheduling turn while
   retaining fresh worker ownership, epoch, and capacity checks before admission.
+- fix: retain exact qexp authority replay across an agent restart between retry reset and
+  worker launch, completing partial terminal publication without authorizing stale writes.
+- perf: prioritize finite qexp ready-index build slices after Project activation so scheduler
+  discovery converges before resumable periodic background services.
 - fix: preserve qexp retry deadlines during transient executor lock contention, preventing
   duplicate recovery workers before their backoff expires.
 - fix: reclaim completed qexp scheduler observations after capacity or Project activation changes,
