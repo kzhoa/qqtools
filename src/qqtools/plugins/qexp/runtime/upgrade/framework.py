@@ -511,10 +511,37 @@ class UpgradeCoordinator:
             with schema_lock(self.cfg.shared_root, blocking=False) as has_schema_lock:
                 if not has_schema_lock:
                     return current
+                can_retry = False
                 try:
                     with migration_json_io_guard():
-                        can_reconcile = plugin.can_reconcile_terminal_state(self._context(current, active))
+                        context = self._context(current, active)
+                        can_retry = plugin.can_retry_historical_failure(context)
+                        if not can_retry:
+                            can_reconcile = plugin.can_reconcile_terminal_state(context)
                 except (OSError, RuntimeError, ValueError, KeyError, TypeError, UpgradeError):
+                    return current
+                if can_retry:
+                    if _load_pause_intent(self.cfg) is not None:
+                        return current
+                    previous_error = active.get("error")
+                    active.update(
+                        {
+                            "state": "runnable",
+                            "in_flight": False,
+                            "error": None,
+                            "blocker": None,
+                            "next_retry_at": None,
+                            "next_probe_at": None,
+                            "admission_blocked": False,
+                            "fence_token": int(active.get("fence_token", 0)) + 1,
+                            "holder_id": self.holder_id,
+                            "historical_retry": {
+                                "error": str(previous_error)[:512],
+                                "reconciled_at": utc_now(),
+                            },
+                        }
+                    )
+                    _save_journal(self.cfg, current)
                     return current
                 if not can_reconcile or _load_pause_intent(self.cfg) is not None:
                     return current

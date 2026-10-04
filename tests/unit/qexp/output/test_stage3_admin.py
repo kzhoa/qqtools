@@ -217,3 +217,32 @@ def test_failed_upgrade_validation_is_not_canonicalized_as_completed() -> None:
     human = render(CliOutput(OutputKind.UPGRADE_REPAIR, result), "human")
     assert "Status: failed" in human
     assert "repair validation did not complete" in human
+
+
+def test_machine_upgrade_payload_promotes_nested_repair_required_to_blocked() -> None:
+    result = _upgrade_payload(
+        {
+            "projects": [
+                {
+                    "project_id": "project-1",
+                    "upgrade": {
+                        "state": "repair_required",
+                        "phase": "activation",
+                        "pending": True,
+                        "migration_blocked": True,
+                        "admission_blocked": False,
+                        "blockers": ["submission source exceeds the wrong legacy limit"],
+                    },
+                }
+            ],
+            "inaccessible_projects": [],
+            "aggregate_state": "pending",
+            "pending_project_ids": ["project-1"],
+            "all_roots_complete": False,
+        },
+        "status",
+    )
+
+    assert result["outcome"] == "blocked"
+    assert result["reason"] == "submission source exceeds the wrong legacy limit"
+    assert result["next_action"] == "qexp admin upgrade status"

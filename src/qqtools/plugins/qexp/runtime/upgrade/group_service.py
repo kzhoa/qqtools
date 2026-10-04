@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any
 
 from ...runtime.group_discovery import locator
-from ...runtime.group_discovery.activation import PROTOCOL as GROUP_SERVICE_PROTOCOL
 from ...runtime.group_discovery.activation import (
+    MAX_RECORD_BYTES,
+    SUBMISSION_SOURCE_MAX_BYTES,
     WRITER_FLOOR,
     advance_group_service_activation_locked,
     group_service_registration_diagnostic,
@@ -19,7 +22,10 @@ from ...runtime.group_discovery.activation import (
     transition_group_service_state_locked,
     writer_floor_satisfied,
 )
+from ...runtime.group_discovery.activation import PROTOCOL as GROUP_SERVICE_PROTOCOL
 from ...runtime.group_namespace import group_directory, is_group_authority_isolated
+from ...runtime.paths import shared_paths
+from ...runtime.records import validate_identifier
 from .contracts import DeterministicUpgradeError, MigrationPlugin, MigrationSpec, PhaseResult, UpgradeContext
 
 GROUP_SERVICE_TARGET_PROTOCOL = "metadata:group-service-v1"
@@ -125,6 +131,52 @@ class GroupServiceMigration(MigrationPlugin):
             return is_group_service_active(context.cfg.shared_root, storage=context.storage)
         except (OSError, RuntimeError, ValueError, KeyError, TypeError):
             return False
+
+    def can_retry_historical_failure(self, context: UpgradeContext) -> bool:
+        """Recognize only the released false-positive Submission size failure."""
+        upgrade = context.journal.get("upgrade")
+        migrations = upgrade.get("migrations") if isinstance(upgrade, dict) else None
+        item = migrations.get(self.spec.name) if isinstance(migrations, dict) else None
+        if not isinstance(item, dict) or item.get("state") != "repair_required" or item.get("phase") != "activation":
+            return False
+
+        error = item.get("error")
+        prefix = f"JSON record exceeds its {MAX_RECORD_BYTES}-byte limit: "
+        suffix = "."
+        if not isinstance(error, str) or not error.startswith(prefix) or not error.endswith(suffix):
+            return False
+        raw_path = error[len(prefix) : -len(suffix)]
+        if not raw_path:
+            return False
+        candidate = Path(raw_path)
+        submissions = shared_paths(context.cfg.shared_root)["submissions"]
+        if candidate.parent != submissions or candidate.suffix != ".json" or not candidate.stem:
+            return False
+        try:
+            validate_identifier(candidate.stem, "submission operation_id")
+        except ValueError:
+            return False
+        try:
+            context.storage.account_metadata_ops(1)
+            metadata = candidate.lstat()
+        except (FileNotFoundError, OSError):
+            return False
+        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+            return False
+        if not MAX_RECORD_BYTES < metadata.st_size <= SUBMISSION_SOURCE_MAX_BYTES:
+            return False
+        try:
+            record = read_group_service_activation_record(context.cfg.shared_root, storage=context.storage)
+        except (OSError, RuntimeError, ValueError, KeyError, TypeError):
+            return False
+        if record is None or record.get("state") != "building":
+            return False
+        bootstrap = record.get("bootstrap")
+        return (
+            isinstance(bootstrap, dict)
+            and bootstrap.get("post_fence") is True
+            and bootstrap.get("phase") in {"submissions", "active_namespaces"}
+        )
 
     def expansion(self, context: UpgradeContext) -> PhaseResult:
         item = context.journal["upgrade"]["migrations"][self.spec.name]

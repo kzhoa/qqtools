@@ -130,6 +130,18 @@ def _upgrade_project_config(runtime: MachineRuntime, identifier: str):
     return matches[0].root_config()
 
 
+def _accessible_nested_upgrade(item: object) -> dict[str, object] | None:
+    """Return an accessible project's upgrade status, including flat status entries."""
+    if not isinstance(item, dict):
+        return None
+    status = item.get("upgrade", item)
+    if not isinstance(status, dict):
+        return None
+    if item.get("state") == "inaccessible" or status.get("state") == "inaccessible":
+        return None
+    return status
+
+
 def _upgrade_payload(
     result: dict[str, object],
     action: str,
@@ -146,11 +158,42 @@ def _upgrade_payload(
     pending = bool(payload.get("pending")) or bool(payload.get("pending_project_ids"))
     aggregate_state = payload.get("aggregate_state")
     state = payload.get("state")
+    nested_blocked = False
+    nested_reason: str | None = None
+    projects = payload.get("projects")
+    if isinstance(projects, (list, tuple)):
+        for project in projects:
+            status = _accessible_nested_upgrade(project)
+            if status is None:
+                continue
+            child_blockers = status.get("blockers")
+            child_blocked = (
+                status.get("state") in {"repair_required", "paused", "pause_pending", "blocked"}
+                or bool(status.get("migration_blocked"))
+                or bool(status.get("admission_blocked"))
+                or bool(child_blockers)
+            )
+            if not child_blocked:
+                continue
+            nested_blocked = True
+            if nested_reason is None:
+                if isinstance(child_blockers, (list, tuple)) and child_blockers:
+                    nested_reason = str(child_blockers[0])
+                elif child_blockers:
+                    nested_reason = str(child_blockers)
+                elif child_reason := status.get("reason") or status.get("error"):
+                    nested_reason = str(child_reason)
+                else:
+                    nested_reason = "registered project upgrade is blocked"
     if payload.get("error") or state == "validation_failed":
         outcome = "failed"
     elif aggregate_state == "inaccessible" or inaccessible_values:
         outcome = "blocked"
-    elif state in {"repair_required", "paused", "pause_pending", "blocked"} or payload.get("admission_blocked"):
+    elif (
+        nested_blocked
+        or state in {"repair_required", "paused", "pause_pending", "blocked"}
+        or payload.get("admission_blocked")
+    ):
         outcome = "blocked"
     elif pending:
         outcome = "waiting"
@@ -168,6 +211,8 @@ def _upgrade_payload(
                 reason = first.get("reason") or first.get("error") or "registered project is inaccessible"
             else:
                 reason = "registered project is inaccessible"
+        elif nested_reason is not None:
+            reason = nested_reason
         elif isinstance(payload.get("pause"), dict) and payload["pause"].get("reason"):
             reason = str(payload["pause"]["reason"])
         elif isinstance(payload.get("repair"), dict) and payload["repair"].get("error"):

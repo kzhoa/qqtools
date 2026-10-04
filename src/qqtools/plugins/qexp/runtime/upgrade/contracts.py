@@ -320,6 +320,11 @@ class MigrationPlugin:
         del context
         return False
 
+    def can_retry_historical_failure(self, context: UpgradeContext) -> bool:
+        """Opt in to retrying an exact historical failure without completing the migration."""
+        del context
+        return False
+
     def phase(self, phase: MigrationPhase, context: UpgradeContext) -> PhaseResult:
         """Run one phase slice using the protocol-specific implementation."""
         handler = getattr(self, phase)

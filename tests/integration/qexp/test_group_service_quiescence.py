@@ -19,8 +19,8 @@ from qqtools.plugins.qexp.runtime.group_discovery.maintenance import GroupMainte
 from qqtools.plugins.qexp.runtime.group_namespace import group_authority_identity
 from qqtools.plugins.qexp.runtime.locks import group_writer_lock
 from qqtools.plugins.qexp.runtime.paths import group_path
-from qqtools.plugins.qexp.runtime.store import atomic_replace, read_json
-from qqtools.plugins.qexp.runtime.upgrade import UpgradeCoordinator
+from qqtools.plugins.qexp.runtime.store import JSONRecordSizeError, atomic_replace, read_json
+from qqtools.plugins.qexp.runtime.upgrade import UpgradeCoordinator, UpgradeSliceBudget, UpgradeStorage
 from tests.helpers.qexp_discovery import isolated_group
 
 pytestmark = [pytest.mark.integration, pytest.mark.qexp_fast_io]
@@ -38,6 +38,25 @@ def activate(cfg) -> dict[str, object]:
         if state["state"] == "active":
             return state
     raise AssertionError("Group service activation did not converge")
+
+
+def _write_sized_submission(path: Path, *, size: int, state: str = "prepared") -> None:
+    encoded = json.dumps(
+        {
+            "submission": {
+                "operation_id": path.stem,
+                "state": state,
+                "target_group": "experiment",
+            }
+        },
+        separators=(",", ":"),
+    ).encode()
+    assert len(encoded) < size
+    path.write_bytes(encoded + b" " * (size - len(encoded)))
+
+
+def _activation_storage() -> UpgradeStorage:
+    return UpgradeStorage(UpgradeSliceBudget(1, 128, 256 * 1024))
 
 
 def test_layout_precreates_exact_identity_bound_shards(tmp_path):
@@ -135,6 +154,51 @@ def test_activation_fences_writer_then_bootstraps_to_active(tmp_path):
     schema = read_json(cfg.shared_root / "schema/version.json")["schema"]
     assert "group-service-v1" in schema["required_capabilities"]
     assert activation.is_group_service_active(cfg.shared_root)
+
+
+@pytest.mark.parametrize("size", [16 * 1024 + 1, 64 * 1024])
+def test_activation_bootstrap_accepts_direct_submission_source_boundary(tmp_path, size):
+    cfg = isolated_group(tmp_path, tail=0)
+    locator.ensure_group_service_layout(cfg)
+    path = cfg.shared_root / "operations/submissions/large-source.json"
+    _write_sized_submission(path, size=size)
+
+    activation._process_entry(cfg, "submissions", path, path.name, storage=_activation_storage())
+
+    published = locator.read_group_locator(cfg.shared_root, "experiment", "membership")
+    assert published is not None
+    assert published["reason"] == "bootstrap"
+
+
+def test_submission_control_bootstrap_uses_direct_submission_source_boundary(tmp_path):
+    cfg = isolated_group(tmp_path, tail=0)
+    locator.ensure_group_service_layout(cfg)
+    path = cfg.shared_root / "operations/submissions/pending-source.json"
+    _write_sized_submission(path, size=20 * 1024, state="committing")
+
+    activation._process_entry(
+        cfg,
+        "submission_control",
+        cfg.shared_root / "indexes/submission-control/pending/pending-source.json",
+        path.name,
+        storage=_activation_storage(),
+    )
+
+    published = locator.read_group_locator(cfg.shared_root, "experiment", "membership")
+    assert published is not None
+    assert published["reason"] == "bootstrap"
+
+
+def test_activation_bootstrap_rejects_submission_above_direct_source_boundary(tmp_path):
+    cfg = isolated_group(tmp_path, tail=0)
+    locator.ensure_group_service_layout(cfg)
+    path = cfg.shared_root / "operations/submissions/oversized-source.json"
+    _write_sized_submission(path, size=64 * 1024 + 1)
+
+    with pytest.raises(JSONRecordSizeError, match="65536-byte limit"):
+        activation._process_entry(cfg, "submissions", path, path.name, storage=_activation_storage())
+
+    assert locator.read_group_locator(cfg.shared_root, "experiment", "membership") is None
 
 
 def test_active_locator_traversal_does_not_enumerate_group_history(tmp_path, monkeypatch):

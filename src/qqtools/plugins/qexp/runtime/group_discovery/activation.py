@@ -28,6 +28,7 @@ PROTOCOL = "group-service-v1"
 WRITER_FLOOR = "1.3.22"
 ACTIVATION_VERSION = 1
 MAX_RECORD_BYTES = 16 * 1024
+SUBMISSION_SOURCE_MAX_BYTES = 64 * 1024
 _STATES = frozenset({"preparing", "fenced", "building", "active", "degraded"})
 _PHASES = ("groups", "submissions", "active_namespaces", "stable_pass", "complete")
 _CURSOR_NAMES = ("groups", "submissions", "submission_control", "group_control", "cleanup", "discovery_debt")
@@ -395,7 +396,11 @@ def _process_entry(cfg: RootConfig, namespace: str, path: Path, name: str, *, st
         _publish_locked(cfg, group_name, "maintenance", "bootstrap", storage=storage)
         return
     if namespace == "submissions":
-        operation = storage.read_json_limited(path, max_bytes=MAX_RECORD_BYTES) if storage else read_json(path)
+        operation = (
+            storage.read_json_limited(path, max_bytes=SUBMISSION_SOURCE_MAX_BYTES)
+            if storage
+            else read_json_limited(path, max_bytes=SUBMISSION_SOURCE_MAX_BYTES, record_type="submission_source")
+        )
         submission = operation.get("submission")
         if type(submission) is not dict:
             raise RuntimeError(f"Submission source is malformed during activation bootstrap: {path.name}")
@@ -423,9 +428,13 @@ def _process_entry(cfg: RootConfig, namespace: str, path: Path, name: str, *, st
         if not operation_path.exists():
             raise RuntimeError(f"Submission-control owner has no Submission source: {name}")
         record = (
-            storage.read_json_limited(operation_path, max_bytes=MAX_RECORD_BYTES)
+            storage.read_json_limited(operation_path, max_bytes=SUBMISSION_SOURCE_MAX_BYTES)
             if storage
-            else read_json(operation_path)
+            else read_json_limited(
+                operation_path,
+                max_bytes=SUBMISSION_SOURCE_MAX_BYTES,
+                record_type="submission_source",
+            )
         )
         operation = record.get("submission")
         group_name = operation.get("target_group") if isinstance(operation, dict) else None

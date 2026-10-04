@@ -2812,6 +2812,23 @@ The reserved zero avoids treating client-local device numbers as shared identity
 Readers validate the regular source file before and after reading its receipt;
 missing truth or replacement cannot be authorized by an old receipt.
 
+Group-service activation applies this same 64 KiB direct-source boundary while
+bootstrapping retained Submission Operations, including authoritative sources
+reached through the submission-control pending namespace. The 16 KiB locator
+and ordinary metadata limit does not apply to Submission sources. Locator,
+activation, Group-control, cleanup, schema, and registration records retain
+their narrower family-specific bounds.
+
+A released coordinator that misclassified a 16--64 KiB regular Submission as
+exceeding the 16 KiB migration-record limit may retry only that exact activation
+failure. Under the upgrade and schema locks, the patched coordinator verifies
+the canonical Submission path, regular-file type, current size boundary, and
+the existing post-fence `building` activation state before restoring the same
+phase to runnable. It preserves audit, cursor, generation, fence, and work
+evidence; the next ordinary slice re-reads the source and must still validate
+its JSON and Submission fields. Other deterministic failures remain
+repair-required.
+
 Large-source publication durably records pending responsibility before preparing
 the source. After the source temporary file is synchronized, its intended state
 and inode/size/mtime witness are synchronized in the pending record before rename.

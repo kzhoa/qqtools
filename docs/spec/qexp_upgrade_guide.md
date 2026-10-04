@@ -28,6 +28,19 @@ working sets, and scheduler diagnostics use the operational procedures below.
 Explicit `admin repair` now performs a bounded slice: inspect `complete`,
 `rerun_required`, and `next_action` before considering a repair finished.
 
+Group-service activation reads retained Submission Operations through the
+runtime's 64 KiB direct-source boundary. A 1.3.23 agent could instead apply the
+16 KiB locator limit and leave a valid 16--64 KiB Submission bootstrap in
+`repair_required`. After installing a release containing the correction and
+restarting the agent, ordinary upgrade discovery verifies and retries that exact
+failure automatically. Do not shrink or delete the Submission, edit the upgrade
+journal, or create a Group-service repair plan for this case. Unrelated size,
+path, type, JSON, or activation failures remain blocked for diagnosis.
+
+Machine-level upgrade status reports `blocked` when any accessible Project is
+repair-required, paused, migration-blocked, or admission-blocked. `waiting` is
+reserved for healthy pending work that can run or await its next probe.
+
 Compatibility items `QQTOOLS-COMPAT-0018`, `0019`, and `0020` first ship in 1.3.23.
 Their `1.4.0-stage1` and `1.4.0-stage2` source labels refer only to earlier
 unreleased development data formats; they are not prerequisite package releases

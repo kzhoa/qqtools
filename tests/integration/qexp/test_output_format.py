@@ -567,7 +567,7 @@ def test_machine_upgrade_advance_human_reads_flat_projects_and_json_is_unchanged
                 "state": "runnable",
                 "pending": True,
                 "admission_blocked": False,
-                "blockers": ["waiting"],
+                "blockers": [],
             }
         ],
         "slices": 1,

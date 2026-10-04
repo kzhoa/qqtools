@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- fix: let qexp Group-service activation read valid Submission sources through
+  their 64 KiB direct-source boundary and automatically retry the exact 1.3.23
+  16 KiB false-positive failure without editing Project truth or upgrade journals.
+- fix: report machine-level qexp upgrade status as blocked when a registered
+  Project requires repair instead of presenting the aggregate as ordinary waiting.
+
 ## v1.3.23
 
 - perf: reduce repeated qexp executor archive scans within each scheduling turn while

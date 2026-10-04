@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from threading import Event, Thread
 
@@ -20,6 +21,7 @@ from qqtools.plugins.qexp.runtime.upgrade import (
     MigrationSpec,
     PhaseResult,
     UpgradeCoordinator,
+    upgrade_journal_path,
 )
 from qqtools.plugins.qexp.runtime.upgrade.machine import (
     MachineUpgradeBudget,
@@ -27,6 +29,7 @@ from qqtools.plugins.qexp.runtime.upgrade.machine import (
     discover_registered_upgrades,
     inspect_registered_upgrades,
 )
+from tests.helpers.qexp_discovery import isolated_group
 
 pytestmark = pytest.mark.integration
 
@@ -857,3 +860,146 @@ def test_terminal_invariant_alone_cannot_reconcile_an_unrelated_failure(tmp_path
     before = path.read_bytes()
     assert coordinator.discover()["migration_blocked"]
     assert path.read_bytes() == before
+
+
+def test_group_service_size_false_positive_retries_same_activation_phase(tmp_path, monkeypatch):
+    from qqtools.plugins.qexp.runtime.group_discovery import activation, locator
+
+    monkeypatch.setattr(activation, "__version__", "1.3.22")
+    cfg = isolated_group(tmp_path, tail=0)
+    locator.ensure_group_service_layout(cfg)
+    source = shared_paths(cfg.shared_root)["submissions"] / "released-large-source.json"
+    encoded = json.dumps(
+        {
+            "submission": {
+                "operation_id": source.stem,
+                "state": "prepared",
+                "target_group": "experiment",
+            }
+        },
+        separators=(",", ":"),
+    ).encode()
+    source.write_bytes(encoded + b" " * (20 * 1024 - len(encoded)))
+    coordinator = UpgradeCoordinator(cfg, holder_id="patched-agent")
+    status = coordinator.discover()
+
+    for _ in range(2_000):
+        status = coordinator.advance(force_retry=True)
+        activation_record_path = activation.activation_path(cfg.shared_root)
+        if not activation_record_path.exists():
+            continue
+        record = read_json(activation_record_path)
+        migration = next(item for item in status["migrations"] if item["name"] == "group-service-v1")
+        if (
+            migration["phase"] == "activation"
+            and record["state"] == "building"
+            and record["bootstrap"]["phase"] == "submissions"
+        ):
+            break
+    else:
+        raise AssertionError("Group service activation did not reach the Submission bootstrap")
+
+    journal_path = upgrade_journal_path(cfg)
+    journal = read_json(journal_path)
+    item = journal["upgrade"]["migrations"]["group-service-v1"]
+    preserved = {
+        key: item.get(key)
+        for key in (
+            "phase",
+            "phase_index",
+            "cursor",
+            "audit_evidence",
+            "detail",
+            "work_items",
+            "retry_count",
+            "completed_at",
+        )
+    }
+    original_fence = item["fence_token"]
+    item.update(
+        state="repair_required",
+        in_flight=False,
+        error=f"JSON record exceeds its 16384-byte limit: {source}.",
+        blocker="legacy size failure",
+        next_retry_at="2099-01-01T00:00:00Z",
+        next_probe_at="2099-01-01T00:00:01Z",
+        admission_blocked=True,
+    )
+    atomic_replace(journal_path, journal)
+
+    recovered = UpgradeCoordinator(cfg, holder_id="replacement-agent").discover()
+    recovered_item = next(item for item in recovered["migrations"] if item["name"] == "group-service-v1")
+    assert recovered_item["state"] == "runnable"
+    assert recovered_item["error"] is None
+    assert recovered_item["fence_token"] == original_fence + 1
+    assert recovered_item["holder_id"] == "replacement-agent"
+    assert {key: recovered_item.get(key) for key in preserved} == preserved
+    assert recovered_item["blocker"] is None
+    assert recovered_item["next_retry_at"] is None
+    assert recovered_item["next_probe_at"] is None
+    assert recovered_item["admission_blocked"] is False
+    assert recovered_item["historical_retry"]["error"] == f"JSON record exceeds its 16384-byte limit: {source}."
+    assert recovered_item["historical_retry"]["reconciled_at"].endswith("Z")
+
+    for _ in range(2_000):
+        if not recovered["pending"]:
+            break
+        recovered = UpgradeCoordinator(cfg).advance(force_retry=True)
+    else:
+        raise AssertionError("Recovered Group service activation did not converge")
+
+    assert recovered["state"] == "completed"
+    assert activation.is_group_service_active(cfg.shared_root)
+
+
+@pytest.mark.parametrize("obstruction", ["other_error", "oversized", "symlink"])
+def test_group_service_size_failure_retry_rejects_unproven_source(tmp_path, monkeypatch, obstruction):
+    from qqtools.plugins.qexp.runtime.group_discovery import activation, locator
+
+    monkeypatch.setattr(activation, "__version__", "1.3.22")
+    cfg = isolated_group(tmp_path, tail=0)
+    locator.ensure_group_service_layout(cfg)
+    source = shared_paths(cfg.shared_root)["submissions"] / "candidate.json"
+    source.write_text('{"submission":{"operation_id":"candidate","state":"prepared","target_group":"demo"}}')
+    coordinator = UpgradeCoordinator(cfg)
+    status = coordinator.discover()
+    for _ in range(2_000):
+        status = coordinator.advance(force_retry=True)
+        activation_record_path = activation.activation_path(cfg.shared_root)
+        if not activation_record_path.exists():
+            continue
+        record = read_json(activation_record_path)
+        migration = next(item for item in status["migrations"] if item["name"] == "group-service-v1")
+        if (
+            migration["phase"] == "activation"
+            and record["state"] == "building"
+            and record["bootstrap"]["phase"] == "submissions"
+        ):
+            break
+    else:
+        raise AssertionError("Group service activation did not reach the Submission bootstrap")
+
+    if obstruction == "oversized":
+        source.write_bytes(b"{}" + b" " * (64 * 1024))
+    elif obstruction == "symlink":
+        source.unlink()
+        source.symlink_to(cfg.shared_root / "schema/version.json")
+    journal_path = upgrade_journal_path(cfg)
+    journal = read_json(journal_path)
+    item = journal["upgrade"]["migrations"]["group-service-v1"]
+    item.update(
+        state="repair_required",
+        in_flight=False,
+        error=(
+            "an unrelated failure"
+            if obstruction == "other_error"
+            else f"JSON record exceeds its 16384-byte limit: {source}."
+        ),
+    )
+    atomic_replace(journal_path, journal)
+    before = journal_path.read_bytes()
+
+    blocked = UpgradeCoordinator(cfg).discover()
+
+    assert blocked["state"] == "repair_required"
+    assert journal_path.read_bytes() == before
