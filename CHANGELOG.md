@@ -4,6 +4,8 @@
 
 ## v1.3.23
 
+- perf: reduce repeated qexp executor archive scans within each scheduling turn while
+  retaining fresh worker ownership, epoch, and capacity checks before admission.
 - fix: preserve qexp retry deadlines during transient executor lock contention, preventing
   duplicate recovery workers before their backoff expires.
 - fix: reclaim completed qexp scheduler observations after capacity or Project activation changes,
