@@ -14,7 +14,8 @@
   for functional startup checks.
 
 - fix: keep eligible qexp Tasks discoverable after concurrent ready-index or Task changes,
-  and replay the same launch authorization when a Project binding needs revalidation.
+  and replay the same launch authorization when a Project binding needs revalidation, including
+  after dynamic Project registration changes.
 - fix: retain qexp agent identity before reporting active status so an immediate crash remains
   diagnosable after restart.
 - perf: avoid unrelated service imports in fresh qexp Project I/O workers.
