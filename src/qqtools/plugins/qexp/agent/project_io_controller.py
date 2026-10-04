@@ -456,7 +456,7 @@ class ProjectIOController:
                 if self._admission.active:
                     # The last producer may have consumed a result after its
                     # snapshot. Grant against final occupancy, not call order.
-                    self._poll_admission_executor()
+                    self._poll_admission_executor(force_poll=True)
                     current_request_ids = {request.request_id for request in self.executor.unresolved_requests()}
                     self._needs_successor_turn = bool(self._initial_request_ids - current_request_ids)
             except BaseException:
@@ -478,10 +478,17 @@ class ProjectIOController:
             self._admission_scope_active = False
             self._initial_request_ids.clear()
 
-    def _poll_admission_executor(self) -> dict[str, Any]:
-        """Open the lazy admission snapshot at the existing validated I/O boundary."""
-        status = self.executor.poll()
-        unresolved = self.executor.unresolved_requests()
+    def _poll_admission_executor(self, *, force_poll: bool = False) -> dict[str, Any]:
+        """Reconcile live ownership per producer, replaying archives at turn boundaries."""
+        if self._admission.active and not force_poll:
+            # This read already reaps/reconciles workers under the executor lock.
+            # Replaying durable archives again for every producer duplicates the
+            # bounded census. Status remains fresh; no epoch or capacity is cached.
+            unresolved = self.executor.unresolved_requests()
+            status = self.executor.status_view()
+        else:
+            status = self.executor.poll()
+            unresolved = self.executor.unresolved_requests()
         blocked = {(request.runtime_id, request.project_id, request.registration_generation) for request in unresolved}
         free_slots = max(0, status["capacity"] - len(unresolved))
         if status["envelope"] == "unknown" or status["overdue_worker_count"] > status["supported_hang_limit"]:

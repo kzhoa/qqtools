@@ -1783,6 +1783,13 @@ registry locks. Their shared-capture and pre-delivery fences remain distinct
 from the local-only private-publication fence. Existing at-most-once delivery
 claims, exact terminal replay and stale-registration suppression are unchanged.
 
+Admission polling replays executor resolution archives at the turn opening and
+before final grants. Intermediate polling still reconciles current workers and
+reads a fresh epoch, hang envelope, and capacity under the existing executor
+boundaries; it does not repeat archive replay or cache authority across the turn.
+Mutation paths retain their own reconciliation and authority checks. Final grant
+selection rechecks actual unresolved ownership after all producers have run.
+
 Each grant covers one typed transaction-sized request. Subsequent requests re-enter the same fair
 admission path. Completion wakes bounded local advancement without waiting an entire agent-loop
 interval per step. At most 64 candidate intents are retained per pass; roster/work cursors must

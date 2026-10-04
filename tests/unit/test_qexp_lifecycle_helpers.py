@@ -8,6 +8,7 @@ from tests.helpers.qexp.lifecycle import (
     LifecycleDeadline,
     LifecycleLab,
     LifecycleWaitError,
+    is_process_running,
     wait_all,
     wait_until,
 )
@@ -141,3 +142,23 @@ def test_lifecycle_lab_cleanup_reports_every_process_error(monkeypatch) -> None:
         lab.close()
 
     assert len(caught.value.exceptions) == 2
+
+
+@pytest.mark.parametrize("state,expected", [("S", True), ("Z", False)])
+def test_process_liveness_observes_procfs_state(monkeypatch, state, expected):
+    monkeypatch.setattr(Path, "read_text", lambda *_args, **_kwargs: f"123 (worker) {state} 0 0")
+    assert is_process_running(123) is expected
+
+
+@pytest.mark.parametrize("error", [FileNotFoundError, ProcessLookupError, PermissionError])
+def test_process_liveness_distinguishes_exit_during_procfs_read_from_inaccessible_evidence(monkeypatch, error):
+    def read(*_args, **_kwargs):
+        raise error("process vanished or became inaccessible during read")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(Path, "read_text", read)
+        if error is PermissionError:
+            with pytest.raises(PermissionError):
+                is_process_running(123)
+        else:
+            assert not is_process_running(123)

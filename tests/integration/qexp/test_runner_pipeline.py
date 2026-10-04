@@ -16,6 +16,7 @@ from qqtools.plugins.qexp.runtime.paths import attempt_path, local_paths
 from qqtools.plugins.qexp.runtime.resources.reservations import active_reservations
 from qqtools.plugins.qexp.runtime.store import atomic_replace, read_json
 from qqtools.plugins.qexp.scheduler import authorize_launch, cancel_task, claim_task
+from tests.helpers.qexp.lifecycle import is_process_running
 
 pytestmark = [pytest.mark.integration, pytest.mark.qexp_fast_io]
 
@@ -395,18 +396,10 @@ time.sleep(60)
         launcher.wait(timeout=5)
 
         deadline = time.monotonic() + 5
-        while any(_is_process_running(pid) for pid in pids.values()) and time.monotonic() < deadline:
+        while any(is_process_running(pid) for pid in pids.values()) and time.monotonic() < deadline:
             time.sleep(0.05)
-        assert not any(_is_process_running(pid) for pid in pids.values())
+        assert not any(is_process_running(pid) for pid in pids.values())
     finally:
         if launcher.poll() is None:
             launcher.kill()
             launcher.wait(timeout=5)
-
-
-def _is_process_running(pid: int) -> bool:
-    try:
-        state = (Path("/proc") / str(pid) / "stat").read_text(encoding="utf-8").rsplit(")", 1)[1].split()[0]
-        return state != "Z"
-    except FileNotFoundError:
-        return False

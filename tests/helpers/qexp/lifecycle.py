@@ -14,6 +14,15 @@ from qqtools.plugins.qexp.agent.lifecycle import get_machine_agent_status, start
 from qqtools.plugins.qexp.runtime.tasks import load_task
 
 
+def is_process_running(pid: int) -> bool:
+    """Observe a live non-zombie process, including exit between procfs open/read."""
+    try:
+        state = (Path("/proc") / str(pid) / "stat").read_text(encoding="utf-8").rsplit(")", 1)[1].split()[0]
+        return state != "Z"
+    except (FileNotFoundError, ProcessLookupError):
+        return False
+
+
 @dataclass(frozen=True)
 class LifecycleDeadline:
     """Share one monotonic deadline across related lifecycle waits."""

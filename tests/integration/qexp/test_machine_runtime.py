@@ -55,6 +55,7 @@ from qqtools.plugins.qexp.runtime.store import atomic_replace, read_json
 from qqtools.plugins.qexp.runtime.tasks import load_task
 from tests.helpers.qexp.clock import set_offer_evaluation_time
 from tests.helpers.qexp.lifecycle import wait_until
+from tests.helpers.qexp.worker_diagnostics import describe_project_io_workers
 
 pytestmark = [pytest.mark.integration, pytest.mark.qexp_fast_io]
 
@@ -2347,7 +2348,11 @@ def test_dispatch_consumes_heartbeat_snapshot_intent_through_isolated_worker(tmp
         while not heartbeat_path.exists() and time.monotonic() < deadline:
             dispatch_machine_cycle_locked(runtime, available_gpus=[], supervise=False, publish_snapshots=False)
             time.sleep(0.02)
-        assert heartbeat_path.exists()
+        assert heartbeat_path.exists(), {
+            "workers": describe_project_io_workers(executor),
+            "working_set": runtime.working_set.snapshot(),
+            "snapshot_intent": runtime.machine_snapshot_intent(),
+        }
     finally:
         executor.shutdown()
 

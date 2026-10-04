@@ -3884,6 +3884,49 @@ def test_controller_advances_activation_registration_observation_and_ack(tmp_pat
     }
 
 
+@pytest.mark.parametrize("envelope", ["healthy", "unknown", "exceeded"])
+def test_admission_replays_archives_at_boundaries_and_rechecks_live_capacity(tmp_path, monkeypatch, envelope):
+    runtime = MachineRuntime(tmp_path / "machine")
+    initialize_machine(runtime, "gpu-1")
+    _cfg, _binding, revision, bindings = _registered(tmp_path, "project", runtime)
+    executor = ProjectIOExecutor(runtime)
+    executor.begin_epoch()
+    controller = ProjectIOController(runtime, executor)
+    original_poll, original_status = executor.poll, executor.status_view
+    polls = []
+
+    def poll():
+        polls.append(None)
+        return original_poll()
+
+    def changed_status():
+        value = original_status()
+        value["envelope"] = envelope
+        value["overdue_worker_count"] = 3 if envelope == "exceeded" else 0
+        return value
+
+    monkeypatch.setattr(executor, "poll", poll)
+    monkeypatch.setattr(executor, "start", lambda _request_id: None)
+    try:
+        with controller.admission_turn():
+            controller.advance_binding_validation(bindings, revision)
+            monkeypatch.setattr(executor, "status_view", changed_status)
+            observed = controller._poll_admission_executor()
+            assert observed["envelope"] == envelope
+            assert observed["overdue_worker_count"] == (3 if envelope == "exceeded" else 0)
+            for _ in range(5):
+                controller.advance_registration_renewals(bindings, revision, renewal_horizon_seconds=10)
+            assert len(polls) == 1
+        assert len(polls) == 2
+        requests = executor.unresolved_requests()
+        if envelope == "healthy":
+            assert len(requests) == 1
+        else:
+            assert not requests
+    finally:
+        executor.shutdown()
+
+
 def test_outer_admission_turn_selects_across_public_service_calls(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
