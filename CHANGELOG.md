@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v1.3.23
+
 - fix: recover qexp Project I/O after interrupted atomic writes without treating uncommitted
   temporary files as authoritative records or consuming executor capacity.
 - feat: isolate blocking qexp Project I/O in a bounded worker pool and retain exact recovery
