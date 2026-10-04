@@ -1798,8 +1798,11 @@ borrow authority by itself.
 
 A loss of local GPU or CPU launch capacity does not retain finished scheduler
 observation requests. The controller reclaims exact completed observations even
-when that lane cannot admit new work, freeing the Project owner for supervision
-and background services. Reclamation grants no claim or launch authority and
+when that lane cannot admit new work or the Project is temporarily excluded
+from scheduling, including pending activation or validation. This frees the
+Project owner for supervision and background services. Selection of one lane
+must not erase another lane's retained candidate evidence. Reclamation grants
+no claim or launch authority and
 does not advance the shared ready cursor; later capacity rediscoveries use the
 same durable position. Live, ambiguous, or identity-unverified workers retain
 their transport ownership until the existing exact-exit rules permit consumption.

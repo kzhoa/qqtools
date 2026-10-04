@@ -1676,47 +1676,42 @@ def _dispatch_isolated_machine_cycle(
             if ordered_bindings:
                 primary_unknown = True
         lane_has_capacity = bool(free_gpu_ids) if lane == "gpu" else free_cpu_slots > 0
-        if not lane_has_capacity:
-            try:
-                controller.discard_scheduler_observations(lane=lane)
-            except (OSError, RuntimeError, ValueError, KeyError, TypeError, AttributeError):
-                runtime.last_cycle_had_demand = True
-        if lane_has_capacity and ordered_bindings:
-            try:
-                observations = dict(
-                    controller.advance_scheduler_observations(
-                        [
-                            binding
-                            for binding in ordered_bindings
-                            if binding.project_id not in blocked_projects
-                            and not controller.scheduler_is_quiescent(binding, registry_revision)
-                        ],
-                        registry_revision,
-                        lane=lane,
-                        admission_role="primary",
-                    )
+        try:
+            observations = dict(
+                controller.advance_scheduler_observations(
+                    [
+                        binding
+                        for binding in ordered_bindings
+                        if lane_has_capacity
+                        and binding.project_id not in blocked_projects
+                        and not controller.scheduler_is_quiescent(binding, registry_revision)
+                    ],
+                    registry_revision,
+                    lane=lane,
+                    admission_role="primary",
                 )
-                if any(
-                    evidence.get("outcome") == "candidate"
-                    for evidence in observations.values()
-                    if isinstance(evidence, Mapping)
-                ):
-                    primary_candidates.update(
-                        {
-                            project_id: evidence
-                            for project_id, evidence in observations.items()
-                            if isinstance(evidence, Mapping) and evidence.get("outcome") == "candidate"
-                        }
-                    )
-                if any(
-                    binding.project_id not in observations
-                    and not controller.scheduler_is_quiescent(binding, registry_revision)
-                    for binding in ordered_bindings
-                ):
-                    primary_unknown = True
-            except (OSError, RuntimeError, ValueError, KeyError, TypeError, AttributeError):
-                diagnostic_increment(f"scheduler.isolated.{lane}.observation_failed")
+            )
+            if any(
+                evidence.get("outcome") == "candidate"
+                for evidence in observations.values()
+                if isinstance(evidence, Mapping)
+            ):
+                primary_candidates.update(
+                    {
+                        project_id: evidence
+                        for project_id, evidence in observations.items()
+                        if isinstance(evidence, Mapping) and evidence.get("outcome") == "candidate"
+                    }
+                )
+            if lane_has_capacity and any(
+                binding.project_id not in observations
+                and not controller.scheduler_is_quiescent(binding, registry_revision)
+                for binding in ordered_bindings
+            ):
                 primary_unknown = True
+        except (OSError, RuntimeError, ValueError, KeyError, TypeError, AttributeError):
+            diagnostic_increment(f"scheduler.isolated.{lane}.observation_failed")
+            primary_unknown = True
 
         all_current_validated = len(validated_bindings) == len(enabled_bindings)
         no_upgrade_blockers = not blocked_projects.intersection(binding_by_project)
@@ -1745,21 +1740,20 @@ def _dispatch_isolated_machine_cycle(
             if any(evidence.get("outcome") == "claimed" for evidence in claim_completions.values()):
                 runtime.last_cycle_had_demand = True
 
-            borrow_observations: dict[str, Mapping[str, Any]] = {}
-            if lane_has_capacity and ordered_bindings:
-                borrow_observations = dict(
-                    controller.advance_scheduler_observations(
-                        [
-                            binding
-                            for binding in ordered_bindings
-                            if binding.project_id not in blocked_projects
-                            and not controller.scheduler_is_quiescent(binding, registry_revision)
-                        ],
-                        registry_revision,
-                        lane=lane,
-                        admission_role="borrow",
-                    )
+            borrow_observations = dict(
+                controller.advance_scheduler_observations(
+                    [
+                        binding
+                        for binding in ordered_bindings
+                        if lane_has_capacity
+                        and binding.project_id not in blocked_projects
+                        and not controller.scheduler_is_quiescent(binding, registry_revision)
+                    ],
+                    registry_revision,
+                    lane=lane,
+                    admission_role="borrow",
                 )
+            )
             borrow_candidates = {
                 project_id: evidence
                 for project_id, evidence in borrow_observations.items()

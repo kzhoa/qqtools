@@ -706,20 +706,6 @@ class ProjectIOController:
                 continue
 
     @_admission_operation
-    def discard_scheduler_observations(self, *, lane: str) -> None:
-        """Free finished observation owners when the lane has no launch capacity."""
-        if lane not in {"gpu", "cpu"}:
-            raise ValueError("lane must be 'gpu' or 'cpu'.")
-        for request in self.executor.unresolved_requests():
-            if request.operation_kind != "scheduler_observe" or request.parameters["lane"] != lane:
-                continue
-            # Observation cannot grant authority or advance the durable cursor.
-            # consume retains live/ambiguous workers and verifies exact identity;
-            # a future capacity window can rediscover the same ready position.
-            if self.executor.consume(request.request_id, request) is not None:
-                self._started_requests.discard(request.request_id)
-
-    @_admission_operation
     def advance_scheduler_observations(
         self,
         bindings: Sequence[ProjectBinding],
@@ -753,8 +739,11 @@ class ProjectIOController:
             current_bindings[identity] = binding
 
         current_identities = set(current_bindings)
+        selected_service = ("scheduler_observe", lane, admission_role)
         self._observations = {
-            key: evidence for key, evidence in self._observations.items() if key[0] in current_identities
+            key: evidence
+            for key, evidence in self._observations.items()
+            if key[1:] != selected_service or key[0] in current_identities
         }
         valid_scheduler_services = {
             ("scheduler_observe", service_lane, service_role)
@@ -764,7 +753,7 @@ class ProjectIOController:
         self._empty_observations = {
             key: evidence
             for key, evidence in self._empty_observations.items()
-            if key[0] in current_identities and key[1:] in valid_scheduler_services
+            if key[1:] in valid_scheduler_services and (key[1:] != selected_service or key[0] in current_identities)
         }
 
         unresolved = self.executor.unresolved_requests()
@@ -801,9 +790,7 @@ class ProjectIOController:
 
             identity = self._request_identity(request)
             binding = current_bindings.get(identity)
-            if binding is None:
-                continue
-            expected_service_namespace = f"scheduler-{binding.project_id}-{admission_role}-{lane}"
+            expected_service_namespace = f"scheduler-{request.project_id}-{admission_role}-{lane}"
             if request.parameters["cursor_namespace"] != expected_service_namespace:
                 continue
 
@@ -821,6 +808,11 @@ class ProjectIOController:
             self._started_requests.discard(request.request_id)
             if result.request != request:
                 raise ProjectIOProtocolError("consumed result does not repeat its exact request identity.")
+            if binding is None:
+                # Finished reads must not hold the slot needed for fresh
+                # activation or validation. Discarding their transient evidence
+                # grants no authority and leaves the durable cursor unchanged.
+                continue
 
             service_key = self._observation_service_key(identity, lane, admission_role)
             if result.status != "completed":

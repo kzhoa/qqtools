@@ -4599,7 +4599,7 @@ def test_blocked_scheduler_observation_does_not_delay_healthy_peer(tmp_path: Pat
     assert observations[healthy.project_id]["outcome"] == "candidate"
     assert observations[healthy.project_id]["candidate"]["task_id"] == healthy_task.task_id
     assert executor.status_view()["active_worker_count"] == 1
-    controller.discard_scheduler_observations(lane="gpu")
+    controller.advance_scheduler_observations([healthy], revision, lane="gpu", admission_role="primary")
     assert any(request.project_id == blocked.project_id for request in executor.unresolved_requests())
     assert executor.status_view()["active_worker_count"] == 1
     replayed = controller.advance_scheduler_observations(
@@ -4610,6 +4610,73 @@ def test_blocked_scheduler_observation_does_not_delay_healthy_peer(tmp_path: Pat
     )
     assert replayed[healthy.project_id] == observations[healthy.project_id]
     executor.shutdown()
+
+
+@pytest.mark.parametrize("invalidation", ["activation", "selection"])
+def test_finished_scheduler_observation_does_not_block_fresh_activation(tmp_path: Path, invalidation: str) -> None:
+    runtime = MachineRuntime(tmp_path / "machine")
+    initialize_machine(runtime, "gpu-1")
+    cfg, binding, revision, bindings = _registered(tmp_path, "project", runtime)
+    task = submit(cfg, ["echo", "eligible"], working_dir=tmp_path)
+    executor = ProjectIOExecutor(runtime)
+    executor.begin_epoch()
+    controller = ProjectIOController(runtime, executor)
+    try:
+        _advance_until_validated(controller, bindings, revision, binding.project_id)
+        _observe_working_set_activation(runtime, controller, bindings, revision)
+        request = executor.prepare_scheduler_observe(
+            binding,
+            revision,
+            lane="gpu",
+            admission_role="primary",
+            cursor_namespace=f"scheduler-{binding.project_id}-primary-gpu",
+        )
+        assert executor.start(request.request_id) is not None
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            status = executor.poll()
+            result = executor.load_result(request.request_id)
+            if result is not None and status["active_worker_count"] == 0:
+                break
+            time.sleep(0.02)
+        else:
+            raise AssertionError("candidate observation did not finish")
+        assert result.evidence["candidate"]["task_id"] == task.task_id
+        if invalidation == "activation":
+            _prime_activation_consumers(runtime, bindings, revision)
+            assert not runtime.working_set.has_current_activation(binding)
+        selected = [] if invalidation == "selection" else bindings
+        assert controller.advance_scheduler_observations(selected, revision, lane="gpu", admission_role="primary") == {}
+        assert all(item.request_id != request.request_id for item in executor.unresolved_requests())
+        assert load_task(cfg, task.task_id).claim_control.get("active_claim") is None
+        # The completed read owns no durable cursor or claim. Fresh activation
+        # can use its slot and rediscover the exact candidate without skipping it.
+        fresh = _advance_until_observed(controller, bindings, revision, binding.project_id, lane="gpu")
+        assert fresh[binding.project_id]["candidate"]["task_id"] == task.task_id
+    finally:
+        executor.shutdown()
+
+
+def test_observation_selection_preserves_other_lane_candidate(tmp_path: Path) -> None:
+    runtime = MachineRuntime(tmp_path / "machine")
+    initialize_machine(runtime, "gpu-1")
+    cfg, binding, revision, bindings = _registered(tmp_path, "project", runtime)
+    task = submit(cfg, ["echo", "eligible"], working_dir=tmp_path)
+    executor = ProjectIOExecutor(runtime)
+    executor.begin_epoch()
+    controller = ProjectIOController(runtime, executor)
+    try:
+        _advance_until_validated(controller, bindings, revision, binding.project_id)
+        expected = _advance_until_observed(controller, bindings, revision, binding.project_id, lane="gpu")
+        assert expected[binding.project_id]["candidate"]["task_id"] == task.task_id
+        assert controller.advance_scheduler_observations([], revision, lane="cpu", admission_role="primary") == {}
+        assert (
+            controller.advance_scheduler_observations(bindings, revision, lane="gpu", admission_role="primary")
+            == expected
+        )
+        assert not any(item.operation_kind == "scheduler_observe" for item in executor.unresolved_requests())
+    finally:
+        executor.shutdown()
 
 
 def test_empty_scheduler_observation_does_not_hide_later_submission(tmp_path: Path) -> None:
