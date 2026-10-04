@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -19,7 +20,7 @@ from qqtools.plugins.qexp.runtime.group_discovery.maintenance import GroupMainte
 from qqtools.plugins.qexp.runtime.group_namespace import group_authority_identity
 from qqtools.plugins.qexp.runtime.locks import group_writer_lock
 from qqtools.plugins.qexp.runtime.paths import group_path
-from qqtools.plugins.qexp.runtime.store import JSONRecordSizeError, atomic_replace, read_json
+from qqtools.plugins.qexp.runtime.store import atomic_replace, read_json
 from qqtools.plugins.qexp.runtime.upgrade import UpgradeCoordinator, UpgradeSliceBudget, UpgradeStorage
 from qqtools.version import __version__
 from tests.helpers.qexp_discovery import isolated_group
@@ -58,6 +59,13 @@ def _write_sized_submission(path: Path, *, size: int, state: str = "prepared") -
 
 def _activation_storage() -> UpgradeStorage:
     return UpgradeStorage(UpgradeSliceBudget(1, 128, 256 * 1024))
+
+
+def _process_submission_until_complete(cfg, namespace: str, path: Path, name: str) -> int:
+    for slices in range(1, 32):
+        if activation._process_entry(cfg, namespace, path, name, storage=_activation_storage()):
+            return slices
+    raise AssertionError("Submission activation projection did not complete")
 
 
 def test_layout_precreates_exact_identity_bound_shards(tmp_path):
@@ -164,42 +172,200 @@ def test_activation_bootstrap_accepts_direct_submission_source_boundary(tmp_path
     path = cfg.shared_root / "operations/submissions/large-source.json"
     _write_sized_submission(path, size=size)
 
-    activation._process_entry(cfg, "submissions", path, path.name, storage=_activation_storage())
+    assert activation._process_entry(cfg, "submissions", path, path.name, storage=_activation_storage())
 
     published = locator.read_group_locator(cfg.shared_root, "experiment", "membership")
     assert published is not None
     assert published["reason"] == "bootstrap"
 
 
-def test_submission_control_bootstrap_uses_direct_submission_source_boundary(tmp_path):
+@pytest.mark.parametrize("size", [20 * 1024, 192 * 1024])
+def test_submission_control_bootstrap_uses_bounded_submission_source_path(tmp_path, size):
     cfg = isolated_group(tmp_path, tail=0)
     locator.ensure_group_service_layout(cfg)
     path = cfg.shared_root / "operations/submissions/pending-source.json"
-    _write_sized_submission(path, size=20 * 1024, state="committing")
+    _write_sized_submission(path, size=size, state="committing")
 
-    activation._process_entry(
+    slices = _process_submission_until_complete(
         cfg,
         "submission_control",
         cfg.shared_root / "indexes/submission-control/pending/pending-source.json",
         path.name,
-        storage=_activation_storage(),
     )
 
+    if size <= 64 * 1024:
+        assert slices == 1
+    else:
+        assert slices > 1
     published = locator.read_group_locator(cfg.shared_root, "experiment", "membership")
     assert published is not None
     assert published["reason"] == "bootstrap"
 
 
-def test_activation_bootstrap_rejects_submission_above_direct_source_boundary(tmp_path):
+@pytest.mark.parametrize("size", [64 * 1024 + 1, 320 * 1024])
+def test_activation_bootstrap_streams_submission_above_direct_source_boundary(tmp_path, size):
     cfg = isolated_group(tmp_path, tail=0)
     locator.ensure_group_service_layout(cfg)
     path = cfg.shared_root / "operations/submissions/oversized-source.json"
-    _write_sized_submission(path, size=64 * 1024 + 1)
+    _write_sized_submission(path, size=size)
 
-    with pytest.raises(JSONRecordSizeError, match="65536-byte limit"):
+    assert not activation._process_entry(cfg, "submissions", path, path.name, storage=_activation_storage())
+    assert locator.read_group_locator(cfg.shared_root, "experiment", "membership") is None
+    checkpoint = cfg.shared_root / "operations/upgrades/group-service-v1-submission-checkpoint.json"
+    assert checkpoint.is_file()
+    assert checkpoint.stat().st_size <= 64 * 1024
+
+    slices = 1 + _process_submission_until_complete(cfg, "submissions", path, path.name)
+
+    assert slices >= 2
+    assert not checkpoint.exists()
+    published = locator.read_group_locator(cfg.shared_root, "experiment", "membership")
+    assert published is not None
+    assert published["reason"] == "bootstrap"
+
+
+def test_activation_bootstrap_streams_realistic_committed_bulk_submission(tmp_path):
+    cfg = isolated_group(tmp_path, tail=0)
+    locator.ensure_group_service_layout(cfg)
+    path = cfg.shared_root / "operations/submissions/bulk-source.json"
+    task_ids = [f"bulk-task-{index:04d}" for index in range(130)]
+    atomic_replace(
+        path,
+        {
+            "meta": {"schema_version": 6},
+            "submission": {
+                "operation_id": path.stem,
+                "state": "committed",
+                "target_group": "experiment",
+                "resolved_context": {
+                    "task_ids": task_ids,
+                    "task_specs": [
+                        {
+                            "task_id": task_id,
+                            "command": ["python", "train.py", "--configuration", "x" * 1024],
+                            "resources": {"gpu": 1, "worker_names": ["g3"]},
+                        }
+                        for task_id in task_ids
+                    ],
+                },
+            },
+        },
+    )
+    assert path.stat().st_size > 64 * 1024
+
+    slices = _process_submission_until_complete(cfg, "submissions", path, path.name)
+
+    assert slices > 1
+    assert locator.read_group_locator(cfg.shared_root, "experiment", "membership") is None
+
+
+def test_activation_bootstrap_restarts_stream_after_source_replacement(tmp_path):
+    cfg = isolated_group(tmp_path, tail=0)
+    locator.ensure_group_service_layout(cfg)
+    path = cfg.shared_root / "operations/submissions/replaced-source.json"
+    _write_sized_submission(path, size=192 * 1024)
+
+    assert not activation._process_entry(cfg, "submissions", path, path.name, storage=_activation_storage())
+    encoded = json.dumps(
+        {
+            "submission": {
+                "operation_id": path.stem,
+                "state": "prepared",
+                "target_group": "replacement",
+            }
+        },
+        separators=(",", ":"),
+    ).encode()
+    atomic_replace(path, json.loads(encoded))
+    path.write_bytes(encoded + b" " * (96 * 1024 - len(encoded)))
+
+    _process_submission_until_complete(cfg, "submissions", path, path.name)
+
+    assert locator.read_group_locator(cfg.shared_root, "experiment", "membership") is None
+    assert locator.read_group_locator(cfg.shared_root, "replacement", "membership") is not None
+
+
+def test_activation_bootstrap_rejects_malformed_large_submission_without_publication(tmp_path):
+    cfg = isolated_group(tmp_path, tail=0)
+    locator.ensure_group_service_layout(cfg)
+    path = cfg.shared_root / "operations/submissions/malformed-source.json"
+    prefix = b'{"submission":{"operation_id":"malformed-source","state":"prepared","target_group":"experiment"}}'
+    path.write_bytes(prefix + b" " * (96 * 1024) + b"invalid")
+
+    with pytest.raises(ValueError, match="JSON|json|byte"):
+        _process_submission_until_complete(cfg, "submissions", path, path.name)
+
+    assert locator.read_group_locator(cfg.shared_root, "experiment", "membership") is None
+
+
+def test_activation_bootstrap_rejects_large_submission_with_mismatched_identity(tmp_path):
+    cfg = isolated_group(tmp_path, tail=0)
+    locator.ensure_group_service_layout(cfg)
+    path = cfg.shared_root / "operations/submissions/expected-source.json"
+    encoded = json.dumps(
+        {
+            "submission": {
+                "operation_id": "different-source",
+                "state": "prepared",
+                "target_group": "experiment",
+            }
+        },
+        separators=(",", ":"),
+    ).encode()
+    path.write_bytes(encoded + b" " * (96 * 1024 - len(encoded)))
+
+    with pytest.raises(ValueError, match="operation_id does not match"):
+        _process_submission_until_complete(cfg, "submissions", path, path.name)
+
+    assert locator.read_group_locator(cfg.shared_root, "experiment", "membership") is None
+
+
+def test_activation_bootstrap_rejects_submission_source_symlink(tmp_path):
+    cfg = isolated_group(tmp_path, tail=0)
+    locator.ensure_group_service_layout(cfg)
+    target = cfg.shared_root / "operations/submissions/target.json"
+    _write_sized_submission(target, size=96 * 1024)
+    path = cfg.shared_root / "operations/submissions/source-link.json"
+    path.symlink_to(target)
+
+    with pytest.raises(RuntimeError, match="not a regular file"):
         activation._process_entry(cfg, "submissions", path, path.name, storage=_activation_storage())
 
     assert locator.read_group_locator(cfg.shared_root, "experiment", "membership") is None
+
+
+def test_activation_bootstrap_rejects_corrupted_stream_checkpoint(tmp_path):
+    cfg = isolated_group(tmp_path, tail=0)
+    locator.ensure_group_service_layout(cfg)
+    path = cfg.shared_root / "operations/submissions/corrupt-checkpoint.json"
+    prefix = b'{"submission":{"operation_id":"corrupt-checkpoint","state":"prepared","target_group":"experiment"}}'
+    path.write_bytes(prefix + b" " * (96 * 1024 - len(prefix) - len(b"invalid")) + b"invalid")
+
+    assert not activation._process_entry(cfg, "submissions", path, path.name, storage=_activation_storage())
+    checkpoint = cfg.shared_root / "operations/upgrades/group-service-v1-submission-checkpoint.json"
+    value = read_json(checkpoint)
+    value["scanner"]["offset"] = path.stat().st_size
+    atomic_replace(checkpoint, value)
+
+    with pytest.raises(ValueError, match="integrity check"):
+        activation._process_entry(cfg, "submissions", path, path.name, storage=_activation_storage())
+
+    assert locator.read_group_locator(cfg.shared_root, "experiment", "membership") is None
+
+
+def test_activation_bootstrap_rejects_fifo_checkpoint_without_blocking(tmp_path):
+    cfg = isolated_group(tmp_path, tail=0)
+    locator.ensure_group_service_layout(cfg)
+    path = cfg.shared_root / "operations/submissions/fifo-checkpoint.json"
+    _write_sized_submission(path, size=96 * 1024)
+    checkpoint = cfg.shared_root / "operations/upgrades/group-service-v1-submission-checkpoint.json"
+    os.mkfifo(checkpoint)
+
+    started = time.monotonic()
+    with pytest.raises(RuntimeError, match="not a regular file"):
+        activation._process_entry(cfg, "submissions", path, path.name, storage=_activation_storage())
+
+    assert time.monotonic() - started < 1.0
 
 
 def test_active_locator_traversal_does_not_enumerate_group_history(tmp_path, monkeypatch):

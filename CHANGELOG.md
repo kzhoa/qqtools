@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- fix: stream valid qexp bulk Submission sources larger than the 64 KiB
+  direct-read boundary during Group-service activation, with revision-bound
+  restart checkpoints and automatic recovery from the released size failure.
+
 ## v1.3.24
 
 - compat: defer the final purge of the 1.3.22 machine-enrollment and notification

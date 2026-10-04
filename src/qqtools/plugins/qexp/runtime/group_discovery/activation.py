@@ -18,8 +18,10 @@ from ..group_namespace import group_authority_identity, group_directory
 from ..locks import group_lock, schema_lock
 from ..paths import shared_paths
 from ..protocol_compatibility import GROUP_SERVICE_CAPABILITY, SUPPORTED_REQUIRED_CAPABILITIES
+from ..records import validate_group_name
 from ..store import atomic_replace, read_json, read_json_limited, require_json_size
 from . import locator
+from .activation_submission import advance_activation_submission_source
 
 # QQTOOLS-COMPAT-0017: dual publication and historical-discovery overlap exists
 # only while a Project moves through its fenced bootstrap activation window.
@@ -29,6 +31,7 @@ WRITER_FLOOR = "1.3.22"
 ACTIVATION_VERSION = 1
 MAX_RECORD_BYTES = 16 * 1024
 SUBMISSION_SOURCE_MAX_BYTES = 64 * 1024
+_SUBMISSION_CHECKPOINT_NAME = "group-service-v1-submission-checkpoint.json"
 _STATES = frozenset({"preparing", "fenced", "building", "active", "degraded"})
 _PHASES = ("groups", "submissions", "active_namespaces", "stable_pass", "complete")
 _CURSOR_NAMES = ("groups", "submissions", "submission_control", "group_control", "cleanup", "discovery_debt")
@@ -384,9 +387,9 @@ def _publish_locked(
         locator.publish_group_locator_locked(cfg, group, lane, reason, storage=storage)
 
 
-def _process_entry(cfg: RootConfig, namespace: str, path: Path, name: str, *, storage: Any | None = None) -> None:
+def _process_entry(cfg: RootConfig, namespace: str, path: Path, name: str, *, storage: Any | None = None) -> bool:
     if not name.endswith(".json"):
-        return
+        return True
     if namespace == "groups":
         group_name = name[:-5]
         # Conservatively enqueue all obligations once. Active consumers recheck
@@ -394,27 +397,73 @@ def _process_entry(cfg: RootConfig, namespace: str, path: Path, name: str, *, st
         _publish_locked(cfg, group_name, "membership", "bootstrap", storage=storage)
         _publish_locked(cfg, group_name, "control", "bootstrap", storage=storage)
         _publish_locked(cfg, group_name, "maintenance", "bootstrap", storage=storage)
-        return
-    if namespace == "submissions":
+        return True
+    if namespace in {"submissions", "submission_control"}:
+        source_path = path if namespace == "submissions" else shared_paths(cfg.shared_root)["submissions"] / name
+        operation_id = name[:-5]
+        try:
+            if storage is not None:
+                storage.account_metadata_ops(1)
+            source_metadata = source_path.lstat()
+        except FileNotFoundError as exc:
+            raise RuntimeError(f"Submission source is missing during activation bootstrap: {name}") from exc
+        if stat.S_ISLNK(source_metadata.st_mode) or not stat.S_ISREG(source_metadata.st_mode):
+            raise RuntimeError(f"Submission source is not a regular file: {name}")
+        if source_metadata.st_size > SUBMISSION_SOURCE_MAX_BYTES:
+            effective_storage = storage
+            if effective_storage is None:
+                from ..upgrade.contracts import UpgradeSliceBudget, UpgradeStorage
+
+                effective_storage = UpgradeStorage(UpgradeSliceBudget(1, 128, 256 * 1024))
+            step = advance_activation_submission_source(
+                effective_storage,
+                source_path,
+                operation_id,
+                shared_paths(cfg.shared_root)["upgrade"] / _SUBMISSION_CHECKPOINT_NAME,
+                namespace,
+            )
+            if step.state == "progressed":
+                return False
+            group_name = step.target_group
+            if group_name is not None and step.submission_state in {"prepared", "committing", "blocked"}:
+                _publish_locked(cfg, group_name, "membership", "bootstrap", storage=storage)
+            return True
+
         operation = (
-            storage.read_json_limited(path, max_bytes=SUBMISSION_SOURCE_MAX_BYTES)
+            storage.read_json_limited(source_path, max_bytes=SUBMISSION_SOURCE_MAX_BYTES)
             if storage
-            else read_json_limited(path, max_bytes=SUBMISSION_SOURCE_MAX_BYTES, record_type="submission_source")
+            else read_json_limited(source_path, max_bytes=SUBMISSION_SOURCE_MAX_BYTES, record_type="submission_source")
         )
         submission = operation.get("submission")
         if type(submission) is not dict:
-            raise RuntimeError(f"Submission source is malformed during activation bootstrap: {path.name}")
-        group_name = submission.get("target_group")
-        if group_name and submission.get("state") in {"prepared", "committing", "blocked"}:
+            raise RuntimeError(f"Submission source is malformed during activation bootstrap: {name}")
+        if submission.get("operation_id") != operation_id:
+            raise RuntimeError(f"Submission operation_id does not match its filename: {name}")
+        if submission.get("state") not in {
+            "prepared",
+            "preparing",
+            "committing",
+            "committed",
+            "aborted",
+            "blocked",
+        }:
+            raise RuntimeError(f"Submission state is invalid during activation bootstrap: {name}")
+        if "target_group" not in submission:
+            raise RuntimeError(f"Submission target_group is missing during activation bootstrap: {name}")
+        try:
+            group_name = validate_group_name(submission.get("target_group"))
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(f"Submission target_group is invalid during activation bootstrap: {name}") from exc
+        if group_name is not None and submission["state"] in {"prepared", "committing", "blocked"}:
             _publish_locked(cfg, group_name, "membership", "bootstrap", storage=storage)
-        return
+        return True
     if namespace == "group_control":
         record = storage.read_json_limited(path, max_bytes=MAX_RECORD_BYTES) if storage else read_json(path)
         operation = record.get("group_control")
         group_name = operation.get("group_name") if isinstance(operation, dict) else None
         if isinstance(group_name, str):
             _publish_locked(cfg, group_name, "control", "bootstrap", storage=storage)
-        return
+        return True
     if namespace == "cleanup":
         record = storage.read_json_limited(path, max_bytes=MAX_RECORD_BYTES) if storage else read_json(path)
         operation = record.get("cleanup")
@@ -422,24 +471,8 @@ def _process_entry(cfg: RootConfig, namespace: str, path: Path, name: str, *, st
         if isinstance(group_name, str):
             _publish_locked(cfg, group_name, "control", "bootstrap", storage=storage)
             _publish_locked(cfg, group_name, "maintenance", "bootstrap", storage=storage)
-        return
-    if namespace == "submission_control":
-        operation_path = shared_paths(cfg.shared_root)["submissions"] / name
-        if not operation_path.exists():
-            raise RuntimeError(f"Submission-control owner has no Submission source: {name}")
-        record = (
-            storage.read_json_limited(operation_path, max_bytes=SUBMISSION_SOURCE_MAX_BYTES)
-            if storage
-            else read_json_limited(
-                operation_path,
-                max_bytes=SUBMISSION_SOURCE_MAX_BYTES,
-                record_type="submission_source",
-            )
-        )
-        operation = record.get("submission")
-        group_name = operation.get("target_group") if isinstance(operation, dict) else None
-        if isinstance(group_name, str):
-            _publish_locked(cfg, group_name, "membership", "bootstrap", storage=storage)
+        return True
+    return True
 
 
 def _advance_cursor(
@@ -464,8 +497,8 @@ def _advance_cursor(
         elif name is None:
             cursor.update(cookie=next_cookie, complete=True)
         else:
-            _process_entry(cfg, namespace, path / name, name, storage=storage)
-            cursor["cookie"] = next_cookie
+            if _process_entry(cfg, namespace, path / name, name, storage=storage):
+                cursor["cookie"] = next_cookie
     bootstrap["cursors"][namespace] = cursor
     record["revision"] += 1
     record["updated_at"] = _utc_now()

@@ -2820,22 +2820,37 @@ The reserved zero avoids treating client-local device numbers as shared identity
 Readers validate the regular source file before and after reading its receipt;
 missing truth or replacement cannot be authorized by an old receipt.
 
-Group-service activation applies this same 64 KiB direct-source boundary while
+Group-service activation applies the same 64 KiB direct-source boundary while
 bootstrapping retained Submission Operations, including authoritative sources
-reached through the submission-control pending namespace. The 16 KiB locator
-and ordinary metadata limit does not apply to Submission sources. Locator,
-activation, Group-control, cleanup, schema, and registration records retain
-their narrower family-specific bounds.
+reached through the submission-control pending namespace. A larger valid source
+is projected in chunks no larger than 64 KiB. Its lexical and structural progress
+is checkpointed against the regular-file revision, namespace and operation ID.
+the complete checkpoint has a canonical integrity checksum and is rejected if
+any persisted field changes. Checkpoint and source descriptors are opened
+no-follow and nonblocking, then verified as regular files before reading. Thus a
+nonregular obstruction cannot hold activation locks while waiting for a peer.
+The activation directory cursor does not advance until projection and any
+required locator publication are durable. Source replacement discards stale
+projection progress and restarts at byte zero. The 256 KiB migration-slice I/O
+budget remains independent of total source size, so a source may require several
+slices. No slice retains the complete source, Task-spec array or unrelated scalar
+values.
 
-A released coordinator that misclassified a 16--64 KiB regular Submission as
-exceeding the 16 KiB migration-record limit may retry only that exact activation
+The 64 KiB value is therefore a whole-record/chunk boundary, not a maximum legal
+Submission size. The 16 KiB locator and ordinary metadata limit does not apply to
+Submission sources. Locator, activation, Group-control, cleanup, schema, and
+registration records retain their narrower family-specific bounds.
+
+A released coordinator that misclassified either a 16--64 KiB regular
+Submission as exceeding the 16 KiB metadata limit or a larger regular Submission
+as exceeding the 64 KiB direct-read limit may retry only that exact activation
 failure. Under the upgrade and schema locks, the patched coordinator verifies
-the canonical Submission path, regular-file type, current size boundary, and
-the existing post-fence `building` activation state before restoring the same
-phase to runnable. It preserves audit, cursor, generation, fence, and work
-evidence; the next ordinary slice re-reads the source and must still validate
-its JSON and Submission fields. Other deterministic failures remain
-repair-required.
+the canonical Submission path, regular-file type, matching historical size
+boundary, and the existing post-fence `building` activation state before
+restoring the same phase to runnable. It preserves audit, cursor, generation,
+fence, and work evidence; the next ordinary slice re-reads or streams the source
+and must still validate its JSON and selected Submission fields. Other
+deterministic failures remain repair-required.
 
 Large-source publication durably records pending responsibility before preparing
 the source. After the source temporary file is synchronized, its intended state

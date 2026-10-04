@@ -286,6 +286,36 @@ class Scanner:
         self._validate_snapshot(snapshot)
         return snapshot
 
+    def flush_fragment(self) -> None:
+        """Emit an active-token prefix while retaining one byte for finalization."""
+        if self._stepping:
+            raise RuntimeError("cannot flush a token fragment while Scanner.step is running")
+        if self._failed:
+            raise RuntimeError("scanner cannot flush after a previous step failure")
+        if self._is_complete or self._token_kind is None:
+            return
+        fragment_start = self._fragment_start
+        token_id = self._token_id
+        if fragment_start is None or token_id is None:
+            raise RuntimeError("active scanner token has no fragment identity")
+        if self._offset - fragment_start <= 1:
+            return
+        end = self._offset - 1
+        span = Span(token_id, self._token_kind, fragment_start, end, False)
+        try:
+            self._emit(span)
+            if self._emit_bytes is not None:
+                fragment_bytes = self._fragment_bytes
+                if fragment_bytes is None or len(fragment_bytes) != self._offset - fragment_start:
+                    raise RuntimeError("raw fragment buffer does not match its active span")
+                self._emit_bytes(span, bytes(fragment_bytes[:-1]))
+                del fragment_bytes[:-1]
+        except BaseException:
+            self._failed = True
+            raise
+        self._step_fragments_emitted += 1
+        self._fragment_start = end
+
     @classmethod
     def from_snapshot(
         cls,
@@ -486,8 +516,10 @@ class Scanner:
                     raise ValueError("active literal token state is incomplete")
                 if not 1 <= literal_progress <= len(literal_target.encode("ascii")):
                     raise ValueError("literal progress is out of range")
-                if literal_progress != fragment_length:
-                    raise ValueError("literal progress does not match active span")
+                if literal_progress > offset:
+                    raise ValueError("literal progress exceeds processed bytes")
+                if fragment_length > literal_progress:
+                    raise ValueError("literal fragment exceeds its lexical progress")
                 if literal_target == "-Infinity" and literal_progress < 2:
                     raise ValueError("negative Infinity literal progress is out of range")
                 if string_state is not None or unicode_digits != 0:

@@ -191,6 +191,71 @@ class UpgradeSliceBudget:
         }
 
 
+@dataclass(frozen=True, slots=True)
+class RegularFileRevision:
+    """The no-follow revision witness for one regular file read."""
+
+    device: int
+    inode: int
+    size: int
+    mtime_ns: int
+    ctime_ns: int
+
+    def __post_init__(self) -> None:
+        for name in ("device", "inode", "size", "mtime_ns", "ctime_ns"):
+            if type(getattr(self, name)) is not int:
+                raise TypeError(f"regular file revision {name} must be an integer")
+        for name in ("device", "inode", "size"):
+            if getattr(self, name) < 0:
+                raise ValueError(f"regular file revision {name} must be nonnegative")
+
+    @classmethod
+    def from_stat(cls, metadata: os.stat_result) -> "RegularFileRevision":
+        return cls(
+            device=metadata.st_dev,
+            inode=metadata.st_ino,
+            size=metadata.st_size,
+            mtime_ns=metadata.st_mtime_ns,
+            ctime_ns=metadata.st_ctime_ns,
+        )
+
+    def to_dict(self) -> dict[str, int]:
+        return {
+            "device": self.device,
+            "inode": self.inode,
+            "size": self.size,
+            "mtime_ns": self.mtime_ns,
+            "ctime_ns": self.ctime_ns,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class RegularFileRead:
+    """A bounded byte read together with its post-read revision witness."""
+
+    revision: RegularFileRevision
+    data: bytes
+    eof: bool
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.revision, RegularFileRevision):
+            raise TypeError("regular file read revision is invalid")
+        if type(self.data) is not bytes:
+            raise TypeError("regular file read data must be bytes")
+        if type(self.eof) is not bool:
+            raise TypeError("regular file read eof must be a boolean")
+
+    @property
+    def size(self) -> int:
+        """Return the source size from the immutable revision witness."""
+        return self.revision.size
+
+    @property
+    def is_eof(self) -> bool:
+        """Return whether the returned bytes reach the source end."""
+        return self.eof
+
+
 class UpgradeStorage:
     """Budget-enforcing storage facade for migration-owned JSON I/O."""
 
@@ -246,6 +311,45 @@ class UpgradeStorage:
             raise ValueError(f"migration JSON record is not an object: {path}")
         return value
 
+    def read_regular_bytes(self, path: Path, offset: int, max_bytes: int) -> RegularFileRead:
+        """Read a bounded slice from a no-follow regular file through the migration budget."""
+        if type(offset) is not int or offset < 0:
+            raise ValueError("offset must be a nonnegative integer")
+        if type(max_bytes) is not int or not 0 < max_bytes <= 65_536:
+            raise ValueError("max_bytes must be between 1 and 65536")
+
+        # Reserve the open, two descriptor witnesses, and close before touching the file.
+        self._budget.consume_metadata_ops(4)
+        descriptor: int | None = None
+        try:
+            descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK)
+            before = os.fstat(descriptor)
+            if not stat.S_ISREG(before.st_mode):
+                raise RuntimeError(f"migration source is not a regular file: {path}")
+            before_revision = RegularFileRevision.from_stat(before)
+            available = self._budget.io_bytes_remaining
+            if available <= 0:
+                raise DeterministicUpgradeError("migration slice has no I/O bytes available for a regular-file read")
+            request = min(max_bytes, available)
+            data = os.pread(descriptor, request, offset)
+            if type(data) is not bytes or len(data) > request:
+                raise TypeError("os.pread returned an invalid byte sequence")
+            self._budget.consume_io_bytes(len(data))
+            after = os.fstat(descriptor)
+            if not stat.S_ISREG(after.st_mode):
+                raise RuntimeError(f"migration source ceased to be a regular file: {path}")
+            after_revision = RegularFileRevision.from_stat(after)
+            if after_revision != before_revision:
+                raise RuntimeError(f"migration source changed while reading: {path}")
+            return RegularFileRead(
+                revision=after_revision,
+                data=data,
+                eof=offset + len(data) >= after_revision.size,
+            )
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+
     def exists(self, path: Path) -> bool:
         self._budget.consume_metadata_ops()
         return path.exists()
@@ -261,6 +365,26 @@ class UpgradeStorage:
         self._budget.consume_io_bytes(size)
         with authorized_migration_json_io():
             atomic_replace(path, value)
+
+    def unlink(self, path: Path) -> None:
+        """Durably remove an owned regular-file checkpoint without following links."""
+        # lstat, unlink, parent open, parent fsync, and close are all bounded metadata work.
+        self._budget.consume_metadata_ops(5)
+        try:
+            metadata = os.lstat(path)
+        except FileNotFoundError:
+            return
+        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+            raise RuntimeError(f"migration checkpoint is not an owned regular file: {path}")
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            return
+        directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
 
 
 @dataclass(frozen=True, slots=True)

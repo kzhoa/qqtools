@@ -36,14 +36,17 @@ process after `qexp agent restart`; do not run `qexp project register` merely to
 refresh a stale package version. A genuinely older active machine remains a blocker
 until that machine is upgraded and restarted or its existing eligibility expires.
 
-Group-service activation reads retained Submission Operations through the
-runtime's 64 KiB direct-source boundary. A 1.3.23 agent could instead apply the
-16 KiB locator limit and leave a valid 16--64 KiB Submission bootstrap in
-`repair_required`. After installing a release containing the correction and
-restarting the agent, ordinary upgrade discovery verifies and retries that exact
-failure automatically. Do not shrink or delete the Submission, edit the upgrade
-journal, or create a Group-service repair plan for this case. Unrelated size,
-path, type, JSON, or activation failures remain blocked for diagnosis.
+Group-service activation reads retained Submission Operations directly through
+64 KiB and streams larger valid sources through durable, revision-bound
+checkpoints. The boundary limits an individual read chunk; it is not a maximum
+legal bulk Submission size. A 1.3.23 agent could apply the 16 KiB locator limit,
+and a 1.3.24 agent could treat the 64 KiB direct-read boundary as a source-size
+limit, leaving a valid bootstrap in `repair_required`. After installing a release
+containing the corresponding correction and restarting the agent, ordinary
+upgrade discovery verifies and retries those exact failures automatically. Do
+not shrink or delete the Submission, edit the upgrade journal, or create a
+Group-service repair plan for these cases. Unrelated path, type, JSON, identity,
+or activation failures remain blocked for diagnosis.
 
 Machine-level upgrade status reports `blocked` when any accessible Project is
 repair-required, paused, migration-blocked, or admission-blocked. `waiting` is

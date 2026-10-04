@@ -257,6 +257,45 @@ def test_repeated_fresh_scanners_resume_every_short_read_step(tmp_path: Path):
     assert raw_events == expected_raw
 
 
+@pytest.mark.parametrize(
+    "payload",
+    [b'"' + (b"a" * 80_000) + b'"', b"-Infinity"],
+    ids=["long-string", "complete-literal-before-eof"],
+)
+def test_flushed_raw_fragment_resumes_without_checkpointing_token_bytes(tmp_path: Path, payload: bytes):
+    path = tmp_path / "flushed-fragment.json"
+    path.write_bytes(payload)
+    raw_events: list[tuple[Span, bytes]] = []
+
+    with path.open("rb") as handle:
+        scanner = Scanner(
+            TracingBinaryIO(handle),
+            lambda _span: None,
+            chunk_bytes=16_384,
+            emit_bytes=lambda span, raw: raw_events.append((span, raw)),
+        )
+        result = scanner.step(min(16_384, len(payload)))
+        assert not result.is_complete
+        scanner.flush_fragment()
+        checkpoint = json.loads(json.dumps(scanner.snapshot()))
+
+    assert checkpoint["fragment_b64"] != ""
+    assert checkpoint["fragment_start"] == checkpoint["offset"] - 1
+
+    with path.open("rb") as handle:
+        handle.seek(checkpoint["offset"])
+        restored = Scanner.from_snapshot(
+            TracingBinaryIO(handle),
+            lambda _span: None,
+            checkpoint,
+            emit_bytes=lambda span, raw: raw_events.append((span, raw)),
+        )
+        _drive(restored, (16_384,))
+
+    assert b"".join(raw for _span, raw in raw_events) == payload
+    assert all(span.end - span.start == len(raw) for span, raw in raw_events)
+
+
 def test_complete_snapshot_restores_without_input_or_output(tmp_path: Path):
     path = tmp_path / "complete.json"
     path.write_bytes(b"[1,true,-Infinity]")

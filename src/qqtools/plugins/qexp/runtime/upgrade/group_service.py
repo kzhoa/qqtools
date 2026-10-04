@@ -141,16 +141,35 @@ class GroupServiceMigration(MigrationPlugin):
             return False
 
         error = item.get("error")
-        prefix = f"JSON record exceeds its {MAX_RECORD_BYTES}-byte limit: "
         suffix = "."
-        if not isinstance(error, str) or not error.startswith(prefix) or not error.endswith(suffix):
+        if not isinstance(error, str) or not error.endswith(suffix):
             return False
+        limits = (MAX_RECORD_BYTES, SUBMISSION_SOURCE_MAX_BYTES)
+        limit = next(
+            (
+                candidate_limit
+                for candidate_limit in limits
+                if error.startswith(f"JSON record exceeds its {candidate_limit}-byte limit: ")
+            ),
+            None,
+        )
+        if limit is None:
+            return False
+        prefix = f"JSON record exceeds its {limit}-byte limit: "
         raw_path = error[len(prefix) : -len(suffix)]
         if not raw_path:
             return False
         candidate = Path(raw_path)
         submissions = shared_paths(context.cfg.shared_root)["submissions"]
-        if candidate.parent != submissions or candidate.suffix != ".json" or not candidate.stem:
+        canonical_candidate = Path(os.path.abspath(os.path.normpath(raw_path)))
+        if raw_path != str(canonical_candidate):
+            return False
+        if (
+            candidate != canonical_candidate
+            or candidate.parent != submissions
+            or candidate.suffix != ".json"
+            or not candidate.stem
+        ):
             return False
         try:
             validate_identifier(candidate.stem, "submission operation_id")
@@ -163,7 +182,10 @@ class GroupServiceMigration(MigrationPlugin):
             return False
         if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
             return False
-        if not MAX_RECORD_BYTES < metadata.st_size <= SUBMISSION_SOURCE_MAX_BYTES:
+        if limit == MAX_RECORD_BYTES:
+            if not MAX_RECORD_BYTES < metadata.st_size <= SUBMISSION_SOURCE_MAX_BYTES:
+                return False
+        elif metadata.st_size <= SUBMISSION_SOURCE_MAX_BYTES:
             return False
         try:
             record = read_group_service_activation_record(context.cfg.shared_root, storage=context.storage)

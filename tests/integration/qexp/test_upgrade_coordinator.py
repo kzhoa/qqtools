@@ -862,7 +862,13 @@ def test_terminal_invariant_alone_cannot_reconcile_an_unrelated_failure(tmp_path
     assert path.read_bytes() == before
 
 
-def test_group_service_size_false_positive_retries_same_activation_phase(tmp_path, monkeypatch):
+@pytest.mark.parametrize(
+    ("source_size", "released_limit"),
+    [(20 * 1024, 16 * 1024), (192 * 1024, 64 * 1024)],
+)
+def test_group_service_size_false_positive_retries_same_activation_phase(
+    tmp_path, monkeypatch, source_size, released_limit
+):
     from qqtools.plugins.qexp.runtime.group_discovery import activation, locator
 
     monkeypatch.setattr(activation, "__version__", "1.3.22")
@@ -879,7 +885,7 @@ def test_group_service_size_false_positive_retries_same_activation_phase(tmp_pat
         },
         separators=(",", ":"),
     ).encode()
-    source.write_bytes(encoded + b" " * (20 * 1024 - len(encoded)))
+    source.write_bytes(encoded + b" " * (source_size - len(encoded)))
     coordinator = UpgradeCoordinator(cfg, holder_id="patched-agent")
     status = coordinator.discover()
 
@@ -919,7 +925,7 @@ def test_group_service_size_false_positive_retries_same_activation_phase(tmp_pat
     item.update(
         state="repair_required",
         in_flight=False,
-        error=f"JSON record exceeds its 16384-byte limit: {source}.",
+        error=f"JSON record exceeds its {released_limit}-byte limit: {source}.",
         blocker="legacy size failure",
         next_retry_at="2099-01-01T00:00:00Z",
         next_probe_at="2099-01-01T00:00:01Z",
@@ -938,7 +944,9 @@ def test_group_service_size_false_positive_retries_same_activation_phase(tmp_pat
     assert recovered_item["next_retry_at"] is None
     assert recovered_item["next_probe_at"] is None
     assert recovered_item["admission_blocked"] is False
-    assert recovered_item["historical_retry"]["error"] == f"JSON record exceeds its 16384-byte limit: {source}."
+    assert recovered_item["historical_retry"]["error"] == (
+        f"JSON record exceeds its {released_limit}-byte limit: {source}."
+    )
     assert recovered_item["historical_retry"]["reconciled_at"].endswith("Z")
 
     for _ in range(2_000):

@@ -182,6 +182,14 @@ bootstrap proof; a per-Group missing `background.bootstrap_complete` marker cann
 sweep after activation. B2 must make the mode explicit in the service interface and must not infer
 it merely from a caller or an absent background file.
 
+Bootstrap enumeration treats 64 KiB as the maximum direct Submission read and
+individual streaming chunk, not as a Submission validity limit. Larger retained
+bulk Submissions use a revision-bound structural projection checkpoint. The
+directory cookie remains on that source until its selected identity, state and
+Group metadata are validated and any membership locator is durable. Projection
+may span coordinator slices and agent restarts without retaining the complete
+Submission or its Task-spec array.
+
 The service may acknowledge the observed generation only when all of these are true under the Group
 writer fence:
 
