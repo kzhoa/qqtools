@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- fix: refresh each enabled qexp Project registration's `client_version` under
+  the existing generation and write fences when a replacement agent starts,
+  allowing machine-rolling upgrades to converge without re-registering Projects.
 - fix: let qexp Group-service activation read valid Submission sources through
   their 64 KiB direct-source boundary and automatically retry the exact 1.3.23
   16 KiB false-positive failure without editing Project truth or upgrade journals.

@@ -15,11 +15,12 @@ import sys
 from inspect import signature
 from qqtools.plugins.qexp.agent.context import MachineRuntime
 from qqtools.plugins.qexp.agent.lifecycle import start_machine_agent, stop_machine_agent
+from qqtools.version import __version__
 runtime = MachineRuntime(sys.argv[1])
 if sys.argv[2] == "start":
     options = {"loop_interval": 0.05} if "loop_interval" in signature(start_machine_agent).parameters else {}
     process = start_machine_agent(runtime, available_gpus=[0], **options)
-    print(json.dumps({"pid": process.pid}))
+    print(json.dumps({"pid": process.pid, "client_version": __version__}))
 else:
     print(json.dumps({"stopped": stop_machine_agent(runtime, timeout=5)}))
 """
@@ -90,11 +91,22 @@ def probe_live_namespace_upgrade(cfg, root: Path, module: Path, workload: str, *
         attempt_id = original["attempt_id"]
         original_identity = dict(original["process"])
         assert original_identity.get("process_group_id") is not None
+        registration_path = cfg.shared_root / "machines" / cfg.machine_name / "registration.json"
+        released_registration = read_json(registration_path)["registration"]
+        released_generation = released_registration["generation"]
         stop_machine_agent(runtime, timeout=5)
         assert process.wait(timeout=5) == 0
         os.kill(int(starts[0]), 0)
         assert not (root / "finished").exists()
-        _target_agent(runtime.root, "start", target_source, root)
+        target_agent = _target_agent(runtime.root, "start", target_source, root)
+        _wait(
+            lambda: (
+                read_json(registration_path)["registration"].get("client_version") == target_agent["client_version"]
+            ),
+            "replacement agent client-version attestation",
+        )
+        refreshed_registration = read_json(registration_path)["registration"]
+        assert refreshed_registration["generation"] == released_generation
         journal = cfg.shared_root / "schema/group-authority.json"
         if peer_runtime is not None:
             registration = cfg.shared_root / "machines" / cfg.machine_name / "registration.json"
@@ -155,6 +167,8 @@ def probe_live_namespace_upgrade(cfg, root: Path, module: Path, workload: str, *
                 "workload_pid": int(starts[0]),
                 "attempt_id": attempt_id,
                 "same_process_identity": True,
+                "registration_generation_retained": True,
+                "replacement_client_version": target_agent["client_version"],
                 "automatic_namespace_activation": True,
                 "paused_rollout": should_pause,
                 "logical_participants": 2 if should_pause else 1,

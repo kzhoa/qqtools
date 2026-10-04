@@ -28,6 +28,14 @@ working sets, and scheduler diagnostics use the operational procedures below.
 Explicit `admin repair` now performs a bounded slice: inspect `complete`,
 `rerun_required`, and `next_action` before considering a repair finished.
 
+For every current enabled Project binding, the replacement agent renews the existing
+shared registration under its original generation and records the version of the
+running qqtools package in `client_version`. This happens even when the eligibility
+lease is not otherwise due. Writer-floor checks therefore observe the replacement
+process after `qexp agent restart`; do not run `qexp project register` merely to
+refresh a stale package version. A genuinely older active machine remains a blocker
+until that machine is upgraded and restarted or its existing eligibility expires.
+
 Group-service activation reads retained Submission Operations through the
 runtime's 64 KiB direct-source boundary. A 1.3.23 agent could instead apply the
 16 KiB locator limit and leave a valid 16--64 KiB Submission bootstrap in

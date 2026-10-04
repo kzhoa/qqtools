@@ -63,6 +63,7 @@ from qqtools.plugins.qexp.runtime.resources.reservations import (
 from qqtools.plugins.qexp.runtime.store import atomic_replace, check_mutation_fence, read_json
 from qqtools.plugins.qexp.runtime.tasks import load_task, save_task
 from qqtools.plugins.qexp.scheduler import claim_task, renew_project_io_attempt_lease
+from qqtools.version import __version__
 from tests.helpers.qexp.worker_diagnostics import describe_project_io_workers
 
 pytestmark = [pytest.mark.integration, pytest.mark.qexp_fast_io]
@@ -3690,6 +3691,67 @@ def test_controller_renews_registration_with_exact_fenced_evidence(tmp_path: Pat
     assert (
         load_machine_registration(cfg)["registration"]["eligibility_expires_at"] == evidence["eligibility_expires_at"]
     )
+    assert executor.unresolved_requests() == ()
+
+
+def test_controller_replays_ambiguous_version_refresh_without_replacing_generation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = MachineRuntime(tmp_path / "machine")
+    initialize_machine(runtime, "gpu-1")
+    cfg, binding, revision, bindings = _registered(tmp_path, "project-a", runtime)
+    executor = ProjectIOExecutor(runtime)
+    executor.begin_epoch()
+    now = [100.0]
+    controller = ProjectIOController(runtime, executor, monotonic=lambda: now[0])
+    envelope = load_machine_registration(cfg)
+    envelope["registration"]["client_version"] = "0.0.1"
+    save_machine_registration(cfg, envelope)
+    generation = envelope["registration"]["generation"]
+    real_start = executor.start
+    monkeypatch.setattr(executor, "start", lambda _request_id, **_kwargs: None)
+    controller.advance_registration_renewals(bindings, revision, renewal_horizon_seconds=0.0)
+    request = next(
+        request for request in executor.unresolved_requests() if request.operation_kind == "registration_renew"
+    )
+    unknown = ProjectIOResult(
+        request=request,
+        status="outcome_unknown",
+        reason_code="project_io_outcome_unknown",
+        completed_at="2026-10-04T00:00:01Z",
+        evidence={},
+    )
+    executor._write_record(
+        executor._record_path("results", request.request_id),
+        unknown.to_dict(),
+        "project_io_result",
+    )
+    monkeypatch.setattr(executor, "start", real_start)
+
+    controller.advance_registration_renewals(bindings, revision, renewal_horizon_seconds=0.0)
+    now[0] += 20.0
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        completions = controller.advance_registration_renewals(
+            bindings,
+            revision,
+            renewal_horizon_seconds=0.0,
+        )
+        if binding.project_id in completions:
+            break
+        time.sleep(0.02)
+    else:
+        raise AssertionError(
+            "ambiguous registration version refresh did not converge: "
+            f"status={executor.status_view()!r}, unresolved={executor.unresolved_requests()!r}, "
+            f"result={executor.load_result(request.request_id)!r}, backoff={controller._service_backoff!r}"
+        )
+
+    assert completions[binding.project_id]["outcome"] == "eligible"
+    refreshed = load_machine_registration(cfg)["registration"]
+    assert refreshed["generation"] == generation
+    assert refreshed["client_version"] == __version__
     assert executor.unresolved_requests() == ()
 
 

@@ -66,6 +66,48 @@ def test_only_due_guard_publishes_and_restart_uses_durable_deadline(registration
     assert len(publications) == 2
 
 
+@pytest.mark.parametrize("running_version", ["1.3.24", "1.3.20"])
+def test_version_change_forces_one_guarded_publication_before_lease_is_due(registration, monkeypatch, running_version):
+    _cfg, runtime, binding, path, now, publications = registration
+    value = read_json(path)
+    record = value["registration"]
+    record["client_version"] = "1.3.22"
+    record["updated_at"] = "2026-09-17T23:59:00Z"
+    preserved = {
+        key: record[key]
+        for key in (
+            "version",
+            "project_id",
+            "shared_root",
+            "machine_name",
+            "generation",
+            "protocol_version",
+            "runtime_instance_id",
+            "runtime_root",
+            "state",
+            "created_at",
+        )
+    }
+    atomic_replace(path, value)
+    previous_expiry = record["eligibility_expires_at"]
+    previous_updated_at = record["updated_at"]
+    now[0] += timedelta(seconds=1)
+    monkeypatch.setattr(registration_authority, "__version__", running_version)
+
+    assert runtime.binding_write_eligible(binding, renew=True)
+
+    refreshed = read_json(path)["registration"]
+    assert refreshed["client_version"] == running_version
+    assert datetime.fromisoformat(refreshed["eligibility_expires_at"]) > datetime.fromisoformat(previous_expiry)
+    assert refreshed["updated_at"] != previous_updated_at
+    assert {key: refreshed[key] for key in preserved} == preserved
+    assert len(publications) == 1
+
+    for _ in range(20):
+        assert runtime.binding_write_eligible(binding, renew=True)
+    assert len(publications) == 1
+
+
 def test_expired_idle_registration_reactivates_after_agent_restart(registration):
     from qqtools.plugins.qexp.agent.control_plane import _MachineControlPlane
 

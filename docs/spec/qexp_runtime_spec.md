@@ -2052,6 +2052,14 @@ Registration renewal is an authority-class service for every enabled binding, wh
 or dormant. Bounded fair selection and its renewal horizon do not depend on background snapshot
 publication or on a Project reaching idle; short registration leases must remain serviceable
 while the Project is active. Disabled bindings are excluded from new registration renewal.
+The shared registration's `client_version` is the package version of the current process that most
+recently established or renewed write eligibility for that exact owner, rather than immutable
+registration-creation history. A same-runtime agent replacement retains the registration generation
+but treats a package-version mismatch as immediately due: under the existing registry, binding,
+executor-epoch, and shared mutation fences, one atomic registration replacement publishes the
+running package version with the renewed eligibility expiry and update time. This applies to
+downgrades as well as upgrades so a historical higher value cannot authorize an older live writer.
+Same-version registrations retain the ordinary lease cadence and write avoidance.
 After a successful renewal, the isolated result returns a local-only next-renewal delay derived
 from the authoritative policy: no longer than its normal renewal interval or a quarter of the
 observed remaining eligibility lease. The exact local service identity waits for that delay before

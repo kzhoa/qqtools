@@ -17,7 +17,9 @@ from qqtools.plugins.qexp.lease import LeasePolicy, save_lease_policy
 from qqtools.plugins.qexp.runtime import registration_authority
 from qqtools.plugins.qexp.runtime.locks import exclusive
 from qqtools.plugins.qexp.runtime.paths import local_paths, task_path
+from qqtools.plugins.qexp.runtime.responsibility_store import DurableIO
 from qqtools.plugins.qexp.runtime.store import atomic_replace, read_json
+from qqtools.version import __version__
 
 pytestmark = [pytest.mark.integration, pytest.mark.qexp_fast_io]
 
@@ -118,12 +120,10 @@ def test_registration_shared_guard_rechecks_identity_before_publication(tmp_path
     runtime, cfg, binding, revision, executor = _case(tmp_path)
     try:
         registration = load_machine_registration(cfg)
-        registration["registration"]["eligibility_expires_at"] = (
-            datetime.now(timezone.utc) + timedelta(seconds=30)
-        ).isoformat()
+        registration["registration"]["client_version"] = "0.0.1"
         save_machine_registration(cfg, registration)
         before = load_machine_registration(cfg)
-        request = executor.prepare_registration_renew(binding, revision, renewal_horizon_seconds=120.0)
+        request = executor.prepare_registration_renew(binding, revision, renewal_horizon_seconds=0.0)
         real_expiry = registration_authority.lease_expiry
 
         def revoke_during_read(policy):
@@ -137,6 +137,57 @@ def test_registration_shared_guard_rechecks_identity_before_publication(tmp_path
             worker._registration_renew(request, runtime.root, executor.paths, possible)
         assert possible == [False]
         assert load_machine_registration(cfg) == before
+    finally:
+        executor.shutdown()
+
+
+def test_ambiguous_version_refresh_replay_completes_directory_barrier(tmp_path: Path, monkeypatch):
+    runtime, cfg, binding, revision, executor = _case(tmp_path)
+    try:
+        envelope = load_machine_registration(cfg)
+        envelope["registration"]["client_version"] = "0.0.1"
+        save_machine_registration(cfg, envelope)
+        request = executor.prepare_registration_renew(binding, revision, renewal_horizon_seconds=0.0)
+        real_save = registration_authority.save_machine_registration
+
+        def commit_then_raise(root_config, value):
+            real_save(root_config, value)
+            raise OSError("injected post-replace failure")
+
+        possible = [False]
+        with monkeypatch.context() as interrupted:
+            interrupted.setattr(registration_authority, "save_machine_registration", commit_then_raise)
+            with pytest.raises(OSError, match="post-replace"):
+                worker._registration_renew(request, runtime.root, executor.paths, possible)
+        assert possible == [True]
+        committed = load_machine_registration(cfg)["registration"]
+        assert committed["client_version"] == __version__
+        generation = committed["generation"]
+
+        def fail_barrier(_durable_io, _path, _operation):
+            raise OSError("injected replay barrier failure")
+
+        with monkeypatch.context() as interrupted:
+            interrupted.setattr(DurableIO, "sync_directory", fail_barrier)
+            possible = [False]
+            with pytest.raises(OSError, match="replay barrier"):
+                worker._registration_renew(request, runtime.root, executor.paths, possible)
+            assert possible == [True]
+
+        barriers = []
+
+        def record_barrier(_durable_io, path, operation):
+            barriers.append((path, operation))
+
+        monkeypatch.setattr(DurableIO, "sync_directory", record_barrier)
+        possible = [False]
+        evidence = worker._registration_renew(request, runtime.root, executor.paths, possible)
+
+        assert evidence["outcome"] == "eligible"
+        assert evidence["renewed"] is False
+        assert possible == [False]
+        assert barriers == [(cfg.shared_root / "machines" / cfg.machine_name, "registration_renewal_replay")]
+        assert load_machine_registration(cfg)["registration"]["generation"] == generation
     finally:
         executor.shutdown()
 

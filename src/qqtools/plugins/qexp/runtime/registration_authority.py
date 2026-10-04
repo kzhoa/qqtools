@@ -192,6 +192,7 @@ def registration_write_guard(
             ):
                 yield None
                 return
+            client_version_mismatch = record.get("client_version") != __version__
             previous_expiry = record["eligibility_expires_at"]
             expires_at = None if can_repair_expiry else parse_utc(previous_expiry)
             next_expiry = lease_expiry(policy)
@@ -206,12 +207,14 @@ def registration_write_guard(
             if (
                 force_renewal
                 or is_reactivation
+                or client_version_mismatch
                 or (
                     parsed_next_expiry != expires_at
                     and (now >= renew_at or expires_at <= horizon or parsed_next_expiry < expires_at)
                 )
             ):
                 record = dict(record)
+                record["client_version"] = __version__
                 record["eligibility_expires_at"] = next_expiry
                 record["updated_at"] = utc_now()
                 if not is_current():

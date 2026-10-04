@@ -30,7 +30,14 @@ from ..layout import (
 from ..lease import load_lease_policy
 from ..machine_config import load_machine_policy
 from ..runtime.authority_lock import authority_locks
-from ..runtime.paths import attempt_path, local_paths, machine_project_paths, machine_runtime_paths, shared_paths
+from ..runtime.paths import (
+    attempt_path,
+    local_paths,
+    machine_project_paths,
+    machine_registration_path,
+    machine_runtime_paths,
+    shared_paths,
+)
 from ..runtime.ready import advance_ready_index_build
 from ..runtime.ready import routes as ready_routes
 from ..runtime.ready import state as ready_state
@@ -1382,6 +1389,28 @@ def _registration_renew(
             if write_possible[0]:
                 raise RuntimeError("registration renewal lost eligibility after its shared write began.")
             return stale_evidence()
+        was_renewed = write_possible[0]
+        if not was_renewed:
+            from ..runtime.responsibility_store import DurableIO
+
+            epoch = _read_epoch(paths)
+            if (
+                not epoch.active
+                or epoch.runtime_id != request.runtime_id
+                or epoch.executor_epoch != request.executor_epoch
+            ):
+                raise _ExecutorEpochFenced
+            if not _claim_binding_is_current(request, runtime_root, cfg, require_eligible=True):
+                raise _BindingAuthorityChanged
+            # An earlier outcome-unknown replace can already expose the target
+            # record. Complete its directory barrier before treating an exact
+            # no-rewrite replay as durable success.
+            write_possible[0] = True
+            DurableIO().sync_directory(
+                machine_registration_path(cfg.shared_root, cfg.machine_name).parent,
+                "registration_renewal_replay",
+            )
+            write_possible[0] = False
         policy = load_lease_policy(cfg)
         remaining = max(
             0.0,
@@ -1392,7 +1421,7 @@ def _registration_renew(
         )
         return {
             "outcome": "eligible",
-            "renewed": write_possible[0],
+            "renewed": was_renewed,
             "eligibility_expires_at": registration["eligibility_expires_at"],
             "renew_after_seconds": min(policy.renew_interval_seconds, policy.ttl_seconds / 2, remaining / 4),
             "reason": None,

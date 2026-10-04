@@ -21,6 +21,7 @@ from qqtools.plugins.qexp.runtime.locks import group_writer_lock
 from qqtools.plugins.qexp.runtime.paths import group_path
 from qqtools.plugins.qexp.runtime.store import JSONRecordSizeError, atomic_replace, read_json
 from qqtools.plugins.qexp.runtime.upgrade import UpgradeCoordinator, UpgradeSliceBudget, UpgradeStorage
+from qqtools.version import __version__
 from tests.helpers.qexp_discovery import isolated_group
 
 pytestmark = [pytest.mark.integration, pytest.mark.qexp_fast_io]
@@ -275,6 +276,30 @@ def test_expired_old_participant_does_not_block_fence(tmp_path):
     )
     state = activation.advance_group_service_activation(cfg)
     assert state["state"] == "fenced"
+
+
+def test_current_registration_refresh_clears_writer_fence_without_reregistration(tmp_path):
+    cfg = isolated_group(tmp_path, tail=0)
+    runtime = MachineRuntime(tmp_path / "runtime")
+    binding = runtime.add_binding(cfg.shared_root, cfg.machine_name)
+    registration_path = cfg.shared_root / "machines/g1/registration.json"
+    envelope = read_json(registration_path)
+    registration = envelope["registration"]
+    registration["client_version"] = "1.3.21"
+    atomic_replace(registration_path, envelope)
+    generation = registration["generation"]
+
+    blocked = activation.advance_group_service_activation(cfg)
+    assert blocked["state"] == "preparing"
+    assert blocked["diagnostic"]["code"] == "participant_below_writer_floor"
+
+    assert runtime.binding_write_eligible(binding, renew=True)
+
+    refreshed = read_json(registration_path)["registration"]
+    assert refreshed["generation"] == generation
+    assert refreshed["client_version"] == __version__
+    advanced = activation.advance_group_service_activation(cfg)
+    assert advanced["state"] == "fenced"
 
 
 @pytest.mark.parametrize("cut", ["preparing", "fenced", "building", "active"])

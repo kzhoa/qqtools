@@ -77,6 +77,7 @@ assert "qqtools.plugins.qexp.agent.project_io_executor" not in sys.modules
 
 from qqtools.plugins.qexp.runtime.tasks import load_task, save_task
 from qqtools.plugins.qexp.scheduler import claim_task
+from qqtools.version import __version__
 from tests.helpers.qexp.worker_diagnostics import describe_project_io_workers
 
 pytestmark = [pytest.mark.integration, pytest.mark.qexp_fast_io]
@@ -957,6 +958,47 @@ def test_registration_renew_runs_in_fresh_worker_and_reports_durable_expiry(tmp_
     assert executor.has_ready_result()
     assert _wait_for_consumed(executor, request) == result
     assert not executor.has_unfinished_work()
+
+
+def test_fresh_worker_refreshes_stale_client_version_without_replacing_owner(tmp_path: Path) -> None:
+    runtime = MachineRuntime(tmp_path / "machine")
+    initialize_machine(runtime, "gpu-1")
+    cfg, binding, revision = _registered(tmp_path, "project-a", runtime)
+    executor = ProjectIOExecutor(runtime)
+    executor.begin_epoch()
+    registration_path = cfg.shared_root / "machines" / cfg.machine_name / "registration.json"
+    envelope = read_json(registration_path)
+    registration = envelope["registration"]
+    registration["client_version"] = "0.0.1"
+    preserved = {
+        key: registration[key]
+        for key in (
+            "version",
+            "project_id",
+            "shared_root",
+            "machine_name",
+            "generation",
+            "protocol_version",
+            "runtime_instance_id",
+            "runtime_root",
+            "state",
+            "created_at",
+        )
+    }
+    atomic_replace(registration_path, envelope)
+
+    request = executor.prepare_registration_renew(binding, revision, renewal_horizon_seconds=0.0)
+    executor.start(request.request_id)
+    result = _wait_for_result(executor, request.request_id)
+
+    assert result.status == "completed"
+    assert result.evidence["outcome"] == "eligible"
+    assert result.evidence["renewed"] is True
+    refreshed = read_json(registration_path)["registration"]
+    assert refreshed["client_version"] == __version__
+    assert {key: refreshed[key] for key in preserved} == preserved
+    assert _wait_for_consumed(executor, request) == result
+    executor.shutdown()
 
 
 def test_registration_renew_stale_registry_does_not_write_shared_registration(tmp_path: Path) -> None:

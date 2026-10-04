@@ -108,11 +108,12 @@ PYTHONPATH=src ~/.cache/qqtools/tox/unit/bin/python -m scripts.qualification.pro
 ```
 
 They assert automatic Group isolation while the original workload is alive,
-unchanged process/Attempt identity, one launch, exit evidence while its agent is
-offline, and terminal reconciliation after restart. The paused case retains a
-second released participant across multiple target enrollment passes before
-upgrading it. Each logical participant uses its own temporary namespace for the
-host-global scheduler lock. This qualifies same-host multi-process ordering, not
-cross-host filesystem semantics or installed-wheel delivery. No production
+the replacement agent's package version under the unchanged registration
+generation, unchanged process/Attempt identity, one launch, exit evidence while
+its agent is offline, and terminal reconciliation after restart. The paused case
+retains a second released participant across multiple target enrollment passes
+before upgrading it. Each logical participant uses its own temporary namespace
+for the host-global scheduler lock. This qualifies same-host multi-process
+ordering, not cross-host filesystem semantics or installed-wheel delivery. No production
 machine runtime is used. Cleanup releases the test workload, stops owned agents,
 and removes only tmux servers under the probe's isolated socket directory.
