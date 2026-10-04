@@ -122,6 +122,13 @@ to = "1.3.25"
 approved_in = "1.3.24"
 reason = "Keep notification migration recovery available while shipping the urgent 1.3.24 qexp repair release."
 
+[[items.extensions]]
+field = "transition_purged_in"
+from = "1.3.25"
+to = "1.3.26"
+approved_in = "1.3.25"
+reason = "Keep notification migration recovery available while shipping the urgent 1.3.25 large-Submission activation repair."
+
 [[items]]
 id = "QQTOOLS-COMPAT-0012"
 component = "qexp.machine-project-inventory"
@@ -151,6 +158,13 @@ from = "1.3.24"
 to = "1.3.25"
 approved_in = "1.3.24"
 reason = "Keep version-1 machine inventory recovery available while shipping the urgent 1.3.24 qexp repair release."
+
+[[items.extensions]]
+field = "transition_purged_in"
+from = "1.3.25"
+to = "1.3.26"
+approved_in = "1.3.25"
+reason = "Keep version-1 machine inventory recovery available while shipping the urgent 1.3.25 large-Submission activation repair."
 
 [[items]]
 id = "QQTOOLS-COMPAT-0013"
@@ -182,6 +196,13 @@ to = "1.3.25"
 approved_in = "1.3.24"
 reason = "Keep machine agent policy recovery available while shipping the urgent 1.3.24 qexp repair release."
 
+[[items.extensions]]
+field = "transition_purged_in"
+from = "1.3.25"
+to = "1.3.26"
+approved_in = "1.3.25"
+reason = "Keep machine agent policy recovery available while shipping the urgent 1.3.25 large-Submission activation repair."
+
 [[items]]
 id = "QQTOOLS-COMPAT-0014"
 component = "qexp.enrollment-cli-cutover"
@@ -201,6 +222,13 @@ from = "1.3.24"
 to = "1.3.25"
 approved_in = "1.3.24"
 reason = "Keep bounded enrollment migration diagnostics while shipping the urgent 1.3.24 qexp repair release."
+
+[[items.extensions]]
+field = "transition_purged_in"
+from = "1.3.25"
+to = "1.3.26"
+approved_in = "1.3.25"
+reason = "Keep bounded enrollment migration diagnostics while shipping the urgent 1.3.25 large-Submission activation repair."
 
 [[items]]
 id = "QQTOOLS-COMPAT-0015"
