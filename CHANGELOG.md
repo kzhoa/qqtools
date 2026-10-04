@@ -4,6 +4,8 @@
 
 ## v1.3.23
 
+- fix: preserve qexp retry deadlines during transient executor lock contention, preventing
+  duplicate recovery workers before their backoff expires.
 - fix: reclaim completed qexp scheduler observations after capacity or Project activation changes,
   preserving supervision, background progress, and other-lane candidates without advancing
   unconsumed ready cursors.
