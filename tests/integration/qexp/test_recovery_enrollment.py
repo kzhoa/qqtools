@@ -17,7 +17,7 @@ from qqtools.plugins.qexp.agent.project_io_executor import ProjectIOExecutor
 from qqtools.plugins.qexp.agent.recovery_enrollment import RecoveryEnrollment
 from qqtools.plugins.qexp.layout import LOCAL_RECOVERY_CAPABILITY
 from qqtools.plugins.qexp.runtime.store import read_json
-from tests.helpers.qexp.lifecycle import wait_until
+from tests.helpers.qexp.lifecycle import LifecycleDeadline, wait_until
 
 pytestmark = [pytest.mark.integration, pytest.mark.qexp_fast_io]
 
@@ -202,6 +202,7 @@ def test_real_global_agent_prepares_registered_roots_before_on_demand_exit(tmp_p
     entries = [register(runtime, tmp_path, f"project-{index}") for index in range(5)]
     environment = os.environ.copy()
     environment["PYTHONPATH"] = str(Path(__file__).parents[3] / "src")
+    startup_deadline = LifecycleDeadline.after(30.0)
     process = subprocess.Popen(
         [
             sys.executable,
@@ -233,6 +234,7 @@ def test_real_global_agent_prepares_registered_roots_before_on_demand_exit(tmp_p
             "all-registrations-prepared",
             lambda: all(read_json(path)["registration"]["version"] == 2 for _binding, path in entries),
             stage="recovery-enrollment:automatic-preparation",
+            deadline=startup_deadline,
             on_timeout=lambda: {
                 "process_returncode": process.poll(),
                 "requests": [
@@ -255,12 +257,12 @@ def test_real_global_agent_prepares_registered_roots_before_on_demand_exit(tmp_p
             },
         )
         # Capture proof precedes Group activation and retained-source release.
-        # Keep those obligations inside the existing 15-second enrollment budget.
+        # Both cold-start stages share the approved multi-Project budget.
         wait_until(
             "all-enrollment-obligations-settled",
             lambda: all(enrollment_has_settled(binding) for binding, _path in entries),
             stage="recovery-enrollment:capture",
-            timeout=15,
+            deadline=startup_deadline,
             on_timeout=lambda: {
                 binding.project_id: {
                     "capture": inspect_recovery_capture(runtime, binding),

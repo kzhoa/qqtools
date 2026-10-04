@@ -592,15 +592,14 @@ class ProjectIOController:
         self._started_requests.intersection_update(unresolved_request_ids)
         for request in unresolved:
             identity = self._request_identity(request)
-            if (
-                request.operation_kind == "scheduler_launch_authorize"
-                and identity in current_bindings
-                and identity not in self._validated
+            if request.operation_kind == "scheduler_launch_authorize" and (
+                identity not in current_bindings or identity not in self._validated
             ):
                 # A finished launch request occupies this owner's admission
                 # slot, but consuming its authority requires validation. Retire
                 # definitive evidence without launching; fresh validation and
-                # exact authorization replay break that circular dependency.
+                # exact authorization replay break that circular dependency,
+                # including requests issued before a registry revision change.
                 if self.executor.resolve_stale_scheduler_launch_authorize(request.request_id, request):
                     unresolved_request_ids.discard(request.request_id)
                     self._started_requests.discard(request.request_id)

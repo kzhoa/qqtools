@@ -291,9 +291,11 @@ and fail-closed behavior remain production code. Clock-failure cases must
 explicitly replace the provider evidence they exercise.
 
 Multi-Project first-launch checks (including newly added bindings), initial
-idle-policy quiescence, and the default authority workload use a 30-second
-functional startup wait, approved on 2026-10-04. Idle shutdown retains its
-separate ten-second bound after confirmed initial quiescence. This is separate
+idle-policy quiescence, five-Project registration/recovery enrollment, and the
+default authority workload use a 30-second functional startup wait, approved on
+2026-10-04. Registration preparation and recovery enrollment share one deadline
+measured from agent launch. Idle shutdown retains its separate ten-second bound
+after confirmed initial quiescence. This is separate
 from the product's already-recovered, two-blocked-worker latency qualification:
 its 15-second foreground completion and two-second worker bounds remain intact.
 Restart recovery, terminal convergence, identity, and resource-accounting

@@ -1373,7 +1373,7 @@ def _create_li07_case(tmp_path: Path, runtime: MachineRuntime, name: str):
     return cfg, binding, task, marker, finish, paths
 
 
-def _wait_li07_first_launch(cases) -> None:
+def _wait_li07_first_launch(cases, runtime: MachineRuntime) -> None:
     wait_all(
         {
             f"running:{index}": lambda case=case: (
@@ -1382,6 +1382,17 @@ def _wait_li07_first_launch(cases) -> None:
             for index, case in enumerate(cases)
         },
         timeout=30.0,
+        stage="multi-project:first-launch",
+        on_timeout=lambda: {
+            "workers": describe_project_io_workers(ProjectIOExecutor(runtime)),
+            "tasks": {
+                binding.project_id: {
+                    "task": load_task(cfg, task.task_id).to_dict(),
+                    "launch_marker": marker.read_text() if marker.exists() else None,
+                }
+                for cfg, binding, task, marker, _finish, _paths in cases
+            },
+        },
     )
 
 
@@ -1403,7 +1414,7 @@ def test_li07_cold_start_bindings_keep_identity_and_reservations_separate(
     cases = [_create_li07_case(tmp_path, runtime, str(index)) for index in range(project_count)]
     process = start_machine_agent(runtime, available_gpus=gpu_ids, loop_interval=0.1)
     try:
-        _wait_li07_first_launch(cases)
+        _wait_li07_first_launch(cases, runtime)
         identities = [
             load_task(cfg, task.task_id).attempt_control["current_attempt_id"]
             for cfg, _binding, task, _marker, _finish, _paths in cases
@@ -1459,14 +1470,14 @@ def test_li07_running_agent_discovers_dynamic_bindings(tmp_path: Path, monkeypat
     cases = [_create_li07_case(tmp_path, runtime, str(index)) for index in range(2)]
     process = start_machine_agent(runtime, available_gpus=gpu_ids, loop_interval=0.1)
     try:
-        _wait_li07_first_launch(cases)
+        _wait_li07_first_launch(cases, runtime)
         initial_ids = {case[1].project_id for case in cases}
         initial_attempt_ids = [
             load_task(cfg, task.task_id).attempt_control["current_attempt_id"]
             for cfg, _binding, task, _marker, _finish, _paths in cases
         ]
         cases.extend(_create_li07_case(tmp_path, runtime, str(index)) for index in range(2, 4))
-        _wait_li07_first_launch(cases[2:])
+        _wait_li07_first_launch(cases[2:], runtime)
         identities = [
             load_task(cfg, task.task_id).attempt_control["current_attempt_id"]
             for cfg, _binding, task, _marker, _finish, _paths in cases

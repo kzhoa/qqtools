@@ -1535,8 +1535,8 @@ revision churn must not strand an otherwise eligible queued Task behind a cursor
 The existing exact cursor comparison still prevents overwriting another advance.
 
 If a binding needs validation again while a definitive launch-authorization
-result awaits consumption, retire that transient request only after exact worker
-absence. Keep the shared launch identity and active reservation, validate the
+result awaits consumption, including after another Project changes the registry
+revision, retire that transient request only after exact worker absence. Keep the shared launch identity and active reservation, validate the
 binding, and replay authorization for the same claim before launching. The old
 request must not occupy the sole owner slot needed by its own validation;
 ambiguous results and live or unverified workers remain retained.

@@ -5614,11 +5614,11 @@ def test_same_turn_claim_selection_allocates_only_selected_distinct_capacity(
         executor.shutdown()
 
 
-@pytest.mark.parametrize("should_revalidate", [False, True])
+@pytest.mark.parametrize("invalidation", ["none", "resident", "registry"])
 def test_scheduler_launch_authorization_requires_and_rechecks_exact_active_reservation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    should_revalidate: bool,
+    invalidation: str,
 ) -> None:
     runtime = MachineRuntime(tmp_path / "machine")
     initialize_machine(runtime, "gpu-1")
@@ -5730,10 +5730,13 @@ def test_scheduler_launch_authorization_requires_and_rechecks_exact_active_reser
     monkeypatch.setattr(project_io_controller_module, "classify_exact_reservation", real_classify)
 
     original_launch_id = executor.load_result(launch_request.request_id).evidence["launch_id"]
-    if should_revalidate:
-        # A binding can leave the resident set while a completed request is
-        # awaiting consumption. The request must not block its revalidation.
-        controller.advance_binding_validation([], revision)
+    if invalidation != "none":
+        # Resident eviction and registry changes must both permit validation
+        # after a completed launch request, without replacing its launch ID.
+        if invalidation == "resident":
+            controller.advance_binding_validation([], revision)
+        else:
+            _cfg, _peer, revision, _bindings = _registered(tmp_path, "new-peer", runtime)
         _advance_until_validated(controller, bindings, revision, binding.project_id)
         assert classify_executor_offer(runtime.root, reservation) == "matching_active"
 
