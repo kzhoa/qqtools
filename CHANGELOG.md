@@ -8,7 +8,8 @@
   preserving supervision, background progress, and other-lane candidates without advancing
   unconsumed ready cursors.
 - ci: isolate release qexp tests across runners and require complete, exact-commit coverage
-  reconciliation within the parallel wall-time budget.
+  reconciliation within the parallel wall-time budget; keep per-operation profiling opt-in
+  for functional startup checks.
 
 - fix: keep eligible qexp Tasks discoverable after concurrent ready-index or Task changes,
   and replay the same launch authorization when a Project binding needs revalidation.
