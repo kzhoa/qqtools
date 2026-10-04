@@ -4,8 +4,9 @@
 
 ## v1.3.23
 
-- fix: release completed qexp scheduler observation slots when GPU or CPU capacity is exhausted,
-  preserving supervision and background progress without advancing unconsumed ready cursors.
+- fix: reclaim completed qexp scheduler observations after capacity or Project activation changes,
+  preserving supervision, background progress, and other-lane candidates without advancing
+  unconsumed ready cursors.
 - ci: isolate release qexp tests across runners and require complete, exact-commit coverage
   reconciliation within the parallel wall-time budget.
 
