@@ -55,6 +55,8 @@ from .project_io_transport_support import (
 )
 
 _RECORD_ID = re.compile(r"^[0-9a-f]{32}$")
+_RECORD_NAME = re.compile(r"([0-9a-f]{32})\.json")
+_ATOMIC_TEMP_SUFFIX = re.compile(r"[a-z0-9_]{8}")
 _RESOLVED_NAME = re.compile(r"^(\d{20})-([0-9a-f]{32})\.json$")
 _WORKER_HANDSHAKE_SECONDS = 2.0
 _START_IDENTITY_SECONDS = 1.0
@@ -261,7 +263,34 @@ class ProjectIOExecutor:
             raise ProjectIOProtocolError("result record identity does not match its local runtime path.")
         return result
 
-    def _directory_ids(self, lane: str, *, limit: int = PROJECT_IO_CAPACITY) -> tuple[list[str], bool]:
+    def _skip_atomic_temporary(
+        self,
+        entry: os.DirEntry[str],
+        record_name: re.Pattern[str],
+        *,
+        discard: bool,
+    ) -> bool:
+        """Exclude uncommitted store temporaries, reclaiming them only under the write lock."""
+        if not entry.name.startswith("."):
+            return False
+        target, _separator, suffix = entry.name[1:].rpartition(".")
+        if record_name.fullmatch(target) is None or _ATOMIC_TEMP_SUFFIX.fullmatch(suffix) is None:
+            return False
+        path = Path(entry.path)
+        # All executor record publishers hold project_io_lock through replacement.
+        # A locked scan can reclaim leftovers; an unlocked status read must leave
+        # a live writer's temporary alone, including one renamed during the scan.
+        if self._validate_local_path(path, must_exist=False) and discard:
+            _durable_unlink(path)
+        return True
+
+    def _directory_ids(
+        self,
+        lane: str,
+        *,
+        limit: int = PROJECT_IO_CAPACITY,
+        discard_temporaries: bool = False,
+    ) -> tuple[list[str], bool]:
         directory = self.paths[f"project_io_{lane}"]
         try:
             metadata = directory.stat(follow_symlinks=False)
@@ -273,12 +302,14 @@ class ProjectIOExecutor:
         too_many = False
         with os.scandir(directory) as entries:
             for entry in entries:
+                if self._skip_atomic_temporary(entry, _RECORD_NAME, discard=discard_temporaries):
+                    continue
                 if len(names) >= limit:
                     too_many = True
                     break
                 if entry.is_symlink() or not entry.is_file(follow_symlinks=False):
                     raise ProjectIOProtocolError(f"executor {lane} contains a non-regular record.")
-                match = re.fullmatch(r"([0-9a-f]{32})\.json", entry.name)
+                match = _RECORD_NAME.fullmatch(entry.name)
                 if match is None:
                     raise ProjectIOProtocolError(f"executor {lane} contains an invalid record filename.")
                 names.append(match.group(1))
@@ -286,10 +317,18 @@ class ProjectIOExecutor:
 
     def _scan_records(
         self,
+        *,
+        discard_temporaries: bool = False,
     ) -> tuple[dict[str, ProjectIORequest], dict[str, ProjectIOProcess], dict[str, ProjectIOResult]]:
-        request_ids, requests_overflow = self._directory_ids("requests", limit=PROJECT_IO_CAPACITY + 1)
-        process_ids, processes_overflow = self._directory_ids("processes", limit=PROJECT_IO_CAPACITY + 1)
-        result_ids, results_overflow = self._directory_ids("results", limit=PROJECT_IO_CAPACITY + 1)
+        request_ids, requests_overflow = self._directory_ids(
+            "requests", limit=PROJECT_IO_CAPACITY + 1, discard_temporaries=discard_temporaries
+        )
+        process_ids, processes_overflow = self._directory_ids(
+            "processes", limit=PROJECT_IO_CAPACITY + 1, discard_temporaries=discard_temporaries
+        )
+        result_ids, results_overflow = self._directory_ids(
+            "results", limit=PROJECT_IO_CAPACITY + 1, discard_temporaries=discard_temporaries
+        )
         all_ids = set(request_ids) | set(process_ids) | set(result_ids)
         if requests_overflow or processes_overflow or results_overflow or len(all_ids) > PROJECT_IO_CAPACITY:
             raise ProjectIOProtocolError("executor has more than four unresolved request identities.")
@@ -317,6 +356,8 @@ class ProjectIOExecutor:
         records: list[tuple[int, Path, int]] = []
         with os.scandir(directory) as entries:
             for entry in entries:
+                if self._skip_atomic_temporary(entry, _RESOLVED_NAME, discard=True):
+                    continue
                 if len(records) >= PROJECT_IO_MAX_RESOLVED_RECORDS + 1:
                     raise ProjectIOProtocolError("resolved history exceeds its bounded record limit.")
                 match = _RESOLVED_NAME.fullmatch(entry.name)
@@ -2086,7 +2127,7 @@ class ProjectIOExecutor:
         for request_id, child in tuple(self._children.items()):
             if child.poll() is not None:
                 self._children.pop(request_id, None)
-        requests, processes, results = self._scan_records()
+        requests, processes, results = self._scan_records(discard_temporaries=True)
         remaining_process_ids = set(processes)
         for request_id, process in processes.items():
             state = inspect_process_identity(process.pid, process.start_time_ticks)
@@ -2513,6 +2554,8 @@ class ProjectIOExecutor:
         record_count = 0
         with os.scandir(directory) as entries:
             for entry in entries:
+                if self._skip_atomic_temporary(entry, _RESOLVED_NAME, discard=True):
+                    continue
                 record_count += 1
                 if record_count > PROJECT_IO_MAX_RESOLVED_RECORDS:
                     raise ProjectIOProtocolError("resolved history exceeds its bounded record limit.")
@@ -2618,6 +2661,8 @@ class ProjectIOExecutor:
         total_bytes = 0
         with os.scandir(directory) as scanned:
             for entry in scanned:
+                if self._skip_atomic_temporary(entry, _RESOLVED_NAME, discard=True):
+                    continue
                 if len(entries) >= PROJECT_IO_MAX_RESOLVED_RECORDS + 1:
                     raise ProjectIOProtocolError("resolved history exceeds its bounded record limit.")
                 match = _RESOLVED_NAME.fullmatch(entry.name)

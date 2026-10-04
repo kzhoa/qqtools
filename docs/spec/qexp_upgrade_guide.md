@@ -1,7 +1,7 @@
 ---
 doc_type: spec
 status: active
-updated_at: 2026-09-29
+updated_at: 2026-10-04
 archived_at:
 ---
 
@@ -9,6 +9,37 @@ archived_at:
 
 This guide is for an existing qexp project rooted at `PROJECT_ROOT` (for example,
 `/mnt/share/myproject/.qexp`). Run commands with its explicit Project path.
+
+## Release 1.3.23
+
+The supported released-source path for the new maintenance protocols is 1.3.22
+to 1.3.23. Upgrade the package and restart each machine's global agent in turn:
+
+```bash
+python -m pip install --upgrade qqtools
+qexp agent restart
+qexp agent status --format json
+```
+
+Running training continues. The new agent reconstructs existing Attempt and
+reservation evidence before new admission; restart success does not certify that
+all background Project maintenance has completed. Project I/O isolation, binding
+working sets, and scheduler diagnostics use the operational procedures below.
+Explicit `admin repair` now performs a bounded slice: inspect `complete`,
+`rerun_required`, and `next_action` before considering a repair finished.
+
+Compatibility items `QQTOOLS-COMPAT-0018`, `0019`, and `0020` first ship in 1.3.23.
+Their `1.4.0-stage1` and `1.4.0-stage2` source labels refer only to earlier
+unreleased development data formats; they are not prerequisite package releases
+or intermediate upgrade steps. Retained adapters still recognize those formats.
+The existing 1.5.0 legacy-removal and 1.6.0 transition-purge deadlines are unchanged.
+
+Executor atomic-write temporaries are not committed request, process, result, or
+resolution evidence. Read-only status ignores recognized, locally owned regular
+temporaries. Reconciliation reclaims them under the same write lock used by all
+executor publishers, preserving live writes and committed records. Malformed
+formal evidence, unknown filenames, links, and foreign ownership still block
+recovery; do not delete such records to make an executor healthy.
 
 ## Upgrade to machine setup and Project enrollment
 

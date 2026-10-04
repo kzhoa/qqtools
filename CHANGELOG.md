@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+- fix: recover qexp Project I/O after interrupted atomic writes without treating uncommitted
+  temporary files as authoritative records or consuming executor capacity.
+- feat: isolate blocking qexp Project I/O in a bounded worker pool and retain exact recovery
+  evidence across agent restarts; running training continues during machine-by-machine upgrades.
+- feat: keep active qexp bindings in a working set with recoverable wake and dormant reconciliation,
+  reducing repeated historical scans while preserving scheduling and recovery obligations.
+- feat: make qexp maintenance and index repair resumable with bounded work slices and durable
+  progress; incomplete `admin repair` results require continuation rather than claiming completion.
+- feat: add qexp scheduler diagnostics and configurable agent log rotation for runtime diagnosis.
+- fix: make implicit Project selection visible and allow explicit adoption during Project registration.
+- upgrade: release the new maintenance protocols in 1.3.23 with 1.3.22 as the released source.
+  Upgrade the package and restart each machine agent; see the
+  [upgrade and recovery guide](docs/spec/qexp_upgrade_guide.md#release-1323).
+
 - fix: recover released qexp runner reservation identity after agent upgrade, preserve restart
   readiness and new-Task admission, and prevent continuous progress from starving upgrade discovery.
 
