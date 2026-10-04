@@ -4,6 +4,11 @@
 
 ## v1.3.23
 
+- fix: release completed qexp scheduler observation slots when GPU or CPU capacity is exhausted,
+  preserving supervision and background progress without advancing unconsumed ready cursors.
+- ci: isolate release qexp tests across runners and require complete, exact-commit coverage
+  reconciliation within the parallel wall-time budget.
+
 - fix: keep eligible qexp Tasks discoverable after concurrent ready-index or Task changes,
   and replay the same launch authorization when a Project binding needs revalidation.
 - fix: retain qexp agent identity before reporting active status so an immediate crash remains
