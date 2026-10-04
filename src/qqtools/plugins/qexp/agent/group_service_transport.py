@@ -6,12 +6,6 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
-from ..runtime.group_discovery.advance import (
-    control_continuation,
-    discovery_continuation,
-    initial_control_continuation,
-    initial_discovery_continuation,
-)
 from ..runtime.group_discovery.probe import validate_group_service_probe_state
 from ..runtime.records import validate_group_name
 
@@ -91,6 +85,8 @@ def group_service_candidate(value: object) -> dict[str, Any]:
 
 
 def _continuation_for(candidate: Mapping[str, Any], value: object) -> dict[str, Any] | None:
+    from ..runtime.group_discovery.advance import control_continuation, discovery_continuation
+
     lane = candidate["lane"]
     if lane in {"legacy", "membership"}:
         return discovery_continuation(value)
@@ -102,6 +98,8 @@ def _continuation_for(candidate: Mapping[str, Any], value: object) -> dict[str, 
 
 
 def initial_group_service_continuation(candidate: Mapping[str, Any]) -> dict[str, Any] | None:
+    from ..runtime.group_discovery.advance import initial_control_continuation, initial_discovery_continuation
+
     lane = candidate["lane"]
     if lane in {"legacy", "membership"}:
         return initial_discovery_continuation()

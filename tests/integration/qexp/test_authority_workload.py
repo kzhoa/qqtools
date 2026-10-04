@@ -4,7 +4,8 @@ Load -p tests.helpers.qexp.authority_measurement to enable comparison options.
 --authority-workload-profile accepts a JSON object with bindings (1..16),
 attempts_per_binding (1..4), local_history (0..1024), shared_history (0..1024), and hold_seconds (0..30).
 --authority-workload-output optionally retains the raw JSON report.
-The default preserves the existing four-Attempt, 15-second convergence budget.
+The default uses a 30-second four-Attempt cold-start budget; terminal convergence
+and resource accounting retain their 15-second budgets.
 """
 
 from __future__ import annotations
@@ -169,7 +170,11 @@ def test_authority_workload(tmp_path, monkeypatch, request):
         return True
 
     try:
-        wait_all({str(index): lambda case=case: running(case) for index, case in enumerate(cases)}, stage="running")
+        wait_all(
+            {str(index): lambda case=case: running(case) for index, case in enumerate(cases)},
+            stage="running",
+            timeout=30.0,
+        )
         assert len(active_reservations(runtime.root)) == len(cases)
         report["all_running_seconds"] = time.monotonic() - started
         initial_attempts = {

@@ -1,11 +1,33 @@
 import os
+from pathlib import Path
 
 import pytest
+
+
+@pytest.fixture
+def qexp_subprocess_bounded_clock(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # The ordinary fixture patches only this pytest process. Provide the same
+    # bounded-clock prerequisite to the real agent and peer through their provider
+    # boundary; wall time, TTL and expiry/claim decisions remain production code.
+    clock_bin = tmp_path / "clock-bin"
+    clock_bin.mkdir()
+    chronyc = clock_bin / "chronyc"
+    chronyc.write_text(
+        "#!/bin/sh\ncat <<'CLOCK'\n"
+        "System time : 0.000001 seconds slow of NTP time\n"
+        "Root delay : 0.000002 seconds\n"
+        "Root dispersion : 0.000001 seconds\n"
+        "Skew : 0.001 ppm\n"
+        "Leap status : Normal\nCLOCK\n"
+    )
+    chronyc.chmod(0o755)
+    monkeypatch.setenv("PATH", str(clock_bin) + os.pathsep + os.environ["PATH"])
 
 
 @pytest.fixture(autouse=True)
 def _qexp_integration_prerequisites(
     qexp_healthy_clock,
+    qexp_subprocess_bounded_clock,
     qexp_resource_scope,
     monkeypatch,
     request,

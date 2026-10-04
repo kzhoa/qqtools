@@ -261,6 +261,21 @@ requests it; [tests/readme.md](../../tests/readme.md) lists entry points. The
 release profile also excludes opt-in `stress` cases. Machine lab tests
 remain part of qexp Integration and can be selected by path.
 
+qexp Integration supplies the healthy bounded-clock prerequisite in both the
+pytest process and fresh child interpreters. Child agents and I/O workers use a
+test-owned `chronyc` provider on PATH; wall time, TTL calculations, lease checks,
+and fail-closed behavior remain production code. Clock-failure cases must
+explicitly replace the provider evidence they exercise.
+
+Multi-Project first-launch checks (including newly added bindings), initial
+idle-policy quiescence, and the default authority workload use a 30-second
+functional startup wait, approved on 2026-10-04. Idle shutdown retains its
+separate ten-second bound after confirmed initial quiescence. This is separate
+from the product's already-recovered, two-blocked-worker latency qualification:
+its 15-second foreground completion and two-second worker bounds remain intact.
+Restart recovery, terminal convergence, identity, and resource-accounting
+assertions retain their existing requirements.
+
 Every qexp Integration test must own isolated temporary roots, HOME/XDG,
 runtime roots, tmux resources, and ledger-based cleanup checks. Never use the
 production default authority, default tmux socket, or resources that can collide

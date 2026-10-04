@@ -29,10 +29,7 @@ from ..layout import (
 )
 from ..lease import load_lease_policy
 from ..machine_config import load_machine_policy
-from ..machine_state import publish_shared_machine_snapshots, publish_shared_machine_stop_snapshot
-from ..project_maintenance import advance_due_offer
 from ..runtime.authority_lock import authority_locks
-from ..runtime.maintenance import advance_maintenance_work
 from ..runtime.paths import attempt_path, local_paths, machine_project_paths, machine_runtime_paths, shared_paths
 from ..runtime.ready import advance_ready_index_build
 from ..runtime.ready import routes as ready_routes
@@ -48,8 +45,6 @@ from ..runtime.store import atomic_replace, fenced_mutations, read_json, read_js
 from ..runtime.tasks import load_task
 from ..runtime.work_budget import SliceBudget, WorkBudgetPolicy
 from .bindings import ProjectBinding, decode_registry
-from .group_service_worker import handle_group_service_request
-from .primary_demand import probe_primary_demand
 from .primary_probe_transport import decode_probe_session, encode_probe_session
 from .project_io_protocol import (
     PROJECT_IO_MAX_RECORD_BYTES,
@@ -1216,6 +1211,8 @@ def _machine_snapshot_publish(
     paths: dict[str, Path],
     write_possible: list[bool],
 ) -> dict[str, Any]:
+    from ..machine_state import publish_shared_machine_snapshots, publish_shared_machine_stop_snapshot
+
     # Protocol records freeze nested objects. Snapshot writers require ordinary
     # JSON containers, including reservation admission and policy warnings.
     parameters = request.to_dict()["project_io_request"]["parameters"]
@@ -1593,6 +1590,7 @@ def _scheduler_cursor_commit(
     write_possible: list[bool],
     *,
     binding_fence_is_error: bool = False,
+    should_retain_observed: bool = False,
 ) -> dict[str, Any]:
     """Compare-and-commit both observed route cursors in deterministic order."""
     parameters = request.parameters
@@ -1618,7 +1616,11 @@ def _scheduler_cursor_commit(
     for scope in ("home", "shared"):
         positions = cursor["routes"][scope]
         observed = _cursor_from_position(namespace, machine_name, scope, positions["observed"])
-        next_cursor = _cursor_from_position(namespace, machine_name, scope, positions["next"])
+        next_cursor = (
+            observed
+            if should_retain_observed
+            else _cursor_from_position(namespace, machine_name, scope, positions["next"])
+        )
         outcomes[scope] = compare_and_commit_ready_cursor(
             cfg,
             namespace,
@@ -1893,6 +1895,8 @@ def _group_service_mutation_fence(
 
 def _scheduler_primary_probe(request: ProjectIORequest) -> dict[str, Any]:
     """Scan primary truth without dispatch cursors or MachineRuntime effects."""
+    from .primary_demand import probe_primary_demand
+
     parameters = request.parameters
     cfg = load_root_config(Path(request.canonical_shared_root), parameters["machine_name"])
     project_id, lane = request.project_id, parameters["lane"]
@@ -2037,6 +2041,8 @@ def _scheduler_due_offer(
     write_possible: list[bool],
 ) -> dict[str, Any]:
     """Advance one due offer under repeated executor and binding fences."""
+    from ..project_maintenance import advance_due_offer
+
     cfg = load_root_config(Path(request.canonical_shared_root), request.parameters["machine_name"])
     cfg = replace(cfg, runtime_root=machine_project_paths(runtime_root, request.project_id)["root"])
 
@@ -2835,6 +2841,8 @@ def _maintenance_descriptor_advance(
     write_possible: list[bool],
 ) -> dict[str, Any]:
     """Advance one Project maintenance descriptor through the isolated worker."""
+    from ..runtime.maintenance import advance_maintenance_work
+
     parameters = request.parameters
     cfg = load_root_config(Path(request.canonical_shared_root), parameters["machine_name"])
     cfg = replace(cfg, runtime_root=machine_project_paths(runtime_root, request.project_id)["root"])
@@ -3193,6 +3201,8 @@ def _run(
                     if request.operation_kind == "group_service_advance"
                     else None
                 )
+                from .group_service_worker import handle_group_service_request
+
                 evidence = handle_group_service_request(request, root, before_shared_mutation)
             elif request.operation_kind == "progress_projection":
                 evidence = _progress_projection(request, root, paths, upgrade_write_possible)
@@ -3253,6 +3263,16 @@ def _run(
                             paths,
                             cursor_write_possible,
                             binding_fence_is_error=True,
+                            # Rejecting an obsolete observation does not prove
+                            # the current candidate can be skipped. Re-observe
+                            # it before advancing past this position.
+                            should_retain_observed=claim_evidence.get("reason")
+                            in {
+                                "ready_changed",
+                                "task_changed",
+                                "group_changed",
+                                "admission_role_changed",
+                            },
                         )
                         evidence = {**claim_evidence, "cursor_routes": cursor_evidence["routes"]}
                     else:

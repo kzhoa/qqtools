@@ -2366,6 +2366,21 @@ class ProjectIOExecutor:
             operation_kind="scheduler_ready_index_build",
         )
 
+    def resolve_stale_scheduler_launch_authorize(
+        self,
+        request_id: str,
+        current_request: ProjectIORequest,
+    ) -> bool:
+        """Retire a definitive result so its binding can revalidate before replay."""
+        if current_request.operation_kind != "scheduler_launch_authorize":
+            raise ValueError("stale resolution requires scheduler_launch_authorize.")
+        result = self.load_result(request_id)
+        if result is None or result.status not in {"completed", "fenced"}:
+            return False
+        # The shared launch identity and active reservation remain intact.
+        # A later authorization replays that identity after fresh validation.
+        return self._resolve_stale_request(request_id, current_request)
+
     def reset_ambiguous_scheduler_launch_authorize_for_retry(
         self,
         request_id: str,

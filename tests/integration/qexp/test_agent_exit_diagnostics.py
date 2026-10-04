@@ -344,3 +344,38 @@ def test_sigkill_is_reconciled_as_unknown_without_invented_signal(tmp_path: Path
     finally:
         successor.terminate()
         successor.wait(timeout=15)
+
+
+def test_sigkill_at_first_active_status_retains_reconcilable_identity(tmp_path, checkout_subprocess_env):
+    runtime = MachineRuntime(tmp_path / "machine-runtime")
+    initialize_machine(runtime, "gpu-1")
+    script = """
+import os, signal, sys
+from qqtools.plugins.qexp.agent import lifecycle
+original = lifecycle._publish_process_status
+def publish(*args, **kwargs):
+    original(*args, **kwargs)
+    os.kill(os.getpid(), signal.SIGKILL)
+lifecycle._publish_process_status = publish
+lifecycle.run_machine_agent_loop(sys.argv[1], loop_interval=0.05, available_gpus=[])
+"""
+    first = subprocess.run(
+        [sys.executable, "-c", script, str(runtime.root)],
+        env=_child_environment(checkout_subprocess_env),
+        capture_output=True,
+        timeout=15,
+        check=False,
+    )
+    assert first.returncode == -signal.SIGKILL, first.stderr.decode()
+    status = read_json(runtime.paths["agent"] / "status.json")["machine_agent"]
+    successor = spawn_machine_agent_process(runtime, loop_interval=0.05, available_gpus=[])
+    try:
+        record = read_json(runtime.paths["diagnostic_instances"] / f"{status['instance_id']}.json")
+        summary = summarize_diagnostic_record(record)
+        assert summary["reason"] == "abnormal_exit_unknown"
+        assert summary["source"] == "observer"
+        assert summary.get("signal") is None
+        assert summary.get("exit_code") is None
+    finally:
+        successor.terminate()
+        successor.wait(timeout=15)

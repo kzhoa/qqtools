@@ -2041,7 +2041,7 @@ def test_maintenance_descriptor_worker_uses_project_machine_runtime_and_one_slic
         observed.append((worker_cfg.runtime_root, reservation_runtime_root, max_scan))
         return {"maintenance_state": "idle", "next_due_at": None, "more": False}
 
-    monkeypatch.setattr(project_io_worker_module, "advance_maintenance_work", observe_slice)
+    monkeypatch.setattr(maintenance_module, "advance_maintenance_work", observe_slice)
     evidence = project_io_worker_module._maintenance_descriptor_advance(
         request,
         runtime.root,
@@ -2076,7 +2076,7 @@ def test_maintenance_descriptor_worker_marks_possible_write_only_after_immediate
         check_mutation_fence(worker_cfg.shared_root / "operations")
         raise OSError("synthetic descriptor write failure")
 
-    monkeypatch.setattr(project_io_worker_module, "advance_maintenance_work", fail_after_fence)
+    monkeypatch.setattr(maintenance_module, "advance_maintenance_work", fail_after_fence)
     with pytest.raises(OSError, match="synthetic descriptor write failure"):
         project_io_worker_module._maintenance_descriptor_advance(
             request,
@@ -5458,9 +5458,11 @@ def test_same_turn_claim_selection_allocates_only_selected_distinct_capacity(
         executor.shutdown()
 
 
+@pytest.mark.parametrize("should_revalidate", [False, True])
 def test_scheduler_launch_authorization_requires_and_rechecks_exact_active_reservation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    should_revalidate: bool,
 ) -> None:
     runtime = MachineRuntime(tmp_path / "machine")
     initialize_machine(runtime, "gpu-1")
@@ -5571,6 +5573,14 @@ def test_scheduler_launch_authorization_requires_and_rechecks_exact_active_reser
     assert launch_request in executor.unresolved_requests()
     monkeypatch.setattr(project_io_controller_module, "classify_exact_reservation", real_classify)
 
+    original_launch_id = executor.load_result(launch_request.request_id).evidence["launch_id"]
+    if should_revalidate:
+        # A binding can leave the resident set while a completed request is
+        # awaiting consumption. The request must not block its revalidation.
+        controller.advance_binding_validation([], revision)
+        _advance_until_validated(controller, bindings, revision, binding.project_id)
+        assert classify_executor_offer(runtime.root, reservation) == "matching_active"
+
     completions = {}
     deadline = time.monotonic() + 5.0
     while time.monotonic() < deadline:
@@ -5584,6 +5594,7 @@ def test_scheduler_launch_authorization_requires_and_rechecks_exact_active_reser
         time.sleep(0.02)
 
     assert completions[reservation.reservation_id]["outcome"] == "authorized"
+    assert completions[reservation.reservation_id]["launch_id"] == original_launch_id
     current = load_task(cfg, task.task_id)
     assert current.claim_control["active_claim"]["launch_state"] == "starting"
     assert executor.unresolved_requests() == ()
@@ -6909,11 +6920,12 @@ def test_scheduler_claim_rejects_observation_from_previous_executor_epoch(tmp_pa
     assert not any(runtime.paths["provisional"].iterdir())
 
 
-def test_scheduler_claim_rechecks_ready_index_source_revision(tmp_path: Path) -> None:
+@pytest.mark.parametrize("ready_state", ["active", "degraded"])
+def test_scheduler_claim_rechecks_ready_index_source_revision(tmp_path: Path, ready_state: str) -> None:
     runtime = MachineRuntime(tmp_path / "machine")
     initialize_machine(runtime, "gpu-1")
     cfg, binding, revision, bindings = _registered(tmp_path, "project-a", runtime)
-    submit(cfg, ["echo", "ok"], working_dir=tmp_path)
+    task = submit(cfg, ["echo", "ok"], working_dir=tmp_path)
     executor = ProjectIOExecutor(runtime)
     executor.begin_epoch()
     controller = ProjectIOController(runtime, executor)
@@ -6927,7 +6939,7 @@ def test_scheduler_claim_rechecks_ready_index_source_revision(tmp_path: Path) ->
     )
     state_path = ready_state_path(cfg.shared_root)
     state = read_json(state_path)
-    state["ready_index"]["state"] = "degraded"
+    state["ready_index"]["state"] = ready_state
     state["ready_index"]["revision"] += 1
     atomic_replace(state_path, state)
 
@@ -6961,6 +6973,32 @@ def test_scheduler_claim_rechecks_ready_index_source_revision(tmp_path: Path) ->
     assert completions[binding.project_id]["outcome"] == "no_claim"
     assert completions[binding.project_id]["reason"] == "ready_changed"
     assert classify_executor_offer(runtime.root, offer_identity) == "matching_released"
+
+    # An index revision change must reject stale evidence without skipping the
+    # still-queued candidate, including after a fresh controller takes over.
+    state["ready_index"]["state"] = "active"
+    atomic_replace(state_path, state)
+    resumed = ProjectIOController(runtime, executor)
+    _advance_until_validated(resumed, bindings, revision, binding.project_id)
+    refreshed = _advance_until_observed(resumed, bindings, revision, binding.project_id, lane="gpu")
+    assert refreshed[binding.project_id]["candidate"] is not None
+    assert refreshed[binding.project_id]["candidate"]["task_id"] == task.task_id
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        completions = resumed.advance_scheduler_claims(
+            bindings,
+            revision,
+            lane="gpu",
+            admission_role="primary",
+            observations=refreshed,
+            available_gpu_ids=[0],
+            available_cpu_slots=0,
+        )
+        if binding.project_id in completions:
+            break
+        time.sleep(0.02)
+    assert completions[binding.project_id]["outcome"] == "claimed"
+    executor.shutdown()
 
 
 def test_completed_claim_reconciles_after_unrelated_registry_revision_change(tmp_path: Path) -> None:

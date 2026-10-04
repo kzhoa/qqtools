@@ -47,26 +47,6 @@ def _isolated_visible_gpu(monkeypatch: pytest.MonkeyPatch, checkout_subprocess_e
 
 
 @pytest.fixture(autouse=True)
-def _subprocess_bounded_clock(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    # The ordinary fixture patches only this pytest process. Provide the same
-    # bounded-clock prerequisite to the real agent and peer through their provider
-    # boundary; wall time, TTL and expiry/claim decisions remain production code.
-    clock_bin = tmp_path / "clock-bin"
-    clock_bin.mkdir()
-    chronyc = clock_bin / "chronyc"
-    chronyc.write_text(
-        "#!/bin/sh\ncat <<'CLOCK'\n"
-        "System time : 0.000001 seconds slow of NTP time\n"
-        "Root delay : 0.000002 seconds\n"
-        "Root dispersion : 0.000001 seconds\n"
-        "Skew : 0.001 ppm\n"
-        "Leap status : Normal\nCLOCK\n"
-    )
-    chronyc.chmod(0o755)
-    monkeypatch.setenv("PATH", str(clock_bin) + os.pathsep + os.environ["PATH"])
-
-
-@pytest.fixture(autouse=True)
 def _require_real_process_prerequisites() -> None:
     """Fail the lifecycle gate explicitly when its Linux/tmux boundary is unavailable."""
     if sys.platform != "linux":
@@ -293,6 +273,7 @@ from pathlib import Path
 from qqtools.plugins.qexp.agent.lifecycle import run_machine_agent_loop
 from qqtools.plugins.qexp.agent.project_io_admission import ProjectIOAdmission
 from qqtools.plugins.qexp.agent import project_io_executor
+from qqtools.plugins.qexp.runtime.paths import shared_paths
 
 root, healthy, foreground_hold, background_arm, background_started, measurement_gate, trace = sys.argv[1:]
 foreground_hold = Path(foreground_hold)
@@ -343,6 +324,16 @@ background_operations = {
     "notification_service", "machine_snapshot_publish", "activation_observe",
     "activation_consumer_register", "activation_consumer_ack",
 }
+blocked_worker_wrapper = r"""
+import sys
+from pathlib import Path
+schema, *args = sys.argv[1:]
+# Every selected blocked-binding invocation crosses the injected I/O boundary,
+# even when its particular operation would otherwise use cached schema state.
+Path(schema).read_bytes()
+from qqtools.plugins.qexp.agent.project_io_worker import main
+raise SystemExit(main(args))
+"""
 real_popen = project_io_executor.subprocess.Popen
 launching = [None]
 background_selected = [False]
@@ -363,6 +354,10 @@ def popen(command, *args, **kwargs):
             command[0], "-c", worker_wrapper, trace, request.project_id, request.operation_kind,
             str(began), str(background_started), str(measurement_gate), "1" if hold else "0", *command[3:]
         ]
+    elif item is not None:
+        request, _began = item
+        schema = shared_paths(Path(request.canonical_shared_root))["schema"] / "version.json"
+        command = [command[0], "-c", blocked_worker_wrapper, str(schema), *command[3:]]
     return real_popen(command, *args, **kwargs)
 project_io_executor.subprocess.Popen = popen
 
@@ -411,6 +406,21 @@ run_machine_agent_loop(root, available_gpus=[0])
             description="current-agent recovery for every qualification binding",
         )
         foreground_hold.touch()
+        executor_paths = machine_runtime_paths(runtime.root)
+
+        def prior_renewal_is_drained() -> bool:
+            for path in executor_paths["project_io_requests"].glob("*.json"):
+                try:
+                    request = read_json(path)["project_io_request"]
+                except FileNotFoundError:
+                    continue
+                if request["project_id"] == healthy.project_id and request["operation_kind"] == "authority_renewal":
+                    return False
+            return True
+
+        # A foreground grant already in flight when the hold is armed must not
+        # satisfy the later measurement using a pre-measurement lease change.
+        _wait_for(prior_renewal_is_drained, description="prior renewal fully consumed")
         before_expiry = load_task(healthy_cfg, running.task_id).claim_control["active_claim"]["lease_expires_at"]
         # The default lease policy renews after ten seconds. Hold only new
         # foreground grants so the exact running Attempt is due at measurement.
@@ -471,16 +481,33 @@ run_machine_agent_loop(root, available_gpus=[0])
         measured_at = time.monotonic()
         measurement_gate.touch()
 
+        def completed_healthy_timings() -> list[dict]:
+            lines = trace.read_text().splitlines(keepends=True) if trace.exists() else []
+            timings = [json.loads(line) for line in lines if line.endswith("\n")]
+            return [
+                item
+                for item in timings
+                if item["project_id"] == healthy.project_id
+                and (item["qualification_background"] or item["started_at"] >= measured_at)
+            ]
+
         def primary_admitted_and_running_renewed() -> bool:
             primary_task = load_task(healthy_cfg, primary.task_id)
             running_task = load_task(healthy_cfg, running.task_id)
             claim = primary_task.claim_control.get("active_claim")
             renewed_expiry = running_task.claim_control["active_claim"]["lease_expires_at"]
             reservations = active_reservations(runtime.root)
+            process_path = local_paths(runtime.project_paths(healthy.project_id)["root"])["processes"] / (
+                f"{running_task.attempt_control['current_attempt_id']}.json"
+            )
+            local_expiry = read_json(process_path)["process"].get("lease_expires_at")
+            kinds = {item["operation_kind"] for item in completed_healthy_timings()}
             return (
                 isinstance(claim, dict)
                 and any(item.get("task_id") == primary.task_id for item in reservations)
                 and renewed_expiry != before_expiry
+                and local_expiry == renewed_expiry
+                and {"scheduler_claim", "authority_renewal"} <= kinds
             )
 
         _wait_for(
@@ -496,13 +523,7 @@ run_machine_agent_loop(root, available_gpus=[0])
         )
         assert time.monotonic() - measured_at <= 15
         assert blocked_ids.issubset(held_project_ids())
-        timings = [json.loads(line) for line in trace.read_text().splitlines()]
-        healthy_timings = [
-            item
-            for item in timings
-            if item["project_id"] == healthy.project_id
-            and (item["qualification_background"] or item["started_at"] >= measured_at)
-        ]
+        healthy_timings = completed_healthy_timings()
         assert healthy_timings
         assert max(item["elapsed_seconds"] for item in healthy_timings) <= 2.0
         kinds = {item["operation_kind"] for item in healthy_timings}
@@ -1349,14 +1370,15 @@ def _create_li07_case(tmp_path: Path, runtime: MachineRuntime, name: str):
     return cfg, binding, task, marker, finish, paths
 
 
-def _wait_li07_running(cases) -> None:
+def _wait_li07_first_launch(cases) -> None:
     wait_all(
         {
             f"running:{index}": lambda case=case: (
                 load_task(case[0], case[2].task_id).state["projection"] == "running" and case[3].exists()
             )
             for index, case in enumerate(cases)
-        }
+        },
+        timeout=30.0,
     )
 
 
@@ -1378,7 +1400,7 @@ def test_li07_cold_start_bindings_keep_identity_and_reservations_separate(
     cases = [_create_li07_case(tmp_path, runtime, str(index)) for index in range(project_count)]
     process = start_machine_agent(runtime, available_gpus=gpu_ids, loop_interval=0.1)
     try:
-        _wait_li07_running(cases)
+        _wait_li07_first_launch(cases)
         identities = [
             load_task(cfg, task.task_id).attempt_control["current_attempt_id"]
             for cfg, _binding, task, _marker, _finish, _paths in cases
@@ -1434,14 +1456,14 @@ def test_li07_running_agent_discovers_dynamic_bindings(tmp_path: Path, monkeypat
     cases = [_create_li07_case(tmp_path, runtime, str(index)) for index in range(2)]
     process = start_machine_agent(runtime, available_gpus=gpu_ids, loop_interval=0.1)
     try:
-        _wait_li07_running(cases)
+        _wait_li07_first_launch(cases)
         initial_ids = {case[1].project_id for case in cases}
         initial_attempt_ids = [
             load_task(cfg, task.task_id).attempt_control["current_attempt_id"]
             for cfg, _binding, task, _marker, _finish, _paths in cases
         ]
         cases.extend(_create_li07_case(tmp_path, runtime, str(index)) for index in range(2, 4))
-        _wait_li07_running(cases[2:])
+        _wait_li07_first_launch(cases[2:])
         identities = [
             load_task(cfg, task.task_id).attempt_control["current_attempt_id"]
             for cfg, _binding, task, _marker, _finish, _paths in cases
@@ -1633,11 +1655,19 @@ def test_global_idle_policy_considers_every_binding(tmp_path: Path, modes: tuple
         runtime.ensure_binding(cfg.shared_root, "gpu-1")
     script = """
 import runpy
+from pathlib import Path
 from qqtools.plugins.qexp.agent import lifecycle
 from tests.helpers.qexp.worker_diagnostics import trace_project_io_requests
 def reject_direct_stop_publication(*args, **kwargs):
     raise AssertionError("agent cleanup performed direct shared stop publication")
 lifecycle.publish_machine_stop_snapshot = reject_direct_stop_publication
+real_confirm_idle_shutdown = lifecycle._confirm_idle_shutdown
+def confirm_idle_shutdown(runtime, *args, **kwargs):
+    guard = real_confirm_idle_shutdown(runtime, *args, **kwargs)
+    if guard is not None:
+        (Path(runtime.root) / "idle-confirmed").touch()
+    return guard
+lifecycle._confirm_idle_shutdown = confirm_idle_shutdown
 trace_project_io_requests()
 runpy.run_module("qqtools.plugins.qexp.agent.process", run_name="__main__")
 """
@@ -1657,6 +1687,11 @@ runpy.run_module("qqtools.plugins.qexp.agent.process", run_name="__main__")
     )
     try:
         if "daemon" not in modes:
+            _wait_for(
+                lambda: process.poll() is not None or (runtime.root / "idle-confirmed").exists(),
+                timeout=30,
+                description="idle-policy cold-start quiescence",
+            )
             assert process.wait(timeout=10) == 0
             assert not get_machine_agent_status(runtime)["is_running"]
             assert all(

@@ -519,6 +519,19 @@ def run_machine_agent_loop(
             previous_hup = signal.signal(signal.SIGHUP, request_stop)
             pid_path.write_text(str(os.getpid()), encoding="utf-8")
             is_pid_published = True
+            # A launcher can return as soon as active status is visible. Retain
+            # identity first so an immediate crash remains diagnosable.
+            publish_agent_evidence(
+                phase="active",
+                admitted=True,
+                pid=os.getpid(),
+                pid_start_time_ticks=start_ticks,
+                capture_health=capture_health_state["health"],
+                capture_error=capture_health_state["error"],
+                log_path=str(log_path) if log_path is not None else None,
+                effective_log_max_bytes=effective_log_max_bytes,
+                capture_mode=capture_mode,
+            )
             _publish_process_status(
                 machine_runtime,
                 instance_id=instance_id,
@@ -539,17 +552,6 @@ def run_machine_agent_loop(
                 capture_mode=capture_mode,
             )
             is_status_published = True
-            publish_agent_evidence(
-                phase="active",
-                admitted=True,
-                pid=os.getpid(),
-                pid_start_time_ticks=start_ticks,
-                capture_health=capture_health_state["health"],
-                capture_error=capture_health_state["error"],
-                log_path=str(log_path) if log_path is not None else None,
-                effective_log_max_bytes=effective_log_max_bytes,
-                capture_mode=capture_mode,
-            )
             if log_service is not None:
                 try:
                     log_service.start()

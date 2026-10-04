@@ -1,7 +1,7 @@
 ---
 doc_type: spec
 status: active
-updated_at: 2026-09-29
+updated_at: 2026-10-04
 archived_at:
 ---
 
@@ -1526,6 +1526,20 @@ It is an arbiter weight, not an admission role or permission to borrow. Existing
 primary-demand proofs, lane policy, revision fences, and conservative unknown-demand handling
 still determine borrow eligibility before submission and at claim. A primary-class grant cannot
 override those rules or preempt an existing borrow Attempt.
+
+A definitive rejected claim releases its matching provisional offer. If rejection
+reports changed ready, Task, Group, or admission-role evidence, it retains the
+observed dispatch cursor instead of committing the position after the candidate.
+A fresh observation must classify the current candidate before it can be skipped;
+revision churn must not strand an otherwise eligible queued Task behind a cursor.
+The existing exact cursor comparison still prevents overwriting another advance.
+
+If a binding needs validation again while a definitive launch-authorization
+result awaits consumption, retire that transient request only after exact worker
+absence. Keep the shared launch identity and active reservation, validate the
+binding, and replay authorization for the same claim before launching. The old
+request must not occupy the sole owner slot needed by its own validation;
+ambiguous results and live or unverified workers remain retained.
 
 Isolated borrow admission uses a dedicated primary probe, never exhaustion of the
 ordinary dispatch cursor. Its bounded slices retain the existing primary route

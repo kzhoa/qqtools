@@ -2295,7 +2295,7 @@ def test_scheduler_claim_commits_shared_truth_without_touching_local_offer(tmp_p
     assert _wait_for_consumed(executor, claim) == claimed
 
 
-def test_scheduler_no_claim_advances_the_exact_observation_cursor(tmp_path: Path) -> None:
+def test_scheduler_changed_task_retains_cursor_for_fresh_observation(tmp_path: Path) -> None:
     runtime = MachineRuntime(tmp_path / "machine")
     initialize_machine(runtime, "gpu-1")
     cfg, binding, revision = _registered(tmp_path, "project-a", runtime)
@@ -2374,9 +2374,23 @@ def test_scheduler_no_claim_advances_the_exact_observation_cursor(tmp_path: Path
     assert result.status == "completed"
     assert result.evidence["outcome"] == "no_claim"
     assert result.evidence["reason"] == "task_changed"
-    assert result.evidence["cursor_routes"] == {"home": "committed", "shared": "already_applied"}
-    assert load_ready_cursor(cfg, namespace, "home").after_name == candidate["marker_name"]
+    assert result.evidence["cursor_routes"] == {"home": "already_applied", "shared": "already_applied"}
+    assert load_ready_cursor(cfg, namespace, "home").after_name == cursor["routes"]["home"]["observed"]["after_name"]
     assert classify_executor_offer(runtime.root, identity) == "matching_provisional"
+
+    # Revision-only churn leaves this Task eligible. A subsequent observation
+    # must still find it instead of silently abandoning it behind the cursor.
+    refreshed = executor.prepare_scheduler_observe(
+        binding,
+        revision,
+        lane="gpu",
+        admission_role="primary",
+        cursor_namespace=namespace,
+    )
+    executor.start(refreshed.request_id)
+    current = _wait_for_consumed(executor, refreshed)
+    assert current.evidence["candidate"]["task_id"] == task.task_id
+    assert current.evidence["candidate"]["task_revision"] == changed.meta["revision"]
 
 
 def test_scheduler_no_claim_binding_fence_makes_cursor_outcome_unknown(tmp_path: Path) -> None:
