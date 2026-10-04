@@ -253,3 +253,25 @@ def test_summary_retains_control_plane_and_checks_generation_coverage(tmp_path):
     assert summarized["control_plane_snapshot"] == snapshot
     snapshot["authority_control_plane"]["projects"].clear()
     assert not result()["control_plane_coverage"]["has_complete_generation_coverage"]
+
+
+@pytest.mark.parametrize("should_measure", [False, True])
+def test_workload_entrypoint_preserves_production_loop_and_makes_sampling_opt_in(tmp_path, monkeypatch, should_measure):
+    from tests.helpers.qexp import authority_measurement as module
+
+    output = tmp_path / "report.json"
+    monkeypatch.delenv("QEXP_TEST_STARTUP_PROFILE_ROOT", raising=False)
+    arguments = ["authority_measurement", str(tmp_path), str(output), "4"]
+    if should_measure:
+        arguments.append("--measure")
+    monkeypatch.setattr(module.sys, "argv", arguments)
+    calls = []
+    for name in ("install", "start", "stop"):
+        monkeypatch.setattr(AgentMeasurements, name, lambda self, name=name: calls.append(name))
+    monkeypatch.setattr(module, "run_machine_agent_loop", lambda *args, **kwargs: calls.append((args, kwargs)))
+    module.main()
+    loop = ((tmp_path,), {"available_gpus": [0, 1, 2, 3], "loop_interval": 0.1})
+    assert calls == (["install", "start", loop, "stop"] if should_measure else [loop])
+    report = json.loads(output.read_text())
+    assert report["operations_instrumented"] is should_measure
+    assert ("operation_samples" in report) is should_measure

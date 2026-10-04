@@ -299,6 +299,15 @@ its 15-second foreground completion and two-second worker bounds remain intact.
 Restart recovery, terminal convergence, identity, and resource-accounting
 assertions retain their existing requirements.
 
+The default authority workload invokes the same real agent loop without
+per-operation filesystem/lock sampling. Sampling is observational overhead,
+not part of the functional cold-start contract. Explicit workload dimensions,
+startup profiling, or `--authority-measure-operations` enable it; requesting only
+`--authority-workload-output` records uninstrumented timing and outcome evidence.
+Reports declare `operations_instrumented`, and failure diagnostics include each
+Task's state before cleanup. The 30-second startup, 15-second terminal/accounting,
+identity, single-launch, and resource assertions are unchanged.
+
 Every qexp Integration test must own isolated temporary roots, HOME/XDG,
 runtime roots, tmux resources, and ledger-based cleanup checks. Never use the
 production default authority, default tmux socket, or resources that can collide

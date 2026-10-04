@@ -4,6 +4,7 @@ Load -p tests.helpers.qexp.authority_measurement to enable comparison options.
 --authority-workload-profile accepts a JSON object with bindings (1..16),
 attempts_per_binding (1..4), local_history (0..1024), shared_history (0..1024), and hold_seconds (0..30).
 --authority-workload-output optionally retains the raw JSON report.
+The default does not instrument individual filesystem/lock operations.
 The default uses a 30-second four-Attempt cold-start budget; terminal convergence
 and resource accounting retain their 15-second budgets.
 """
@@ -139,6 +140,11 @@ def test_authority_workload(tmp_path, monkeypatch, request):
         monkeypatch.setenv("QEXP_TEST_STARTUP_PROFILE_ROOT", str(startup_profiles))
     else:
         monkeypatch.delenv("QEXP_TEST_STARTUP_PROFILE_ROOT", raising=False)
+    should_measure_operations = (
+        bool(overrides)
+        or should_profile_startup
+        or request.config.getoption("--authority-measure-operations", default=False)
+    )
     started = time.monotonic()
     report["agent_requested_monotonic"] = started
     agent = subprocess.Popen(
@@ -149,6 +155,7 @@ def test_authority_workload(tmp_path, monkeypatch, request):
             str(runtime.root),
             str(measurements),
             str(gpu_count),
+            *(["--measure"] if should_measure_operations else []),
         ],
         cwd=repo,
         start_new_session=True,
@@ -223,6 +230,17 @@ def test_authority_workload(tmp_path, monkeypatch, request):
             except (OSError, ValueError) as failure:
                 snapshot["observation_error"] = {"type": type(failure).__name__, "message": str(failure)}
             report["failure_tasks"].append(snapshot)
+        print(
+            "authority workload failure: "
+            + json.dumps(
+                {
+                    "failure": report["failure"],
+                    "stage_seen_seconds": report["stage_seen_seconds"],
+                    "tasks": report["failure_tasks"],
+                },
+                sort_keys=True,
+            )
+        )
         raise
     finally:
         for _cfg, _task, _marker, finish in cases:

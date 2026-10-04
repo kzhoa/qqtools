@@ -6,6 +6,7 @@ This changes observation only; it invokes the production control plane and runne
 
 from __future__ import annotations
 
+import argparse
 import fcntl
 import json
 import os
@@ -30,6 +31,9 @@ def pytest_addoption(parser):
     group.addoption("--authority-workload-profile", default="{}", help="JSON workload dimensions")
     group.addoption("--authority-workload-output", default=None, help="Raw workload report path")
     group.addoption("--authority-profile-startup", action="store_true", help="Observe real runner launch phases")
+    group.addoption(
+        "--authority-measure-operations", action="store_true", help="Sample individual filesystem and lock operations"
+    )
 
 
 class AgentMeasurements:
@@ -257,32 +261,42 @@ class AgentMeasurements:
 
 
 def main() -> None:
-    runtime, output, gpu_count = sys.argv[1:]
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("runtime", type=Path)
+    parser.add_argument("output", type=Path)
+    parser.add_argument("gpu_count", type=int)
+    parser.add_argument("--measure", action="store_true")
+    args = parser.parse_args()
     launch_calls = []
     if profile_root := os.environ.get("QEXP_TEST_STARTUP_PROFILE_ROOT"):
         from tests.helpers.qexp.startup_profile import install_launch_observer
 
         launch_calls = install_launch_observer(Path(profile_root))
-    measurements = AgentMeasurements()
-    measurements.install()
-    measurements.start()
+    measurements = AgentMeasurements() if args.measure else None
+    if measurements is not None:
+        measurements.install()
+        measurements.start()
     try:
-        run_machine_agent_loop(Path(runtime), available_gpus=list(range(int(gpu_count))), loop_interval=0.1)
+        run_machine_agent_loop(args.runtime, available_gpus=list(range(args.gpu_count)), loop_interval=0.1)
     finally:
-        measurements.stop()
-        with measurements.lock:
-            value = {
-                "operations": dict(measurements.operations),
-                "events": list(measurements.events),
-                "operation_samples": list(measurements.samples),
-                "operation_samples_dropped": measurements.samples_dropped,
-                "operation_sample_interval_seconds": 0.25,
-                "write_observations": list(measurements.writes),
-                "write_observations_dropped": measurements.writes_dropped,
-                "startup_import_seconds": IMPORT_FINISHED - IMPORT_STARTED,
-                "launch_calls": launch_calls,
-            }
-        Path(output).write_text(json.dumps(value, indent=2), encoding="utf-8")
+        value = {
+            "operations_instrumented": args.measure,
+            "startup_import_seconds": IMPORT_FINISHED - IMPORT_STARTED,
+            "launch_calls": launch_calls,
+        }
+        if measurements is not None:
+            measurements.stop()
+            with measurements.lock:
+                value.update(
+                    operations=dict(measurements.operations),
+                    events=list(measurements.events),
+                    operation_samples=list(measurements.samples),
+                    operation_samples_dropped=measurements.samples_dropped,
+                    operation_sample_interval_seconds=0.25,
+                    write_observations=list(measurements.writes),
+                    write_observations_dropped=measurements.writes_dropped,
+                )
+        args.output.write_text(json.dumps(value, indent=2), encoding="utf-8")
 
 
 if __name__ == "__main__":
