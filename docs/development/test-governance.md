@@ -152,6 +152,29 @@ and runs the release source profile against its exact SHA. That profile checks
 version and changelog consistency, compatibility and export contracts, static and
 governance rules, Unit, general Integration, the marked slow qpipeline/qexp
 real-training and LMDB process cases, and qexp Integration.
+In GitHub Actions, the partial `release-source` command runs metadata, static,
+Unit, general Integration, and slow process checks. It is not complete release
+evidence. Four independent ordinary qexp shards use two pytest workers each;
+two independent lifecycle shards execute serially. Each shard collects the full
+phase before deterministic partitioning, and lifecycle collection still checks
+the mandatory matrix. `Release preflight (Python 3.13)` succeeds only after source
+checks, all six shards, and exact-SHA aggregation pass. Aggregation requires
+identical full collections, disjoint complete partitions, and exactly one passed
+setup/call/teardown report per selected case; skipped or missing cases fail.
+
+The qexp 600-second budget is the UTC wall span from the first shard's pytest
+start to the last shard's completion, including collection and teardown, rather
+than the sum of overlapping shard durations. Per-shard monotonic duration checks
+reject inconsistent clock evidence; the 1200-second subprocess hard timeout
+still terminates a stuck process group. Runner setup is outside that span, but
+staggered test starts consume the budget. All test assertions and the 15-second
+foreground/two-second worker qualification bounds remain unchanged. Reports,
+full collection manifests, JUnit, and stdout/stderr diagnostics are retained for
+seven days even on failure. Rerun the entire workflow to produce a consistent set
+of artifacts for a new run attempt; partial reruns cannot reuse stale shards.
+Local `--profile release` and `qexp-integration` retain the complete sequential
+two-phase gate and its 600-second total budget.
+
 Tagged publishing separately runs `release-e2e` against the selected wheel before
 publication. These distinct gates cannot substitute for one another.
 

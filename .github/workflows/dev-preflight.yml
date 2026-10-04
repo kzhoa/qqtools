@@ -147,7 +147,7 @@ jobs:
       needs.select-evidence.outputs.reused != 'true' &&
       (needs.classify_profile.outputs.profile == 'release' ||
       needs.promotion-provenance.outputs.attested != 'true')
-    name: ${{ needs.classify_profile.outputs.profile == 'release' && 'Release preflight (Python 3.13)' || 'CPU-only preflight (Python 3.13)' }}
+    name: ${{ needs.classify_profile.outputs.profile == 'release' && 'Release source checks (Python 3.13)' || 'CPU-only preflight (Python 3.13)' }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
 
@@ -190,7 +190,7 @@ jobs:
           set -euo pipefail
           if [[ "$PROFILE" == "release" ]]; then
             python -m tox run -e preflight-ci -- \
-              --profile release \
+              --profile release-source \
               --release-base "$RELEASE_BASE" \
               --release-head "$RELEASE_HEAD" \
               --release-actor "$RELEASE_ACTOR"
@@ -198,9 +198,100 @@ jobs:
             python -m tox run -e preflight-ci -- --profile feature
           fi
 
+  qexp-shards:
+    needs: [classify_profile, select-evidence]
+    if: needs.classify_profile.outputs.profile == 'release' && needs.select-evidence.outputs.reused != 'true'
+    name: qexp ${{ matrix.phase }} shard ${{ matrix.index }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {phase: ordinary, index: 0}
+          - {phase: ordinary, index: 1}
+          - {phase: ordinary, index: 2}
+          - {phase: ordinary, index: 3}
+          - {phase: lifecycle, index: 0}
+          - {phase: lifecycle, index: 1}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: Install qexp test dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y tmux
+          python -m pip install tox==4.61.5
+      - name: Run complete phase shard
+        env:
+          PYTHONPATH: src
+          OMP_NUM_THREADS: "1"
+          MKL_NUM_THREADS: "1"
+          OPENBLAS_NUM_THREADS: "1"
+          NUMEXPR_NUM_THREADS: "1"
+          SHARD_PHASE: ${{ matrix.phase }}
+          SHARD_INDEX: ${{ matrix.index }}
+          SOURCE_SHA: ${{ github.sha }}
+        run: >-
+          python -m tox run -e qexp-shard --
+          --phase "$SHARD_PHASE" --index "$SHARD_INDEX" --sha "$SOURCE_SHA"
+      - name: Preserve shard evidence and failure diagnostics
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: qexp-${{ github.run_attempt }}-${{ matrix.phase }}-${{ matrix.index }}
+          path: qexp-shard-reports/
+          if-no-files-found: error
+          retention-days: 7
+
+  release-preflight:
+    if: >-
+      always() && needs.classify_profile.outputs.profile == 'release' &&
+      needs.select-evidence.outputs.reused != 'true'
+    needs: [classify_profile, select-evidence, preflight, qexp-shards]
+    name: Release preflight (Python 3.13)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: qexp-${{ github.run_attempt }}-*
+          path: qexp-shard-reports
+          merge-multiple: true
+      - name: Verify exact full coverage and parallel wall time
+        env:
+          SOURCE_SHA: ${{ github.sha }}
+        run: python -m scripts.ci.qexp_shards aggregate --sha "$SOURCE_SHA"
+      - name: Require source and every shard to succeed
+        if: always()
+        env:
+          SOURCE_RESULT: ${{ needs.preflight.result }}
+          SHARD_RESULT: ${{ needs.qexp-shards.result }}
+          EVIDENCE_RESULT: ${{ needs.select-evidence.result }}
+        run: |
+          [[ "$SOURCE_RESULT" == "success" ]] &&
+          [[ "$SHARD_RESULT" == "success" ]] &&
+          [[ "$EVIDENCE_RESULT" == "success" ]]
+      - name: Preserve aggregate evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: qexp-${{ github.run_attempt }}-summary
+          path: qexp-shard-reports/summary.json
+          if-no-files-found: error
+          retention-days: 7
+
   gate-result:
     if: always()
-    needs: [classify_profile, promotion-provenance, select-evidence, preflight]
+    needs: [classify_profile, promotion-provenance, select-evidence, preflight, release-preflight]
     runs-on: ubuntu-latest
     steps:
       - name: Require successful evidence or fresh gates
@@ -211,7 +302,7 @@ jobs:
           REUSED: ${{ needs.select-evidence.outputs.reused }}
           PROFILE: ${{ needs.classify_profile.outputs.profile }}
           ATTESTED: ${{ needs.promotion-provenance.outputs.attested }}
-          FRESH_RESULTS: ${{ needs.preflight.result }}
+          FRESH_RESULTS: ${{ needs.classify_profile.outputs.profile == 'release' && needs.release-preflight.result || needs.preflight.result }}
         run: |
           set -euo pipefail
           [[ "$CLASSIFICATION_RESULT" == "success" ]] || exit 1

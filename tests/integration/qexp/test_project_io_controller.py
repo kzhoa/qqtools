@@ -1771,6 +1771,58 @@ def test_ready_index_inactive_observation_resumes_later_bounded_repair(tmp_path:
     executor.shutdown()
 
 
+@pytest.mark.parametrize("admission_role", ["primary", "borrow"])
+@pytest.mark.parametrize("lane", ["gpu", "cpu"])
+def test_isolated_dispatch_drains_finished_observation_after_capacity_disappears(
+    tmp_path: Path, admission_role: str, lane: str
+) -> None:
+    runtime = MachineRuntime(tmp_path / "machine")
+    initialize_machine(runtime, "gpu-1")
+    _cfg, binding, revision, bindings = _registered(tmp_path, "project", runtime)
+    executor = ProjectIOExecutor(runtime)
+    executor.begin_epoch()
+    controller = ProjectIOController(runtime, executor)
+    runtime.project_io_executor = executor
+    runtime.project_io_controller = controller
+    try:
+        _advance_until_validated(controller, bindings, revision, binding.project_id)
+        _observe_working_set_activation(runtime, controller, bindings, revision)
+        request = executor.prepare_scheduler_observe(
+            binding,
+            revision,
+            lane=lane,
+            admission_role=admission_role,
+            cursor_namespace=f"scheduler-{binding.project_id}-{admission_role}-{lane}",
+        )
+        assert executor.start(request.request_id) is not None
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            status = executor.poll()
+            if executor.load_result(request.request_id) is not None and status["active_worker_count"] == 0:
+                break
+            time.sleep(0.02)
+        else:
+            raise AssertionError("observation did not finish")
+        # Capacity may be consumed by another binding before this result is
+        # applied. Its owner slot must still become available to other lanes.
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            dispatch_machine_cycle_locked(runtime, available_gpus=[], publish_snapshots=False)
+            pending = executor.unresolved_requests()
+            if all(item.request_id != request.request_id for item in pending):
+                break
+            time.sleep(0.02)
+        else:
+            raise AssertionError("completed observation retained its owner without launch capacity")
+        assert all(item.operation_kind != "scheduler_observe" for item in pending)
+        assert active_reservations(runtime.root) == []
+    finally:
+        coordinator = getattr(runtime, "attempt_supervision_coordinator", None)
+        if coordinator is not None:
+            coordinator.close()
+        executor.shutdown()
+
+
 def test_isolated_dispatch_does_not_start_ready_build_without_capacity(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -4546,6 +4598,9 @@ def test_blocked_scheduler_observation_does_not_delay_healthy_peer(tmp_path: Pat
     assert blocked.project_id not in observations
     assert observations[healthy.project_id]["outcome"] == "candidate"
     assert observations[healthy.project_id]["candidate"]["task_id"] == healthy_task.task_id
+    assert executor.status_view()["active_worker_count"] == 1
+    controller.discard_scheduler_observations(lane="gpu")
+    assert any(request.project_id == blocked.project_id for request in executor.unresolved_requests())
     assert executor.status_view()["active_worker_count"] == 1
     replayed = controller.advance_scheduler_observations(
         bindings,

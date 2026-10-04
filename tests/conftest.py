@@ -32,9 +32,23 @@ def pytest_addoption(parser):
     )
     parser.addoption("--qexp-collection-manifest", type=Path)
     parser.addoption("--qexp-timing-json", type=Path)
+    parser.addoption("--qexp-shard", help="Zero-based shard index/count")
+    parser.addoption("--qexp-shard-directory", type=Path)
 
 
 def pytest_configure(config):
+    shard = config.getoption("--qexp-shard")
+    if shard is not None:
+        from tests.helpers.qexp.sharding import CollectionShard
+
+        try:
+            index, count = map(int, shard.split("/"))
+        except ValueError as exc:
+            raise pytest.UsageError("--qexp-shard must be index/count") from exc
+        directory = config.getoption("--qexp-shard-directory")
+        if directory is None:
+            raise pytest.UsageError("--qexp-shard requires --qexp-shard-directory")
+        config.pluginmanager.register(CollectionShard(config, index, count, directory), "qexp-shard")
     if config.getoption("--lifecycle-gate"):
         config.pluginmanager.register(_LifecycleGate(config), "qexp-lifecycle-gate")
     manifest = config.getoption("--qexp-collection-manifest")
@@ -177,7 +191,13 @@ class _LifecycleGate:
             required_names = self.representative_names
         else:
             required_names = self.full_names
-        missing = sorted(required_names - {item.name for item in items})
+        full_collection = getattr(getattr(session, "config", None), "_qexp_full_collection", None)
+        collected_names = (
+            {nodeid.rsplit("::", 1)[-1] for nodeid in full_collection}
+            if full_collection is not None
+            else {item.name for item in items}
+        )
+        missing = sorted(required_names - collected_names)
         if missing:
             raise pytest.UsageError("Missing lifecycle gate cases: " + ", ".join(missing))
         self.required = {item.nodeid for item in items}

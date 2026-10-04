@@ -706,6 +706,20 @@ class ProjectIOController:
                 continue
 
     @_admission_operation
+    def discard_scheduler_observations(self, *, lane: str) -> None:
+        """Free finished observation owners when the lane has no launch capacity."""
+        if lane not in {"gpu", "cpu"}:
+            raise ValueError("lane must be 'gpu' or 'cpu'.")
+        for request in self.executor.unresolved_requests():
+            if request.operation_kind != "scheduler_observe" or request.parameters["lane"] != lane:
+                continue
+            # Observation cannot grant authority or advance the durable cursor.
+            # consume retains live/ambiguous workers and verifies exact identity;
+            # a future capacity window can rediscover the same ready position.
+            if self.executor.consume(request.request_id, request) is not None:
+                self._started_requests.discard(request.request_id)
+
+    @_admission_operation
     def advance_scheduler_observations(
         self,
         bindings: Sequence[ProjectBinding],

@@ -21,6 +21,7 @@ from qqtools.plugins.qexp.agent.lifecycle import (
     start_machine_agent,
     stop_machine_agent,
 )
+from qqtools.plugins.qexp.agent.project_io_executor import ProjectIOExecutor
 from qqtools.plugins.qexp.layout import machine_state_path
 from qqtools.plugins.qexp.runtime.paths import attempt_path, local_paths, machine_runtime_paths, shared_paths
 from qqtools.plugins.qexp.runtime.project_activation import publish_project_activation
@@ -31,6 +32,7 @@ from qqtools.plugins.qexp.runtime.tasks import load_task
 from qqtools.plugins.qexp.scheduler import expire_claim
 from qqtools.plugins.qexp.tmux import is_libtmux_available
 from tests.helpers.qexp.lifecycle import LifecycleBranch, LifecycleLab, wait_all
+from tests.helpers.qexp.worker_diagnostics import describe_project_io_workers
 
 pytestmark = [pytest.mark.integration, pytest.mark.machine_lab]
 
@@ -470,6 +472,7 @@ run_machine_agent_loop(root, available_gpus=[0])
             lambda: blocked_ids.issubset(held_project_ids()),
             timeout=30,
             description="two held qualification workers",
+            on_timeout=lambda: describe_project_io_workers(ProjectIOExecutor(runtime)),
         )
         background_arm.touch()
         _wait_for(

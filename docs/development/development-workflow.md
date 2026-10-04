@@ -120,7 +120,10 @@ of rebuilding and retesting the same commit.
 Reuse accepts only `kzhoa`-requested and `kzhoa`-rerun executions on `dev`, created
 within the last 24 hours, for the identical commit SHA. Feature and release source
 evidence are distinct jobs in `dev-preflight.yml`; a release accepts only a
-completed release-profile job. An attested feature promotion whose duplicate job
+completed `Release preflight (Python 3.13)` aggregate job. Its source checks,
+six qexp shards, full-coverage reconciliation, and parallel 600-second wall-time
+check must all pass; `Release source checks` alone is not reusable evidence.
+See [test governance](test-governance.md) for shard and report semantics. An attested feature promotion whose duplicate job
 was skipped is not release evidence. Artifact evidence comes from
 `repository-governance.yml` release dispatches and must include the Python 3.12
 and 3.14 smoke jobs and the Python 3.13 installed E2E job. Evidence jobs must finish

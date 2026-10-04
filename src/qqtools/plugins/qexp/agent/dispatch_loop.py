@@ -1676,6 +1676,11 @@ def _dispatch_isolated_machine_cycle(
             if ordered_bindings:
                 primary_unknown = True
         lane_has_capacity = bool(free_gpu_ids) if lane == "gpu" else free_cpu_slots > 0
+        if not lane_has_capacity:
+            try:
+                controller.discard_scheduler_observations(lane=lane)
+            except (OSError, RuntimeError, ValueError, KeyError, TypeError, AttributeError):
+                runtime.last_cycle_had_demand = True
         if lane_has_capacity and ordered_bindings:
             try:
                 observations = dict(

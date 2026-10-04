@@ -1796,6 +1796,14 @@ unclaimable evidence is released back to discovery; the shared ready marker,
 not the cache entry, remains authoritative. This rotation cannot grant claim or
 borrow authority by itself.
 
+A loss of local GPU or CPU launch capacity does not retain finished scheduler
+observation requests. The controller reclaims exact completed observations even
+when that lane cannot admit new work, freeing the Project owner for supervision
+and background services. Reclamation grants no claim or launch authority and
+does not advance the shared ready cursor; later capacity rediscoveries use the
+same durable position. Live, ambiguous, or identity-unverified workers retain
+their transport ownership until the existing exact-exit rules permit consumption.
+
 Latency accounting includes slot wait, all dependent worker invocations (including startup and
 exit), result consumption, intervening grants, and successor wakeups. The
 [product latency qualification](qexp_product_spec.md#blocking-project-io-isolation) requires both

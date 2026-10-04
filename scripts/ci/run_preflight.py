@@ -96,7 +96,12 @@ def check_prerequisites() -> str | None:
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--profile", choices=("feature", "release"), default="feature")
+    parser.add_argument(
+        "--profile",
+        choices=("feature", "release", "release-source"),
+        default="feature",
+        help="release-source is partial CI validation and requires the separate qexp shard aggregate",
+    )
     parser.add_argument("--release-base")
     parser.add_argument("--release-head")
     parser.add_argument("--release-actor")
@@ -113,7 +118,7 @@ def _commands(
         return COMMANDS
     if not all((release_base, release_head, release_actor)):
         _parser().error("--profile release requires --release-base, --release-head, and --release-actor")
-    return (
+    source_commands = (
         (
             PYTHON,
             "scripts/checks/check_release_commit.py",
@@ -127,6 +132,11 @@ def _commands(
         ),
         *COMMON_COMMANDS,
         (PYTHON, "-m", "pytest", *RELEASE_SLOW_INTEGRATION_NODES, "-q", "--durations=20"),
+    )
+    if profile == "release-source":
+        return source_commands
+    return (
+        *source_commands,
         (
             PYTHON,
             "scripts/qexp_integration_gate.py",

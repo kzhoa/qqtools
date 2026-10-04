@@ -116,3 +116,15 @@ def test_lifecycle_gate_leaves_xdist_worker_exit_status_to_controller():
     gate.pytest_sessionfinish(session, 0)
 
     assert session.exitstatus == 0
+
+
+def test_lifecycle_shard_validates_full_matrix_before_requiring_selected_cases():
+    gate, session = _gate()
+    all_ids = [item.nodeid for item in session.items]
+    session.config = SimpleNamespace(_qexp_full_collection=all_ids)
+    session.items = session.items[::2]
+    gate.pytest_collection_finish(session)
+    assert gate.required == {item.nodeid for item in session.items}
+    session.config._qexp_full_collection = all_ids[:-1]
+    with pytest.raises(pytest.UsageError, match="Missing lifecycle gate cases"):
+        gate.pytest_collection_finish(session)
