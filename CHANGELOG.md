@@ -4,6 +4,11 @@
 
 ## v1.3.23
 
+- fix: keep eligible qexp Tasks discoverable after concurrent ready-index or Task changes,
+  and replay the same launch authorization when a Project binding needs revalidation.
+- fix: retain qexp agent identity before reporting active status so an immediate crash remains
+  diagnosable after restart.
+- perf: avoid unrelated service imports in fresh qexp Project I/O workers.
 - fix: recover qexp Project I/O after interrupted atomic writes without treating uncommitted
   temporary files as authoritative records or consuming executor capacity.
 - feat: isolate blocking qexp Project I/O in a bounded worker pool and retain exact recovery
