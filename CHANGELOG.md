@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## v1.3.25
+
+- compat: defer the final purge of the 1.3.22 machine-enrollment and notification
+  transitions to 1.3.26 so the urgent 1.3.25 repair keeps existing recovery paths.
 - fix: stream valid qexp bulk Submission sources larger than the 64 KiB
   direct-read boundary during Group-service activation, with revision-bound
   restart checkpoints and automatic recovery from the released size failure.
