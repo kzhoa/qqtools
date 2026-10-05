@@ -75,7 +75,7 @@ def test_installed_wheel_cli_flow(tmp_path):
         assert task["task"]["group_name"] == "release-e2e"
         assert task["observation"]["tmux_override"] == "disabled"
         assert any(item["task_id"] == task_id for item in tasks)
-        assert any(item["group"]["name"] == "release-e2e" for item in groups)
+        assert any(item["group"]["name"] == "release-e2e" for item in groups["items"])
         assert any(item["machine"]["machine_name"] == "gpu-1" for item in machines)
         assert "cli ok" in followed.stdout
     finally:
