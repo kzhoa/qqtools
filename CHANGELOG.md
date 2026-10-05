@@ -13,7 +13,8 @@
   enrollment-CLI, and notification-policy compatibility transitions.
 - ci: align the qexp lifecycle release gate with the machine-global residency
   cases used after the compatibility purge, and initialize release integration
-  fixtures through the canonical machine setup and Project enrollment paths.
+  fixtures through the canonical machine setup and Project enrollment paths,
+  including paginated CLI artifact output.
 
 ## v1.3.25
 
