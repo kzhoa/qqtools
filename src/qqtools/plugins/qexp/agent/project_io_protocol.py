@@ -706,6 +706,81 @@ def _validate_offer(value: object) -> dict[str, Any]:
     return offer
 
 
+def _validate_timeout_retirement(value: object, parameters: Mapping[str, Any]) -> dict[str, Any]:
+    retirement = dict(_require_mapping(value, "authority_termination_commit.retirement"))
+    required = frozenset(
+        {
+            "receipt_version",
+            "operation",
+            "operation_id",
+            "decision_id",
+            "decision_digest",
+            "task_id",
+            "attempt_id",
+            "attempt_number",
+            "fencing_token",
+            "machine_name",
+            "process_identity",
+            "source_state",
+            "source_shared_commitment",
+            "source_authority_outcome",
+            "source_reason",
+            "state",
+            "delivery",
+            "shared_receipt",
+            "created_at",
+            "updated_at",
+            "marker",
+        }
+    )
+    _require_exact_keys(retirement, required, "authority_termination_commit.retirement")
+    if retirement["receipt_version"] != 1 or retirement["operation"] != "timeout_decision_retirement":
+        raise ValueError("timeout retirement receipt identity is invalid.")
+    if retirement["marker"] != "QQTOOLS-COMPAT-0022":
+        raise ValueError("timeout retirement compatibility marker is invalid.")
+    if retirement["state"] not in {"suppressed", "shared_reconciled", "retired"}:
+        raise ValueError("timeout retirement state is invalid.")
+    if retirement["delivery"] not in {"not_attempted", "unknown"}:
+        raise ValueError("timeout retirement delivery state is invalid.")
+    for field in ("task_id", "attempt_id", "machine_name"):
+        retirement[field] = _require_identifier(retirement[field], f"retirement.{field}")
+    retirement["decision_id"] = _require_identifier(retirement["decision_id"], "retirement.decision_id")
+    for field in ("decision_digest", "operation_id"):
+        if not isinstance(retirement[field], str) or not _SHA256_DIGEST.fullmatch(retirement[field]):
+            raise ValueError(f"retirement.{field} must be a SHA-256 digest.")
+    retirement["attempt_number"] = _require_nonnegative_int(
+        retirement["attempt_number"], "retirement.attempt_number", positive=True
+    )
+    retirement["fencing_token"] = _require_nonnegative_int(
+        retirement["fencing_token"], "retirement.fencing_token", positive=True
+    )
+    if retirement["task_id"] != parameters["task_id"] or retirement["attempt_id"] != parameters["attempt_id"]:
+        raise ValueError("timeout retirement Attempt identity differs from its request.")
+    if (
+        retirement["attempt_number"] != parameters["attempt_number"]
+        or retirement["fencing_token"] != parameters["fencing_token"]
+        or retirement["machine_name"] != parameters["machine_name"]
+    ):
+        raise ValueError("timeout retirement authority identity differs from its request.")
+    retirement["process_identity"] = _validate_supervised_process_identity(
+        retirement["process_identity"], "retirement.process_identity"
+    )
+    if retirement["process_identity"] != parameters["process_identity"]:
+        raise ValueError("timeout retirement process identity differs from its request.")
+    if retirement["source_authority_outcome"] != "holder_safe_deadline_elapsed":
+        raise ValueError("timeout retirement source outcome is invalid.")
+    if retirement["source_reason"] != "holder_safe_deadline_elapsed":
+        raise ValueError("timeout retirement source reason is invalid.")
+    for field in ("source_state", "source_shared_commitment"):
+        if not isinstance(retirement[field], str):
+            raise ValueError(f"retirement.{field} must be text.")
+    if retirement["shared_receipt"] is not None:
+        retirement["shared_receipt"] = _bounded_json_value(retirement["shared_receipt"], "retirement.shared_receipt")
+    retirement["created_at"] = _require_timestamp(retirement["created_at"], "retirement.created_at")
+    retirement["updated_at"] = _require_timestamp(retirement["updated_at"], "retirement.updated_at")
+    return retirement
+
+
 def _request_parameters(operation_kind: str, value: object) -> dict[str, Any]:
     parameters = dict(_require_mapping(value, f"{operation_kind} parameters"))
     if operation_kind == "validate_binding":
@@ -942,25 +1017,23 @@ def _request_parameters(operation_kind: str, value: object) -> dict[str, Any]:
             raise ValueError("authority_orphan_recovery binding_signature is invalid.")
         parameters["binding_signature"] = list(signature)
     elif operation_kind == "authority_termination_commit":
-        _require_exact_keys(
-            parameters,
-            frozenset(
-                {
-                    "machine_name",
-                    "task_id",
-                    "attempt_id",
-                    "attempt_number",
-                    "fencing_token",
-                    "reservation_id",
-                    "decision_id",
-                    "decision_token",
-                    "authority_outcome",
-                    "reason",
-                    "process_identity",
-                }
-            ),
-            "authority_termination_commit parameters",
+        required = frozenset(
+            {
+                "machine_name",
+                "task_id",
+                "attempt_id",
+                "attempt_number",
+                "fencing_token",
+                "reservation_id",
+                "decision_id",
+                "decision_token",
+                "authority_outcome",
+                "reason",
+                "process_identity",
+            }
         )
+        if set(parameters) not in (required, required | {"retirement"}):
+            raise ValueError("authority_termination_commit parameters contain unknown fields.")
         parameters["machine_name"] = _require_identifier(parameters["machine_name"], "machine_name")
         parameters["task_id"] = _require_identifier(parameters["task_id"], "task_id")
         parameters["attempt_id"] = _require_identifier(parameters["attempt_id"], "attempt_id")
@@ -988,6 +1061,8 @@ def _request_parameters(operation_kind: str, value: object) -> dict[str, Any]:
         parameters["process_identity"] = _validate_supervised_process_identity(
             parameters["process_identity"], "authority_termination_commit process_identity"
         )
+        if "retirement" in parameters:
+            parameters["retirement"] = _validate_timeout_retirement(parameters["retirement"], parameters)
     elif operation_kind == "authority_terminal_observe":
         _require_exact_keys(
             parameters,
@@ -2691,33 +2766,31 @@ def _validate_evidence(request: ProjectIORequest, status: str, value: Mapping[st
             evidence["source_revisions"] = source
             evidence["committed_revisions"] = committed
         elif request.operation_kind == "authority_termination_commit":
-            _require_exact_keys(
-                evidence,
-                frozenset(
-                    {
-                        "outcome",
-                        "reason",
-                        "machine_name",
-                        "task_id",
-                        "attempt_id",
-                        "attempt_number",
-                        "fencing_token",
-                        "reservation_id",
-                        "decision_id",
-                        "decision_token",
-                        "authority_outcome",
-                        "decision_reason",
-                        "process_identity",
-                        "source_revisions",
-                        "committed_revisions",
-                        "shared_commitment",
-                        "authority_granted",
-                        "local_effects",
-                    }
-                ),
-                "authority_termination_commit evidence",
-            )
             parameters = request.parameters
+            required = frozenset(
+                {
+                    "outcome",
+                    "reason",
+                    "machine_name",
+                    "task_id",
+                    "attempt_id",
+                    "attempt_number",
+                    "fencing_token",
+                    "reservation_id",
+                    "decision_id",
+                    "decision_token",
+                    "authority_outcome",
+                    "decision_reason",
+                    "process_identity",
+                    "source_revisions",
+                    "committed_revisions",
+                    "shared_commitment",
+                    "authority_granted",
+                    "local_effects",
+                }
+            )
+            expected = required | {"retirement_receipt"} if "retirement" in parameters else required
+            _require_exact_keys(evidence, expected, "authority_termination_commit evidence")
             for field in (
                 "machine_name",
                 "task_id",
@@ -2756,6 +2829,11 @@ def _validate_evidence(request: ProjectIORequest, status: str, value: Mapping[st
                 raise ValueError("termination commit cannot grant reusable authority.")
             if type(evidence["local_effects"]) is not list or evidence["local_effects"]:
                 raise ValueError("termination commit cannot return local effects.")
+            if "retirement" in parameters:
+                retirement = _validate_timeout_retirement(evidence["retirement_receipt"], parameters)
+                if retirement["operation_id"] != parameters["retirement"]["operation_id"]:
+                    raise ValueError("timeout retirement evidence differs from its request.")
+                evidence["retirement_receipt"] = retirement
             evidence["committed_revisions"] = committed
         elif request.operation_kind == "authority_terminal_observe":
             _require_exact_keys(
@@ -2810,7 +2888,7 @@ def _validate_evidence(request: ProjectIORequest, status: str, value: Mapping[st
                 raise ValueError("authority_terminal_observe cancel_requested must be a boolean.")
             outcome = evidence["outcome"]
             reason = evidence["reason"]
-            if outcome not in {"current", "already_terminal", "settled_terminal", "stale"}:
+            if outcome not in {"current", "historical_current", "already_terminal", "settled_terminal", "stale"}:
                 raise ValueError("authority_terminal_observe outcome is invalid.")
             if (outcome == "stale" and reason not in _PROJECT_IO_STALE_REASONS) or (
                 outcome != "stale" and reason is not None
@@ -2844,7 +2922,7 @@ def _validate_evidence(request: ProjectIORequest, status: str, value: Mapping[st
             revisions = _validate_observed_authority_revisions(
                 evidence["source_revisions"], "authority_terminal_observe.source_revisions"
             )
-            if outcome in {"current", "settled_terminal"} and (
+            if outcome in {"current", "historical_current", "settled_terminal"} and (
                 revisions["task"] is None or revisions["attempt_digest"] is None
             ):
                 raise ValueError(f"{outcome} terminal observation requires exact source revisions.")
@@ -2928,7 +3006,13 @@ def _validate_evidence(request: ProjectIORequest, status: str, value: Mapping[st
                 raise ValueError("authority_terminal_publish source revisions differ from its request.")
             outcome = evidence["outcome"]
             reason = evidence["reason"]
-            if outcome not in {"committed", "already_committed", "stale"}:
+            if outcome not in {
+                "committed",
+                "already_committed",
+                "historical_committed",
+                "historical_already_committed",
+                "stale",
+            }:
                 raise ValueError("authority_terminal_publish outcome is invalid.")
             if (outcome == "stale" and reason not in _PROJECT_IO_STALE_REASONS) or (
                 outcome != "stale" and reason is not None
@@ -2940,7 +3024,12 @@ def _validate_evidence(request: ProjectIORequest, status: str, value: Mapping[st
             if outcome != "stale" and (committed["task"] is None or committed["attempt_digest"] is None):
                 raise ValueError("committed terminal publication requires exact revisions.")
             event = evidence["lifecycle_event"]
-            if outcome != "stale" and event is None:
+            historical = outcome in {"historical_committed", "historical_already_committed"}
+            if historical and (
+                parameters["mode"] != "active" or parameters["termination_result"] is not None or event is not None
+            ):
+                raise ValueError("historical terminal publication cannot finalize Task lifecycle.")
+            if outcome != "stale" and not historical and event is None:
                 raise ValueError("committed terminal publication requires a lifecycle event.")
             if event is not None:
                 event = _validate_terminal_lifecycle_event(event, "authority_terminal_publish.lifecycle_event")

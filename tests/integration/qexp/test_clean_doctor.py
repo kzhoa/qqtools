@@ -31,6 +31,7 @@ from qqtools.plugins.qexp.scheduler import (
     fail_attempt,
     reconcile_running_tasks,
 )
+from tests.fixtures.qexp_legacy_ownership import persist_legacy_orphan
 
 pytestmark = [pytest.mark.integration, pytest.mark.qexp_fast_io]
 
@@ -751,7 +752,7 @@ def test_repair_orphan_keeps_blocked_on_unknown_identity(tmp_path: Path, monkeyp
             }
         },
     )
-    assert expire_claim(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token)
+    persist_legacy_orphan(cfg, task.task_id)
     if evidence_reason != "identity_mismatch":
         evidence = ProcessEvidence(state="unknown", reason=evidence_reason)
         monkeypatch.setattr("qqtools.plugins.qexp.scheduler.inspect_group_identity", lambda *_args: evidence)
@@ -790,7 +791,7 @@ def test_repair_orphan_finalizes_identity_matched_absent_process(tmp_path: Path,
             }
         },
     )
-    assert expire_claim(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token)
+    persist_legacy_orphan(cfg, task.task_id)
     monkeypatch.setattr(
         "qqtools.plugins.qexp.doctor.inspect_group_identity",
         lambda *_args: ProcessEvidence(state="absent"),

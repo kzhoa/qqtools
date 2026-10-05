@@ -44,18 +44,34 @@ def actor(root: Path, action: str, task_id: str | None) -> dict:
     from qqtools.plugins.qexp import init_shared_root, observer
     from qqtools.plugins.qexp.agent.context import MachineRuntime
     from qqtools.plugins.qexp.agent.lifecycle import start_machine_agent, stop_machine_agent
+    from qqtools.plugins.qexp.agent.setup import initialize_machine, register_projects
     from qqtools.plugins.qexp.commands.cleanup import clean
     from qqtools.plugins.qexp.config_types import RootConfig
+    from qqtools.plugins.qexp.lease import LeasePolicy, save_lease_policy
     from qqtools.plugins.qexp.progress_policy import set_progress_policy
     from qqtools.plugins.qexp.runtime.submission import submit_specs
 
     runtime = MachineRuntime(root / "machine")
-    if action == "setup":
+    if action in {"setup", "setup-short"}:
         cfg = init_shared_root(root / ".qexp", "rollout-machine", runtime_root=root / "local")
+        if not runtime.has_identity:
+            initialize_machine(runtime, cfg.machine_name, agent_mode="daemon")
+        register_projects(runtime, [cfg.shared_root], machine_name=cfg.machine_name)
         binding = runtime.ensure_binding(cfg.shared_root, cfg.machine_name)[0]
         runtime_root = runtime.project_paths(binding.project_id)["root"]
         (root / "runtime-root").write_text(str(runtime_root))
         set_progress_policy(cfg.shared_root, 1)
+        if action == "setup-short":
+            save_lease_policy(
+                cfg,
+                LeasePolicy(
+                    ttl_seconds=13,
+                    renew_interval_seconds=1.5,
+                    retry_initial_seconds=0.25,
+                    retry_max_seconds=1.0,
+                    renewal_commit_margin_seconds=2.0,
+                ),
+            )
         return {"source": observer.__file__}
     cfg = RootConfig(root / ".qexp", root, "rollout-machine", Path((root / "runtime-root").read_text()))
     if action == "start":
@@ -79,6 +95,25 @@ def actor(root: Path, action: str, task_id: str | None) -> dict:
         return {"task_id": task.task_id}
     if action == "show":
         return observer.inspect_task(cfg, task_id)
+    if action == "probe-durable":
+        from qqtools.plugins.qexp.runtime.paths import attempt_path
+        from qqtools.plugins.qexp.runtime.store import read_json
+        from qqtools.plugins.qexp.runtime.tasks import load_task
+        from qqtools.plugins.qexp.scheduler import expire_claim, renew_attempt_lease
+
+        task = load_task(cfg, task_id)
+        claim = task.claim_control["active_claim"]
+        path = attempt_path(cfg.shared_root, task_id, claim["attempt_number"])
+        before = read_json(path)
+        assert claim["authority_mode"] == "holder_bound"
+        renewal = renew_attempt_lease(cfg, task_id, claim["attempt_id"], claim["fencing_token"])
+        assert renewal.outcome.value == "not_required"
+        assert not expire_claim(
+            cfg, task_id, claim["attempt_id"], claim["fencing_token"], reservation_runtime_root=runtime.root
+        )
+        assert read_json(path) == before
+        assert load_task(cfg, task_id).claim_control["active_claim"] == claim
+        return {"source": observer.__file__, "renewal": renewal.outcome.value, "expiry_rejected": True}
     if action in {"clean", "clean-running"}:
         try:
             return clean(cfg, task_id=task_id, reservation_runtime_root=runtime.root)
@@ -192,16 +227,22 @@ def qualify(output: Path, ref: str, scenario: str = "rollout") -> None:
     try:
         original = None
         original_attempt = None
-        if scenario == "rollout":
-            setup = call("old", "setup")
+        if scenario in {"rollout", "durable"}:
+            setup = call("old", "setup-short")
             assert str(old) in setup["source"], setup
             old_task = call("old", "submit-old")["task_id"]
             call("old", "start")
             original = wait(lambda: started("submit-old"), "released workload start")
-            assert original["v3"] is None and str(old) in original["source"]
+            assert str(old) in original["source"]
+            if scenario == "rollout":
+                assert original["v3"] is None
             before = wait(lambda: snapshot("old", old_task), "released v2 report")
             original_attempt = before["task"]["attempt_control"]["current_attempt_id"]
             call("old", "stop")
+            os.kill(original["pid"], 0)
+            # Outlive the released source's valid short execution lease. The candidate must
+            # preserve this exact process and Attempt without a timeout signal or replacement.
+            time.sleep(15)
             os.kill(original["pid"], 0)
             call("new", "start")
             restarted_at = datetime.now(timezone.utc)
@@ -209,7 +250,18 @@ def qualify(output: Path, ref: str, scenario: str = "rollout") -> None:
             assert after["task"]["attempt_control"]["current_attempt_id"] == original_attempt
             assert started("submit-old") == original
             os.kill(original["pid"], 0)
-            assert after["progress_scoped"]["status"] != "available"
+            wait(
+                lambda: (
+                    call("new", "show", old_task)["task"]["claim_control"]["active_claim"]["authority_mode"]
+                    == "holder_bound"
+                ),
+                "legacy durable ownership adoption",
+            )
+            call("old", "probe-durable", old_task)
+            decision_root = Path((output / "runtime-root").read_text()) / "termination-decisions" / original_attempt
+            assert not decision_root.exists() or not any(decision_root.glob("*.json"))
+            if scenario == "rollout":
+                assert after["progress_scoped"]["status"] != "available"
 
             def continued_reporting():
                 view = snapshot("new", old_task)
@@ -257,7 +309,7 @@ def qualify(output: Path, ref: str, scenario: str = "rollout") -> None:
         assert cleaned["operations"][new_task]["state"] == "completed", cleaned
         # Old cleanup can leave unknown advisory sidecars, but cannot resurrect truth.
         assert not (output / ".qexp/tasks" / f"{new_task}.json").exists()
-        if scenario == "rollout":
+        if scenario in {"rollout", "durable"}:
             # Completion while the agent is offline exercises separate recovery proof.
             call("new", "stop")
             (output / "submit-old/release").touch()
@@ -283,10 +335,11 @@ def qualify(output: Path, ref: str, scenario: str = "rollout") -> None:
                 [
                     "released-import provenance",
                     "same-PID same-Attempt rolling agent restart",
+                    "TTL=13 agent outage beyond last lease expiry without signal",
                     "continued v1/v2 old producer",
                     "offline completion recovery",
                 ]
-                if scenario == "rollout"
+                if scenario in {"rollout", "durable"}
                 else []
             )
             + [
@@ -318,7 +371,7 @@ if __name__ == "__main__":
     else:
         parser = argparse.ArgumentParser(description=__doc__)
         parser.add_argument("--ref", required=True)
-        parser.add_argument("--scenario", choices=("rollout", "new-attempt"), default="rollout")
+        parser.add_argument("--scenario", choices=("rollout", "new-attempt", "durable"), default="rollout")
         parser.add_argument("--output", type=Path, required=True)
         args = parser.parse_args()
         qualify(args.output.resolve(), args.ref, args.scenario)

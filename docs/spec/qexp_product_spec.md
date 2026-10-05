@@ -418,7 +418,8 @@ and conflicting side effects. qexp must distinguish:
 - a running Attempt whose process state is unknown
 
 Only the first two may be automatically returned to schedulable work under defined rules.
-An ambiguously running Attempt becomes orphaned and blocks automatic retry.
+An ambiguously running durable Attempt retains ownership and blocks automatic retry. Historical
+`orphaned` records from supported older sources remain readable and recoverable.
 
 ## 5. Product Goals
 
@@ -1323,41 +1324,36 @@ For a private Task:
 If the agent disappears before process launch, recovery may safely release the expired
 claim after verifying no process started.
 
-For a running Attempt, heartbeat staleness and lease expiry have different meanings:
-
-- while the heartbeat is stale but the Attempt lease remains valid, keep the Attempt
-  running and show an explicit stale-machine warning
-- when the lease expires, archive the claim as expired with its fencing token preserved,
-  mark the Attempt orphaned, and project the Task as blocked
-- do not change the Task to `queued_home` or `queued_shared`
+For a launch-authorized Attempt, heartbeat staleness and old lease timestamps describe
+observation freshness only. They never revoke execution ownership, authorize a signal, release
+the reservation, or permit a replacement. Keep the same Attempt and durable claim, show an
+explicit stale-supervision warning, and reconcile its exact process or exit evidence when the
+owning agent returns. Only a `claimed` pre-launch lease may expire automatically after qexp proves
+that no process was authorized to start.
 
 Schema-6 treats an individual renewal I/O failure as a visible `suspect` condition, not as
 an immediate task failure. The running process and its GPUs remain reserved while qexp
-retries within the authoritative lease. Users can inspect lease diagnostics and any pending
+retries supervision without imposing an execution deadline. Users can inspect diagnostics and any pending
 termination reconciliation through `qexp admin check --project PATH`.
 
-The shared default lease policy is 120 seconds with a 10 second renewal interval. Long
-training may use a larger authoritative TTL after a maintenance-window policy change. A holder
-that loses shared storage does not use a runner-local grace period or auto-terminate at TTL:
-its agent retains the process and reservation in `isolated` state until shared authority is
-available again. Quarantine remains disabled.
+The shared default lease policy remains available for revocable pre-launch coordination and
+supported legacy records. At the launch authorization commit, execution ownership becomes
+`holder_bound`; it has no active lease or renewal deadline. A holder that loses shared storage
+retains the process and reservation in `isolated` state until shared authority is available again.
+Quarantine remains disabled.
 
-The resulting state is:
+qexp must not automatically start a replacement. For legacy records already made `orphaned`, the
+ordinary `qexp task retry <task-id>` contract remains available without an additional flag. For a
+current durable `starting` or `running` Attempt, the explicit operator escape hatch is:
 
-```text
-Attempt: running -> orphaned
-Task: running -> blocked
+```bash
+qexp task retry <task-id> --supersede-attempt <attempt-id>
 ```
 
-qexp must not automatically start a replacement. An ordinary `qexp task retry <task-id>`
-is the explicit operator decision for an unclaimed `blocked` Task whose current Attempt is
-`orphaned`; it supersedes qexp authority for the old Attempt without confirming that its process
-stopped or requiring an additional duplicate-risk flag. `orphaned` remains a recoverable
-uncertainty state, not proof that the process terminated.
-
-When the old machine returns, its agent must reconcile local processes against current
-fencing tokens before taking new work. Lease expiry archives the old claim, so a returning
-agent cannot perform an ordinary renewal.
+It abandons only the named Attempt's qexp ownership and warns that its process may still run and
+write external outputs. It does not signal that process or claim it stopped. The old reservation
+remains held until its owning machine proves exact process and wrapper absence; a successor must
+use independent available capacity. Group retry never performs this operation.
 
 A live process may recover the same Attempt only through a recovery CAS requiring:
 
@@ -1373,19 +1369,19 @@ Grouped recovery also respects current Group control:
 - a draining worker may recover only the same Attempt when launch authorization predates
   the drain request
 - removing or removed workers cannot recover execution authority
-- applicable Group or Task termination intent rejects recovery and requires the old
-  process to terminate or quarantine
+- applicable Group or Task termination intent rejects recovery and follows its explicit stop
+  semantics; loss of authority alone never signals the old process
 
-Success issues a new fencing token and lease for the same Attempt and reconciles it to
-`running`. CAS failure makes the local process obsolete; it must be terminated or
-quarantined.
+This recovery CAS is retained for historical `orphaned` records. Ordinary durable-owner restart
+keeps the original Attempt and fencing token and reconciles it directly; elapsed time alone never
+makes the process obsolete or authorizes termination.
 
 Other cases:
 
 - if the process finished, publish its recorded terminal result
 - if the process is absent, confirm local cleanup and resolve the Attempt as failed
-- if a newer Attempt exists, reject stale writes and terminate or quarantine the old
-  process
+- if a newer Attempt exists, reject stale writes and retain historical observations; signal the old
+  process only for a separately applicable explicit stop instruction
 
 Fencing protects qexp scheduler truth. It cannot undo side effects already produced by an
 old process, which is why ambiguous automatic retry remains forbidden.
@@ -1566,6 +1562,12 @@ Retry supersedes the old Attempt's qexp execution authority. It does not inspect
 claim that the old process stopped, or undo external side effects. No additional duplicate-risk
 acknowledgement flag is required. `qexp group retry` remains limited to failed Tasks and
 never selects blocked or orphaned work.
+
+For an active durable Attempt, `--supersede-attempt <attempt-id>` is a distinct exact-ID operation.
+It accepts only the current `holder_bound` Attempt in `starting` or `running`, rejects unresolved
+stop/cleanup control, increments fencing once, records an idempotent supersession receipt, and
+queues the Task without releasing the old reservation or changing the historical Attempt's phase
+or result. Human and JSON output disclose possible duplicate execution and external output writes.
 
 Task cancellation semantics:
 
@@ -2048,8 +2050,8 @@ policy separately from a differing observed process mode.
 
 Machine runtime loss is not project loss. A replacement machine agent starts from explicitly
 registered bindings and does not infer, supervise, or declare the terminal state of processes
-from a discarded runtime. Shared lease and fencing rules leave an unreachable previously running
-Attempt `orphaned` and its Task `blocked`; no automatic retry follows.
+from a discarded runtime. Durable ownership and fencing keep an unreachable previously running
+Attempt owned with its reservation retained; no automatic retry follows.
 
 ### 15.6 Scheduling Logs Only
 
@@ -2151,7 +2153,7 @@ they never rewrite policies frozen into existing Attempts.
 - `qexp task logs [-n|--tail <lines>]`
 - `qexp task logs -f|--follow [-n|--tail <lines>] [--interval-seconds <seconds>] [--follow-retries]`
 - `qexp task wait <task-id> [--timeout <duration>]`
-- `qexp task retry`
+- `qexp task retry [--supersede-attempt <attempt-id>]`
 - `qexp task cancel`
 - `qexp task share`
 - `qexp task unshare`
@@ -2338,6 +2340,8 @@ validation-failed and admission-blocked states retain precedence and next action
 - [ ] Explicit project migration verifies old PID identity, keeps training processes alive, and
       leaves one global agent process responsible for the migrated Project.
 - [ ] Machine runtime loss cannot assert process termination or cause automatic retry.
+- [ ] Elapsed time never revokes a launch-authorized Attempt, authorizes a signal, or releases its
+      reservation; returning supervision retains the same Attempt and fencing token.
 - [ ] Agent stop/crash leaves an authorized runner and guardian process group alive, and leaves
   any existing optional tmux observer untouched; restart reconciles the same Attempt and never
   launches a successor or replays an observer attachment decision.
@@ -2392,8 +2396,8 @@ validation-failed and admission-blocked states retain precedence and next action
 - [ ] Open settled Groups may accept later control experiments.
 - [ ] Sealed Groups reject additions until reopened.
 - [ ] Heartbeat loss alone never authorizes silent duplicate execution.
-- [ ] An expired Attempt returns to running only through recovery CAS, never ordinary
-  lease renewal.
+- [ ] Historical orphaned Attempts use recovery CAS; durable launch-authorized Attempts do not
+      expire and resume supervision without token rotation.
 - [ ] Grouped recovery respects Worker Set drain/removal and applicable termination intent;
   pause alone does not block the same Attempt from recovering.
 - [ ] Terminating Group cancellation preserves pending-machine acknowledgements across CLI

@@ -11,6 +11,7 @@ import pytest
 
 from qqtools.plugins.qexp import init_shared_root, submit
 from qqtools.plugins.qexp import layout as qexp_layout
+from qqtools.plugins.qexp.authority import AuthoritySupervisor
 from qqtools.plugins.qexp.commands.group import create_group
 from qqtools.plugins.qexp.infrastructure.process import process_start_time_ticks as _process_start_time_ticks
 from qqtools.plugins.qexp.layout import load_root_config, migrate_schema5_to_schema6
@@ -28,6 +29,7 @@ from qqtools.plugins.qexp.runtime.paths import attempt_path, shared_paths, task_
 from qqtools.plugins.qexp.runtime.process_evidence import ProcessEvidence
 from qqtools.plugins.qexp.runtime.records import AttemptRecord
 from qqtools.plugins.qexp.runtime.store import atomic_replace, read_json
+from qqtools.plugins.qexp.runtime.tasks import load_task, save_task
 from qqtools.plugins.qexp.runtime.termination import (
     commit_local_unavailable,
     commit_signal,
@@ -44,6 +46,7 @@ from qqtools.plugins.qexp.scheduler import (
     reconcile_running_tasks,
     renew_attempt_lease,
     renew_project_io_attempt_lease,
+    resume_starting_attempt,
 )
 
 pytestmark = [pytest.mark.integration, pytest.mark.qexp_fast_io]
@@ -270,6 +273,32 @@ def test_local_irreversible_commitment_blocks_recovery(tmp_path: Path):
     assert is_recovery_blocked(cfg, "attempt")
 
 
+def test_deadline_only_decision_cannot_commit_or_send_a_signal(tmp_path: Path, monkeypatch):
+    cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
+    decision = create_decision(
+        cfg,
+        task_id="task",
+        attempt_id="attempt",
+        fencing_token=7,
+        process={"process_group_id": 1234, "process_group_start_time_ticks": 5678},
+        authority_outcome="holder_safe_deadline_elapsed",
+        reason="holder_safe_deadline_elapsed",
+    )
+    sent: list[tuple[int, int]] = []
+    monkeypatch.setattr("qqtools.plugins.qexp.runtime.termination.os.killpg", lambda *args: sent.append(args))
+
+    with pytest.raises(RuntimeError, match="deadline-only termination decisions cannot authorize signals"):
+        commit_signal(cfg, "attempt", decision["decision_id"])
+    with pytest.raises(RuntimeError, match="deadline-only termination decisions cannot authorize signals"):
+        send_signals(cfg, "attempt", decision["decision_id"], grace_seconds=0)
+
+    stored = read_json(cfg.runtime_root / "termination-decisions" / "attempt" / f"{decision['decision_id']}.json")[
+        "termination_decision"
+    ]
+    assert stored["state"] == "pending"
+    assert sent == []
+
+
 def test_unqualified_clock_creates_local_safe_claim_and_blocks_expiry(tmp_path: Path, monkeypatch):
     cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
     task = submit(cfg, ["echo", "ok"])
@@ -286,6 +315,61 @@ def test_unqualified_clock_creates_local_safe_claim_and_blocks_expiry(tmp_path: 
     assert recover_running_attempt(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token) is None
 
 
+@pytest.mark.parametrize("has_wrapper", [False, True])
+def test_exact_legacy_running_execution_is_adopted_without_lease_renewal(tmp_path: Path, has_wrapper: bool):
+    cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
+    task = submit(cfg, ["echo", "ok"])
+    attempt = claim_task(cfg, task.task_id, [0])
+    assert attempt is not None and attempt.authority_mode == "bounded_lease"
+    process_identity = {
+        "wrapper_pid": 1001 if has_wrapper else None,
+        "wrapper_start_time_ticks": 2002 if has_wrapper else None,
+        "process_group_id": 3003,
+        "process_group_start_time_ticks": 4004,
+    }
+    launch_id = "legacy-launch"
+    launch_time = "2026-10-01T00:00:00Z"
+    task_path = cfg.shared_root / "tasks" / f"{task.task_id}.json"
+    running_task = load_task(cfg, task.task_id)
+    running_claim = running_task.claim_control["active_claim"]
+    running_claim.update(
+        {
+            "launch_state": "running",
+            "launch_id": launch_id,
+            "launch_authorized_at": launch_time,
+        }
+    )
+    running_task.state = {"projection": "running", "reason": "running"}
+    running_task.meta["revision"] += 1
+    save_task(cfg, running_task)
+    path = attempt_path(cfg.shared_root, task.task_id, attempt.attempt_number)
+    running_attempt = AttemptRecord.from_dict(read_json(path))
+    running_attempt.phase = "running"
+    running_attempt.authorization["launch_id"] = launch_id
+    running_attempt.timestamps["launch_authorized_at"] = launch_time
+    running_attempt.process.update(process_identity)
+    atomic_replace(path, running_attempt.to_dict())
+
+    renewal = renew_attempt_lease(
+        cfg,
+        task.task_id,
+        attempt.attempt_id,
+        attempt.current_fencing_token,
+        process_identity=process_identity,
+    )
+
+    assert renewal.outcome is LeaseRenewalOutcome.NOT_REQUIRED
+    adopted_task = load_task(cfg, task.task_id)
+    adopted_attempt = AttemptRecord.from_dict(read_json(path))
+    assert adopted_task.claim_control["active_claim"]["authority_mode"] == "holder_bound"
+    assert adopted_attempt.authority_mode == "holder_bound"
+    assert adopted_task.claim_control["active_claim"]["lease_expires_at"] is None
+    assert adopted_attempt.lease["expires_at"] is None
+    assert adopted_attempt.phase == "running"
+    assert adopted_attempt.process == running_attempt.process
+    assert task_path.exists()
+
+
 def test_shared_termination_commitment_rejects_renewal(tmp_path: Path):
     cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
     task = submit(cfg, ["echo", "ok"])
@@ -299,8 +383,104 @@ def test_shared_termination_commitment_rejects_renewal(tmp_path: Path):
     previous_expiry = claim["lease_expires_at"]
     atomic_replace(task_file, value)
     result = renew_attempt_lease(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token)
-    assert result.outcome is LeaseRenewalOutcome.TERMINATION_REQUESTED
+    assert result.outcome is LeaseRenewalOutcome.AUTHORITY_CHANGED
     assert read_json(task_file)["task"]["claim_control"]["active_claim"]["lease_expires_at"] == previous_expiry
+
+
+@pytest.mark.parametrize("operation", ["authorize", "resume"])
+def test_expired_prelaunch_authority_cannot_become_durable(tmp_path: Path, operation: str):
+    cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
+    task = submit(cfg, ["echo", "ok"])
+    attempt = claim_task(cfg, task.task_id, [0])
+    assert attempt is not None and attempt.authority_mode == "bounded_lease"
+    current = load_task(cfg, task.task_id)
+    current.claim_control["active_claim"]["lease_expires_at"] = "2000-01-01T00:00:00Z"
+    attempt.lease["expires_at"] = "2000-01-01T00:00:00Z"
+    save_task(cfg, current)
+    path = attempt_path(cfg.shared_root, task.task_id, attempt.attempt_number)
+    atomic_replace(path, attempt.to_dict())
+    task_before, attempt_before = load_task(cfg, task.task_id).to_dict(), path.read_bytes()
+    if operation == "authorize":
+        assert not authorize_launch(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token)
+    else:
+        assert resume_starting_attempt(cfg, task.task_id) is None
+    assert load_task(cfg, task.task_id).to_dict() == task_before
+    assert path.read_bytes() == attempt_before
+
+
+def test_explicit_cancellation_accepts_exact_process_group_without_wrapper(tmp_path: Path):
+    cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
+    task = submit(cfg, ["echo", "ok"])
+    attempt = claim_task(cfg, task.task_id, [0])
+    assert attempt is not None
+    identity = {
+        "wrapper_pid": None,
+        "wrapper_start_time_ticks": None,
+        "process_group_id": 303,
+        "process_group_start_time_ticks": 404,
+    }
+    attempt.process.update(identity)
+    atomic_replace(attempt_path(cfg.shared_root, task.task_id, attempt.attempt_number), attempt.to_dict())
+    current = load_task(cfg, task.task_id)
+    current.control["terminate_running"] = True
+    save_task(cfg, current)
+    assert (
+        renew_attempt_lease(
+            cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token, process_identity=identity
+        ).outcome
+        is LeaseRenewalOutcome.TERMINATION_REQUESTED
+    )
+    incomplete = {**identity, "wrapper_pid": 101}
+    assert (
+        renew_attempt_lease(
+            cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token, process_identity=incomplete
+        ).outcome
+        is LeaseRenewalOutcome.AUTHORITY_CHANGED
+    )
+
+
+@pytest.mark.parametrize("mismatch", ["attempt", "token"])
+def test_successor_cancellation_does_not_authorize_old_holder_termination(tmp_path: Path, mismatch: str):
+    cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
+    task = submit(cfg, ["echo", "ok"])
+    attempt = claim_task(cfg, task.task_id, [0])
+    assert attempt is not None
+    current = load_task(cfg, task.task_id)
+    current.control["terminate_running"] = True
+    save_task(cfg, current)
+    result = renew_attempt_lease(
+        cfg,
+        task.task_id,
+        "old-holder" if mismatch == "attempt" else attempt.attempt_id,
+        attempt.current_fencing_token - 1 if mismatch == "token" else attempt.current_fencing_token,
+    )
+    assert result.outcome is LeaseRenewalOutcome.AUTHORITY_CHANGED
+
+
+def test_historical_timeout_marker_cannot_create_a_new_signal_decision(tmp_path: Path):
+    cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
+    task = submit(cfg, ["echo", "ok"])
+    attempt = claim_task(cfg, task.task_id, [0])
+    assert attempt is not None
+    identity = {
+        "wrapper_pid": 101,
+        "wrapper_start_time_ticks": 202,
+        "process_group_id": 303,
+        "process_group_start_time_ticks": 404,
+    }
+    attempt.process.update(identity)
+    atomic_replace(attempt_path(cfg.shared_root, task.task_id, attempt.attempt_number), attempt.to_dict())
+    current = load_task(cfg, task.task_id)
+    current.claim_control["active_claim"].update(
+        termination_decision_id="historical-timeout",
+        termination_decision_token=attempt.current_fencing_token,
+    )
+    save_task(cfg, current)
+    process = {"task_id": task.task_id, "attempt_id": attempt.attempt_id, **identity}
+    supervisor = AuthoritySupervisor(cfg)
+    supervisor._renew_or_isolate(task.task_id, attempt.attempt_id, attempt.current_fencing_token, process)
+    assert list((cfg.runtime_root / "termination-decisions").rglob("*.json")) == []
+    assert process["authority_state"] == "isolated"
 
 
 def test_committed_termination_is_completed_by_agent_and_blocks_recovery(tmp_path: Path, monkeypatch):
@@ -409,7 +589,7 @@ def test_termination_confirmation_uses_real_process_group_identity(tmp_path: Pat
             child.wait(timeout=5)
 
 
-def test_recovery_uses_authoritative_policy_ttl(tmp_path: Path):
+def test_launch_ownership_does_not_use_policy_ttl_after_authorization(tmp_path: Path):
     cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
     create_group(cfg, "exp")
     save_lease_policy(cfg, LeasePolicy(ttl_seconds=180))
@@ -417,28 +597,16 @@ def test_recovery_uses_authoritative_policy_ttl(tmp_path: Path):
     attempt = claim_task(cfg, task.task_id, [0])
     assert attempt is not None
     assert authorize_launch(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token)
-    assert expire_claim(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token)
-    manifest_path = cfg.runtime_root / "processes" / f"{attempt.attempt_id}.json"
-    atomic_replace(
-        manifest_path,
-        {
-            "process": {
-                "task_id": task.task_id,
-                "attempt_id": attempt.attempt_id,
-                "fencing_token": attempt.current_fencing_token,
-            }
-        },
+    assert not expire_claim(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token)
+    current_task = load_task(cfg, task.task_id)
+    current_attempt = AttemptRecord.from_dict(
+        read_json(attempt_path(cfg.shared_root, task.task_id, attempt.attempt_number))
     )
-    token = recover_running_attempt(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token)
-    assert token == attempt.current_fencing_token + 1
-    recovered = read_json(attempt_path(cfg.shared_root, task.task_id, attempt.attempt_number))["attempt"]
-    expires_at = recovered["lease"]["expires_at"]
-    from datetime import datetime, timezone
-
-    from qqtools.plugins.qexp.lease import parse_utc
-
-    remaining = (parse_utc(expires_at) - datetime.now(timezone.utc)).total_seconds()
-    assert 175 <= remaining <= 180
+    assert current_task.claim_control["active_claim"]["authority_mode"] == "holder_bound"
+    assert current_attempt.authority_mode == "holder_bound"
+    assert current_attempt.lease["expires_at"] is None
+    renewal = renew_attempt_lease(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token)
+    assert renewal.outcome is LeaseRenewalOutcome.NOT_REQUIRED
 
 
 def test_schema5_migration_requires_drain_then_writes_policy(tmp_path: Path):

@@ -724,11 +724,13 @@ reservation_id: str
 queue_origin: home | shared
 fencing_token: int
 claimed_at: str
-lease_expires_at: str
+authority_mode: bounded_lease | holder_bound
+lease_expires_at: str | null
 launch_state: claimed | starting | running
 launch_authorized_at: str | null
 group_dispatch_epoch: int | null
 group_worker_set_epoch: int | null
+ownership_transition: object | null
 ```
 
 Task rules:
@@ -770,7 +772,8 @@ attempt:
   lease:
     claimed_at: str
     renewed_at: str
-    expires_at: str
+    expires_at: str | null
+    clock_evidence: object | null
   authorization:
     group_name: str | null
     group_dispatch_epoch: int | null
@@ -808,11 +811,13 @@ Attempt rules:
 - `claimed` is pre-launch and revocable
 - `starting` means the shared launch gate committed
 - `running` means the owning Agent fenced and published immutable local process-creation evidence into shared Attempt truth
+- every launch-authorized `starting` or `running` Attempt uses `holder_bound`; its active lease and
+  clock evidence are null and its prior bounded evidence is retained in transition history
 - `launch_authorized_at` is written once by the Scheduler when the shared launch gate commits
 - `process_created_at` is written once by the passive Runner immediately after guardian process creation, in its immutable local registration
 - `running_at` is written once by the owning Agent when it accepts that registration and commits shared `running` truth
 - a terminal Attempt never returns to an active phase
-- `orphaned` records ambiguous process ownership after lease expiry
+- `orphaned` records historical ambiguous process ownership imported from supported older sources
 - a recovery CAS may issue a new token for the same orphaned Attempt
 - every older token remains in immutable history and loses write authority
 
@@ -1292,9 +1297,9 @@ cache. Whole-runtime loss may destroy the only durable exit and accounting evide
 Loss of its registry, cursor, PID, reservation, or process
 records neither changes project truth nor proves an old process stopped. A replacement runtime
 requires explicit re-registration and may schedule queued work, but it does not recover or write
-a terminal outcome for executions evidenced only by the lost runtime. Project lease expiry and
-fencing retain the existing post-authorization safety outcome: orphaned Attempt, blocked Task,
-and no automatic replacement.
+a terminal outcome for executions evidenced only by the lost runtime. Durable post-authorization
+ownership and fencing retain the Attempt and reservation without automatic replacement; explicit
+supersession is required to queue a successor while the old execution remains uncertain.
 
 ### 9.5 Explicit Legacy Project Migration
 
@@ -2165,7 +2170,13 @@ a different request to replay the commit.
 Epoch checks also cover nested claim archival, projection, and maintenance mutations; revocation
 preserves existing recovery evidence instead of continuing later writes in the old request.
 
-A successful terminal publication returns a lifecycle event, including on exact replay. The event's
+A current terminal publication returns a lifecycle event, including on exact replay. Historical
+superseded ownership returns `historical_current` observation and `historical_committed` or
+`historical_already_committed` publication. Its exact operation receipt, Attempt/token/process,
+source revisions and publication digest authorize only the historical Attempt update. The Task
+and successor remain unchanged; no Task lifecycle event or completion notification is emitted.
+Exact local process/wrapper absence is still required to settle its original reservation.
+The event's
 Task-name display prefix is bounded to 16 KiB of encoded JSON, including escaping; the full name and
 user-relevant execution facts remain in shared Task/Attempt truth. These additive replay markers do
 not introduce a new shared schema version, writer capability, or temporary compatibility reader.
@@ -3442,21 +3453,27 @@ The winning fenced transition uses one authorization timestamp and changes:
 
 ```text
 active_claim.launch_state: claimed -> starting
+active_claim.authority_mode: bounded_lease | holder_bound -> holder_bound
 active_claim.launch_authorized_at: null -> timestamp
 Attempt.phase: claimed -> starting
+Attempt.authority_mode: bounded_lease | holder_bound -> holder_bound
 Attempt.timestamps.launch_authorized_at: null -> same timestamp
 ```
 
-The Task write is the launch gate linearization point. Role or borrow-limit changes after a
+The same Task replacement clears active lease and clock evidence and stores an
+`ownership_transition` receipt containing a stable operation ID, source Task revision and Attempt
+digest, exact execution identities, source and target mode/phase, launch ID, and historical lease
+evidence. The Task write is the launch gate linearization point. Role or borrow-limit changes after a
 successful claim do not revoke that claim; pause, drain/remove, cancellation, lease, and fencing
 continue to gate launch. If a crash leaves the matching Attempt in
-`claimed`, a later fenced authorization replay may only reconcile it to `starting` using the
-persisted Task timestamp; it must not authorize a second Runner. It records the current Group
-dispatch epoch and Worker Set epoch.
+`claimed`, a later fenced authorization replay first validates the receipt's source digest and
+exact identities, then repairs only that Attempt to `starting/holder_bound` using the persisted
+launch ID and timestamp. A changed Attempt, successor, or newer token is a conflict and cannot
+spawn, signal, or release capacity. It records the current Group dispatch epoch and Worker Set epoch.
 
 This transition is the linearization point:
 
-- if pause, cancellation, expiry, or Worker Set control commits first, launch fails
+- if pause, cancellation, pre-launch expiry, or Worker Set control commits first, launch fails
 - if `starting` commits first, pause allows the Attempt to proceed
 - later default cancellation treats it as running work
 - later terminating cancellation publishes termination intent
@@ -3524,15 +3541,17 @@ Compensation rules:
 
 ### 15.1 Renewal
 
-The owning agent renews before expiry by presenting:
+Pre-launch bounded ownership and supported legacy post-launch records renew by presenting:
 
 - Task ID and Attempt ID
 - machine and agent instance identity
 - current fencing token
 - observed local process state
 
-Renewal updates Task active claim and Attempt lease idempotently. A mismatched token,
-Attempt, machine, or agent authority is rejected.
+Renewal updates Task active claim and Attempt lease idempotently. A matching live legacy
+`starting` or `running` execution is instead converted through the same Task-first ownership
+receipt to `holder_bound`, after exact process, reservation, launch, control, and fencing checks.
+A mismatched token, Attempt, machine, or agent authority is rejected.
 
 Schema-6 renewal returns a tagged outcome rather than a boolean. `renewed`,
 `retryable_error`, `authority_changed`, `orphaned_recovery_required`, and
@@ -3564,6 +3583,7 @@ Machine heartbeat and Attempt lease are distinct:
 - heartbeat describes agent reachability
 - lease describes current execution write authority
 - stale heartbeat alone does not revoke a valid lease
+- a launch-authorized holder-bound Attempt has no execution lease to renew or expire
 
 ### 15.2 Pre-Launch Expiry
 
@@ -3579,24 +3599,17 @@ start. Reconciliation may therefore:
 
 ### 15.3 Post-Authorization Expiry
 
-If `launch_state = starting | running` expires:
-
-- archive the claim with its token preserved
-- change Attempt to `orphaned`
-- change Task projection to `blocked`
-- clear active execution authority without returning Task to a queue
-- preserve machine, GPU, process, log, and token history
-- set `orphaned_at` without setting terminal `finished_at`
-- record the expiry reason in the append-only event stream rather than terminal result
-- forbid automatic replacement Attempt creation
-
-`orphaned` means process state is unknown, not that the process stopped.
+`launch_state = starting | running` is durable execution ownership and never expires. Old lease
+timestamps, stale heartbeat, invalid clock evidence, storage unavailability, or agent replacement
+may make supervision stale or isolate shared writes, but they cannot archive the claim, create an
+`orphaned` state, signal the process, release its reservation, or permit a replacement Attempt.
+`orphaned` remains readable only as historical uncertainty produced by supported older sources.
 
 ### 15.4 Recovery CAS
 
-A returning machine with a verified live process cannot perform ordinary renewal after
-expiry. A grouped Task acquires Group then Task lock; an ungrouped Task acquires only Task
-lock.
+This section applies only to historical `orphaned` records created by supported older sources.
+A returning machine with a verified live orphaned process cannot perform ordinary renewal. A
+grouped Task acquires Group then Task lock; an ungrouped Task acquires only Task lock.
 
 For a grouped Task, recovery first reconciles any pending Group submission commit and
 verifies:
@@ -3627,10 +3640,10 @@ Success:
 5. clears terminal result fields and `finished_at`
 6. sets `recovered_at` and reconciles Attempt and Task to running
 
-Failure means the local process is obsolete or no longer permitted to resume authority.
-The agent must terminate or quarantine it and must not publish scheduler truth.
+Failure rejects shared mutation. A lost token or successor is not itself a stop instruction; the
+agent must not signal the historical process unless a separate explicit control operation applies.
 
-Before any Recovery CAS, agent and doctor acquire the local per-Attempt control lock and inspect
+Before any legacy Recovery CAS, agent and doctor acquire the local per-Attempt control lock and inspect
 durable termination decisions. Runner never performs Recovery. A decision with shared commitment
 `committed` or `unavailable`, or local state `signal_committed` or later, rejects Recovery.
 
@@ -3664,15 +3677,22 @@ with fresh identity and fencing checks. Completing those effects preserves any k
 result. Filesystem or process-inspection unavailability, lock contention, and ambiguous writes are
 deferred execution outcomes; they do not create an invalid evidence classification and are retried.
 
-Only agent or a doctor holding the local Attempt control lock may issue a qexp signal. The runner's
+Only agent or a doctor holding the local Attempt control lock may issue a qexp signal, and only for
+an exact explicit stop instruction such as user cancellation. Lease expiry, stale observation,
+storage failure, and authority replacement are never sufficient signal causes. The runner's
 `wait()` result is an exit observation only; it never confirms a termination decision. `confirmed`
-is written only after the recorded PGID and start-time identity is absent. For normal authority
-loss, the Task lock first commits `termination_decision_id` and token;
-Recovery CAS then rejects that Attempt. When authority is unavailable after the holder
-safe deadline, qexp fsyncs `shared_commitment=unavailable` before `signal_committed` and
-the signal. This local exception prevents an unsafe local recovery and is reconciled by
-`decision_id` after shared storage returns. A process exit caused by this path records its
-lease termination reason and must not become `process_exited_without_status`.
+is written only after the recorded PGID and start-time identity is absent. For explicit
+termination, the Task lock first commits `termination_decision_id` and token; Recovery CAS then
+rejects that Attempt.
+
+Fixed agents reject deadline-only decisions independently at every signal entry. Historical
+`holder_safe_deadline_elapsed` decisions are preserved and gain an audited
+`timeout_decision_retirement` operation. Its local phases are `suppressed -> shared_reconciled ->
+retired`; suppression is durable before signal/recovery lanes proceed, shared reconciliation
+conditionally replaces only the exact old active stop reference with a receipt, and retirement
+never rewrites the old monotonic decision state or successor truth. Unknown delivery, unavailable
+shared state, conflicting identity, or malformed evidence remains pending and cannot authorize a
+signal, recovery, or reservation release.
 
 ### 15.6 Other Return Cases
 
@@ -3683,7 +3703,8 @@ lease termination reason and must not become `process_exited_without_status`.
 - missing process: for a grouped Task acquire Group then Task lock, confirm machine-local
   cleanup, use a recovery-resolution CAS to fail the orphaned Attempt, and satisfy any
   applicable termination acknowledgement
-- newer Attempt or token: reject stale writes and terminate or quarantine the old process
+- newer Attempt or token: reject stale scheduler writes; observe it as historical execution and
+  signal only when an independently applicable explicit stop instruction exists
 
 Fencing protects qexp metadata. It cannot undo external side effects already produced by
 an obsolete process.
@@ -3735,6 +3756,16 @@ command requires no additional duplicate-risk acknowledgement flag. The retired
 retry and `qexp group retry` never
 select blocked or orphaned work.
 
+`qexp task retry <task-id> --supersede-attempt <attempt-id>` is the explicit active-owner
+transition. Under Group then Task locks it requires the exact current `holder_bound` Attempt in
+`starting` or `running`, no applicable stop/cleanup conflict, and unchanged Task revision, token,
+machine, launch, and reservation identity. One Task replacement records an
+`attempt_superseded_by_retry` receipt, archives the exact claim, increments fencing once, clears the
+current pointer, and queues the Task. The old Attempt keeps its phase, observations, result, and
+reservation and receives only an idempotent historical annotation. Repeating the same exact ID
+returns that operation; it never retargets a successor. The operation never signals the old process,
+and successor dispatch must use independent capacity until the old holder proves exact absence.
+
 ## 17. Agent Lifecycle
 
 ### 17.0 Lifecycle independence invariant
@@ -3743,7 +3774,8 @@ Stopping or losing only the machine agent does not signal, detach, or relaunch a
 authorized runner, guardian, process group, or existing optional tmux observer window. The runner writes an immutable exit
 observation containing the Attempt and Task identity. On the next agent start, startup
 reconciliation validates that identity, then either performs the recovery CAS for a verified live
-process or publishes the recorded exit through the original Attempt. A mismatched or incomplete
+legacy orphan, restores supervision of the same durable owner without token rotation, or publishes
+the recorded exit through the original Attempt. A mismatched or incomplete
 observation remains in the machine-local evidence partition with a diagnostic blocker; it is not
 interpreted as success and is not reclaimed by elapsed downtime.
 
@@ -3965,7 +3997,7 @@ It must distinguish:
 - queued Task referencing an uncommitted operation
 - claim without Attempt truth
 - expired pre-launch claim
-- expired post-authorization claim
+- historical post-authorization expiry imported from a supported older source
 - unattached or expired local reservation
 - active reservation with no authoritative claim
 - local process with obsolete token
@@ -4148,9 +4180,9 @@ retention does not change the active projection gate.
 | CW-09 | Process starts before running metadata | Local manifest and token reconcile the same Attempt |
 | CW-10 | Process exits before terminal publish | Owning agent republishes terminal result idempotently |
 | CW-11 | Lease expires before launch authorization | Claim returns safely to its previous queue scope |
-| CW-12 | Lease expires after launch authorization | Attempt becomes orphaned and Task blocked; no automatic replacement |
-| CW-13 | Old machine returns with current orphan token | Recovery CAS may issue a new token for the same Attempt |
-| CW-14 | Old machine returns after successor token | Old process is terminated or quarantined; writes are rejected |
+| CW-12 | Old deadline elapses after launch authorization | Same holder-bound Attempt and reservation remain; no signal, orphaning, or replacement |
+| CW-13 | Old machine returns with current durable owner | Supervision resumes for the same Attempt and token; historical orphans retain recovery CAS |
+| CW-14 | Old machine returns after explicit supersession | Stale scheduler writes are rejected; old execution is observed historically and is not implicitly killed |
 | CW-15 | Worker removal races with submission or claim | Group lock yields one order; removal cannot strand queued work |
 | CW-16 | Pause/cancel races with launch | Exactly one Group-lock order wins and defines running semantics |
 | CW-17 | Recovery races with drain/remove or terminating cancellation | Group-then-Task lock order yields one result; forbidden recovery terminates or quarantines the process |
@@ -4188,12 +4220,14 @@ The runtime implementation is not releasable until tests demonstrate:
 - manual and `after_seconds` offering are idempotent under repeated scanners
 - heartbeat staleness does not trigger an unsupported early offer
 - pre-launch expiry requeues safely
-- post-authorization expiry blocks instead of automatically retrying
-- recovery CAS issues a new token only for the same orphaned Attempt
+- post-authorization deadlines preserve the same durable Attempt and never signal or retry
+- legacy recovery CAS issues a new token only for the same historical orphaned Attempt
 - grouped recovery obeys Group-then-Task lock order, Worker Set state, and termination
   barriers while allowing pause semantics
 - manual retry can supersede an unclaimed blocked/orphaned Attempt without an additional risk
   flag, issues a higher fencing epoch, and remains excluded from Group retry
+- exact `--supersede-attempt` records one idempotent transition for active durable work, warns of
+  duplicate execution, retains the old reservation, and never signals or retargets a successor
 - Group cancellation progress and pending acknowledgements survive process restart
 - on-demand idle exit does not abandon processes, reservations, or repair work
 - daemon background startup preserves daemon mode

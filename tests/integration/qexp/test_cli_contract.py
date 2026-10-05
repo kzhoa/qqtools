@@ -12,9 +12,12 @@ from qqtools.plugins.qexp.cli.entrypoint import main
 from qqtools.plugins.qexp.commands.group import create_group
 from qqtools.plugins.qexp.layout import load_context, runtime_pid_path
 from qqtools.plugins.qexp.legacy_agent import get_agent_status
-from qqtools.plugins.qexp.runtime.store import atomic_replace
-from qqtools.plugins.qexp.runtime.tasks import load_task
-from qqtools.plugins.qexp.scheduler import authorize_launch, claim_task, expire_claim, fail_attempt
+from qqtools.plugins.qexp.runtime.paths import attempt_path
+from qqtools.plugins.qexp.runtime.records import AttemptRecord
+from qqtools.plugins.qexp.runtime.resources.reservations import active_reservations
+from qqtools.plugins.qexp.runtime.store import atomic_replace, read_json
+from qqtools.plugins.qexp.runtime.tasks import load_task, save_task
+from qqtools.plugins.qexp.scheduler import authorize_launch, claim_task, fail_attempt
 
 pytestmark = [pytest.mark.integration, pytest.mark.qexp_fast_io]
 
@@ -32,6 +35,21 @@ def _base_args(cfg) -> list[str]:
         "--machine-runtime-root",
         str(machine_runtime_root),
     ]
+
+
+def _mark_legacy_orphaned(cfg, task, attempt) -> None:
+    """Build the supported historical orphan image without expiring new durable ownership."""
+    path = attempt_path(cfg.shared_root, task.task_id, attempt.attempt_number)
+    stored_attempt = AttemptRecord.from_dict(read_json(path))
+    stored_attempt.phase = "orphaned"
+    stored_attempt.timestamps["orphaned_at"] = "2026-10-01T00:00:00Z"
+    atomic_replace(path, stored_attempt.to_dict())
+    stored_task = load_task(cfg, task.task_id)
+    stored_task.state = {"projection": "blocked", "reason": "orphaned_attempt_requires_recovery"}
+    stored_task.claim_control["active_claim"] = None
+    stored_task.attempt_control["current_attempt_id"] = None
+    stored_task.meta["revision"] += 1
+    save_task(cfg, stored_task)
 
 
 def test_explicit_cli_validation_errors_are_structured(tmp_path: Path, capsys) -> None:
@@ -92,7 +110,7 @@ def test_blocked_orphan_cancel_reports_blocked_recovery_state(tmp_path: Path, ca
     attempt = claim_task(cfg, task.task_id, [0])
     assert attempt is not None
     assert authorize_launch(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token)
-    assert expire_claim(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token)
+    _mark_legacy_orphaned(cfg, task, attempt)
 
     assert main([*_base_args(cfg), "task", "cancel", task.task_id, "--format=json"]) == 1
 
@@ -109,7 +127,7 @@ def test_task_retry_accepts_blocked_orphan_without_acknowledgement(tmp_path: Pat
     attempt = claim_task(cfg, task.task_id, [0])
     assert attempt is not None
     assert authorize_launch(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token)
-    assert expire_claim(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token)
+    _mark_legacy_orphaned(cfg, task, attempt)
     monkeypatch.setattr(
         "qqtools.plugins.qexp.cli.project_handlers.ensure_local_agent_active", lambda *_args, **_kwargs: False
     )
@@ -128,7 +146,7 @@ def test_task_retry_quiet_preserves_task_id_only_output(tmp_path: Path, monkeypa
     attempt = claim_task(cfg, task.task_id, [0])
     assert attempt is not None
     assert authorize_launch(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token)
-    assert expire_claim(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token)
+    _mark_legacy_orphaned(cfg, task, attempt)
     monkeypatch.setattr(
         "qqtools.plugins.qexp.cli.project_handlers.ensure_local_agent_active", lambda *_args, **_kwargs: False
     )
@@ -146,7 +164,7 @@ def test_task_retry_rejects_retired_duplicate_risk_flag_without_mutation(tmp_pat
     attempt = claim_task(cfg, task.task_id, [0])
     assert attempt is not None
     assert authorize_launch(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token)
-    assert expire_claim(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token)
+    _mark_legacy_orphaned(cfg, task, attempt)
     monkeypatch.setattr(
         "qqtools.plugins.qexp.cli.project_handlers.ensure_local_agent_active", lambda *_args, **_kwargs: False
     )
@@ -587,7 +605,7 @@ def test_retry_requests_local_agent_activation(tmp_path: Path, monkeypatch):
     attempt = claim_task(cfg, task.task_id, [0])
     assert attempt is not None
     assert authorize_launch(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token)
-    assert expire_claim(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token)
+    assert fail_attempt(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token, "test_failure")
     reasons: list[str] = []
     monkeypatch.setattr(
         "qqtools.plugins.qexp.cli.project_handlers.ensure_local_agent_active",
@@ -596,6 +614,88 @@ def test_retry_requests_local_agent_activation(tmp_path: Path, monkeypatch):
 
     assert main([*_base_args(cfg), "task", "retry", task.task_id]) == 0
     assert reasons == ["task-retry"]
+
+
+def test_retry_can_explicitly_supersede_exact_live_durable_attempt(tmp_path: Path, monkeypatch, capsys):
+    cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")
+    task = submit(cfg, ["sleep", "60"])
+    attempt = claim_task(cfg, task.task_id, [0])
+    assert attempt is not None
+    assert authorize_launch(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token)
+    path = attempt_path(cfg.shared_root, task.task_id, attempt.attempt_number)
+    running_attempt = AttemptRecord.from_dict(read_json(path))
+    running_attempt.phase = "running"
+    running_attempt.process.update(
+        {
+            "process_group_id": 9876,
+            "process_group_start_time_ticks": 123,
+        }
+    )
+    atomic_replace(path, running_attempt.to_dict())
+    running_task = load_task(cfg, task.task_id)
+    running_task.claim_control["active_claim"]["launch_state"] = "running"
+    running_task.state = {"projection": "running", "reason": "running"}
+    running_task.meta["revision"] += 1
+    save_task(cfg, running_task)
+    original_epoch = running_task.claim_control["fencing_epoch"]
+    monkeypatch.setattr(
+        "qqtools.plugins.qexp.cli.project_handlers.ensure_local_agent_active",
+        lambda *_args, **_kwargs: True,
+    )
+
+    argv = [
+        *_base_args(cfg),
+        "task",
+        "retry",
+        task.task_id,
+        "--supersede-attempt",
+        attempt.attempt_id,
+        "--format=json",
+    ]
+    assert main(argv) == 0
+    output = json.loads(capsys.readouterr().out)
+    assert output["superseded_attempt_id"] == attempt.attempt_id
+    assert output["terminate_old_process"] is False
+    assert output["duplicate_execution_risk"] is True
+    assert "may still be running" in output["warning"]
+    assert "external output" in output["warning"]
+
+    superseded = load_task(cfg, task.task_id)
+    receipt = superseded.attempt_control["last_supersession"]
+    assert superseded.state == {"projection": "queued", "reason": "attempt_superseded_by_retry"}
+    assert superseded.claim_control["active_claim"] is None
+    assert superseded.claim_control["fencing_epoch"] == original_epoch + 1
+    assert superseded.attempt_control["current_attempt_id"] is None
+    assert receipt["attempt_id"] == attempt.attempt_id
+    assert receipt["terminate_old_process"] is False
+    assert receipt["duplicate_risk_acknowledged"] is True
+    historical = AttemptRecord.from_dict(read_json(path))
+    assert historical.phase == "running"
+    assert historical.authorization["ownership_superseded"]["operation_id"] == receipt["operation_id"]
+    assert len(active_reservations(cfg.runtime_root)) == 1
+
+    # Exact replay returns the committed operation and does not advance fencing again.
+    assert main(argv) == 0
+    capsys.readouterr()
+    replayed = load_task(cfg, task.task_id)
+    assert replayed.claim_control["fencing_epoch"] == original_epoch + 1
+    assert replayed.attempt_control["last_supersession"] == receipt
+    assert len(active_reservations(cfg.runtime_root)) == 1
+
+    successor = claim_task(cfg, task.task_id, [1])
+    assert successor is not None
+    assert authorize_launch(cfg, task.task_id, successor.attempt_id, successor.current_fencing_token)
+    second_argv = [successor.attempt_id if item == attempt.attempt_id else item for item in argv]
+    assert main(second_argv) == 0
+    capsys.readouterr()
+    after_second = load_task(cfg, task.task_id)
+    second_receipt = after_second.attempt_control["last_supersession"]
+    assert main(argv) == 0
+    historical_output = json.loads(capsys.readouterr().out)
+    assert historical_output["superseded_attempt_id"] == attempt.attempt_id
+    assert load_task(cfg, task.task_id).to_dict() == after_second.to_dict()
+    assert load_task(cfg, task.task_id).attempt_control["last_supersession"] == second_receipt
+    assert len(active_reservations(cfg.runtime_root)) == 2
 
 
 def test_offer_requests_local_agent_activation(tmp_path: Path, monkeypatch):
@@ -641,7 +741,7 @@ def test_group_retry_failed_skips_blocked_orphans_and_requests_activation(tmp_pa
     assert authorize_launch(
         cfg, blocked_task.task_id, orphaned_attempt.attempt_id, orphaned_attempt.current_fencing_token
     )
-    assert expire_claim(cfg, blocked_task.task_id, orphaned_attempt.attempt_id, orphaned_attempt.current_fencing_token)
+    _mark_legacy_orphaned(cfg, blocked_task, orphaned_attempt)
     reasons: list[str] = []
     monkeypatch.setattr(
         "qqtools.plugins.qexp.cli.project_handlers.ensure_local_agent_active",

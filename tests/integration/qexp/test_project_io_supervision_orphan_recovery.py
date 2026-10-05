@@ -31,6 +31,7 @@ from qqtools.plugins.qexp.scheduler import (
     recover_project_io_orphaned_attempt,
     renew_project_io_attempt_lease,
 )
+from tests.fixtures.qexp_legacy_ownership import persist_legacy_orphan
 
 pytestmark = [pytest.mark.integration, pytest.mark.qexp_fast_io]
 _LAST_RESULTS = {}
@@ -110,7 +111,7 @@ def _orphan_case(tmp_path: Path, *, is_cpu: bool = False):
         process_group_start_time_ticks=ticks,
     )
     atomic_replace(attempt_file, stored)
-    assert expire_claim(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token)
+    persist_legacy_orphan(cfg, task.task_id)
     revision, bindings = runtime.load_registry()
     binding = bindings[0]
     paths = local_paths(runtime.project_paths(binding.project_id)["root"])

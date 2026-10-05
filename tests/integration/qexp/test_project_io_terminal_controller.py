@@ -20,6 +20,7 @@ from qqtools.plugins.qexp.runtime.records import AttemptRecord
 from qqtools.plugins.qexp.runtime.store import atomic_replace, read_json
 from qqtools.plugins.qexp.runtime.tasks import load_task, save_task
 from qqtools.plugins.qexp.scheduler import claim_task, expire_claim, fail_attempt
+from tests.fixtures.qexp_legacy_ownership import persist_legacy_orphan
 
 pytestmark = [pytest.mark.integration, pytest.mark.qexp_fast_io]
 
@@ -132,13 +133,7 @@ def test_terminal_controller_observes_real_detached_orphan_identity(
     )
     running.meta["revision"] += 1
     save_task(cfg, running)
-    assert expire_claim(
-        cfg,
-        task.task_id,
-        attempt.attempt_id,
-        attempt.current_fencing_token,
-        reservation_runtime_root=runtime.root,
-    )
+    persist_legacy_orphan(cfg, task.task_id)
     orphaned = load_task(cfg, task.task_id)
     assert orphaned.state["projection"] == "blocked"
     assert orphaned.attempt_control["current_attempt_id"] is None

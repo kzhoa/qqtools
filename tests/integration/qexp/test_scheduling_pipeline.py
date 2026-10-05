@@ -22,6 +22,7 @@ from qqtools.plugins.qexp.scheduler import (
     reconcile_running_tasks,
     run_dispatch_cycle,
 )
+from tests.fixtures.qexp_legacy_ownership import persist_legacy_orphan
 
 pytestmark = [pytest.mark.integration, pytest.mark.qexp_fast_io]
 
@@ -114,7 +115,7 @@ def test_blocked_orphan_retry_supersedes_orphan_and_records_audit_event(tmp_path
     attempt = claim_task(cfg, task.task_id, [0])
     assert attempt is not None
     assert authorize_launch(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token)
-    assert expire_claim(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token)
+    persist_legacy_orphan(cfg, task.task_id)
 
     queued = retry(cfg, task.task_id)
 

@@ -12,6 +12,7 @@ from qqtools.plugins.qexp.runtime.tasks import load_task
 from qqtools.plugins.qexp.runtime.termination import attempt_control_lock, create_decision, update_decision
 from qqtools.plugins.qexp.runtime.work_budget import activate_diagnostics
 from qqtools.plugins.qexp.scheduler import authorize_launch, cancel_task, claim_task, expire_claim
+from tests.fixtures.qexp_legacy_ownership import persist_legacy_orphan
 
 pytestmark = [pytest.mark.integration, pytest.mark.qexp_fast_io]
 
@@ -75,7 +76,8 @@ def test_renewal_waits_for_bounded_negative_proof_under_lock(tmp_path, monkeypat
                 assert not acquired
             work.tick(1)
         assert work.diagnostics.counters["store.inventory_entries"] == 17
-        assert load_task(cfg, task.task_id).meta["revision"] == revision + 1
+        assert load_task(cfg, task.task_id).meta["revision"] == revision
+        assert supervisor.metrics["renewal.not_required"] == 1
         assert work.snapshot()["pending_control_attempt"] is None
         with attempt_control_lock(cfg, attempt.attempt_id, blocking=False) as acquired:
             assert acquired
@@ -95,7 +97,7 @@ def test_delayed_supervision_revalidates_identity_and_releases_lock(tmp_path, mu
                 local_paths(cfg.runtime_root)["processes"] / f"{attempt.attempt_id}.json", {"process": changed}
             )
         elif mutation == "orphan":
-            assert expire_claim(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token)
+            persist_legacy_orphan(cfg, task.task_id)
         revision = load_task(cfg, task.task_id).meta["revision"]
         if mutation == "close":
             supervisor.cancel_pending_control()
@@ -118,7 +120,8 @@ def test_short_inventory_keeps_other_attempt_renewing_while_long_scan_waits(tmp_
     try:
         supervisor._supervise(process)
         supervisor._supervise(other_process)
-        assert load_task(cfg, other.task_id).meta["revision"] == revision + 1
+        assert load_task(cfg, other.task_id).meta["revision"] == revision
+        assert supervisor.metrics["renewal.not_required"] == 1
         assert supervisor._work.snapshot()["pending_control_attempt"] == attempt.attempt_id
         with attempt_control_lock(cfg, attempt.attempt_id, blocking=False) as acquired:
             assert not acquired
@@ -170,9 +173,27 @@ def test_pending_irreversible_commitment_prevents_renewal_and_completes_signal(t
         supervisor.close()
 
 
-def test_cancel_during_inventory_commits_termination_without_reentering_lock(tmp_path):
+def test_cancel_during_inventory_commits_termination_without_reentering_lock(tmp_path, monkeypatch):
     cfg, supervisor = _setup(tmp_path)
     task, attempt, process = _process(cfg)
+    from qqtools.plugins.qexp.runtime.paths import attempt_path
+    from qqtools.plugins.qexp.runtime.process_evidence import ProcessEvidence
+
+    identity = {
+        "wrapper_pid": None,
+        "wrapper_start_time_ticks": None,
+        "process_group_id": 9876,
+        "process_group_start_time_ticks": 123,
+    }
+    process.update(identity)
+    path = attempt_path(cfg.shared_root, task.task_id, attempt.attempt_number)
+    stored = read_json(path)
+    stored["attempt"]["process"].update(identity)
+    atomic_replace(path, stored)
+    atomic_replace(local_paths(cfg.runtime_root)["processes"] / f"{attempt.attempt_id}.json", {"process": process})
+    monkeypatch.setattr(
+        "qqtools.plugins.qexp.authority.inspect_local_group_identity", lambda *_args: ProcessEvidence(state="alive")
+    )
     try:
         supervisor._supervise(process)
         cancel_task(cfg, task.task_id, terminate_running=True)
@@ -203,7 +224,8 @@ def test_second_long_inventory_does_not_retain_a_second_lock(tmp_path):
         supervisor._supervise(other_process)
         supervisor._work.tick(1)
         supervisor._work.tick(1)
-        assert load_task(cfg, other.task_id).meta["revision"] == revision + 1
+        assert load_task(cfg, other.task_id).meta["revision"] == revision
+        assert supervisor.metrics["renewal.not_required"] == 2
     finally:
         supervisor.close()
 
@@ -278,7 +300,8 @@ def test_corrupt_manifest_after_terminal_cas_preserves_hooks_and_other_service(t
             assert (paths["observations"] / f"{attempt.attempt_id}.json").exists()
             assert all(path.exists() for path in decisions)
         supervisor._supervise(other_process)
-        assert load_task(cfg, other.task_id).meta["revision"] == other_revision + 1
+        assert load_task(cfg, other.task_id).meta["revision"] == other_revision
+        assert supervisor.metrics["renewal.not_required"] == 1
         with attempt_control_lock(cfg, attempt.attempt_id, blocking=False) as acquired:
             assert acquired
     finally:

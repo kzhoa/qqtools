@@ -322,6 +322,23 @@ def _render_task_operation(result: Mapping[str, Any], _presentation: Mapping[str
     )
 
 
+def _render_task_retry(result: Mapping[str, Any], _presentation: Mapping[str, object]) -> str:
+    """Render retry status, including the explicit supersession warning."""
+    return _operation(
+        result.get("action", "retry"),
+        result.get("outcome", result.get("operation_state", result.get("task_state"))),
+        (
+            ("Task ID", result.get("task_id")),
+            ("Task state", result.get("task_state")),
+            ("Superseded Attempt", result.get("superseded_attempt_id")),
+            ("Terminate old process", result.get("terminate_old_process")),
+            ("Duplicate execution risk", result.get("duplicate_execution_risk")),
+            ("Warning", result.get("warning")),
+            ("Next", result.get("follow_up_command")),
+        ),
+    )
+
+
 def _render_dependencies(result: Mapping[str, Any], _presentation: Mapping[str, object]) -> str:
     return _details(tuple((str(label).replace("_", " ").capitalize(), value) for label, value in result.items()))
 
@@ -503,6 +520,23 @@ def _validate_task_operation(result: Any) -> None:
         raise ValueError("task-operation payload requires 'operation_state' or 'task_state'")
 
 
+def _validate_task_retry(result: Any) -> None:
+    """Validate the finite payload emitted by task retry."""
+    value = _mapping(result, "task-retry payload")
+    for key in ("task_id", "action", "outcome", "task_state", "operation_state"):
+        _required(value, key, "task-retry payload")
+    superseded_attempt_id = _required(value, "superseded_attempt_id", "task-retry payload")
+    if superseded_attempt_id is not None and not isinstance(superseded_attempt_id, str):
+        raise TypeError("task-retry payload.superseded_attempt_id must be a string or null")
+    terminate_old_process = _required(value, "terminate_old_process", "task-retry payload")
+    if terminate_old_process is not None and type(terminate_old_process) is not bool:
+        raise TypeError("task-retry payload.terminate_old_process must be a boolean or null")
+    _required_bool(value, "duplicate_execution_risk", "task-retry payload")
+    warning = _required(value, "warning", "task-retry payload")
+    if warning is not None and not isinstance(warning, str):
+        raise TypeError("task-retry payload.warning must be a string or null")
+
+
 def _validate_dependencies(result: Any) -> None:
     value = _mapping(result, "dependencies payload")
     _required(value, "task_id", "dependencies payload")
@@ -529,7 +563,7 @@ CONTRACTS = {
     OutputKind.TASK_SHOW: OutputContract(_validate_task_show, _render_task_show),
     OutputKind.TASK_WATCH: OutputContract(_validate_task_watch, _render_task_watch),
     OutputKind.TASK_CANCEL: OutputContract(_validate_task_operation, _render_task_operation),
-    OutputKind.TASK_RETRY: OutputContract(_validate_task_operation, _render_task_operation),
+    OutputKind.TASK_RETRY: OutputContract(_validate_task_retry, _render_task_retry),
     OutputKind.DEPENDENCIES: OutputContract(_validate_dependencies, _render_dependencies),
     OutputKind.AVAILABILITY: OutputContract(_validate_availability, _render_availability),
     OutputKind.TASK_WAIT: OutputContract(_validate_task_wait, _render_task_wait),

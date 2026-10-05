@@ -312,6 +312,20 @@ def _authority_renewal_task_commit_matches_request(request: ProjectIORequest, cf
     except FileNotFoundError:
         return False
     claim = task.claim_control.get("active_claim") or {}
+    receipt = claim.get("ownership_transition")
+    durable_adoption_matches = bool(
+        isinstance(receipt, dict)
+        and receipt.get("source_task_revision") == request.source_revisions.get("task")
+        and receipt.get("source_attempt_digest") == request.source_revisions.get("attempt_digest")
+        and receipt.get("task_id") == parameters["task_id"]
+        and receipt.get("attempt_id") == parameters["attempt_id"]
+        and receipt.get("attempt_number") == parameters["attempt_number"]
+        and receipt.get("fencing_token") == parameters["fencing_token"]
+        and receipt.get("machine_name") == parameters["machine_name"]
+        and receipt.get("reservation_id") == parameters["reservation_id"]
+        and receipt.get("target_authority_mode") == "holder_bound"
+        and receipt.get("target_phase") == "running"
+    )
     task_matches = bool(
         task.attempt_control.get("current_attempt_id") == parameters["attempt_id"]
         and task.attempt_control.get("current_attempt_number") == parameters["attempt_number"]
@@ -320,7 +334,7 @@ def _authority_renewal_task_commit_matches_request(request: ProjectIORequest, cf
         and claim.get("fencing_token") == parameters["fencing_token"]
         and claim.get("machine_name") == parameters["machine_name"]
         and claim.get("reservation_id") == parameters["reservation_id"]
-        and claim.get("clock_observation_id") == request.request_id
+        and (claim.get("clock_observation_id") == request.request_id or durable_adoption_matches)
     )
     if not task_matches:
         return False
@@ -705,6 +719,10 @@ def _authority_terminal_publish_partial_target_matches(
         return False
     task_phase = task.state.get("projection")
     active_claim = task.claim_control.get("active_claim") or {}
+    from ..scheduler import _has_superseded_ownership
+
+    if parameters["mode"] == "active" and _has_superseded_ownership(task, attempt):
+        return True
     if (
         task_phase == parameters["phase"]
         and task.state.get("reason") == parameters["reason"]
@@ -812,25 +830,46 @@ def _authority_termination_commit(
             raise _BindingAuthorityChanged
         write_possible[0] = True
 
-    from ..scheduler import commit_project_io_shared_termination
+    if parameters.get("retirement") is not None:
+        from ..scheduler import retire_project_io_timeout_decision
 
-    result = commit_project_io_shared_termination(
-        cfg,
-        machine_name=parameters["machine_name"],
-        task_id=parameters["task_id"],
-        attempt_id=parameters["attempt_id"],
-        attempt_number=parameters["attempt_number"],
-        fencing_token=parameters["fencing_token"],
-        reservation_id=parameters["reservation_id"],
-        decision_id=parameters["decision_id"],
-        decision_token=parameters["decision_token"],
-        authority_outcome=parameters["authority_outcome"],
-        reason=parameters["reason"],
-        process_identity=parameters["process_identity"],
-        expected_task_revision=request.source_revisions["task"],
-        expected_attempt_digest=request.source_revisions["attempt_digest"],
-        mutation_fence=mutation_fence,
-    )
+        result = retire_project_io_timeout_decision(
+            cfg,
+            machine_name=parameters["machine_name"],
+            task_id=parameters["task_id"],
+            attempt_id=parameters["attempt_id"],
+            attempt_number=parameters["attempt_number"],
+            fencing_token=parameters["fencing_token"],
+            reservation_id=parameters["reservation_id"],
+            decision_id=parameters["decision_id"],
+            decision_token=parameters["decision_token"],
+            authority_outcome=parameters["authority_outcome"],
+            reason=parameters["reason"],
+            process_identity=parameters["process_identity"],
+            source_revisions=request.source_revisions,
+            retirement=request.to_dict()["project_io_request"]["parameters"]["retirement"],
+            mutation_fence=mutation_fence,
+        )
+    else:
+        from ..scheduler import commit_project_io_shared_termination
+
+        result = commit_project_io_shared_termination(
+            cfg,
+            machine_name=parameters["machine_name"],
+            task_id=parameters["task_id"],
+            attempt_id=parameters["attempt_id"],
+            attempt_number=parameters["attempt_number"],
+            fencing_token=parameters["fencing_token"],
+            reservation_id=parameters["reservation_id"],
+            decision_id=parameters["decision_id"],
+            decision_token=parameters["decision_token"],
+            authority_outcome=parameters["authority_outcome"],
+            reason=parameters["reason"],
+            process_identity=parameters["process_identity"],
+            expected_task_revision=request.source_revisions["task"],
+            expected_attempt_digest=request.source_revisions["attempt_digest"],
+            mutation_fence=mutation_fence,
+        )
     if not replay_only:
         epoch = _read_epoch(paths)
         if not epoch.active or epoch.runtime_id != request.runtime_id or epoch.executor_epoch != request.executor_epoch:
@@ -1039,7 +1078,7 @@ def _authority_replay_blocked_evidence(request: ProjectIORequest) -> dict[str, A
     parameters = request.parameters
     revisions = dict(request.source_revisions)
     if request.operation_kind == "authority_termination_commit":
-        return {
+        evidence = {
             "outcome": "stale",
             "reason": "executor_epoch_fence",
             "machine_name": parameters["machine_name"],
@@ -1059,6 +1098,9 @@ def _authority_replay_blocked_evidence(request: ProjectIORequest) -> dict[str, A
             "authority_granted": False,
             "local_effects": [],
         }
+        if "retirement" in parameters:
+            evidence["retirement_receipt"] = dict(parameters["retirement"])
+        return evidence
     return {
         "outcome": "stale",
         "reason": "executor_epoch_fence",

@@ -20,7 +20,7 @@ from qqtools.plugins.qexp.runtime.records import AttemptRecord, utc_now
 from qqtools.plugins.qexp.runtime.resources.reservations import reservation_snapshot
 from qqtools.plugins.qexp.runtime.store import atomic_replace, read_json
 from qqtools.plugins.qexp.runtime.tasks import load_task, save_task
-from qqtools.plugins.qexp.scheduler import claim_task, expire_claim
+from qqtools.plugins.qexp.scheduler import authorize_launch, claim_task
 
 pytestmark = [pytest.mark.integration, pytest.mark.qexp_fast_io]
 
@@ -155,6 +155,60 @@ def test_terminal_coordinator_commits_natural_exit_and_converges_local_capacity(
         assert observation.exists()
         assert (paths["registrations"] / observation.name).exists()
         assert not executor.has_unfinished_work()
+    finally:
+        coordinator.close()
+        executor.shutdown()
+
+
+@pytest.mark.parametrize("exit_code", [0, -15])
+def test_superseded_exit_settles_old_capacity_without_changing_successor(tmp_path: Path, exit_code: int) -> None:
+    runtime, cfg, binding, revision, task, attempt, paths, manifest, _ = _case(tmp_path, exit_code=exit_code)
+    path = attempt_path(cfg.shared_root, task.task_id, attempt.attempt_number)
+    historical = AttemptRecord.from_dict(read_json(path))
+    historical.authority_mode = "holder_bound"
+    historical.authorization["launch_id"] = "original-launch"
+    historical.timestamps["launch_authorized_at"] = utc_now()
+    historical.lease.update(expires_at=None, clock_evidence=None)
+    atomic_replace(path, historical.to_dict())
+    current = load_task(cfg, task.task_id)
+    current.claim_control["active_claim"].update(
+        authority_mode="holder_bound",
+        launch_id="original-launch",
+        launch_authorized_at=historical.timestamps["launch_authorized_at"],
+        lease_expires_at=None,
+        clock_error_bound_seconds=None,
+        clock_provider=None,
+        clock_observation_id=None,
+    )
+    save_task(cfg, current)
+    retry(cfg, task.task_id, supersede_attempt=attempt.attempt_id)
+    successor = claim_task(cfg, task.task_id, [1], reservation_runtime_root=runtime.root, project_id=binding.project_id)
+    assert successor is not None
+    assert authorize_launch(
+        cfg,
+        task.task_id,
+        successor.attempt_id,
+        successor.current_fencing_token,
+        reservation_runtime_root=runtime.root,
+    )
+    before = load_task(cfg, task.task_id).to_dict()
+    executor = ProjectIOExecutor(runtime)
+    executor.begin_epoch()
+    controller = ProjectIOController(runtime, executor)
+    coordinator = AttemptSupervisionCoordinator(runtime, controller)
+    try:
+        _until(lambda: controller.advance_binding_validation([binding], revision), bool)
+
+        def advance():
+            coordinator.advance_terminal_completions([binding], revision)
+            return read_json(manifest)["process"].get("observed_state"), len(reservation_snapshot(runtime.root).active)
+
+        _until(advance, lambda value: value == ("exited", 1))
+        assert load_task(cfg, task.task_id).to_dict() == before
+        settled = AttemptRecord.from_dict(read_json(path))
+        assert settled.phase == ("succeeded" if exit_code == 0 else "failed")
+        assert settled.result["exit_code"] == exit_code
+        assert reservation_snapshot(runtime.root).active[0]["attempt_id"] == successor.attempt_id
     finally:
         coordinator.close()
         executor.shutdown()
@@ -504,13 +558,16 @@ def test_terminal_coordinator_completes_real_detached_orphan(
     )
     running.meta["revision"] += 1
     save_task(cfg, running)
-    assert expire_claim(
-        cfg,
-        task.task_id,
-        attempt.attempt_id,
-        attempt.current_fencing_token,
-        reservation_runtime_root=runtime.root,
-    )
+    # A supported source already persisted this detached orphan before upgrade.
+    historical_path = attempt_path(cfg.shared_root, task.task_id, attempt.attempt_number)
+    historical = AttemptRecord.from_dict(read_json(historical_path))
+    historical.phase = "orphaned"
+    historical.timestamps["orphaned_at"] = utc_now()
+    atomic_replace(historical_path, historical.to_dict())
+    running.state.update(projection="blocked", reason="orphaned_attempt_requires_recovery")
+    running.claim_control["active_claim"] = None
+    running.attempt_control["current_attempt_id"] = None
+    save_task(cfg, running)
     if disabled:
         runtime.set_enabled(binding.project_id, False)
     revision, bindings = runtime.load_registry()

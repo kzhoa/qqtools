@@ -1309,25 +1309,29 @@ class ProjectIOExecutor:
         reason: str,
         process_identity: Mapping[str, object],
         source_revisions: Mapping[str, object],
+        retirement: Mapping[str, object] | None = None,
     ) -> ProjectIORequest:
         """Persist one exact replayable shared termination commitment."""
+        parameters = {
+            "machine_name": getattr(binding, "machine_name", None),
+            "task_id": task_id,
+            "attempt_id": attempt_id,
+            "attempt_number": attempt_number,
+            "fencing_token": fencing_token,
+            "reservation_id": reservation_id,
+            "decision_id": decision_id,
+            "decision_token": decision_token,
+            "authority_outcome": authority_outcome,
+            "reason": reason,
+            "process_identity": dict(process_identity),
+        }
+        if retirement is not None:
+            parameters["retirement"] = dict(retirement)
         return self._prepare_request(
             binding,
             registry_revision,
             "authority_termination_commit",
-            {
-                "machine_name": getattr(binding, "machine_name", None),
-                "task_id": task_id,
-                "attempt_id": attempt_id,
-                "attempt_number": attempt_number,
-                "fencing_token": fencing_token,
-                "reservation_id": reservation_id,
-                "decision_id": decision_id,
-                "decision_token": decision_token,
-                "authority_outcome": authority_outcome,
-                "reason": reason,
-                "process_identity": dict(process_identity),
-            },
+            parameters,
             source_revisions=source_revisions,
         )
 

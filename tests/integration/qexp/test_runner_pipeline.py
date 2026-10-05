@@ -56,29 +56,25 @@ def test_exit_observation_rejects_invalid_records(tmp_path: Path, value, reason)
     assert diagnostic["reason"] == reason
 
 
-def test_authority_state_publication_keeps_recovered_fencing_token(tmp_path: Path, monkeypatch):
-    from qqtools.plugins.qexp.lease import (
-        AuthorityResolution,
-        AuthorityResolutionOutcome,
-        LeaseRenewalOutcome,
-        LeaseRenewalResult,
-    )
+def test_authority_loss_preserves_token_without_implicit_recovery_or_signal(tmp_path: Path, monkeypatch):
+    from qqtools.plugins.qexp.lease import LeaseRenewalOutcome, LeaseRenewalResult
 
     cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")
     supervisor = AuthoritySupervisor(cfg)
     process = {"task_id": "task", "attempt_id": "attempt", "fencing_token": 1}
     monkeypatch.setattr(
         "qqtools.plugins.qexp.authority.renew_attempt_lease",
-        lambda *args: LeaseRenewalResult(LeaseRenewalOutcome.ORPHANED_RECOVERY_REQUIRED, "attempt", 1),
+        lambda *args, **kwargs: LeaseRenewalResult(LeaseRenewalOutcome.ORPHANED_RECOVERY_REQUIRED, "attempt", 1),
     )
     monkeypatch.setattr(
-        "qqtools.plugins.qexp.authority.resolve_execution_authority",
-        lambda *args, **kwargs: AuthorityResolution(AuthorityResolutionOutcome.RECOVERED, "decision", "attempt", 1, 2),
+        supervisor,
+        "_terminate",
+        lambda *args, **kwargs: pytest.fail("authority loss cannot authorize a signal"),
     )
     supervisor._renew_or_isolate("task", "attempt", 1, process)
     stored = read_json(local_paths(cfg.runtime_root)["processes"] / "attempt.json")["process"]
-    assert stored["fencing_token"] == 2
-    assert stored["authority_state"] == "healthy"
+    assert stored["fencing_token"] == 1
+    assert stored["authority_state"] == "isolated"
 
 
 class FakeChild:

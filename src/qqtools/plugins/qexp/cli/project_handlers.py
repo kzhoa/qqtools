@@ -355,10 +355,12 @@ def dispatch_project(
             if args.quiet and args.format == "json":
                 raise CliUsageError("--quiet cannot be combined with --format json.")
             ensure_local_agent_active(cfg, reason="task-retry", **get_lifecycle_kwargs())
-            task_value = task_commands.retry(cfg, args.task_id)
+            supersede_attempt = getattr(args, "supersede_attempt", None)
+            task_value = task_commands.retry(cfg, args.task_id, supersede_attempt=supersede_attempt)
             if args.quiet:
                 print(task_value.task_id)
             else:
+                is_supersession = supersede_attempt is not None
                 return CommandOutcome(
                     0,
                     CliOutput(
@@ -369,6 +371,10 @@ def dispatch_project(
                             "task_id": task_value.task_id,
                             "task_state": task_value.state["projection"],
                             "operation_state": "accepted",
+                            "superseded_attempt_id": supersede_attempt,
+                            "terminate_old_process": False if is_supersession else None,
+                            "duplicate_execution_risk": is_supersession,
+                            "warning": task_commands.SUPERSESSION_WARNING if is_supersession else None,
                             "follow_up_command": (
                                 f"qexp task show {shlex.quote(task_value.task_id)} "
                                 f"--project {shlex.quote(str(cfg.project_root))}"

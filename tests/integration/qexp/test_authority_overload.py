@@ -23,7 +23,7 @@ pytestmark = [pytest.mark.integration, pytest.mark.qexp_fast_io]
         pytest.param(256, 64, 8, id="sustained-overload", marks=pytest.mark.stress),
     ],
 )
-def test_mixed_leases_survive_saturated_discovery_and_fail_closed_without_clock(
+def test_durable_owners_survive_saturated_discovery_and_clock_loss(
     tmp_path, monkeypatch, active_count, work_limit, arrivals_per_turn
 ):
     now = [datetime.now(timezone.utc).replace(microsecond=0)]
@@ -56,13 +56,15 @@ def test_mixed_leases_survive_saturated_discovery_and_fail_closed_without_clock(
         assert attempt is not None and attempt.authority_mode == mode
         assert scheduler.authorize_launch(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token)
         claim = load_task(cfg, task.task_id).claim_control["active_claim"]
+        attempt.authority_mode = claim["authority_mode"]
+        assert attempt.authority_mode == "holder_bound"
         process = {
             "protocol_version": 1,
             "task_id": task.task_id,
             "attempt_id": attempt.attempt_id,
             "fencing_token": attempt.current_fencing_token,
             "reservation_id": attempt.reservation_id,
-            "authority_mode": mode,
+            "authority_mode": attempt.authority_mode,
             "observed_state": "running",
             "lease_expires_at": claim.get("lease_expires_at"),
             "clock_error_bound_seconds": claim.get("clock_error_bound_seconds"),
@@ -88,6 +90,10 @@ def test_mixed_leases_survive_saturated_discovery_and_fail_closed_without_clock(
             if attempt.authority_mode == "holder_bound":
                 assert stored["lease"]["expires_at"] is None
                 assert stored["lease"]["clock_evidence"] is None
+                serviced_at = supervisor._last_renewal.get(attempt.attempt_id)
+                if serviced_at is not None and serviced_at != previous_expiries.get(attempt.attempt_id):
+                    publications[attempt.attempt_id].append(elapsed[0])
+                    previous_expiries[attempt.attempt_id] = serviced_at
                 continue
             expiry = stored["lease"]["expires_at"]
             assert datetime.fromisoformat(expiry.replace("Z", "+00:00")) - now[0] > timedelta(seconds=100)
@@ -129,7 +135,7 @@ def test_mixed_leases_survive_saturated_discovery_and_fail_closed_without_clock(
             supervisor.tick()
             observe_leases()
         for attempt in attempts:
-            if attempt.authority_mode == "bounded_lease":
+            if attempt.authority_mode == "holder_bound":
                 times = publications[attempt.attempt_id]
                 assert len(times) >= 3
                 assert all(later - earlier <= 18 for earlier, later in zip(times, times[1:])), (
@@ -138,7 +144,7 @@ def test_mixed_leases_survive_saturated_discovery_and_fail_closed_without_clock(
                     supervisor.work_snapshot,
                 )
                 assert elapsed[0] - times[-1] <= 18
-        assert supervisor.metrics["renewal.renewed"] > 0
+        assert supervisor.metrics.get("renewal.renewed", 0) == 0
         assert supervisor.metrics["renewal.not_required"] > 0
         assert supervisor.work_snapshot["active_cache_size"] == active_count
         assert supervisor.work_snapshot["cleanup_failures"] > 0

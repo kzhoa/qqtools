@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import uuid
 from collections.abc import Generator, Iterable
 from contextlib import nullcontext
 from dataclasses import asdict
@@ -10,7 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from .config_types import RootConfig
-from .lease import AuthorityResolutionOutcome, LeasePolicy, LeaseRenewalOutcome, holder_safe_deadline, load_lease_policy
+from .lease import LeasePolicy, LeaseRenewalOutcome, holder_safe_deadline, load_lease_policy
 from .lifecycle import TerminalTransition, commit_terminal_transition_locked, dispatch_task_lifecycle_hooks_noexcept
 from .runtime.authority_scan import EvidenceScan, is_path_present
 from .runtime.claims import archive_claim, reconcile_claim_archives
@@ -50,7 +49,7 @@ from .runtime.termination import (
     termination_check_steps,
     update_decision,
 )
-from .scheduler import authority_locks, commit_shared_termination, renew_attempt_lease, resolve_execution_authority
+from .scheduler import authority_locks, commit_shared_termination, renew_attempt_lease
 
 
 class AuthoritySupervisor:
@@ -703,7 +702,8 @@ class AuthoritySupervisor:
                 if (
                     attempt.attempt_id != attempt_id
                     or attempt.phase != "running"
-                    or attempt.authority_mode != "bounded_lease"
+                    or attempt.authority_mode not in {"bounded_lease", "holder_bound"}
+                    or claim.get("authority_mode") != attempt.authority_mode
                     or attempt.current_fencing_token != claim.get("fencing_token")
                     or not isinstance(old_token, int)
                     or old_token >= attempt.current_fencing_token
@@ -1040,7 +1040,21 @@ class AuthoritySupervisor:
                 self.metrics.get("renewal_lateness.maximum_seconds", 0), lateness
             )
         self._last_renewal[attempt_id] = now
-        renewal = renew_attempt_lease(self.cfg, task_id, attempt_id, token)
+        renewal = renew_attempt_lease(
+            self.cfg,
+            task_id,
+            attempt_id,
+            token,
+            process_identity={
+                field: process.get(field)
+                for field in (
+                    "wrapper_pid",
+                    "wrapper_start_time_ticks",
+                    "process_group_id",
+                    "process_group_start_time_ticks",
+                )
+            },
+        )
         outcome_metric = f"renewal.{renewal.outcome.value}"
         self.metrics[outcome_metric] = self.metrics.get(outcome_metric, 0) + 1
         if renewal.outcome is LeaseRenewalOutcome.NOT_REQUIRED:
@@ -1067,32 +1081,15 @@ class AuthoritySupervisor:
             else:
                 self._set_authority_state(process, "suspect")
             return
-        resolution = resolve_execution_authority(
-            self.cfg,
-            task_id,
-            attempt_id,
-            token,
-            uuid.uuid4().hex,
-            reservation_runtime_root=self.reservation_runtime_root,
-            defer_recovery=self._work is not None,
-        )
-        if resolution.outcome in {AuthorityResolutionOutcome.RENEWED, AuthorityResolutionOutcome.RECOVERED}:
-            if resolution.effective_token is not None:
-                process["fencing_token"] = resolution.effective_token
-            self._set_authority_state(process, "healthy")
+        if renewal.outcome is LeaseRenewalOutcome.TERMINATION_REQUESTED:
+            terminate = self._terminate_locked if has_attempt_lock else self._terminate
+            terminate(task_id, attempt_id, token, process, renewal.outcome.value, "termination_requested")
             return
-        if resolution.outcome is AuthorityResolutionOutcome.AUTHORITY_UNAVAILABLE:
-            self._set_authority_state(process, "isolated")
-            return
-        terminate = self._terminate_locked if has_attempt_lock else self._terminate
-        terminate(
-            task_id,
-            attempt_id,
-            token,
-            process,
-            resolution.outcome.value,
-            resolution.reason or "authority_changed",
-        )
+        # Authority loss, lease expiry, orphan observations, and renewal
+        # failures cannot authorize a signal for an already launched process.
+        # Keep it isolated/suspect until an explicit cancellation path proves
+        # the exact process and authority identity.
+        self._set_authority_state(process, "isolated")
 
     def _send_signals(self, attempt_id: str, decision_id: str) -> dict[str, object]:
         if self._work is None:

@@ -673,6 +673,42 @@ qqtools 1.3.15.
 | Existing schema-6 root moving to 1.3.15 | Drain all participants and run `admin migrate schema6 check/start/attest/resume`. |
 | Existing schema-5 root | Drain it and run `qexp admin migrate schema --project PATH --to-schema 6` before the schema-6 capability upgrade. |
 
+## Durable Attempt ownership rollout
+
+Targets 1.3.26 through 1.3.28 support direct machine-rolling upgrades from the source rows below.
+Install the target package and restart each machine's global agent one machine at a time. Do not
+drain training, wait for idle GPUs, run per-Project repair, or install an intermediate qqtools
+release.
+
+| Source package and persisted data | 1.3.26 | 1.3.27 | 1.3.28 |
+| --- | --- | --- | --- |
+| 1.3.23 | supported | supported | supported |
+| 1.3.25 | supported | supported | supported |
+| 1.3.26 | same-version restart | supported | supported |
+| 1.3.27 | no downgrade | same-version restart | supported |
+
+At launch authorization, the Task records a durable ownership receipt and changes the Attempt from
+a revocable pre-launch lease to `holder_bound`. A restarted agent validates the same process and
+Attempt; an old lease deadline cannot signal training, orphan the Attempt, release its reservation,
+or launch a replacement. Supported legacy live Attempts are converted in place after exact process,
+token, reservation, and control checks. Unavailable or conflicting evidence defers shared mutation
+while training continues.
+
+Historical deadline-only termination decisions are suppressed before fixed signal lanes run and
+are reconciled by exact receipt. Do not delete their files or clear shared stop fields manually.
+An unavailable machine remains pending; elapsed time is not process-absence evidence.
+
+Use `qexp agent status` and `qexp admin upgrade status` to observe deployment and bounded Project
+progress. `qexp admin upgrade advance` may advance background work but is not a prerequisite for
+compatible scheduling or training continuity. A user who deliberately wants to abandon one exact
+active durable owner may run `qexp task retry TASK --supersede-attempt ATTEMPT`; this warns that the
+old process may still run and write outputs, does not stop it, and keeps its reservation until exact
+absence is verified.
+
+Temporary legacy-writer and timeout-retirement adapters follow the compatibility registry through
+1.3.28. The permanent source-evidence importer, ownership receipts, exact identity checks, and
+historical retirement interpretation remain supported after temporary cleanup.
+
 ## Task history pagination
 
 After upgrading the package and restarting each machine's global agent, registered

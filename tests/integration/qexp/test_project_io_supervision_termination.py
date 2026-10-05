@@ -24,6 +24,13 @@ from qqtools.plugins.qexp.runtime.records import AttemptRecord, utc_now
 from qqtools.plugins.qexp.runtime.resources.reservations import reservation_snapshot
 from qqtools.plugins.qexp.runtime.store import atomic_replace, iter_json, read_json
 from qqtools.plugins.qexp.runtime.tasks import load_task, save_task
+from qqtools.plugins.qexp.runtime.termination import (
+    create_decision,
+    is_recovery_blocked,
+    read_timeout_retirement,
+    timeout_retirement_path,
+    update_decision,
+)
 from qqtools.plugins.qexp.scheduler import claim_task
 
 pytestmark = [pytest.mark.integration, pytest.mark.qexp_fast_io]
@@ -114,14 +121,12 @@ def _running_case(tmp_path: Path, *, trigger: str):
     return runtime, cfg, binding, revision, task, attempt, child, paths, manifest, attempt_file
 
 
-@pytest.mark.parametrize("trigger", ["cancel", "safe_deadline"])
 def test_termination_coordinator_commits_before_signaling_and_converges_capacity(
     tmp_path: Path,
-    trigger: str,
 ) -> None:
     runtime, cfg, binding, revision, task, attempt, child, paths, manifest, _attempt_file = _running_case(
         tmp_path,
-        trigger=trigger,
+        trigger="cancel",
     )
     try:
         executor = ProjectIOExecutor(runtime)
@@ -157,6 +162,118 @@ def test_termination_coordinator_commits_before_signaling_and_converges_capacity
             coordinator.close()
             executor.shutdown()
     finally:
+        if child.poll() is None:
+            child.kill()
+        child.wait(timeout=5)
+
+
+def test_elapsed_legacy_execution_deadline_never_signals_or_releases_capacity(tmp_path: Path) -> None:
+    runtime, cfg, binding, revision, task, attempt, child, paths, manifest, _attempt_file = _running_case(
+        tmp_path,
+        trigger="safe_deadline",
+    )
+    try:
+        executor = ProjectIOExecutor(runtime)
+        executor.begin_epoch()
+        controller = ProjectIOController(runtime, executor)
+        coordinator = AttemptSupervisionCoordinator(runtime, controller)
+        try:
+            _until(lambda: controller.advance_binding_validation([binding], revision), bool)
+            for _ in range(24):
+                coordinator.advance_terminations([binding], revision)
+                time.sleep(0.01)
+
+            assert child.poll() is None
+            assert load_task(cfg, task.task_id).state["projection"] == "running"
+            assert read_json(manifest)["process"]["observed_state"] == "running"
+            assert len(reservation_snapshot(runtime.root).active) == 1
+            assert iter_json(paths["termination_decisions"] / attempt.attempt_id) == []
+        finally:
+            coordinator.close()
+            executor.shutdown()
+    finally:
+        if child.poll() is None:
+            child.kill()
+        child.wait(timeout=5)
+
+
+@pytest.mark.parametrize("committed", [False, True])
+@pytest.mark.parametrize("crash_after_shared", [False, True])
+def test_historical_timeout_decision_retires_through_worker_without_signaling(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, committed: bool, crash_after_shared: bool
+) -> None:
+    runtime, cfg, binding, revision, task, attempt, child, paths, manifest, _ = _running_case(
+        tmp_path, trigger="safe_deadline"
+    )
+    local_cfg = project_io_supervision._termination_local_config(runtime, binding)
+    process = read_json(manifest)["process"]
+    decision = create_decision(
+        local_cfg,
+        task_id=task.task_id,
+        attempt_id=attempt.attempt_id,
+        fencing_token=attempt.current_fencing_token,
+        process=process,
+        authority_outcome="holder_safe_deadline_elapsed",
+        reason="holder_safe_deadline_elapsed",
+    )
+    if committed:
+        update_decision(local_cfg, attempt.attempt_id, decision["decision_id"], shared_commitment="committed")
+        current = load_task(cfg, task.task_id)
+        current.claim_control["active_claim"].update(
+            termination_decision_id=decision["decision_id"],
+            termination_decision_token=attempt.current_fencing_token,
+        )
+        current.meta["revision"] += 1
+        save_task(cfg, current)
+    executor = ProjectIOExecutor(runtime)
+    executor.begin_epoch()
+    controller = ProjectIOController(runtime, executor)
+    coordinator = AttemptSupervisionCoordinator(runtime, controller)
+    interrupted = False
+    original_update = project_io_supervision.update_timeout_retirement
+
+    def interrupted_update(*args, **kwargs):
+        nonlocal interrupted
+        if crash_after_shared and kwargs.get("state") == "retired" and not interrupted:
+            interrupted = True
+            raise OSError("interrupted after shared retirement acknowledgement")
+        return original_update(*args, **kwargs)
+
+    monkeypatch.setattr(project_io_supervision, "update_timeout_retirement", interrupted_update)
+    try:
+        _until(lambda: controller.advance_binding_validation([binding], revision), bool)
+
+        def advance():
+            results = coordinator.advance_terminations([binding], revision)
+            receipt = read_timeout_retirement(local_cfg, attempt.attempt_id, decision["decision_id"])
+            return receipt, results, executor.status_view()
+
+        _until(advance, lambda value: value[0] is not None and value[0]["state"] == "retired")
+        assert interrupted == crash_after_shared
+        assert child.poll() is None
+        assert len(reservation_snapshot(runtime.root).active) == 1
+        current = load_task(cfg, task.task_id)
+        assert current.state["projection"] == "running"
+        assert current.claim_control["active_claim"].get("termination_decision_id") is None
+        stored = read_json(paths["termination_decisions"] / attempt.attempt_id / f"{decision['decision_id']}.json")
+        assert stored["termination_decision"]["signal_attempts"] == []
+        assert not is_recovery_blocked(local_cfg, attempt.attempt_id)
+        decision_file = paths["termination_decisions"] / attempt.attempt_id / f"{decision['decision_id']}.json"
+        changed = {"termination_decision": {**stored["termination_decision"], "process_group_start_time_ticks": 1}}
+        atomic_replace(decision_file, changed)
+        assert is_recovery_blocked(local_cfg, attempt.attempt_id)
+        atomic_replace(decision_file, stored)
+        receipt_file = timeout_retirement_path(local_cfg, attempt.attempt_id, decision["decision_id"])
+        valid_receipt = read_json(receipt_file)
+        missing_proof = {
+            "timeout_decision_retirement": {**valid_receipt["timeout_decision_retirement"], "shared_receipt": None}
+        }
+        atomic_replace(receipt_file, missing_proof)
+        assert is_recovery_blocked(local_cfg, attempt.attempt_id)
+        atomic_replace(receipt_file, valid_receipt)
+    finally:
+        coordinator.close()
+        executor.shutdown()
         if child.poll() is None:
             child.kill()
         child.wait(timeout=5)

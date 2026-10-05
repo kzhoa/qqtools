@@ -145,8 +145,8 @@ class _LifecycleGate:
         {
             "test_real_agent_healthy_binding_scale_preserves_incumbent_progress[3-window-2]",
             "test_li03_expired_claim_recovers_same_attempt_without_relaunch",
-            "test_li03_real_peer_observes_natural_lease_expiry[False]",
-            "test_li03_real_peer_observes_natural_lease_expiry[True]",
+            "test_li03_real_peer_cannot_expire_durable_execution[False]",
+            "test_li03_real_peer_cannot_expire_durable_execution[True]",
             "test_li05_launch_boundary_has_no_duplicate_authorized_process[before_authorization]",
             "test_li05_launch_boundary_has_no_duplicate_authorized_process[after_authorization]",
             "test_li05_agent_crash_between_process_creation_and_registration",

@@ -42,6 +42,11 @@ from .runtime.authority_lock import authority_locks
 from .runtime.authority_scan import is_path_present
 from .runtime.claims import archive_claim
 from .runtime.dependencies import dependency_gate, dependency_locks
+from .runtime.durable_ownership import (
+    OwnershipTransitionConflict,
+    process_identity_matches,
+    transition_attempt_ownership,
+)
 from .runtime.group_cancellation import has_active_cancellation
 from .runtime.group_discovery.changes import record_task_change
 from .runtime.group_namespace import read_group
@@ -834,18 +839,42 @@ def _persist_starting_pair_locked(
     *,
     launch_id: str,
     authorized_at: str,
+    mutation_fence: Callable[[], None] | None = None,
+    launch_handoff_timeout_seconds: int | float | None = None,
+    task_writer: Callable[[TaskRecord], None] | None = None,
 ) -> None:
-    claim = task.claim_control["active_claim"]
-    claim["launch_state"] = "starting"
-    claim["launch_id"] = launch_id
-    claim["launch_authorized_at"] = authorized_at
-    task.meta["revision"] += 1
-    task.meta["updated_at"] = authorized_at
-    save_task(cfg, task)
-    attempt.phase = "starting"
-    attempt.authorization["launch_id"] = launch_id
-    attempt.timestamps["launch_authorized_at"] = authorized_at
-    atomic_replace(attempt_path(cfg.shared_root, task.task_id, attempt.attempt_number), attempt.to_dict())
+    if task_writer is None:
+        task_writer = lambda value: save_task(cfg, value)
+
+    def write_attempt(value: AttemptRecord) -> None:
+        target = attempt_path(cfg.shared_root, value.task_id, value.attempt_number)
+        if mutation_fence is None:
+            atomic_replace(target, value.to_dict())
+        else:
+            atomic_replace(target, value.to_dict(), before_replace=lambda _stat: mutation_fence())
+
+    result = transition_attempt_ownership(
+        cfg,
+        task,
+        attempt,
+        target_phase="starting",
+        launch_id=launch_id,
+        authorized_at=authorized_at,
+        launch_handoff_timeout_seconds=launch_handoff_timeout_seconds,
+        mutation_fence=mutation_fence,
+        task_writer=task_writer,
+        attempt_writer=write_attempt,
+    )
+    # Replay repair returns a projected copy because its Task is already
+    # durable. Keep the caller's Attempt object equally current.
+    for field in (
+        "phase",
+        "lease",
+        "authority_mode",
+        "authorization",
+        "timestamps",
+    ):
+        setattr(attempt, field, copy.deepcopy(getattr(result.attempt, field)))
 
 
 def resume_starting_attempt(
@@ -900,10 +929,29 @@ def resume_starting_attempt(
             or not isinstance(attempt.authorization, dict)
         ):
             return None
+
+        # A Task-first authorization may have reached durable storage while
+        # the companion Attempt write was interrupted.  Replay that exact
+        # receipt before evaluating ordinary mode/gate state; this is the
+        # only path allowed to repair the stranded Attempt projection.
+        if claim.get("launch_state") == "starting":
+            try:
+                _persist_starting_pair_locked(
+                    cfg,
+                    task,
+                    attempt,
+                    launch_id=claim.get("launch_id"),
+                    authorized_at=claim.get("launch_authorized_at"),
+                    launch_handoff_timeout_seconds=claim.get("launch_handoff_timeout_seconds"),
+                )
+            except (OwnershipTransitionConflict, TypeError, ValueError):
+                return None
+            claim = task.claim_control.get("active_claim") or {}
         launch_id = claim.get("launch_id")
         has_committed_authorization = (
             claim.get("launch_state") == "starting"
             and attempt.phase == "starting"
+            and attempt.authority_mode == "holder_bound"
             and isinstance(launch_id, str)
             and bool(launch_id)
             and attempt.authorization.get("launch_id") == launch_id
@@ -932,6 +980,8 @@ def resume_starting_attempt(
             if cancel_result is None:
                 if not (claim.get("authority_mode") != "bounded_lease" or clock_capability(cfg).is_healthy):
                     return None
+                if claim.get("authority_mode") == "bounded_lease" and not _bounded_lease_is_current(claim, attempt):
+                    return None
                 launch_id = launch_id if has_committed_authorization else uuid.uuid4().hex
                 authorized_at = claim.get("launch_authorized_at") if has_committed_authorization else utc_now()
                 change_context = (
@@ -956,6 +1006,7 @@ def resume_starting_attempt(
                         attempt,
                         launch_id=launch_id,
                         authorized_at=authorized_at,
+                        launch_handoff_timeout_seconds=claim.get("launch_handoff_timeout_seconds"),
                     )
                 return attempt
     if cancel_result is not None:
@@ -1045,15 +1096,12 @@ def authorize_project_io_launch(
             or attempt.current_fencing_token != fencing_token
             or attempt.reservation_id != reservation_id
             or attempt.machine_name != cfg.machine_name
-            or attempt.authority_mode != claim.get("authority_mode")
             or attempt.phase not in {"claimed", "starting"}
         ):
             return denied("attempt_not_current")
 
         authority_mode = claim.get("authority_mode")
         if authority_mode not in {"bounded_lease", "holder_bound"}:
-            return denied("authority_unavailable")
-        if attempt.authority_mode != authority_mode:
             return denied("authority_unavailable")
 
         # Once the Task-side launch gate commits, later pause, cancellation,
@@ -1062,33 +1110,46 @@ def authorize_project_io_launch(
         if claim.get("launch_state") == "starting":
             launch_id = claim.get("launch_id")
             authorized_at = claim.get("launch_authorized_at")
-            if not isinstance(launch_id, str) or not _LAUNCH_ID.fullmatch(launch_id):
+            if not isinstance(launch_id, str) or not launch_id:
                 return denied("attempt_not_current")
             if not _valid_utc_timestamp(authorized_at):
                 return denied("attempt_not_current")
-            stored_timeout = claim.get(
-                "launch_handoff_timeout_seconds",
-                attempt.authorization.get("launch_handoff_timeout_seconds", timeout_seconds),
-            )
+            stored_timeout = claim.get("launch_handoff_timeout_seconds")
+            if stored_timeout is None:
+                stored_timeout = attempt.authorization.get("launch_handoff_timeout_seconds")
             try:
-                stored_timeout = validate_launch_handoff_timeout_seconds(stored_timeout)
+                if stored_timeout is not None:
+                    stored_timeout = validate_launch_handoff_timeout_seconds(stored_timeout)
             except (TypeError, ValueError):
                 return denied("attempt_not_current")
-            if attempt.phase == "claimed" and attempt.authorization.get("launch_id") is None:
-                attempt.phase = "starting"
-                attempt.authorization["launch_id"] = launch_id
-                attempt.authorization["launch_handoff_timeout_seconds"] = stored_timeout
-                attempt.timestamps["launch_authorized_at"] = authorized_at
-                mutation_fence()
-                atomic_replace(attempt_path(cfg.shared_root, task_id, attempt_number), attempt.to_dict())
-            elif (
-                attempt.phase != "starting"
-                or attempt.authorization.get("launch_id") != launch_id
-                or attempt.authorization.get("launch_handoff_timeout_seconds") != stored_timeout
-                or attempt.timestamps.get("launch_authorized_at") != authorized_at
-            ):
+
+            def write_task(value: TaskRecord) -> None:
+                atomic_replace(
+                    task_path(cfg.shared_root, task_id),
+                    value.to_dict(),
+                    before_replace=lambda _stat: mutation_fence(),
+                )
+
+            try:
+                _persist_starting_pair_locked(
+                    cfg,
+                    task,
+                    attempt,
+                    launch_id=launch_id,
+                    authorized_at=authorized_at,
+                    launch_handoff_timeout_seconds=stored_timeout,
+                    mutation_fence=mutation_fence,
+                    task_writer=write_task,
+                )
+            except (OwnershipTransitionConflict, TypeError, ValueError):
                 return denied("attempt_not_current")
-            return authorized(launch_id, stored_timeout)
+            refreshed_claim = task.claim_control.get("active_claim") or {}
+            resolved_timeout = refreshed_claim.get("launch_handoff_timeout_seconds", stored_timeout)
+            if resolved_timeout is None:
+                resolved_timeout = timeout_seconds
+            return authorized(launch_id, resolved_timeout)
+        if attempt.authority_mode != authority_mode:
+            return denied("authority_unavailable")
         if claim.get("launch_state") != "claimed" or attempt.phase != "claimed":
             return denied("attempt_not_current")
 
@@ -1134,23 +1195,30 @@ def authorize_project_io_launch(
         # entering it, then fence immediately before the Task and Attempt writes.
         mutation_fence()
         with record_task_change(cfg, task, "launch", details=details, mutation_fence=mutation_fence):
-            claim["launch_state"] = "starting"
-            claim["launch_id"] = launch_id
-            claim["launch_authorized_at"] = authorized_at
-            claim["launch_handoff_timeout_seconds"] = timeout_seconds
             if group is not None:
                 claim["group_dispatch_epoch"] = group["group"]["dispatch_epoch"]
                 claim["group_worker_set_epoch"] = group["group"]["worker_set_epoch"]
-            task.meta["revision"] += 1
-            task.meta["updated_at"] = authorized_at
-            mutation_fence()
-            save_task(cfg, task)
-            attempt.phase = "starting"
-            attempt.authorization["launch_id"] = launch_id
-            attempt.authorization["launch_handoff_timeout_seconds"] = timeout_seconds
-            attempt.timestamps["launch_authorized_at"] = authorized_at
-            mutation_fence()
-            atomic_replace(attempt_path(cfg.shared_root, task_id, attempt_number), attempt.to_dict())
+
+            def write_task(value: TaskRecord) -> None:
+                atomic_replace(
+                    task_path(cfg.shared_root, task_id),
+                    value.to_dict(),
+                    before_replace=lambda _stat: mutation_fence(),
+                )
+
+            try:
+                _persist_starting_pair_locked(
+                    cfg,
+                    task,
+                    attempt,
+                    launch_id=launch_id,
+                    authorized_at=authorized_at,
+                    launch_handoff_timeout_seconds=timeout_seconds,
+                    mutation_fence=mutation_fence,
+                    task_writer=write_task,
+                )
+            except OwnershipTransitionConflict:
+                return denied("attempt_not_current")
         return authorized(launch_id, timeout_seconds)
 
 
@@ -1189,12 +1257,6 @@ def authorize_launch(
                 return False
             if claim.get("authority_mode") not in {"bounded_lease", "holder_bound"}:
                 return False
-            if claim.get("authority_mode") == "bounded_lease" and not clock_capability(cfg).is_healthy:
-                return False
-            if task.control.get("cleanup_operation_id") or task.control.get("cleanup_state"):
-                return False
-            if operation_exists(cfg, "cleanup", task.task_id):
-                return False
             if claim.get("attempt_id") != attempt_id or claim.get("fencing_token") != fencing_token:
                 return False
             attempt_number = task.attempt_control.get("current_attempt_number")
@@ -1214,8 +1276,32 @@ def authorize_launch(
             ):
                 return False
             if claim.get("launch_state") == "starting":
+                launch_id = claim.get("launch_id")
+                authorized_at = claim.get("launch_authorized_at")
+                if not isinstance(launch_id, str) or not launch_id or not _valid_utc_timestamp(authorized_at):
+                    return False
+                try:
+                    _persist_starting_pair_locked(
+                        cfg,
+                        task,
+                        attempt,
+                        launch_id=launch_id,
+                        authorized_at=authorized_at,
+                        launch_handoff_timeout_seconds=claim.get("launch_handoff_timeout_seconds"),
+                    )
+                except (OwnershipTransitionConflict, TypeError, ValueError):
+                    return False
+                return True
+            if attempt.authority_mode != claim.get("authority_mode"):
                 return False
-            elif (
+            if claim.get("authority_mode") == "bounded_lease":
+                if not clock_capability(cfg).is_healthy or not _bounded_lease_is_current(claim, attempt):
+                    return False
+            if task.control.get("cleanup_operation_id") or task.control.get("cleanup_state"):
+                return False
+            if operation_exists(cfg, "cleanup", task.task_id):
+                return False
+            if (
                 claim.get("launch_state") != "claimed"
                 or attempt.phase != "claimed"
                 or task.control.get("cancellation_requested_at")
@@ -1246,13 +1332,16 @@ def authorize_launch(
                         "launch_id": launch_id,
                     },
                 ):
-                    _persist_starting_pair_locked(
-                        cfg,
-                        task,
-                        attempt,
-                        launch_id=launch_id,
-                        authorized_at=authorized_at,
-                    )
+                    try:
+                        _persist_starting_pair_locked(
+                            cfg,
+                            task,
+                            attempt,
+                            launch_id=launch_id,
+                            authorized_at=authorized_at,
+                        )
+                    except OwnershipTransitionConflict:
+                        return False
     if cancel_result is not None:
         if cancel_result.reservation_id and cancel_result.reservation_machine_name == cfg.machine_name:
             _release_task_reservation(
@@ -1836,7 +1925,13 @@ def has_eligible_local_work(cfg: RootConfig) -> bool:
 
 
 def renew_attempt_lease(
-    cfg: RootConfig, task_id: str, attempt_id: str, fencing_token: int, lease_seconds: int | None = None
+    cfg: RootConfig,
+    task_id: str,
+    attempt_id: str,
+    fencing_token: int,
+    lease_seconds: int | None = None,
+    *,
+    process_identity: Mapping[str, Any] | None = None,
 ) -> LeaseRenewalResult:
     """Renew an Attempt lease without collapsing errors into fencing decisions."""
     try:
@@ -1849,10 +1944,6 @@ def renew_attempt_lease(
                 return LeaseRenewalResult(
                     LeaseRenewalOutcome.AUTHORITY_CHANGED, attempt_id, observed_token=claim.get("fencing_token")
                 )
-            if task.control.get("terminate_running"):
-                return LeaseRenewalResult(LeaseRenewalOutcome.TERMINATION_REQUESTED, attempt_id)
-            if claim.get("termination_decision_id"):
-                return LeaseRenewalResult(LeaseRenewalOutcome.TERMINATION_REQUESTED, attempt_id)
             if claim.get("attempt_id") != attempt_id:
                 if task.state.get("projection") == "blocked":
                     return LeaseRenewalResult(LeaseRenewalOutcome.ORPHANED_RECOVERY_REQUIRED, attempt_id)
@@ -1871,8 +1962,65 @@ def renew_attempt_lease(
                 )
             if claim.get("authority_mode") != attempt.authority_mode:
                 return LeaseRenewalResult(LeaseRenewalOutcome.AUTHORITY_CHANGED, attempt_id)
+            if task.control.get("terminate_running"):
+                if process_identity is not None and not process_identity_matches(attempt, process_identity):
+                    return LeaseRenewalResult(LeaseRenewalOutcome.AUTHORITY_CHANGED, attempt_id)
+                return LeaseRenewalResult(LeaseRenewalOutcome.TERMINATION_REQUESTED, attempt_id)
+            if claim.get("termination_decision_id"):
+                # A historical stop marker is not a new cancellation request.
+                # Its exact local decision must be reconciled separately.
+                return LeaseRenewalResult(LeaseRenewalOutcome.AUTHORITY_CHANGED, attempt_id)
+            if (
+                process_identity is not None
+                and claim.get("authority_mode") == "bounded_lease"
+                and attempt.authority_mode == "bounded_lease"
+                and claim.get("launch_state") == "running"
+                and attempt.phase == "running"
+                and claim.get("launch_id") == attempt.authorization.get("launch_id")
+                and isinstance(claim.get("launch_id"), str)
+                and bool(claim.get("launch_id"))
+                and _valid_utc_timestamp(claim.get("launch_authorized_at"))
+                and process_identity_matches(attempt, process_identity)
+                and not task.control.get("cancellation_requested_at")
+                and not task.control.get("terminate_running")
+                and not any(
+                    claim.get(field) is not None
+                    for field in (
+                        "termination_decision_id",
+                        "termination_decision_token",
+                        "termination_committed_at",
+                        "termination_commitment_digest",
+                    )
+                )
+                and not any(
+                    attempt.termination.get(field) is not None
+                    for field in ("requested_at", "requested_by_operation_id", "decision_id", "decision_token")
+                )
+            ):
+                try:
+                    transition_attempt_ownership(
+                        cfg,
+                        task,
+                        attempt,
+                        target_phase="running",
+                        launch_id=claim["launch_id"],
+                        authorized_at=claim["launch_authorized_at"],
+                        task_writer=lambda value: save_task(cfg, value),
+                        attempt_writer=lambda value: atomic_replace(
+                            attempt_path(cfg.shared_root, value.task_id, value.attempt_number), value.to_dict()
+                        ),
+                    )
+                except OwnershipTransitionConflict:
+                    return LeaseRenewalResult(LeaseRenewalOutcome.AUTHORITY_CHANGED, attempt_id)
+                return LeaseRenewalResult(
+                    LeaseRenewalOutcome.NOT_REQUIRED,
+                    attempt_id,
+                    observed_token=fencing_token,
+                )
             if attempt.authority_mode == "holder_bound":
                 return LeaseRenewalResult(LeaseRenewalOutcome.NOT_REQUIRED, attempt_id, observed_token=fencing_token)
+            if process_identity is not None and not process_identity_matches(attempt, process_identity):
+                return LeaseRenewalResult(LeaseRenewalOutcome.AUTHORITY_CHANGED, attempt_id)
             capability = clock_capability(cfg, policy)
             if not capability.is_healthy or capability.observation is None:
                 return LeaseRenewalResult(
@@ -2053,6 +2201,76 @@ def renew_project_io_attempt_lease(
             return stale("process_changed", task_revision=task_revision, attempt_digest=attempt_digest)
         if attempt.phase != "running":
             return stale("attempt_not_running", task_revision=task_revision, attempt_digest=attempt_digest)
+
+        # An exact process observation can adopt a legacy running pair into
+        # holder-bound ownership. Replay-only requests may repair only a
+        # receipt whose Task commit already exists; they never create a new
+        # conversion after a worker restart.
+        if (
+            claim.get("authority_mode") in {"bounded_lease", "holder_bound"}
+            and attempt.authority_mode == "bounded_lease"
+            and claim.get("launch_state") == "running"
+            and claim.get("launch_id") == attempt.authorization.get("launch_id")
+            and isinstance(claim.get("launch_id"), str)
+            and bool(claim.get("launch_id"))
+            and _valid_utc_timestamp(claim.get("launch_authorized_at"))
+            and process_identity_matches(attempt, process_identity)
+            and not task.control.get("terminate_running")
+            and not task.control.get("cancellation_requested_at")
+            and not any(
+                claim.get(field) is not None
+                for field in (
+                    "termination_decision_id",
+                    "termination_decision_token",
+                    "termination_committed_at",
+                    "termination_commitment_digest",
+                )
+            )
+            and not any(
+                attempt.termination.get(field) is not None
+                for field in ("requested_at", "requested_by_operation_id", "decision_id", "decision_token")
+            )
+        ):
+
+            def write_task(value: TaskRecord) -> None:
+                atomic_replace(
+                    task_path(cfg.shared_root, task_id),
+                    value.to_dict(),
+                    before_replace=lambda _stat: mutation_fence(),
+                )
+
+            try:
+                transition_attempt_ownership(
+                    cfg,
+                    task,
+                    attempt,
+                    target_phase="running",
+                    launch_id=claim["launch_id"],
+                    authorized_at=claim["launch_authorized_at"],
+                    mutation_fence=mutation_fence,
+                    task_writer=write_task,
+                    attempt_writer=lambda value: atomic_replace(
+                        attempt_path(cfg.shared_root, value.task_id, value.attempt_number), value.to_dict()
+                    ),
+                    replay_only=replay_only,
+                    expected_task_revision=expected_task_revision,
+                    expected_attempt_digest=expected_attempt_digest,
+                )
+            except OwnershipTransitionConflict:
+                return stale("attempt_changed", task_revision=task_revision, attempt_digest=attempt_digest)
+            committed_task = load_task(cfg, task_id)
+            committed_attempt_file = attempt_path(cfg.shared_root, task_id, attempt_number)
+            committed_attempt_digest = hashlib.sha256(committed_attempt_file.read_bytes()).hexdigest()
+            return {
+                "outcome": "not_required",
+                "reason": None,
+                "lease_expires_at": None,
+                "renew_after_seconds": None,
+                "committed_revisions": {
+                    "task": committed_task.meta["revision"],
+                    "attempt_digest": committed_attempt_digest,
+                },
+            }
 
         attempt_clock = attempt.lease.get("clock_evidence")
         task_applied = claim.get("clock_observation_id") == request_id
@@ -2377,7 +2595,7 @@ def commit_project_io_shared_termination(
         attempt_digest: str | None,
         shared_commitment: str | None,
     ) -> dict[str, Any]:
-        return {
+        value = {
             "outcome": outcome,
             "reason": stale_reason,
             "machine_name": machine_name,
@@ -2400,6 +2618,7 @@ def commit_project_io_shared_termination(
             "authority_granted": False,
             "local_effects": [],
         }
+        return value
 
     def read_attempt() -> tuple[AttemptRecord | None, str | None]:
         path = attempt_path(cfg.shared_root, task_id, attempt_number)
@@ -2545,6 +2764,193 @@ def commit_project_io_shared_termination(
         return evidence("committed", None, task, attempt, attempt_digest, "committed")
 
 
+def retire_project_io_timeout_decision(
+    cfg: RootConfig,
+    *,
+    machine_name: str,
+    task_id: str,
+    attempt_id: str,
+    attempt_number: int,
+    fencing_token: int,
+    reservation_id: str | None,
+    decision_id: str,
+    decision_token: int,
+    authority_outcome: str,
+    reason: str,
+    process_identity: Mapping[str, Any],
+    source_revisions: Mapping[str, Any],
+    retirement: Mapping[str, Any],
+    mutation_fence: Callable[[], None],
+) -> dict[str, Any]:
+    """Conditionally replace one historical timeout stop reference with a receipt."""
+
+    def evidence(
+        outcome: str,
+        stale_reason: str | None,
+        task: TaskRecord | None,
+        attempt: AttemptRecord | None,
+        attempt_digest: str | None,
+    ) -> dict[str, Any]:
+        value = {
+            "outcome": outcome,
+            "reason": stale_reason,
+            "machine_name": machine_name,
+            "task_id": task_id,
+            "attempt_id": attempt_id,
+            "attempt_number": attempt_number,
+            "fencing_token": fencing_token,
+            "reservation_id": reservation_id,
+            "decision_id": decision_id,
+            "decision_token": decision_token,
+            "authority_outcome": authority_outcome,
+            "decision_reason": reason,
+            "process_identity": dict(process_identity),
+            "source_revisions": dict(source_revisions),
+            "committed_revisions": {
+                "task": None if task is None else task.meta.get("revision"),
+                "attempt_digest": attempt_digest,
+            },
+            "shared_commitment": "committed" if outcome in {"committed", "already_committed"} else None,
+            "authority_granted": False,
+            "local_effects": [],
+        }
+        value["retirement_receipt"] = dict(retirement)
+        return value
+
+    required = {
+        "receipt_version",
+        "operation",
+        "operation_id",
+        "decision_id",
+        "decision_digest",
+        "task_id",
+        "attempt_id",
+        "attempt_number",
+        "fencing_token",
+        "machine_name",
+        "process_identity",
+        "source_state",
+        "source_shared_commitment",
+        "source_authority_outcome",
+        "source_reason",
+    }
+    if not isinstance(retirement, Mapping) or not required.issubset(retirement):
+        raise ValueError("timeout retirement receipt is incomplete")
+    if (
+        retirement.get("operation") != "timeout_decision_retirement"
+        or retirement.get("decision_id") != decision_id
+        or retirement.get("task_id") != task_id
+        or retirement.get("attempt_id") != attempt_id
+        or retirement.get("attempt_number") != attempt_number
+        or retirement.get("fencing_token") != fencing_token
+        or retirement.get("machine_name") != machine_name
+        or retirement.get("process_identity") != process_identity
+        or retirement.get("source_authority_outcome") != "holder_safe_deadline_elapsed"
+        or retirement.get("source_reason") != "holder_safe_deadline_elapsed"
+    ):
+        raise ValueError("timeout retirement receipt identity is inconsistent")
+
+    def read_attempt() -> tuple[AttemptRecord | None, str | None]:
+        path = attempt_path(cfg.shared_root, task_id, attempt_number)
+        try:
+            raw = path.read_bytes()
+        except FileNotFoundError:
+            return None, None
+        value = json.loads(raw.decode("utf-8"))
+        if not isinstance(value, dict):
+            raise ValueError("Attempt record must contain a JSON object.")
+        return AttemptRecord.from_dict(value), hashlib.sha256(raw).hexdigest()
+
+    def exact_attempt(attempt: AttemptRecord | None) -> bool:
+        return (
+            attempt is not None
+            and attempt.task_id == task_id
+            and attempt.attempt_id == attempt_id
+            and attempt.attempt_number == attempt_number
+            and attempt.current_fencing_token == fencing_token
+            and attempt.machine_name == machine_name
+            and attempt.reservation_id == reservation_id
+            and all(attempt.process.get(field) == process_identity.get(field) for field in process_identity)
+        )
+
+    try:
+        initial = load_task(cfg, task_id)
+    except FileNotFoundError:
+        attempt, attempt_digest = read_attempt()
+        return evidence("stale", "task_missing", None, attempt, attempt_digest)
+    with authority_locks(cfg, initial):
+        task = load_task(cfg, task_id)
+        attempt, attempt_digest = read_attempt()
+        if not exact_attempt(attempt):
+            return evidence("stale", "attempt_identity_mismatch", task, attempt, attempt_digest)
+        assert attempt is not None
+        claim = task.claim_control.get("active_claim") or {}
+        active_matches = (
+            task.attempt_control.get("current_attempt_id") == attempt_id
+            and task.attempt_control.get("current_attempt_number") == attempt_number
+            and claim.get("attempt_id") == attempt_id
+            and claim.get("attempt_number") == attempt_number
+            and claim.get("fencing_token") == fencing_token
+            and claim.get("machine_name") == machine_name
+        )
+        existing = (
+            claim.get("termination_decision_retirement")
+            if active_matches
+            else attempt.meta.get("timeout_decision_retirement")
+        )
+        if existing is not None:
+            if existing.get("operation_id") != retirement.get("operation_id"):
+                return evidence("stale", "decision_conflict", task, attempt, attempt_digest)
+            return evidence("already_committed", None, task, attempt, attempt_digest)
+        if task.meta.get("revision") != source_revisions.get("task"):
+            return evidence("stale", "task_changed", task, attempt, attempt_digest)
+        if attempt_digest != source_revisions.get("attempt_digest"):
+            return evidence("stale", "attempt_changed", task, attempt, attempt_digest)
+        active_stop = (
+            claim.get("termination_decision_id") == decision_id
+            and claim.get("termination_decision_token") == decision_token
+        )
+        if active_matches and not active_stop:
+            # A pending local decision has no active shared stop reference; the
+            # receipt itself is still the conditional audit commit.
+            other_stop = claim.get("termination_decision_id") or claim.get("termination_decision_token")
+            if other_stop is not None:
+                return evidence("stale", "decision_conflict", task, attempt, attempt_digest)
+        shared_receipt = {
+            **dict(retirement),
+            "state": "shared_reconciled",
+            "shared_at": utc_now(),
+            "original_shared_commitment": retirement.get("source_shared_commitment"),
+        }
+        mutation_fence()
+        if active_matches:
+            claim["termination_decision_retirement"] = shared_receipt
+            if active_stop:
+                for field in (
+                    "termination_decision_id",
+                    "termination_decision_token",
+                    "termination_committed_at",
+                    "termination_commitment_digest",
+                ):
+                    claim.pop(field, None)
+            task.meta["revision"] += 1
+            task.meta["updated_at"] = utc_now()
+            save_task(cfg, task, mutation_fence=mutation_fence)
+            committed_task = task
+        else:
+            # A successor or an archived claim won the Task pointer.  Annotate
+            # only the historical Attempt; never alter successor control truth.
+            attempt.meta["timeout_decision_retirement"] = shared_receipt
+            atomic_replace(
+                attempt_path(cfg.shared_root, task_id, attempt_number),
+                attempt.to_dict(),
+                before_replace=lambda _stat: mutation_fence(),
+            )
+            committed_task = task
+        refreshed_attempt, refreshed_digest = read_attempt()
+        return evidence("committed", None, committed_task, refreshed_attempt, refreshed_digest)
+
+
 def recover_project_io_orphaned_attempt(
     cfg: RootConfig,
     *,
@@ -2631,6 +3037,8 @@ def expire_claim(
         task = load_task(cfg, task_id)
         claim = task.claim_control.get("active_claim") or {}
         if claim.get("attempt_id") != attempt_id or claim.get("fencing_token") != fencing_token:
+            return False
+        if claim.get("launch_state") != "claimed":
             return False
         if claim.get("authority_mode") != "bounded_lease":
             return False
@@ -2930,6 +3338,27 @@ def finalize_orphaned_attempt(
     return True
 
 
+def _has_superseded_ownership(task: TaskRecord, attempt: AttemptRecord) -> bool:
+    """Prove historical ownership from the committed operation, never age."""
+    receipt = task.attempt_control.get("last_supersession")
+    if not isinstance(receipt, dict) or receipt.get("attempt_id") != attempt.attempt_id:
+        receipt = attempt.authorization.get("supersession_receipt")
+    return (
+        isinstance(receipt, dict)
+        and receipt.get("task_id") == task.task_id == attempt.task_id
+        and receipt.get("attempt_id") == attempt.attempt_id
+        and receipt.get("attempt_number") == attempt.attempt_number
+        and receipt.get("fencing_token") == attempt.current_fencing_token
+        and receipt.get("old_machine") == attempt.machine_name
+        and receipt.get("reservation_id") == attempt.reservation_id
+        and receipt.get("terminate_old_process") is False
+        and receipt.get("duplicate_risk_acknowledged") is True
+        and task.attempt_control.get("current_attempt_id") != attempt.attempt_id
+        and (task.claim_control.get("active_claim") or {}).get("attempt_id") != attempt.attempt_id
+        and task.claim_control.get("fencing_epoch", 0) > attempt.current_fencing_token
+    )
+
+
 def observe_project_io_terminal_state(
     cfg: RootConfig,
     *,
@@ -3016,6 +3445,10 @@ def observe_project_io_terminal_state(
 
         task_phase = task.state.get("projection")
         attempt_phase = attempt.phase
+        if _has_superseded_ownership(task, attempt) and attempt_phase in {"starting", "running"}:
+            observed = evidence("historical_current", None, task, attempt, attempt_digest)
+            observed["cancel_requested"] = False
+            return observed
         terminal_pair = (
             task_phase in {"succeeded", "failed", "cancelled"}
             and attempt_phase == task_phase
@@ -3204,6 +3637,36 @@ def publish_project_io_terminal_transition(
             and task.control.get("termination_result") == termination_result
             and task.control.get("project_io_publication_id") == request_id
         )
+        if _has_superseded_ownership(task, attempt):
+            if target_attempt_matches:
+                return evidence("historical_already_committed", None, task, attempt, attempt_digest)
+            if (
+                mode != "active"
+                or phase not in {"succeeded", "failed"}
+                or termination_result is not None
+                or exit_code is None
+                or phase != ("succeeded" if exit_code == 0 else "failed")
+                or reason != ("completed" if exit_code == 0 else "nonzero_exit")
+            ):
+                return evidence("stale", "terminal_conflict", task, attempt, attempt_digest)
+            if task.meta.get("revision") != expected_task_revision or attempt_digest != expected_attempt_digest:
+                return evidence("stale", "source_revision_mismatch", task, attempt, attempt_digest)
+            if attempt.phase not in {"starting", "running"}:
+                return evidence("stale", "attempt_phase_mismatch", task, attempt, attempt_digest)
+            attempt.phase = phase
+            attempt.result.update(exit_code=exit_code, reason=reason, signal=-exit_code if exit_code < 0 else None)
+            attempt.timestamps["finished_at"] = utc_now()
+            attempt.termination.update(result=None, project_io_publication_id=request_id)
+            attempt.meta["revision"] += 1
+            attempt.meta["updated_at"] = utc_now()
+            mutation_fence()
+            atomic_replace(
+                attempt_path(cfg.shared_root, task_id, attempt_number),
+                attempt.to_dict(),
+                before_replace=lambda _stat: mutation_fence(),
+            )
+            committed_attempt, committed_digest = read_attempt()
+            return evidence("historical_committed", None, task, committed_attempt, committed_digest)
         if target_attempt_matches and target_task_matches:
             replay_transition = TerminalTransition(
                 task_id,

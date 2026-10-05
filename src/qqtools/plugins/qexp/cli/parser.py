@@ -384,8 +384,19 @@ def build_parser() -> argparse.ArgumentParser:
         modes=OutputMode.FINITE,
         output_kinds=OutputKind.TASK_CANCEL,
     )
-    retry = task_sub.add_parser("retry", help="Queue the next Attempt for one failed Task.")
+    retry = task_sub.add_parser(
+        "retry",
+        help="Queue the next Attempt, or explicitly abandon one active Attempt without stopping it.",
+    )
     retry.add_argument("task_id")
+    retry.add_argument(
+        "--supersede-attempt",
+        metavar="ATTEMPT_ID",
+        help=(
+            "Abandon qexp ownership without stopping a possibly live process; "
+            "this can cause duplicate execution and external output writes."
+        ),
+    )
     retry.add_argument("--quiet", action="store_true", help="Print only the retained Task ID.")
     _add_output_format(retry)
     bind_command(

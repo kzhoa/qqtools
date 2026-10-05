@@ -33,6 +33,7 @@ from qqtools.plugins.qexp.runtime.store import atomic_replace, read_json
 from qqtools.plugins.qexp.runtime.tasks import load_task
 from qqtools.plugins.qexp.scheduler import expire_claim
 from qqtools.plugins.qexp.tmux import is_libtmux_available
+from tests.fixtures.qexp_legacy_ownership import persist_legacy_orphan
 from tests.helpers.qexp.lifecycle import LifecycleBranch, LifecycleLab, wait_all
 from tests.helpers.qexp.worker_diagnostics import describe_project_io_workers
 
@@ -521,7 +522,8 @@ run_machine_agent_loop(root, available_gpus=[0])
             return (
                 isinstance(claim, dict)
                 and any(item.get("task_id") == primary.task_id for item in reservations)
-                and renewed_expiry != before_expiry
+                and renewed_expiry == before_expiry is None
+                and running_task.claim_control["active_claim"]["authority_mode"] == "holder_bound"
                 and local_expiry == renewed_expiry
                 and {"scheduler_claim", "authority_renewal"} <= kinds
             )
@@ -946,14 +948,8 @@ def test_li03_expired_claim_recovers_same_attempt_without_relaunch(tmp_path: Pat
     cfg, runtime, task, marker, process = _start_case(tmp_path, seconds=2.0)
     try:
         _wait_running(cfg, task.task_id, marker)
-        stored = load_task(cfg, task.task_id)
-        claim = stored.claim_control["active_claim"]
-        claim_path = cfg.shared_root / "tasks" / f"{task.task_id}.json"
-        value = read_json(claim_path)
-        value["task"]["claim_control"]["active_claim"]["lease_expires_at"] = "2000-01-01T00:00:00Z"
-        atomic_replace(claim_path, value)
         stop_machine_agent(runtime)
-        assert expire_claim(cfg, task.task_id, claim["attempt_id"], claim["fencing_token"])
+        persist_legacy_orphan(cfg, task.task_id)
         start_machine_agent(runtime, available_gpus=[0], loop_interval=0.1)
         terminal = _wait_terminal(cfg, task.task_id)
         assert terminal.state["projection"] == "succeeded"
@@ -981,7 +977,7 @@ def test_li04_sigkill_agent_does_not_kill_runner(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize("is_finished", [False, True])
-def test_li03_real_peer_observes_natural_lease_expiry(tmp_path: Path, is_finished: bool) -> None:
+def test_li03_real_peer_cannot_expire_durable_execution(tmp_path: Path, is_finished: bool) -> None:
     from qqtools.plugins.qexp.commands.group import change_worker, create_group
     from qqtools.plugins.qexp.commands.task import offer
     from qqtools.plugins.qexp.lease import LeasePolicy, save_lease_policy
@@ -1026,7 +1022,8 @@ def test_li03_real_peer_observes_natural_lease_expiry(tmp_path: Path, is_finishe
     try:
         _wait_running(cfg, task.task_id, marker)
         claim = load_task(cfg, task.task_id).claim_control["active_claim"]
-        assert claim["authority_mode"] == "bounded_lease"
+        assert claim["authority_mode"] == "holder_bound"
+        assert claim["lease_expires_at"] is None
         stop_machine_agent(runtime)
         if is_finished:
             finish.touch()
@@ -1040,15 +1037,16 @@ from qqtools.plugins.qexp.scheduler import expire_claim, claim_task
 from qqtools.plugins.qexp.runtime.tasks import load_task
 shared,root,task_id,attempt_id,token,observed = sys.argv[1:]
 cfg=RootConfig(Path(shared),Path(shared).parent,"gpu-2",Path(root))
-deadline=time.monotonic()+15
+deadline=time.monotonic()+6
 while time.monotonic()<deadline:
-    if expire_claim(cfg,task_id,attempt_id,int(token)):
-        assert load_task(cfg,task_id).state["projection"]=="blocked"
-        assert claim_task(cfg,task_id,[0]) is None
-        Path(observed).touch()
-        break
+    assert not expire_claim(cfg,task_id,attempt_id,int(token))
+    current=load_task(cfg,task_id)
+    assert current.state["projection"]=="running"
+    assert current.attempt_control["current_attempt_id"]==attempt_id
+    assert current.claim_control["active_claim"]["fencing_token"]==int(token)
+    assert claim_task(cfg,task_id,[0]) is None
     time.sleep(0.01)
-else: raise TimeoutError("peer did not observe natural expiry")
+Path(observed).touch()
 """
         peer = subprocess.Popen(
             [
@@ -1066,7 +1064,7 @@ else: raise TimeoutError("peer did not observe natural expiry")
         )
         _wait_for(
             observed.exists,
-            description="LI-03 peer lease-expiry observation",
+            description="LI-03 peer preserves durable ownership beyond old TTL",
             on_timeout=lambda: _li03_timeout_diagnostics(cfg, runtime, task.task_id, peer, observed=observed),
         )
         assert peer.wait(timeout=5) == 0
@@ -1274,12 +1272,7 @@ def test_li06_terminal_publication_is_idempotent(tmp_path: Path, boundary: str, 
         observation = paths["observations"] / f"{attempt_id}.json"
         _wait_for(observation.exists)
         if is_orphaned:
-            task_path = cfg.shared_root / "tasks" / f"{task.task_id}.json"
-            stored = read_json(task_path)
-            claim = stored["task"]["claim_control"]["active_claim"]
-            claim["lease_expires_at"] = "2000-01-01T00:00:00Z"
-            atomic_replace(task_path, stored)
-            assert expire_claim(cfg, task.task_id, attempt_id, claim["fencing_token"])
+            persist_legacy_orphan(cfg, task.task_id)
         reached = tmp_path / "crash-boundary"
         worker_script = """
 import os, sys
@@ -1608,10 +1601,7 @@ def test_li08_superseded_offline_attempt_preserves_evidence(tmp_path: Path) -> N
         paths = local_paths(runtime.project_paths(binding.project_id)["root"])
         observation = paths["observations"] / f"{claim['attempt_id']}.json"
         _wait_for(observation.exists)
-        value = read_json(cfg.shared_root / "tasks" / f"{task.task_id}.json")
-        value["task"]["claim_control"]["active_claim"]["lease_expires_at"] = "2000-01-01T00:00:00Z"
-        atomic_replace(cfg.shared_root / "tasks" / f"{task.task_id}.json", value)
-        assert expire_claim(cfg, task.task_id, claim["attempt_id"], claim["fencing_token"])
+        persist_legacy_orphan(cfg, task.task_id)
         retry(cfg, task.task_id)
         runtime.set_enabled(binding.project_id, False)
         expected = load_task(cfg, task.task_id).to_dict()

@@ -15,6 +15,7 @@ from qqtools.plugins.qexp.runtime.tasks import load_task
 from qqtools.plugins.qexp.runtime.termination import attempt_control_lock
 from qqtools.plugins.qexp.runtime.work_budget import RuntimeDiagnostics, activate_diagnostics
 from qqtools.plugins.qexp.scheduler import authorize_launch, claim_task, expire_claim
+from tests.fixtures.qexp_legacy_ownership import persist_legacy_orphan
 
 pytestmark = [pytest.mark.integration, pytest.mark.qexp_fast_io]
 
@@ -35,7 +36,7 @@ def _orphan(tmp_path, monkeypatch):
     }
     paths = local_paths(cfg.runtime_root)
     atomic_replace(paths["processes"] / f"{attempt.attempt_id}.json", {"process": process})
-    assert expire_claim(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token)
+    persist_legacy_orphan(cfg, task.task_id)
     directory = paths["termination_decisions"] / attempt.attempt_id
     for index in range(17):
         atomic_replace(directory / f"{index}.json", {"termination_decision": {"state": "superseded"}})

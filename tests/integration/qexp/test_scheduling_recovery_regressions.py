@@ -20,12 +20,13 @@ from qqtools.plugins.qexp.project_maintenance import (
 )
 from qqtools.plugins.qexp.runner import run_attempt
 from qqtools.plugins.qexp.runtime.attempt_recovery import recover_running_attempt
+from qqtools.plugins.qexp.runtime.claims import archive_claim
 from qqtools.plugins.qexp.runtime.maintenance import advance_maintenance_work
-from qqtools.plugins.qexp.runtime.maintenance_outbox import read_work
+from qqtools.plugins.qexp.runtime.maintenance_outbox import activate_work, prepare_work, read_work
 from qqtools.plugins.qexp.runtime.operation_store import active_operation_path, write_active_operation
 from qqtools.plugins.qexp.runtime.paths import attempt_path
 from qqtools.plugins.qexp.runtime.process_evidence import ProcessEvidence
-from qqtools.plugins.qexp.runtime.records import AttemptRecord
+from qqtools.plugins.qexp.runtime.records import AttemptRecord, utc_now
 from qqtools.plugins.qexp.runtime.resources.reservations import (
     ReservationIdentity,
     active_reservations,
@@ -74,6 +75,53 @@ def _repair_until(cfg, predicate, *, reservation_runtime_root=None, limit: int =
         if predicate():
             return {**result, "repaired": repaired, "blocked": blocked}
     pytest.fail(f"repair predicate was not reached in {limit} bounded slices")
+
+
+def _mark_legacy_orphaned(cfg, task_id: str) -> AttemptRecord:
+    """Build the supported historical image produced by pre-1.3.26 expiry."""
+    task = load_task(cfg, task_id)
+    claim = task.claim_control["active_claim"]
+    attempt_file = attempt_path(cfg.shared_root, task_id, task.attempt_control["current_attempt_number"])
+    attempt = AttemptRecord.from_dict(read_json(attempt_file))
+    source = claim.get("ownership_transition", {}).get("source_active_lease_evidence", {})
+    attempt.phase = "orphaned"
+    attempt.authority_mode = "bounded_lease"
+    if isinstance(source.get("attempt"), dict):
+        attempt.lease = source["attempt"]
+    attempt.result.update({"exit_code": None, "signal": None, "category": None, "reason": None})
+    attempt.timestamps["orphaned_at"] = utc_now()
+    atomic_replace(attempt_file, attempt.to_dict())
+    legacy_claim = dict(claim)
+    legacy_claim["authority_mode"] = "bounded_lease"
+    if isinstance(source.get("claim"), dict):
+        legacy_claim.update(source["claim"])
+    archive_claim(cfg, task_id, legacy_claim, "lease_expired")
+    task.state.update({"projection": "blocked", "reason": "orphaned_attempt_requires_recovery"})
+    task.claim_control["active_claim"] = None
+    task.attempt_control["current_attempt_id"] = None
+    task.meta["revision"] += 1
+    task.meta["updated_at"] = utc_now()
+    save_task(cfg, task)
+    work = prepare_work(
+        cfg,
+        kind="orphan_recovery",
+        target_id=attempt.attempt_id,
+        work_generation=f"fencing-{attempt.current_fencing_token}",
+        phase="attempt_recovery",
+        cursor={
+            "stage": "process",
+            "task_id": task_id,
+            "attempt_number": attempt.attempt_number,
+            "attempt_id": attempt.attempt_id,
+            "fencing_token": attempt.current_fencing_token,
+            "attempt_process_identity": {
+                key: attempt.process.get(key) for key in ("process_group_id", "process_group_start_time_ticks")
+            },
+            "was_terminated": False,
+        },
+    )
+    activate_work(cfg, work)
+    return attempt
 
 
 class RecordingExecutor:
@@ -158,6 +206,21 @@ def test_fresh_launch_persists_matching_starting_pair_in_order(tmp_path: Path, m
     assert [write[0] for write in writes] == ["task", "attempt"]
     assert writes[0][2] == "claimed"
     assert claim["launch_state"] == stored_attempt.phase == "starting"
+    assert claim["authority_mode"] == stored_attempt.authority_mode == "holder_bound"
+    assert claim["lease_expires_at"] is None
+    assert claim["clock_error_bound_seconds"] is None
+    assert claim["clock_provider"] is None
+    assert claim["clock_observation_id"] is None
+    assert stored_attempt.lease["expires_at"] is None
+    assert stored_attempt.lease["clock_evidence"] is None
+    receipt = claim["ownership_transition"]
+    assert receipt["source_authority_mode"] == "bounded_lease"
+    assert receipt["target_authority_mode"] == "holder_bound"
+    assert receipt["source_phase"] == "claimed"
+    assert receipt["target_phase"] == "starting"
+    assert receipt["attempt_id"] == attempt.attempt_id
+    assert receipt["fencing_token"] == attempt.current_fencing_token
+    assert receipt["launch_id"] == launch_id
     assert claim["launch_id"] == stored_attempt.authorization["launch_id"] == launch_id
     assert claim["launch_authorized_at"] == stored_attempt.timestamps["launch_authorized_at"] == authorized_at
     assert stored_task.meta["revision"] == original_revision + 1
@@ -264,15 +327,15 @@ def test_committed_starting_recovery_preserves_pair_and_write_order(tmp_path: Pa
     stored_task = load_task(cfg, task.task_id)
     stored_attempt = AttemptRecord.from_dict(read_json(path))
     claim = stored_task.claim_control["active_claim"]
-    assert writes == ["task", "attempt"]
+    assert writes == []
     assert claim["launch_id"] == stored_attempt.authorization["launch_id"] == original_claim["launch_id"]
     assert (
         claim["launch_authorized_at"]
         == stored_attempt.timestamps["launch_authorized_at"]
         == original_claim["launch_authorized_at"]
     )
-    assert stored_task.meta["revision"] == original_revision + 1
-    assert stored_task.meta["updated_at"] == original_claim["launch_authorized_at"]
+    assert stored_task.meta["revision"] == original_revision
+    assert stored_task.meta["updated_at"] == before.meta["updated_at"]
 
 
 @pytest.mark.parametrize(
@@ -353,6 +416,7 @@ def test_launch_authorization_replays_after_task_write_interruption(tmp_path: Pa
     stored_attempt = AttemptRecord.from_dict(read_json(path))
     claim = stored_task.claim_control["active_claim"]
     assert claim["launch_state"] == stored_attempt.phase == "starting"
+    assert claim["authority_mode"] == stored_attempt.authority_mode == "holder_bound"
     assert claim["launch_id"] == stored_attempt.authorization["launch_id"]
     assert claim["launch_authorized_at"] == stored_attempt.timestamps["launch_authorized_at"]
 
@@ -377,6 +441,8 @@ def test_dispatch_resumes_starting_attempt_after_authorization_write_crash(tmp_p
     stranded = load_task(cfg, task.task_id)
     stale_launch_id = stranded.claim_control["active_claim"]["launch_id"]
     assert stranded.claim_control["active_claim"]["launch_state"] == "starting"
+    assert stranded.claim_control["active_claim"]["authority_mode"] == "holder_bound"
+    assert "ownership_transition" in stranded.claim_control["active_claim"]
     assert AttemptRecord.from_dict(read_json(path)).phase == "claimed"
     monkeypatch.setattr("qqtools.plugins.qexp.scheduler.atomic_replace", original_atomic_replace)
 
@@ -389,12 +455,36 @@ def test_dispatch_resumes_starting_attempt_after_authorization_write_crash(tmp_p
     assert resumed.reservation_id == attempt.reservation_id
     assert resumed.current_fencing_token == attempt.current_fencing_token
     assert stored.phase == "starting"
-    assert stored.authorization["launch_id"] != stale_launch_id
+    assert stored.authority_mode == "holder_bound"
+    assert stored.authorization["launch_id"] == stale_launch_id
     assert load_task(cfg, task.task_id).claim_control["fencing_epoch"] == attempt.current_fencing_token
 
-    with pytest.raises(RuntimeError, match="not authorized"):
-        run_attempt(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token, stale_launch_id)
-    assert not (cfg.runtime_root / "launch-intents" / f"{attempt.attempt_id}.json").exists()
+
+def test_legacy_starting_authorization_preserves_launch_identity_on_import(tmp_path: Path):
+    cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
+    task = submit(cfg, ["echo", "ok"])
+    attempt = claim_task(cfg, task.task_id, [0])
+    assert attempt is not None
+    path = attempt_path(cfg.shared_root, task.task_id, attempt.attempt_number)
+    attempt.phase = "starting"
+    attempt.authorization.update(launch_id="legacy-launch", launch_handoff_timeout_seconds=30.0)
+    attempt.timestamps["launch_authorized_at"] = utc_now()
+    atomic_replace(path, attempt.to_dict())
+    current = load_task(cfg, task.task_id)
+    current.state.update(projection="running", reason="launch_authorized")
+    current.claim_control["active_claim"].update(
+        launch_state="starting",
+        launch_id="legacy-launch",
+        launch_authorized_at=attempt.timestamps["launch_authorized_at"],
+        launch_handoff_timeout_seconds=30.0,
+    )
+    save_task(cfg, current)
+    assert authorize_launch(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token)
+    imported = AttemptRecord.from_dict(read_json(path))
+    assert imported.authority_mode == "holder_bound"
+    assert imported.authorization["launch_id"] == "legacy-launch"
+    assert imported.current_fencing_token == attempt.current_fencing_token
+    assert imported.lease["expires_at"] is None
 
 
 def test_cancelling_stranded_starting_attempt_prevents_relaunch(tmp_path: Path, monkeypatch):
@@ -449,7 +539,7 @@ def test_expired_provisional_is_reclaimed_before_next_reservation(tmp_path: Path
     assert second["reservation"]["task_id"] == "two"
 
 
-def test_recovery_cas_issues_new_fencing_token(tmp_path: Path):
+def test_authorized_attempt_does_not_expire_or_rotate_fencing_token(tmp_path: Path):
     cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
     _existing_group(cfg)
     task = submit(cfg, ["echo", "ok"], group="exp", sharing_mode="spillover")
@@ -469,16 +559,16 @@ def test_recovery_cas_issues_new_fencing_token(tmp_path: Path):
             }
         },
     )
-    assert expire_claim(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token)
-    token = recover_running_attempt(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token)
-    assert token == attempt.current_fencing_token + 1
-    assert read_json(manifest_path)["process"]["fencing_token"] == token
+    assert not expire_claim(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token)
+    current = load_task(cfg, task.task_id)
     recovered = AttemptRecord.from_dict(read_json(attempt_path(cfg.shared_root, task.task_id, attempt.attempt_number)))
-    assert recovered.phase == "running"
-    assert recovered.timestamps["orphaned_at"] is not None
-    assert recovered.timestamps["recovered_at"] is not None
+    assert current.claim_control["active_claim"]["fencing_token"] == attempt.current_fencing_token
+    assert current.claim_control["active_claim"]["authority_mode"] == "holder_bound"
+    assert recovered.current_fencing_token == attempt.current_fencing_token
+    assert recovered.authority_mode == "holder_bound"
+    assert recovered.phase == "starting"
+    assert recovered.timestamps["orphaned_at"] is None
     assert recovered.timestamps["finished_at"] is None
-    assert recovered.result["reason"] is None
     reconcile_project_reservations(cfg)
     assert reserved_gpu_ids(cfg.runtime_root) == {0}
 
@@ -511,29 +601,13 @@ def test_shared_reservation_classifier_never_releases_blocked_or_malformed_claim
     assert ReservationIdentity.from_record(active_reservations(cfg.runtime_root)[0]) == identity
 
 
-def test_resident_waits_for_complete_orphan_handoff(tmp_path: Path, monkeypatch):
+def test_resident_accepts_supported_historical_orphan_handoff(tmp_path: Path):
     cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
     task = submit(cfg, ["echo", "ok"])
     attempt = claim_task(cfg, task.task_id, [0])
     assert attempt is not None
     assert authorize_launch(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token)
-    for _ in range(32):
-        drained = advance_maintenance_work(cfg, reservation_runtime_root=cfg.runtime_root)
-        if drained["maintenance_state"] in {"idle", "waiting"}:
-            break
-    target = attempt_path(cfg.shared_root, task.task_id, attempt.attempt_number)
-    replace = scheduler_module.atomic_replace
-
-    def interrupt_after_attempt(path, value):
-        replace(path, value)
-        if path == target and value["attempt"]["phase"] == "orphaned":
-            raise OSError("after orphan Attempt before Task handoff")
-
-    with monkeypatch.context() as interrupted:
-        interrupted.setattr(scheduler_module, "atomic_replace", interrupt_after_attempt)
-        with pytest.raises(OSError, match="before Task handoff"):
-            expire_claim(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token)
-
+    _mark_legacy_orphaned(cfg, task.task_id)
     generation = f"fencing-{attempt.current_fencing_token}"
     prepared = read_work(
         cfg,
@@ -541,28 +615,9 @@ def test_resident_waits_for_complete_orphan_handoff(tmp_path: Path, monkeypatch)
         target_id=attempt.attempt_id,
         work_generation=generation,
     )
-    assert prepared is not None and prepared["state"] == "prepared"
+    assert prepared is not None and prepared["state"] == "pending"
     result = advance_maintenance_work(cfg, reservation_runtime_root=cfg.runtime_root)
-    assert result["maintenance_state"] == "waiting"
-    still_prepared = read_work(
-        cfg,
-        kind="orphan_recovery",
-        target_id=attempt.attempt_id,
-        work_generation=generation,
-    )
-    assert still_prepared is not None and still_prepared["state"] == "prepared"
-    interrupted_task = load_task(cfg, task.task_id)
-    assert interrupted_task.state["projection"] == "running"
-    assert interrupted_task.claim_control["active_claim"] is not None
-
-    assert expire_claim(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token)
-    activated = read_work(
-        cfg,
-        kind="orphan_recovery",
-        target_id=attempt.attempt_id,
-        work_generation=generation,
-    )
-    assert activated is not None and activated["state"] == "pending"
+    assert result["maintenance_state"] in {"completed", "progressed", "waiting"}
 
 
 def test_blocked_orphan_with_missing_process_finalizes_and_releases_gpu(tmp_path: Path, monkeypatch):
@@ -586,7 +641,7 @@ def test_blocked_orphan_with_missing_process_finalizes_and_releases_gpu(tmp_path
             }
         },
     )
-    assert expire_claim(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token)
+    _mark_legacy_orphaned(cfg, task.task_id)
     orphaned = AttemptRecord.from_dict(read_json(attempt_path(cfg.shared_root, task.task_id, attempt.attempt_number)))
     assert orphaned.phase == "orphaned"
     assert orphaned.timestamps["orphaned_at"] is not None
@@ -610,7 +665,7 @@ def test_orphan_partial_terminal_replays_persisted_result(tmp_path: Path, monkey
     attempt = claim_task(cfg, task.task_id, [0])
     assert attempt is not None
     assert authorize_launch(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token)
-    assert expire_claim(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token)
+    _mark_legacy_orphaned(cfg, task.task_id)
     original = lifecycle.save_task
 
     def unavailable(*args, **kwargs):
@@ -656,7 +711,7 @@ def test_partial_recovery_finalize_preserves_monotonic_fencing_epoch(tmp_path: P
             }
         },
     )
-    assert expire_claim(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token)
+    _mark_legacy_orphaned(cfg, task.task_id)
     path = attempt_path(cfg.shared_root, task.task_id, attempt.attempt_number)
     attempt_data = read_json(path)
     recovered_token = attempt.current_fencing_token + 1
@@ -694,7 +749,7 @@ def test_reconcile_finishes_recovery_when_manifest_write_was_interrupted(tmp_pat
             }
         },
     )
-    assert expire_claim(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token)
+    _mark_legacy_orphaned(cfg, task.task_id)
     token = recover_running_attempt(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token)
     manifest = read_json(manifest_path)
     manifest["process"]["fencing_token"] = attempt.current_fencing_token
@@ -746,7 +801,7 @@ def test_authority_restart_finishes_interrupted_recovery(tmp_path: Path, monkeyp
     record = read_json(stored_path)
     record["attempt"]["process"].update(process_group_id=9876, process_group_start_time_ticks=123)
     atomic_replace(stored_path, record)
-    assert expire_claim(cfg, task.task_id, attempt.attempt_id, old_token)
+    _mark_legacy_orphaned(cfg, task.task_id)
     monkeypatch.setattr(
         "qqtools.plugins.qexp.authority.inspect_group_identity",
         lambda *_args: ProcessEvidence(state="alive"),
@@ -893,9 +948,9 @@ def test_terminal_accounting_transient_failure_retries_next_tick(tmp_path: Path,
     renewed = []
     original_renew = authority.renew_attempt_lease
 
-    def record_renewal(*args):
+    def record_renewal(*args, **kwargs):
         renewed.append(args[3])
-        return original_renew(*args)
+        return original_renew(*args, **kwargs)
 
     monkeypatch.setattr(authority, "renew_attempt_lease", record_renewal)
     supervisor.tick()
@@ -923,7 +978,7 @@ def test_agent_supervises_recovered_child_without_runner(tmp_path: Path, monkeyp
             }
         },
     )
-    assert expire_claim(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token)
+    _mark_legacy_orphaned(cfg, task.task_id)
     assert recover_running_attempt(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token)
     renewed: list[int] = []
     monkeypatch.setattr(
@@ -1069,7 +1124,7 @@ def test_default_group_cancel_does_not_block_authorized_attempt_recovery(tmp_pat
             }
         },
     )
-    assert expire_claim(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token)
+    _mark_legacy_orphaned(cfg, task.task_id)
     group_control(cfg, "exp", "cancel")
     assert recover_running_attempt(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token)
 
@@ -1666,7 +1721,7 @@ def test_repeated_removal_rechecks_tasks_retried_after_completion(tmp_path, phas
     if phase == "failed":
         assert fail_attempt(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token, "test_failure")
     else:
-        assert expire_claim(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token)
+        _mark_legacy_orphaned(cfg, task.task_id)
     first = change_worker(cfg, "exp", "g1", "remove")["worker_control"]
     first = _converge_worker_removal(cfg, first)
     assert first["state"] == "completed"

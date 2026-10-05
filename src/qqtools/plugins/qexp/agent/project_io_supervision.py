@@ -32,7 +32,12 @@ from ..runtime.termination import (
     commit_signal,
     create_decision,
     decision_path,
+    is_deadline_only_decision,
+    read_timeout_retirement,
+    retirement_matches_decision,
+    suppress_timeout_decision,
     update_decision,
+    update_timeout_retirement,
 )
 from ..runtime.work_budget import diagnostic_increment
 from .context import MachineRuntime, ProjectBinding
@@ -677,6 +682,7 @@ class _TerminationCandidate:
     decision_id: str | None = None
     source_revisions: dict[str, Any] | None = None
     decision: dict[str, Any] | None = None
+    retirement: dict[str, Any] | None = None
     pending_commit: dict[str, Any] | None = None
     commit_evidence: dict[str, Any] | None = None
     pending_publication: dict[str, Any] | None = None
@@ -1001,9 +1007,8 @@ def _termination_trigger(process: Mapping[str, Any], evidence: Mapping[str, Any]
     """Choose the only local trigger allowed by an exact current observation."""
     if evidence.get("cancel_requested") is True:
         return "cancellation_requested"
-    deadline = _termination_holder_safe_deadline(process)
-    if deadline is not None and time.time() >= deadline:
-        return "holder_safe_deadline_elapsed"
+    # Lease/deadline expiry remains readable for historical decision replay,
+    # but cannot create or advance a new termination decision.
     return None
 
 
@@ -1090,14 +1095,104 @@ def _termination_decision_matches_candidate(
         or decision.get("reason") != expected_trigger
         or decision.get("process_group_id") != process_identity.get("process_group_id")
         or decision.get("process_group_start_time_ticks") != process_identity.get("process_group_start_time_ticks")
-        or decision.get("state") not in {"pending", "signal_committed", "sigterm_sent", "sigkill_sent", "confirmed"}
-        or decision.get("shared_commitment") not in {"pending", "committed"}
+        or decision.get("state")
+        not in {"pending", "signal_committed", "sigterm_sent", "sigkill_sent", "confirmed", "superseded"}
+        or decision.get("shared_commitment") not in {"pending", "committed", "unavailable"}
         or type(decision.get("decision_token")) is not int
         or decision["decision_token"] != parameters["fencing_token"]
     ):
         return False
     attempts = decision.get("signal_attempts")
     return isinstance(attempts, list) and all(isinstance(item, Mapping) for item in attempts)
+
+
+def _termination_retirement_matches_candidate(
+    receipt: Mapping[str, Any] | None,
+    candidate: _TerminationCandidate,
+) -> bool:
+    """Validate the exact timeout-retirement receipt for one local candidate."""
+    decision = candidate.decision
+    if decision is None:
+        return False
+    parameters = candidate.parameters
+    return retirement_matches_decision(
+        receipt,
+        decision,
+        task_id=parameters["task_id"],
+        attempt_id=parameters["attempt_id"],
+        attempt_number=parameters["attempt_number"],
+        fencing_token=parameters["fencing_token"],
+        machine_name=candidate.binding.machine_name,
+        process_identity=parameters["process_identity"],
+    )
+
+
+def _termination_retirement_parameters(candidate: _TerminationCandidate) -> dict[str, Any] | None:
+    """Build the exact shared request for a locally suppressed timeout decision."""
+    receipt = candidate.retirement
+    decision = candidate.decision
+    if (
+        not is_deadline_only_decision(decision)
+        or not isinstance(receipt, Mapping)
+        or receipt.get("state") not in {"suppressed", "shared_reconciled"}
+        or not _termination_retirement_matches_candidate(receipt, candidate)
+        or not _has_exact_terminal_revisions(candidate.source_revisions)
+    ):
+        return None
+    parameters = candidate.parameters
+    return {
+        "task_id": parameters["task_id"],
+        "attempt_id": parameters["attempt_id"],
+        "attempt_number": parameters["attempt_number"],
+        "fencing_token": parameters["fencing_token"],
+        "reservation_id": parameters["reservation_id"],
+        "process_identity": parameters["process_identity"],
+        "decision_id": candidate.decision_id,
+        "decision_token": decision.get("decision_token"),
+        "authority_outcome": "holder_safe_deadline_elapsed",
+        "reason": "holder_safe_deadline_elapsed",
+        "source_revisions": dict(candidate.source_revisions),
+        "retirement": dict(receipt),
+    }
+
+
+def _termination_retirement_proof(
+    evidence: Mapping[str, Any] | None,
+    candidate: _TerminationCandidate,
+) -> bool:
+    """Accept only a shared result bound to the exact old timeout decision."""
+    request = _termination_retirement_parameters(candidate)
+    if (
+        request is None
+        or not isinstance(evidence, Mapping)
+        or evidence.get("outcome") not in {"committed", "already_committed"}
+        or evidence.get("shared_commitment") != "committed"
+        or evidence.get("authority_granted") is not False
+        or evidence.get("local_effects") not in ([], ())
+    ):
+        return False
+    return (
+        all(
+            evidence.get(field) == request[field]
+            for field in (
+                "task_id",
+                "attempt_id",
+                "attempt_number",
+                "fencing_token",
+                "reservation_id",
+                "decision_id",
+                "decision_token",
+                "authority_outcome",
+                "process_identity",
+            )
+        )
+        and evidence.get("decision_reason") == request["reason"]
+        and (
+            isinstance(evidence.get("retirement_receipt"), Mapping)
+            and evidence["retirement_receipt"].get("operation_id") == request["retirement"].get("operation_id")
+            and evidence["retirement_receipt"].get("decision_digest") == request["retirement"].get("decision_digest")
+        )
+    )
 
 
 def _termination_commit_parameters(candidate: _TerminationCandidate) -> dict[str, Any] | None:
@@ -1377,7 +1472,9 @@ def _build_terminal_transition(
     task_phase = evidence.get("task_phase")
     attempt_phase = evidence.get("attempt_phase")
     if mode == "active":
-        source_phases_match = task_phase == "running" and attempt_phase == "running"
+        source_phases_match = (task_phase == "running" and attempt_phase == "running") or (
+            evidence.get("outcome") == "historical_current" and attempt_phase in {"starting", "running"}
+        )
     elif mode == "detached_orphan":
         # A retained local process identity is eligible for detached completion
         # only while the shared Attempt still records the expired claim as an
@@ -1386,7 +1483,7 @@ def _build_terminal_transition(
     else:
         return None
     if (
-        evidence.get("outcome") != "current"
+        evidence.get("outcome") not in {"current", "historical_current"}
         or not _terminal_observation_matches_candidate(evidence, candidate)
         or not source_phases_match
         or evidence.get("termination_result") is not None
@@ -2143,13 +2240,68 @@ class AttemptSupervisionCoordinator:
             candidate.trigger = decision.get("authority_outcome")
             candidate.decision_id = decision_path_value.stem
             candidate.decision = dict(decision)
+            decision_id_matches = decision_path_value.stem == _termination_decision_id(
+                candidate, candidate.trigger
+            ) or is_deadline_only_decision(decision)
             decision_matches = (
                 candidate.trigger in _TERMINATION_TRIGGERS
-                and decision_path_value.stem == _termination_decision_id(candidate, candidate.trigger)
+                and decision_id_matches
                 and _termination_decision_matches_candidate(decision, candidate)
             )
             if not decision_matches:
                 result = TerminationConvergence("invalid", "termination_decision_invalid", None, False, False)
+                self._record_termination_convergence(signature, attempt_id, result)
+                return result
+
+            if is_deadline_only_decision(decision) and decision.get("state") != "confirmed":
+                cfg = _termination_local_config(self.runtime, binding)
+                try:
+                    retirement = read_timeout_retirement(cfg, attempt_id, decision.get("decision_id", ""))
+                except (OSError, TypeError, ValueError):
+                    result = TerminationConvergence(
+                        "invalid",
+                        "timeout_decision_retirement_invalid",
+                        None,
+                        False,
+                        False,
+                    )
+                    self._record_termination_convergence(signature, attempt_id, result)
+                    return result
+                process_identity = process.parameters.get("process_identity")
+                retirement_matches = retirement_matches_decision(
+                    retirement,
+                    decision,
+                    task_id=process.parameters["task_id"],
+                    attempt_id=process.parameters["attempt_id"],
+                    attempt_number=process.parameters["attempt_number"],
+                    fencing_token=process.parameters["fencing_token"],
+                    machine_name=binding.machine_name,
+                    process_identity=process_identity,
+                )
+                if not retirement_matches:
+                    result = TerminationConvergence(
+                        "repairable",
+                        "timeout_decision_retirement_pending",
+                        None,
+                        False,
+                        False,
+                    )
+                elif retirement is not None and retirement.get("state") == "retired":
+                    result = TerminationConvergence(
+                        "converged",
+                        "timeout_decision_retired",
+                        None,
+                        False,
+                        False,
+                    )
+                else:
+                    result = TerminationConvergence(
+                        "repairable",
+                        "timeout_decision_retirement_pending",
+                        None,
+                        False,
+                        False,
+                    )
                 self._record_termination_convergence(signature, attempt_id, result)
                 return result
 
@@ -2284,6 +2436,8 @@ class AttemptSupervisionCoordinator:
             directory = Path(nested_path)
             page = nested_scan.take(_INITIAL_RECONCILIATION_ENTRIES_PER_LANE)
             for decision_path_value in page.paths:
+                if decision_path_value.name.startswith("retirement-"):
+                    continue
                 converged = self._initial_termination_decision_converged(
                     binding,
                     paths,
@@ -2311,6 +2465,8 @@ class AttemptSupervisionCoordinator:
                 nested_scan = nested_scans[str(directory)]
                 nested_page = nested_scan.take(_INITIAL_RECONCILIATION_ENTRIES_PER_LANE)
                 for decision_path_value in nested_page.paths:
+                    if decision_path_value.name.startswith("retirement-"):
+                        continue
                     converged = self._initial_termination_decision_converged(
                         binding,
                         paths,
@@ -3177,7 +3333,7 @@ class AttemptSupervisionCoordinator:
             if (
                 candidate.pending_transition is None
                 and isinstance(evidence, Mapping)
-                and evidence.get("outcome") == "current"
+                and evidence.get("outcome") in {"current", "historical_current"}
             ):
                 candidate.pending_transition = _build_terminal_transition(candidate, evidence)
 
@@ -3203,7 +3359,15 @@ class AttemptSupervisionCoordinator:
             if (
                 candidate is not None
                 and project_id in transition_requests
-                and evidence.get("outcome") in {"committed", "already_committed", "stale", "unavailable"}
+                and evidence.get("outcome")
+                in {
+                    "committed",
+                    "already_committed",
+                    "historical_committed",
+                    "historical_already_committed",
+                    "stale",
+                    "unavailable",
+                }
             ):
                 candidate.pending_transition = None
 
@@ -3334,9 +3498,12 @@ class AttemptSupervisionCoordinator:
             candidate.trigger = decision.get("authority_outcome")
             candidate.decision_id = decision_path_value.stem
             candidate.decision = decision
+            decision_id_matches = decision_path_value.stem == _termination_decision_id(
+                candidate, candidate.trigger
+            ) or is_deadline_only_decision(decision)
             if (
                 candidate.trigger in _TERMINATION_TRIGGERS
-                and decision_path_value.stem == _termination_decision_id(candidate, candidate.trigger)
+                and decision_id_matches
                 and _termination_decision_matches_candidate(decision, candidate)
             ):
                 return decision_path_value, decision
@@ -3544,6 +3711,105 @@ class AttemptSupervisionCoordinator:
                     candidate.decision = dict(decision)
                     if candidate.source_revisions is None:
                         return "invalid"
+                    return "applied"
+        except _TERMINATION_SOURCE_ERRORS:
+            return "deferred"
+
+    def _prepare_timeout_decision_retirement(
+        self,
+        candidate: _TerminationCandidate,
+        paths: Mapping[str, Path],
+    ) -> str:
+        """Persist local timeout suppression before submitting shared work."""
+        if candidate.decision_id is None or not is_deadline_only_decision(candidate.decision):
+            return "invalid"
+        cfg = _termination_local_config(self.runtime, candidate.binding)
+        attempt_id = candidate.parameters["attempt_id"]
+        try:
+            with evidence_write_guard(paths["root"], attempt_id) as evidence_acquired:
+                if not evidence_acquired:
+                    return "deferred"
+                with attempt_control_lock(cfg, attempt_id, blocking=False) as lock_acquired:
+                    if not lock_acquired:
+                        return "deferred"
+                    process = _read_terminal_process_record(candidate.process_path, paths["root"], candidate.binding)
+                    if not self._termination_process_matches(process, candidate):
+                        return "invalid"
+                    decision = _read_termination_decision(cfg, attempt_id, candidate.decision_id)
+                    if not _termination_decision_matches_candidate(decision, candidate):
+                        return "invalid"
+                    receipt = suppress_timeout_decision(
+                        cfg,
+                        decision=decision,
+                        task_id=candidate.parameters["task_id"],
+                        attempt_id=attempt_id,
+                        attempt_number=candidate.parameters["attempt_number"],
+                        fencing_token=candidate.parameters["fencing_token"],
+                        machine_name=candidate.binding.machine_name,
+                        process_identity=candidate.parameters["process_identity"],
+                    )
+                    if not _termination_retirement_matches_candidate(receipt, candidate):
+                        return "invalid"
+                    candidate.decision = dict(decision)
+                    candidate.retirement = dict(receipt)
+                    # Source revisions are obtained only from the isolated
+                    # authority terminal observation below.  Never read the
+                    # shared Task/Attempt files from this local-lock scope.
+                    return "applied"
+        except _TERMINATION_SOURCE_ERRORS:
+            return "deferred"
+
+    def _finish_timeout_decision_retirement(
+        self,
+        candidate: _TerminationCandidate,
+        paths: Mapping[str, Path],
+        evidence: Mapping[str, Any],
+    ) -> str:
+        """Durably acknowledge an exact shared retirement receipt locally."""
+        if not _termination_retirement_proof(evidence, candidate):
+            return "invalid"
+        cfg = _termination_local_config(self.runtime, candidate.binding)
+        attempt_id = candidate.parameters["attempt_id"]
+        try:
+            with evidence_write_guard(paths["root"], attempt_id) as evidence_acquired:
+                if not evidence_acquired:
+                    return "deferred"
+                with attempt_control_lock(cfg, attempt_id, blocking=False) as lock_acquired:
+                    if not lock_acquired:
+                        return "deferred"
+                    decision = _read_termination_decision(cfg, attempt_id, candidate.decision_id or "")
+                    receipt = read_timeout_retirement(cfg, attempt_id, candidate.decision_id or "")
+                    if not _termination_decision_matches_candidate(decision, candidate):
+                        return "invalid"
+                    if not _termination_retirement_matches_candidate(receipt, candidate):
+                        return "invalid"
+                    receipt = update_timeout_retirement(
+                        cfg,
+                        attempt_id,
+                        candidate.decision_id or "",
+                        state="shared_reconciled",
+                        shared_receipt=evidence,
+                    )
+                    receipt = update_timeout_retirement(
+                        cfg,
+                        attempt_id,
+                        candidate.decision_id or "",
+                        state="retired",
+                        shared_receipt=evidence,
+                    )
+                    candidate.retirement = dict(receipt)
+                    candidate.convergence = TerminationConvergence(
+                        "converged",
+                        "timeout_decision_retired",
+                        None,
+                        False,
+                        False,
+                    )
+                    self._record_termination_convergence(
+                        candidate.binding_signature,
+                        attempt_id,
+                        candidate.convergence,
+                    )
                     return "applied"
         except _TERMINATION_SOURCE_ERRORS:
             return "deferred"
@@ -4143,7 +4409,7 @@ class AttemptSupervisionCoordinator:
         for key, candidate in tuple(selected_candidates.items()):
             if (
                 candidate.decision is None
-                or not candidate.is_retained_replay
+                or (not candidate.is_retained_replay and not is_deadline_only_decision(candidate.decision))
                 or key not in self._termination_candidates
             ):
                 continue
@@ -4151,6 +4417,28 @@ class AttemptSupervisionCoordinator:
             if state is None:
                 continue
             paths = machine_project_paths(self.runtime.root, candidate.binding.project_id)
+            if is_deadline_only_decision(candidate.decision) and candidate.decision.get("state") != "confirmed":
+                retirement_outcome = self._prepare_timeout_decision_retirement(candidate, paths)
+                if retirement_outcome == "invalid":
+                    self._termination_candidates.pop(key, None)
+                    continue
+                if retirement_outcome == "deferred":
+                    continue
+                if candidate.retirement is not None and candidate.retirement.get("state") == "retired":
+                    candidate.convergence = TerminationConvergence(
+                        "converged",
+                        "timeout_decision_retired",
+                        None,
+                        False,
+                        False,
+                    )
+                    self._record_termination_convergence(
+                        candidate.binding_signature,
+                        candidate.parameters["attempt_id"],
+                        candidate.convergence,
+                    )
+                    self._termination_candidates.pop(key, None)
+                    continue
             try:
                 result = self._termination_convergence_for_decision(
                     candidate.binding,
@@ -4166,7 +4454,11 @@ class AttemptSupervisionCoordinator:
             if result is None:
                 continue
             candidate.convergence = result
-            if result.state == "repairable" and result.reason != "termination_decision_progress_pending":
+            if (
+                result.state == "repairable"
+                and result.reason != "termination_decision_progress_pending"
+                and not is_deadline_only_decision(candidate.decision)
+            ):
                 local_outcome = self._apply_termination_local_effects(candidate, paths, state)
                 if local_outcome == "invalid":
                     candidate.convergence = TerminationConvergence(
@@ -4198,6 +4490,10 @@ class AttemptSupervisionCoordinator:
         for key, candidate in selected_candidates.items():
             if candidate.decision is not None and candidate.decision.get("state") == "confirmed":
                 continue
+            if is_deadline_only_decision(candidate.decision) and candidate.source_revisions is not None:
+                # One binding has one isolated request slot. Retain the
+                # observed CAS source until retirement consumes that slot.
+                continue
             candidates_by_project.setdefault(candidate.binding.project_id, (key, candidate))
         if candidates_by_project:
             observation_bindings = [candidate.binding for _, candidate in candidates_by_project.values()]
@@ -4216,6 +4512,18 @@ class AttemptSupervisionCoordinator:
         current_observations: dict[tuple[str, str], Mapping[str, Any]] = {}
         for key, candidate in tuple(selected_candidates.items()):
             evidence = observation_results.get(candidate.binding.project_id)
+            if (
+                is_deadline_only_decision(candidate.decision)
+                and isinstance(evidence, Mapping)
+                and evidence.get("outcome") in {"current", "historical_current", "settled_terminal", "stale"}
+                and evidence.get("reason")
+                in {None, "task_identity_mismatch", "claim_not_current", "task_phase_mismatch"}
+                and _terminal_observation_matches_candidate(evidence, candidate)
+                and evidence.get("execution_machine_name") == candidate.binding.machine_name
+                and _has_exact_terminal_revisions(evidence.get("source_revisions"))
+            ):
+                candidate.source_revisions = dict(evidence["source_revisions"])
+                continue
             if _termination_observation_is_current(evidence, candidate):
                 paths = machine_project_paths(self.runtime.root, candidate.binding.project_id)
                 try:
@@ -4224,6 +4532,17 @@ class AttemptSupervisionCoordinator:
                     continue
                 if not self._termination_process_matches(process, candidate):
                     self._termination_candidates.pop(key, None)
+                    continue
+                if is_deadline_only_decision(candidate.decision):
+                    revisions = evidence.get("source_revisions")
+                    if _has_exact_terminal_revisions(revisions):
+                        # The isolated Project-I/O observation is the only
+                        # source of shared CAS revisions for timeout
+                        # retirement.  Keep an existing pending request's
+                        # exact revisions stable; otherwise retain this
+                        # observation for the next retirement submission.
+                        if candidate.source_revisions is None or candidate.pending_commit is None:
+                            candidate.source_revisions = dict(revisions)
                     continue
                 trigger = _termination_trigger(process.record, evidence)
                 if trigger is None:
@@ -4289,7 +4608,11 @@ class AttemptSupervisionCoordinator:
         commit_requests: dict[str, Mapping[str, Any]] = {}
         commit_candidates: dict[str, _TerminationCandidate] = {}
         for key, candidate in selected_candidates.items():
-            if candidate.binding.project_id not in selected_projects or candidate.decision is None:
+            if (
+                candidate.binding.project_id not in selected_projects
+                or candidate.decision is None
+                or is_deadline_only_decision(candidate.decision)
+            ):
                 continue
             has_durable_commit = candidate.decision.get("shared_commitment") == "committed"
             if candidate.pending_commit is None and (candidate.commit_evidence is not None or has_durable_commit):
@@ -4323,9 +4646,59 @@ class AttemptSupervisionCoordinator:
             elif isinstance(evidence, Mapping) and evidence.get("outcome") in {"stale", "invalid"}:
                 self._termination_candidates.pop(self._termination_key(candidate), None)
 
+        retirement_requests: dict[str, Mapping[str, Any]] = {}
+        retirement_candidates: dict[str, _TerminationCandidate] = {}
+        for key, candidate in selected_candidates.items():
+            if (
+                key not in self._termination_candidates
+                or not is_deadline_only_decision(candidate.decision)
+                or candidate.retirement is None
+                or candidate.retirement.get("state") == "retired"
+            ):
+                continue
+            request = _termination_retirement_parameters(candidate)
+            if request is None:
+                continue
+            retirement_requests[candidate.binding.project_id] = request
+            retirement_candidates[candidate.binding.project_id] = candidate
+        retirement_results: Mapping[str, Mapping[str, Any]] = {}
+        if retirement_requests:
+            try:
+                retirement_results = self.controller.advance_authority_termination_commits(
+                    [candidate.binding for candidate in retirement_candidates.values()],
+                    registry_revision,
+                    retirement_requests,
+                )
+            except _TERMINATION_SOURCE_ERRORS:
+                retirement_results = {}
+        for project_id, evidence in retirement_results.items():
+            candidate = retirement_candidates.get(project_id)
+            if candidate is None:
+                continue
+            if _termination_retirement_proof(evidence, candidate):
+                paths = machine_project_paths(self.runtime.root, candidate.binding.project_id)
+                outcome = self._finish_timeout_decision_retirement(candidate, paths, evidence)
+                if outcome == "invalid":
+                    self._termination_candidates.pop(self._termination_key(candidate), None)
+                elif outcome == "applied":
+                    self._termination_candidates.pop(self._termination_key(candidate), None)
+            elif isinstance(evidence, Mapping) and evidence.get("outcome") in {"stale", "invalid"}:
+                # Keep an exact suppressed receipt for replay diagnostics; a
+                # stale shared result is not permission to touch successors.
+                candidate.source_revisions = None
+                candidate.convergence = TerminationConvergence(
+                    "repairable",
+                    "timeout_decision_retirement_pending",
+                    None,
+                    False,
+                    False,
+                )
+
         # Advance one nonblocking local signal step only after exact commit proof.
         for key, candidate in tuple(selected_candidates.items()):
             if key not in self._termination_candidates or candidate.decision is None:
+                continue
+            if is_deadline_only_decision(candidate.decision):
                 continue
             if candidate.commit_evidence is None and candidate.decision.get("shared_commitment") != "committed":
                 continue

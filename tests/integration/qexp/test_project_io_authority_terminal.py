@@ -35,6 +35,7 @@ from qqtools.plugins.qexp.scheduler import (
     observe_project_io_terminal_state,
     publish_project_io_terminal_transition,
 )
+from tests.fixtures.qexp_legacy_ownership import persist_legacy_orphan
 
 pytestmark = [pytest.mark.integration, pytest.mark.qexp_fast_io]
 
@@ -808,12 +809,7 @@ def test_detached_terminal_publish_cross_epoch_replays_attempt_first_write(
     )
     task.meta["revision"] += 1
     save_task(running.cfg, task)
-    assert expire_claim(
-        running.cfg,
-        running.task_id,
-        running.attempt_id,
-        running.fencing_token,
-    )
+    persist_legacy_orphan(running.cfg, running.task_id)
     orphan = load_task(running.cfg, running.task_id)
     assert orphan.state["projection"] == "blocked"
     assert orphan.attempt_control["current_attempt_id"] is None

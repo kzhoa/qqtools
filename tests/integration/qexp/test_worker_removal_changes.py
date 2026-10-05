@@ -15,6 +15,7 @@ from qqtools.plugins.qexp.runtime.paths import attempt_path
 from qqtools.plugins.qexp.runtime.ready.routes import reference_for_generation
 from qqtools.plugins.qexp.runtime.store import read_json
 from qqtools.plugins.qexp.runtime.tasks import load_task
+from tests.fixtures.qexp_legacy_ownership import persist_legacy_orphan
 from tests.helpers.qexp_discovery import isolated_group
 
 pytestmark = pytest.mark.integration
@@ -201,7 +202,7 @@ def test_interrupted_launch_obligation_accepts_fenced_recovery_successor(tmp_pat
             }
         },
     )
-    assert scheduler.expire_claim(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token)
+    persist_legacy_orphan(cfg, task.task_id)
     token = recover_running_attempt(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token)
     assert token == attempt.current_fencing_token + 1
     assert settle(cfg, event) == (True, [])
@@ -319,17 +320,17 @@ def test_old_obligation_accepts_identified_recovery_and_terminal_successors(tmp_
             patch.setattr(lifecycle, "atomic_replace", stop_before_attempt)
             with pytest.raises(ProcessStopped):
                 scheduler.fail_attempt(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token, "old")
-        assert scheduler.expire_claim(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token)
+        persist_legacy_orphan(cfg, task.task_id)
         token = recover(cfg, task, attempt)
     elif owner == "claim_loss":
         tail = journal.snapshot().tail
         with monkeypatch.context() as patch:
             interrupt_resolution(patch, owner)
             with pytest.raises(ProcessStopped):
-                scheduler.expire_claim(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token)
+                persist_legacy_orphan(cfg, task.task_id)
         token = recover(cfg, task, attempt)
     else:
-        assert scheduler.expire_claim(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token)
+        persist_legacy_orphan(cfg, task.task_id)
         tail = journal.snapshot().tail
         with monkeypatch.context() as patch:
             interrupt_resolution(patch, owner)
@@ -358,7 +359,7 @@ def test_interrupted_obligation_accepts_detached_orphan(tmp_path, owner):
         tail = journal.snapshot().tail
         run_crash(cfg, task.task_id, owner, "after_attempt")
         claim = load_task(cfg, task.task_id).claim_control["active_claim"]
-    assert scheduler.expire_claim(cfg, task.task_id, claim["attempt_id"], claim["fencing_token"])
+    persist_legacy_orphan(cfg, task.task_id)
     assert load_task(cfg, task.task_id).state["projection"] == "blocked"
     event = journal.read(journal.snapshot(), tail + 1)
     assert event["owner"] == owner and event["state"] == "in_flight"

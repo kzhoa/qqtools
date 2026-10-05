@@ -26,7 +26,9 @@ _PROCESS_IDENTITY_FIELDS = (
 )
 
 _TERMINAL_OBSERVATION_OUTCOMES = frozenset({"already_terminal", "settled_terminal"})
-_TERMINAL_PUBLICATION_OUTCOMES = frozenset({"committed", "already_committed"})
+_TERMINAL_PUBLICATION_OUTCOMES = frozenset(
+    {"committed", "already_committed", "historical_committed", "historical_already_committed"}
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -443,7 +445,14 @@ def build_terminal_publication_proof(
         reservation_id is not None and reservation_machine != machine_name
     ):
         return None
-    if not matches_terminal_lifecycle_event(
+    historical = evidence.get("outcome") in {"historical_committed", "historical_already_committed"}
+    if historical and (
+        parameters.get("mode") != "active"
+        or transition_termination_result is not None
+        or evidence.get("lifecycle_event") is not None
+    ):
+        return None
+    if not historical and not matches_terminal_lifecycle_event(
         evidence.get("lifecycle_event"),
         evidence.get("committed_revisions"),
         parameters,

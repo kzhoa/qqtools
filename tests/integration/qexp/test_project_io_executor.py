@@ -1763,16 +1763,24 @@ def test_scheduler_launch_authorize_commits_exact_gate_and_replays_launch_id(tmp
     current = load_task(cfg, task.task_id)
     assert current.claim_control["active_claim"]["launch_state"] == "starting"
     assert current.claim_control["active_claim"]["launch_id"] == launch_id
+    assert current.claim_control["active_claim"]["authority_mode"] == "holder_bound"
+    assert current.claim_control["active_claim"]["lease_expires_at"] is None
+    assert "ownership_transition" in current.claim_control["active_claim"]
     persisted_attempt_record = read_json(
         shared_paths(cfg.shared_root)["attempts"] / task.task_id / f"{attempt.attempt_number}.json"
     )
     persisted_attempt = persisted_attempt_record["attempt"]
     assert persisted_attempt["phase"] == "starting"
+    assert persisted_attempt["authority_mode"] == "holder_bound"
+    assert persisted_attempt["lease"]["expires_at"] is None
     assert persisted_attempt["authorization"]["launch_id"] == launch_id
 
     # Replay repairs the only permitted partial pair: Task launch authority
     # committed, while the matching Attempt write did not become durable.
     persisted_attempt["phase"] = "claimed"
+    persisted_attempt["authority_mode"] = "bounded_lease"
+    source_lease = current.claim_control["active_claim"]["ownership_transition"]["source_active_lease_evidence"]
+    persisted_attempt["lease"] = source_lease["attempt"]
     persisted_attempt["authorization"].pop("launch_id")
     persisted_attempt["authorization"].pop("launch_handoff_timeout_seconds")
     persisted_attempt["timestamps"]["launch_authorized_at"] = None
@@ -1798,6 +1806,8 @@ def test_scheduler_launch_authorize_commits_exact_gate_and_replays_launch_id(tmp
         shared_paths(cfg.shared_root)["attempts"] / task.task_id / f"{attempt.attempt_number}.json"
     )["attempt"]
     assert repaired_attempt["phase"] == "starting"
+    assert repaired_attempt["authority_mode"] == "holder_bound"
+    assert repaired_attempt["lease"]["expires_at"] is None
     assert repaired_attempt["authorization"]["launch_id"] == launch_id
 
     repaired_record = read_json(

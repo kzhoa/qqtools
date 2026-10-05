@@ -4248,7 +4248,7 @@ class ProjectIOController:
         }
         for project_id, value in decisions.items():
             validate_identifier(project_id, "project_id")
-            if not isinstance(value, Mapping) or set(value) != expected:
+            if not isinstance(value, Mapping) or set(value) not in (expected, expected | {"retirement"}):
                 raise ValueError("authority termination decision fields are invalid.")
             parameters[project_id] = dict(value)
         return self._advance_activation_io(
@@ -4565,7 +4565,12 @@ class ProjectIOController:
             if operation_kind in {"progress_projection", "legacy_capture_scan"}:
                 request_matches = _json_copy(request.parameters) == expected_parameters
             if operation_kind in _AUTHORITY_MUTATION_OPERATION_KINDS and expected_parameters is not None:
-                request_matches = dict(request.parameters) == {
+                observed_parameters = (
+                    _json_copy(request.parameters)
+                    if operation_kind == "authority_termination_commit"
+                    else dict(request.parameters)
+                )
+                request_matches = observed_parameters == {
                     key: value for key, value in expected_parameters.items() if key != "source_revisions"
                 } and dict(request.source_revisions) == expected_parameters.get("source_revisions")
             if binding is None or not request_matches:
@@ -4771,6 +4776,7 @@ class ProjectIOController:
                     "legacy_capture_read",
                     "legacy_capture_scan",
                     "recovery_source_hold",
+                    "authority_termination_commit",
                 }:
                     evidence = _json_copy(consumed.evidence)
                 completions[binding.project_id] = evidence
@@ -4991,6 +4997,7 @@ class ProjectIOController:
                     reason=parameters["reason"],
                     process_identity=parameters["process_identity"],
                     source_revisions=parameters["source_revisions"],
+                    retirement=parameters.get("retirement"),
                 )
             elif operation_kind == "authority_terminal_publish":
                 request = self.executor.prepare_authority_terminal_publish(

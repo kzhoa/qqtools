@@ -11,6 +11,7 @@ from typing import Any, Callable, Generator, Mapping
 from ..config_types import RootConfig
 from ..lease import clock_capability, lease_expiry, load_lease_policy, persist_clock_observation
 from ..scheduler import authority_locks
+from .durable_ownership import transition_attempt_ownership
 from .group_discovery.changes import record_task_change
 from .group_namespace import read_group
 from .paths import attempt_path, group_path, local_paths
@@ -20,6 +21,31 @@ from .resources.reservations import retag
 from .store import atomic_replace, read_json
 from .tasks import load_task, save_task
 from .termination import attempt_control_lock, recovery_check_steps
+
+
+def _restore_durable_ownership(
+    cfg: RootConfig, task: Any, attempt: AttemptRecord, *, mutation_fence: Callable[[], None] | None = None
+) -> None:
+    """Convert a recovered exact legacy launch through the Task-first receipt."""
+    claim = task.claim_control.get("active_claim") or {}
+    launch_id = attempt.authorization.get("launch_id")
+    authorized_at = attempt.timestamps.get("launch_authorized_at")
+    if not isinstance(launch_id, str) or not launch_id or not isinstance(authorized_at, str):
+        # Older incomplete evidence remains readable, but cannot invent a
+        # launch identity or reusable durable ownership.
+        return
+    if claim.get("launch_id") != launch_id:
+        return
+    transition_attempt_ownership(
+        cfg,
+        task,
+        attempt,
+        target_phase="running",
+        launch_id=launch_id,
+        authorized_at=authorized_at,
+        mutation_fence=mutation_fence,
+        task_writer=lambda value: save_task(cfg, value, mutation_fence=mutation_fence),
+    )
 
 
 def recover_orphaned_attempt_shared(
@@ -176,6 +202,7 @@ def recover_orphaned_attempt_shared(
         marker_source = marker.get("source_revisions") if isinstance(marker, dict) else None
         marker_token = marker.get("recovered_fencing_token") if isinstance(marker, dict) else None
         marker_expiry = marker.get("lease_expires_at") if isinstance(marker, dict) else None
+        marker_launch_id = marker.get("launch_id") if isinstance(marker, dict) else None
         marker_matches = (
             isinstance(marker, dict)
             and marker.get("recovery_id") == recovery_id
@@ -189,6 +216,7 @@ def recover_orphaned_attempt_shared(
             and marker_token > expired_token
             and isinstance(marker_expiry, str)
             and bool(marker_expiry)
+            and ("launch_id" not in marker or marker_launch_id == attempt.authorization.get("launch_id"))
             and attempt.phase == "running"
             and attempt.current_fencing_token == marker_token
             and attempt.timestamps.get("recovered_at") is not None
@@ -209,11 +237,13 @@ def recover_orphaned_attempt_shared(
             and claim.get("project_io_orphan_recovery_id") == recovery_id
         )
         if already_recovered:
+            _restore_durable_ownership(cfg, task, attempt, mutation_fence=mutation_fence)
+            _, attempt_digest = read_attempt()
             return evidence(
                 "already_recovered",
                 None,
                 source=marker_source,
-                task_revision=task_revision,
+                task_revision=task.meta["revision"],
                 attempt_digest=attempt_digest,
                 recovered_token=marker_token,
                 expires_at=marker_expiry,
@@ -381,6 +411,7 @@ def recover_orphaned_attempt_shared(
                 "source_revisions": dict(source),
                 "recovered_fencing_token": token,
                 "lease_expires_at": expires,
+                "launch_id": attempt.authorization.get("launch_id"),
             }
             mutation_fence()
             atomic_replace(attempt_path(cfg.shared_root, task_id, attempt_number), attempt.to_dict())
@@ -410,7 +441,9 @@ def recover_orphaned_attempt_shared(
                 "clock_observation_id": clock_evidence["observation_id"],
                 "lease_expires_at": expires,
                 "launch_state": "running",
+                "launch_id": attempt.authorization.get("launch_id"),
                 "launch_authorized_at": attempt.timestamps.get("launch_authorized_at"),
+                "launch_handoff_timeout_seconds": attempt.authorization.get("launch_handoff_timeout_seconds"),
                 "group_dispatch_epoch": attempt.authorization.get("group_dispatch_epoch"),
                 "group_worker_set_epoch": attempt.authorization.get("group_worker_set_epoch"),
                 "project_io_orphan_recovery_id": recovery_id,
@@ -424,6 +457,7 @@ def recover_orphaned_attempt_shared(
             mutation_fence()
             save_task(cfg, task, mutation_fence=mutation_fence)
 
+        _restore_durable_ownership(cfg, task, attempt, mutation_fence=mutation_fence)
         _, committed_digest = read_attempt()
         return evidence(
             "already_recovered" if partial else "recovered",
@@ -569,7 +603,11 @@ def recovery_steps(
                             "clock_observation_id": evidence["observation_id"],
                             "lease_expires_at": expires,
                             "launch_state": "running",
+                            "launch_id": attempt.authorization.get("launch_id"),
                             "launch_authorized_at": attempt.timestamps.get("launch_authorized_at"),
+                            "launch_handoff_timeout_seconds": attempt.authorization.get(
+                                "launch_handoff_timeout_seconds"
+                            ),
                             "group_dispatch_epoch": attempt.authorization.get("group_dispatch_epoch"),
                             "group_worker_set_epoch": attempt.authorization.get("group_worker_set_epoch"),
                         },
@@ -589,6 +627,7 @@ def recovery_steps(
                 attempt.lease.update({"renewed_at": utc_now(), "expires_at": expires, "clock_evidence": evidence})
                 atomic_replace(path, attempt.to_dict())
                 save_task(cfg, task)
+                _restore_durable_ownership(cfg, task, attempt)
                 manifest = dict(manifest)
                 manifest.update(
                     {

@@ -6008,6 +6008,8 @@ def test_authority_service_observes_exact_running_attempt_without_shared_writes(
     attempt_file = attempt_path(cfg.shared_root, task.task_id, claim["attempt_number"])
     attempt = AttemptRecord.from_dict(read_json(attempt_file))
     attempt.phase = "running"
+    attempt.authorization["launch_id"] = "legacy-running-launch"
+    attempt.timestamps["launch_authorized_at"] = "2026-09-28T00:00:00Z"
     attempt.process.update(
         {
             "wrapper_pid": os.getpid(),
@@ -6019,6 +6021,8 @@ def test_authority_service_observes_exact_running_attempt_without_shared_writes(
     atomic_replace(attempt_file, attempt.to_dict())
     current_task = load_task(cfg, task.task_id)
     current_task.claim_control["active_claim"]["launch_state"] = "running"
+    current_task.claim_control["active_claim"]["launch_id"] = "legacy-running-launch"
+    current_task.claim_control["active_claim"]["launch_authorized_at"] = "2026-09-28T00:00:00Z"
     save_task(cfg, current_task)
     runtime.set_enabled(binding.project_id, False)
     revision, bindings = runtime.load_registry()
@@ -6104,6 +6108,7 @@ def test_authority_service_observes_exact_running_attempt_without_shared_writes(
     bounded_claim = bounded_task.claim_control["active_claim"]
     bounded_claim["authority_mode"] = "bounded_lease"
     bounded_claim["lease_expires_at"] = "2026-09-28T01:00:00Z"
+    bounded_claim.pop("ownership_transition", None)
     save_task(cfg, bounded_task)
     bounded_attempt = AttemptRecord.from_dict(read_json(attempt_file))
     bounded_attempt.authority_mode = "bounded_lease"
@@ -6121,14 +6126,19 @@ def test_authority_service_observes_exact_running_attempt_without_shared_writes(
         renewal = controller.advance_authority_renewals(bindings, revision, authority)
         time.sleep(0.02)
 
-    assert renewal[binding.project_id]["outcome"] == "renewed"
+    assert renewal[binding.project_id]["outcome"] == "not_required"
     assert renewal[binding.project_id]["authority_granted"] is False
     assert not renewal[binding.project_id]["local_effects"]
     renewed_task = load_task(cfg, task.task_id)
     renewed_attempt = AttemptRecord.from_dict(read_json(attempt_file))
-    renewal_id = renewed_task.claim_control["active_claim"]["clock_observation_id"]
-    assert renewal_id == renewed_attempt.lease["clock_evidence"]["observation_id"]
-    assert renewed_task.claim_control["active_claim"]["lease_expires_at"] == renewed_attempt.lease["expires_at"]
+    renewed_claim = renewed_task.claim_control["active_claim"]
+    assert renewed_claim["authority_mode"] == renewed_attempt.authority_mode == "holder_bound"
+    assert renewed_claim["clock_observation_id"] is None
+    assert renewed_claim["lease_expires_at"] is None
+    assert renewed_attempt.lease["clock_evidence"] is None
+    assert renewed_attempt.lease["expires_at"] is None
+    assert renewed_claim["ownership_transition"]["source_phase"] == "running"
+    assert renewed_claim["ownership_transition"]["target_phase"] == "running"
 
     renewed_task_bytes = (cfg.shared_root / "tasks" / f"{task.task_id}.json").read_bytes()
     renewed_attempt_bytes = attempt_file.read_bytes()

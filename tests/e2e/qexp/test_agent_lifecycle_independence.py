@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import sys
 import time
@@ -33,6 +34,7 @@ def test_installed_cli_stop_offline_completion_start(tmp_path: Path) -> None:
     marker = base / "launch-count"
     release = base / "allow-exit"
     finished = base / "training-finished"
+    training_pid = base / "training-pid"
     env = make_env(base)
     common = [
         "qexp",
@@ -47,6 +49,19 @@ def test_installed_cli_stop_offline_completion_start(tmp_path: Path) -> None:
     ]
     try:
         initialize_machine_project(common, env=env, agent_mode="daemon")
+        run(
+            [
+                *common,
+                "config",
+                "set",
+                "lease",
+                "--ttl-seconds",
+                "13",
+                "--renew-interval-seconds",
+                "1.5",
+            ],
+            env=env,
+        )
         run([*common, "agent", "start"], env=env)
         wait_for(lambda: is_machine_agent_running(common, env=env), timeout=10, label="agent startup")
         command = [
@@ -56,6 +71,7 @@ def test_installed_cli_stop_offline_completion_start(tmp_path: Path) -> None:
                 "from pathlib import Path\nimport time\n"
                 f"p=Path({str(marker)!r})\n"
                 "p.write_text(str(int(p.read_text()) + 1) if p.exists() else '1')\n"
+                f"Path({str(training_pid)!r}).write_text(str(__import__('os').getpid()))\n"
                 "deadline=time.monotonic()+60\n"
                 f"while not Path({str(release)!r}).exists():\n"
                 "    if time.monotonic()>deadline: raise SystemExit(99)\n"
@@ -74,10 +90,26 @@ def test_installed_cli_stop_offline_completion_start(tmp_path: Path) -> None:
         wait_for(marker.exists, timeout=10, label="training command started")
         original = jrun([*common, "task", "show", task_id], env=env)["task"]
         attempt_id = original["attempt_control"]["current_attempt_id"]
+        original_pid = int(training_pid.read_text(encoding="utf-8"))
         run([*common, "agent", "stop"], env=env)
         assert not is_machine_agent_running(common, env=env)
+        time.sleep(15)
+        os.kill(original_pid, 0)
+        assert not release.exists()
+
+        started_at = time.monotonic()
+        run([*common, "agent", "start"], env=env)
+        wait_for(
+            lambda: jrun([*common, "task", "show", task_id], env=env)["task"]["state"]["projection"] == "running",
+            timeout=30,
+            label="durable owner supervision restoration",
+        )
+        restored = jrun([*common, "task", "show", task_id], env=env)["task"]
+        assert restored["attempt_control"]["current_attempt_id"] == attempt_id
+        os.kill(original_pid, 0)
+        assert not list(machine_runtime_root.glob(f"projects/*/termination-decisions/{attempt_id}/*.json"))
         release.touch()
-        wait_for(finished.exists, timeout=10, label="offline training completion")
+        wait_for(finished.exists, timeout=10, label="restored training completion")
 
         def exit_observations():
             return list(machine_runtime_root.glob(f"projects/*/process-observations/{attempt_id}.json"))
@@ -86,9 +118,6 @@ def test_installed_cli_stop_offline_completion_start(tmp_path: Path) -> None:
         observation = json.loads(exit_observations()[0].read_text())["exit_observation"]
         assert observation["attempt_id"] == attempt_id
         assert observation["observed_exit_code"] == 0
-        assert not is_machine_agent_running(common, env=env)
-        started_at = time.monotonic()
-        run([*common, "agent", "start"], env=env)
         wait_for(
             lambda: (
                 jrun([*common, "task", "show", task_id], env=env)["task"]["state"]["projection"]
@@ -114,6 +143,28 @@ def test_installed_cli_stop_offline_completion_start(tmp_path: Path) -> None:
         )
         assert "offline lifecycle result" in run([*common, "task", "logs", task_id], env=env).stdout
         assert marker.read_text(encoding="utf-8") == "1"
+        next_marker = base / "next-task-started"
+        next_submit = run(
+            [
+                *common,
+                "submit",
+                "--quiet",
+                "--",
+                sys.executable,
+                "-c",
+                f"from pathlib import Path; Path({str(next_marker)!r}).touch()",
+            ],
+            env=env,
+        )
+        next_task_id = next_submit.stdout.strip()
+        wait_for(next_marker.exists, timeout=15, label="subsequent Task dispatch")
+        wait_for(
+            lambda: (
+                jrun([*common, "task", "show", next_task_id], env=env)["task"]["state"]["projection"] == "succeeded"
+            ),
+            timeout=15,
+            label="subsequent Task completion",
+        )
         assert "site-packages" in ensure_site_packages_import()
     finally:
         release.touch()

@@ -53,6 +53,7 @@ from qqtools.plugins.qexp.runtime.resources.reservations import (
 )
 from qqtools.plugins.qexp.runtime.store import atomic_replace, read_json
 from qqtools.plugins.qexp.runtime.tasks import load_task
+from tests.fixtures.qexp_legacy_ownership import persist_legacy_orphan
 from tests.helpers.qexp.clock import set_offer_evaluation_time
 from tests.helpers.qexp.lifecycle import wait_until
 from tests.helpers.qexp.worker_diagnostics import describe_project_io_workers
@@ -1007,14 +1008,7 @@ def test_machine_recovery_retags_global_reservation(tmp_path: Path) -> None:
             }
         },
     )
-    attempt_path = cfg.shared_root / "attempts" / task.task_id / "1.json"
-    attempt_value = read_json(attempt_path)
-    attempt_value["attempt"]["phase"] = "orphaned"
-    atomic_replace(attempt_path, attempt_value)
-    task_value = load_task(cfg, task.task_id)
-    task_value.state.update({"projection": "blocked", "reason": "test"})
-    task_value.claim_control["active_claim"] = None
-    atomic_replace(cfg.shared_root / "tasks" / f"{task.task_id}.json", task_value.to_dict())
+    persist_legacy_orphan(cfg, task.task_id)
 
     token = recover_running_attempt(
         context.local_cfg,
