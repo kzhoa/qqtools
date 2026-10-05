@@ -11,6 +11,8 @@
   selectable and paginated Group status listings.
 - breaking: purge the completed 1.3.22 machine-inventory, global-agent-residency,
   enrollment-CLI, and notification-policy compatibility transitions.
+- ci: align the qexp lifecycle release gate with the machine-global residency
+  cases used after the compatibility purge.
 
 ## v1.3.25
 
