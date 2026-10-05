@@ -9,6 +9,7 @@ import pytest
 from qqtools.plugins.qexp import init_shared_root
 from qqtools.plugins.qexp.agent.context import MachineRuntime
 from qqtools.plugins.qexp.agent.helpers import _machine_is_true_idle
+from qqtools.plugins.qexp.agent.setup import initialize_machine
 from qqtools.plugins.qexp.commands.task import submit as submit_task
 from qqtools.plugins.qexp.layout import read_schema_version
 from qqtools.plugins.qexp.runtime.locks import exclusive
@@ -142,6 +143,7 @@ def test_machine_upgrade_discovery_is_cached_until_registry_changes(tmp_path: Pa
     cfg = _config(tmp_path)
     (cfg.shared_root / "operations" / "upgrades" / "protocol-manifest.json").unlink()
     runtime = MachineRuntime(tmp_path / "machine-runtime")
+    initialize_machine(runtime, "gpu-1", agent_mode="on_demand")
     runtime.add_binding(cfg.shared_root, cfg.machine_name)
 
     first = discover_registered_upgrades(runtime)
@@ -158,6 +160,7 @@ def test_machine_upgrade_discovery_is_cached_until_registry_changes(tmp_path: Pa
 def test_cached_upgrade_discovery_does_not_iterate_unchanged_registry(tmp_path: Path, monkeypatch) -> None:
     cfg = _config(tmp_path)
     runtime = MachineRuntime(tmp_path / "machine-runtime")
+    initialize_machine(runtime, "gpu-1", agent_mode="on_demand")
     runtime.add_binding(cfg.shared_root, cfg.machine_name)
     discover_registered_upgrades(runtime)
     revision, bindings = runtime.load_registry_snapshot()
@@ -177,6 +180,7 @@ def test_concurrent_upgrade_discovery_retries_after_registry_change(tmp_path: Pa
     first_cfg = _config(tmp_path / "first")
     second_cfg = _config(tmp_path / "second")
     runtime = MachineRuntime(tmp_path / "machine-runtime")
+    initialize_machine(runtime, "gpu-1", agent_mode="on_demand")
     runtime.add_binding(first_cfg.shared_root, first_cfg.machine_name)
     discover_registered_upgrades(runtime)
     entered = Event()
@@ -214,6 +218,7 @@ def test_concurrent_upgrade_discovery_retries_after_registry_change(tmp_path: Pa
 def test_busy_upgrade_discovery_fails_closed_during_cache_publication(tmp_path: Path, monkeypatch) -> None:
     cfg = _config(tmp_path)
     runtime = MachineRuntime(tmp_path / "machine-runtime")
+    initialize_machine(runtime, "gpu-1", agent_mode="on_demand")
     runtime.add_binding(cfg.shared_root, cfg.machine_name)
     discover_registered_upgrades(runtime)
     runtime.last_cycle_had_demand = False
@@ -252,6 +257,7 @@ def test_busy_upgrade_discovery_fails_closed_during_cache_publication(tmp_path: 
 def test_upgrade_advance_rebuilds_until_registry_revision_is_stable(tmp_path: Path, monkeypatch) -> None:
     configs = [_config(tmp_path / name) for name in ("first", "second", "third")]
     runtime = MachineRuntime(tmp_path / "machine-runtime")
+    initialize_machine(runtime, "gpu-1", agent_mode="on_demand")
     runtime.add_binding(configs[0].shared_root, configs[0].machine_name)
     original_discover = UpgradeCoordinator.discover
     calls = 0
@@ -280,6 +286,7 @@ def test_machine_budget_rotates_projects_without_losing_queued_work(tmp_path: Pa
     (first_cfg.shared_root / "operations" / "upgrades" / "protocol-manifest.json").unlink()
     (second_cfg.shared_root / "operations" / "upgrades" / "protocol-manifest.json").unlink()
     runtime = MachineRuntime(tmp_path / "machine-runtime")
+    initialize_machine(runtime, "gpu-1", agent_mode="on_demand")
     runtime.add_binding(first_cfg.shared_root, first_cfg.machine_name)
     runtime.add_binding(second_cfg.shared_root, second_cfg.machine_name)
     budget = MachineUpgradeBudget(
@@ -310,6 +317,7 @@ def test_advance_recomputes_aggregate_after_final_slice(tmp_path: Path, monkeypa
 
     cfg = _config(tmp_path)
     runtime = MachineRuntime(tmp_path / "machine-runtime")
+    initialize_machine(runtime, "gpu-1", agent_mode="on_demand")
     binding = runtime.add_binding(cfg.shared_root, cfg.machine_name)
     runtime.upgrade_runnable_projects = {binding.project_id}
     monkeypatch.setattr(
@@ -360,6 +368,7 @@ def test_inaccessible_discovery_is_retained_and_reprobed(tmp_path: Path, monkeyp
     cfg = _config(tmp_path)
     (cfg.shared_root / "operations" / "upgrades" / "protocol-manifest.json").unlink()
     runtime = MachineRuntime(tmp_path / "machine-runtime")
+    initialize_machine(runtime, "gpu-1", agent_mode="on_demand")
     runtime.add_binding(cfg.shared_root, cfg.machine_name)
     original_discover = UpgradeCoordinator.discover
 

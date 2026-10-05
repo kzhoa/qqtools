@@ -12,6 +12,7 @@ from qqtools.plugins.qexp import init_shared_root
 from qqtools.plugins.qexp.agent.context import MachineRuntime
 from qqtools.plugins.qexp.agent.helpers import _machine_is_true_idle
 from qqtools.plugins.qexp.agent.recovery_capture import RecoveryCapture
+from qqtools.plugins.qexp.agent.setup import initialize_machine
 from qqtools.plugins.qexp.runtime import responsibility_completion as completion
 from qqtools.plugins.qexp.runtime import responsibility_process_capture as processes
 from qqtools.plugins.qexp.runtime.paths import local_paths
@@ -33,6 +34,7 @@ pytestmark = pytest.mark.integration
 def project(tmp_path, monkeypatch):
     cfg = init_shared_root(tmp_path / "project/.qexp", "worker", runtime_root=tmp_path / "legacy")
     runtime = MachineRuntime(tmp_path / "machine")
+    initialize_machine(runtime, "gpu-1", agent_mode="on_demand")
     binding = runtime.add_binding(cfg.shared_root, cfg.machine_name)
     root = runtime.project_paths(binding.project_id)["root"]
     root.mkdir(parents=True, exist_ok=True)
@@ -666,6 +668,7 @@ def test_captured_live_writer_blocks_cleanup_until_real_process_exits(project):
 def test_process_crash_after_completion_rename_recovers(tmp_path):
     cfg = init_shared_root(tmp_path / "project/.qexp", "worker", runtime_root=tmp_path / "legacy")
     runtime = MachineRuntime(tmp_path / "machine")
+    initialize_machine(runtime, "gpu-1", agent_mode="on_demand")
     binding = runtime.add_binding(cfg.shared_root, cfg.machine_name)
     root = runtime.project_paths(binding.project_id)["root"]
     pid = os.fork()

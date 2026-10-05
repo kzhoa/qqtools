@@ -15,6 +15,7 @@ from qqtools.plugins.qexp.agent.helpers import _machine_is_true_idle
 from qqtools.plugins.qexp.agent.project_io_controller import ProjectIOController
 from qqtools.plugins.qexp.agent.project_io_executor import ProjectIOExecutor
 from qqtools.plugins.qexp.agent.recovery_enrollment import RecoveryEnrollment
+from qqtools.plugins.qexp.agent.setup import initialize_machine
 from qqtools.plugins.qexp.layout import LOCAL_RECOVERY_CAPABILITY
 from qqtools.plugins.qexp.runtime.store import read_json
 from tests.helpers.qexp.lifecycle import LifecycleDeadline, wait_until
@@ -75,6 +76,7 @@ def settle_coordinated(enrollment, controller, *, timeout=20):
 
 def test_all_registered_projects_are_prepared_in_fair_bounded_passes(tmp_path, monkeypatch):
     runtime = MachineRuntime(tmp_path / "machine")
+    initialize_machine(runtime, "gpu-1", agent_mode="on_demand")
     entries = [register(runtime, tmp_path, f"project-{index}") for index in range(9)]
     monkeypatch.setattr(
         runtime,
@@ -113,6 +115,7 @@ def test_pending_project_retries_without_starving_new_or_disabled_bindings(tmp_p
     from qqtools.plugins.qexp.runtime.locks import machine_lock
 
     runtime = MachineRuntime(tmp_path / "machine")
+    initialize_machine(runtime, "gpu-1", agent_mode="on_demand")
     first, first_path = register(runtime, tmp_path, "first")
     others = [register(runtime, tmp_path, f"other-{index}") for index in range(5)]
     disabled = runtime.set_enabled(others[-1][0].project_id, False)
@@ -145,6 +148,7 @@ def test_pending_project_retries_without_starving_new_or_disabled_bindings(tmp_p
 
 def test_binding_changes_invalidate_success_and_superseded_generation_settles(tmp_path, monkeypatch):
     runtime = MachineRuntime(tmp_path / "machine")
+    initialize_machine(runtime, "gpu-1", agent_mode="on_demand")
     binding, _path = register(runtime, tmp_path, "project")
     with coordinated_enrollment(runtime) as (enrollment, controller):
         settle_coordinated(enrollment, controller)
@@ -163,6 +167,7 @@ def test_slow_worker_does_not_block_poll_or_start_duplicate_worker(tmp_path, mon
     from qqtools.plugins.qexp.runtime.locks import machine_lock
 
     runtime = MachineRuntime(tmp_path / "machine")
+    initialize_machine(runtime, "gpu-1", agent_mode="on_demand")
     binding, _path = register(runtime, tmp_path, "project")
     with coordinated_enrollment(runtime) as (enrollment, controller):
         calls = []
@@ -199,6 +204,7 @@ def test_real_global_agent_prepares_registered_roots_before_on_demand_exit(tmp_p
     from qqtools.plugins.qexp.runtime.responsibility_completion import is_source_released, read_capture_completion
 
     runtime = MachineRuntime(tmp_path / "machine")
+    initialize_machine(runtime, "gpu-1", agent_mode="on_demand")
     entries = [register(runtime, tmp_path, f"project-{index}") for index in range(5)]
     environment = os.environ.copy()
     environment["PYTHONPATH"] = str(Path(__file__).parents[3] / "src")
@@ -294,6 +300,7 @@ def test_real_global_agent_prepares_registered_roots_before_on_demand_exit(tmp_p
 
 def test_failed_worker_start_is_retryable(tmp_path, monkeypatch):
     runtime = MachineRuntime(tmp_path / "machine")
+    initialize_machine(runtime, "gpu-1", agent_mode="on_demand")
     binding, path = register(runtime, tmp_path, "project")
     with coordinated_enrollment(runtime) as (enrollment, controller):
         start = controller.executor.start
@@ -314,6 +321,7 @@ def test_background_preparation_waits_for_migration_then_resumes(tmp_path, monke
     from qqtools.plugins.qexp.runtime.store import atomic_replace
 
     runtime = MachineRuntime(tmp_path / "machine")
+    initialize_machine(runtime, "gpu-1", agent_mode="on_demand")
     binding, path = register(runtime, tmp_path, "project")
     journal_path = runtime.migration_path(binding.project_id)
     original = {
@@ -355,6 +363,7 @@ def test_malformed_binding_does_not_abort_other_projects_in_pass(tmp_path):
     from qqtools.plugins.qexp.runtime.store import atomic_replace
 
     runtime = MachineRuntime(tmp_path / "machine")
+    initialize_machine(runtime, "gpu-1", agent_mode="on_demand")
     damaged, damaged_path = register(runtime, tmp_path, "damaged")
     healthy, healthy_path = register(runtime, tmp_path, "healthy")
     atomic_replace(damaged_path.parent / "machine.json", {"machine": None})
@@ -374,10 +383,12 @@ def test_paused_machine_rollout_waits_without_stalling_other_projects(tmp_path, 
     from qqtools.plugins.qexp.agent.lifecycle import get_machine_agent_status
 
     runtime = MachineRuntime(tmp_path / "machine")
+    initialize_machine(runtime, "gpu-1", agent_mode="on_demand")
     first, _path = register(runtime, tmp_path, "first")
     other, _other_path = register(runtime, tmp_path, "other")
     peer_cfg = init_shared_root(first.shared_root, "peer", runtime_root=tmp_path / "peer-local")
     peer = MachineRuntime(tmp_path / "peer-machine")
+    initialize_machine(peer, "gpu-1", agent_mode="on_demand")
     peer_binding = peer.add_binding(peer_cfg.shared_root, peer_cfg.machine_name)
     with coordinated_enrollment(runtime) as (enrollment, controller):
 

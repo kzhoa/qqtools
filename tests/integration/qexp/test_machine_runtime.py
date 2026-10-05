@@ -1581,6 +1581,7 @@ def test_first_registration_wait_survives_stale_binding_until_adoption(tmp_path:
         runtime_root=tmp_path / "legacy",
     )
     runtime = MachineRuntime(tmp_path / "machine-runtime")
+    initialize_machine(runtime, "gpu-1", agent_mode="on_demand")
     binding = runtime.add_binding(cfg.shared_root, cfg.machine_name, enabled=False)
     registration_path = cfg.shared_root / "machines" / cfg.machine_name / "registration.json"
     registration = read_json(registration_path)["registration"]

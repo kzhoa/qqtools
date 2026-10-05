@@ -5,6 +5,7 @@ import pytest
 
 from qqtools.plugins.qexp import init_shared_root, submit
 from qqtools.plugins.qexp.agent.context import MachineRuntime
+from qqtools.plugins.qexp.agent.setup import initialize_machine
 from qqtools.plugins.qexp.cli.entrypoint import main
 from qqtools.plugins.qexp.commands.group import create_group
 from qqtools.plugins.qexp.runtime.tasks import load_task
@@ -14,7 +15,10 @@ pytestmark = [pytest.mark.integration, pytest.mark.qexp_fast_io]
 
 def _base_args(cfg) -> list[str]:
     machine_runtime_root = cfg.runtime_root.parent / "machine-runtime"
-    MachineRuntime(machine_runtime_root).ensure_binding(cfg.shared_root, cfg.machine_name)
+    runtime = MachineRuntime(machine_runtime_root)
+    if not runtime.has_identity:
+        initialize_machine(runtime, cfg.machine_name, agent_mode="on_demand")
+    runtime.ensure_binding(cfg.shared_root, cfg.machine_name)
     return [
         "--project",
         str(cfg.shared_root),
@@ -118,9 +122,9 @@ def test_progress_policy_cli_reports_default_and_configured_value(tmp_path: Path
 
     assert main([*base, "config", "show", "progress"]) == 0
     human = capsys.readouterr().out
-    assert "interval_seconds=60" in human
-    assert "source=configured" in human
-    assert "applies_to=new_launches" in human
+    assert "Interval seconds: 60.0" in human
+    assert "Source: configured" in human
+    assert "Applies to: new_launches" in human
 
 
 def test_tmux_policy_cli_reports_project_default_and_configured_value_without_activation(
@@ -212,9 +216,9 @@ def test_launch_handoff_policy_cli_reports_default_and_configured_value(tmp_path
 
     assert main([*base, "config", "show", "launch-handoff"]) == 0
     human = capsys.readouterr().out
-    assert "timeout_seconds=12.5" in human
-    assert "source=configured" in human
-    assert "applies_to=new_launches" in human
+    assert "Timeout seconds: 12.5" in human
+    assert "Source: configured" in human
+    assert "Applies to: new_launches" in human
 
 
 @pytest.mark.parametrize("value", ["0", "0.5", "301", "nan", "inf", "-inf"])

@@ -11,6 +11,7 @@ import pytest
 from qqtools.plugins.qexp import init_shared_root
 from qqtools.plugins.qexp.agent.context import MachineRuntime
 from qqtools.plugins.qexp.agent.helpers import _machine_is_true_idle
+from qqtools.plugins.qexp.agent.setup import initialize_machine
 from qqtools.plugins.qexp.events import flush_local_events
 from qqtools.plugins.qexp.runtime.locks import exclusive
 from qqtools.plugins.qexp.runtime.paths import local_paths
@@ -139,6 +140,7 @@ def test_pending_writer_capture_retains_an_empty_binding(tmp_path, is_corrupt, l
 def binding_fixture(tmp_path, *, enabled=False):
     cfg = init_shared_root(tmp_path / "project" / ".qexp", "gpu-1", runtime_root=tmp_path / "old")
     runtime = MachineRuntime(tmp_path / "machine")
+    initialize_machine(runtime, "gpu-1", agent_mode="on_demand")
     binding = runtime.add_binding(cfg.shared_root, cfg.machine_name, enabled=enabled)
     runtime.last_cycle_had_demand = False
     root = runtime.project_paths(binding.project_id)["root"]

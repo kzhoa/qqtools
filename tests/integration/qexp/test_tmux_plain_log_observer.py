@@ -16,6 +16,7 @@ import pytest
 from qqtools.plugins.qexp import init_shared_root, submit
 from qqtools.plugins.qexp.agent.context import MachineRuntime
 from qqtools.plugins.qexp.agent.lifecycle import get_machine_agent_status, start_machine_agent, stop_machine_agent
+from qqtools.plugins.qexp.agent.setup import initialize_machine
 from qqtools.plugins.qexp.executor import Executor
 from qqtools.plugins.qexp.layout import project_id, shared_attempt_log_path
 from qqtools.plugins.qexp.runtime import submission as submission_runtime
@@ -81,6 +82,7 @@ def test_enabled_tmux_observer_streams_plain_log_without_owning_training(
     project_root = tmp_path / "project with spaces"
     cfg = init_shared_root(project_root / ".qexp", "gpu-1", agent_mode="daemon", runtime_root=tmp_path / "legacy")
     runtime = MachineRuntime(tmp_path / "machine-runtime")
+    initialize_machine(runtime, "gpu-1", agent_mode="daemon")
     runtime.ensure_binding(cfg.shared_root, "gpu-1")
     ready = tmp_path / "ready"
     append = tmp_path / "append"
@@ -207,6 +209,7 @@ def test_selected_viewer_two_read_only_clients_and_recreation(
     monkeypatch.setenv("QEXP_VISIBLE_GPUS", "0")
     cfg = init_shared_root(tmp_path / "project" / ".qexp", "gpu-1", agent_mode="daemon", runtime_root=tmp_path / "rt")
     runtime = MachineRuntime(tmp_path / "machine-runtime")
+    initialize_machine(runtime, "gpu-1", agent_mode="daemon")
     runtime.ensure_binding(cfg.shared_root, "gpu-1")
     ready, finish = tmp_path / "ready", tmp_path / "finish"
     command = [

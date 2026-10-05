@@ -19,9 +19,15 @@ from qqtools.plugins.qexp.runtime.store import atomic_replace, read_json
 pytestmark = [pytest.mark.integration, pytest.mark.qexp_fast_io]
 
 
+def _runtime(root: Path) -> MachineRuntime:
+    runtime = MachineRuntime(root)
+    initialize_machine(runtime, "gpu-1", agent_mode="on_demand")
+    return runtime
+
+
 def test_unregistered_current_project_requires_explicit_registration(tmp_path: Path) -> None:
     cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "legacy-runtime")
-    runtime = MachineRuntime(tmp_path / "machine-runtime")
+    runtime = _runtime(tmp_path / "machine-runtime")
 
     with pytest.raises(RuntimeError, match="qexp project register"):
         ensure_local_agent_active(cfg, reason="submit", machine_runtime=runtime)
@@ -35,7 +41,7 @@ def test_legacy_project_requires_explicit_migration(tmp_path: Path) -> None:
     atomic_replace(record_path, record)
 
     with pytest.raises(RuntimeError) as error:
-        ensure_local_agent_active(cfg, reason="submit", machine_runtime=MachineRuntime(tmp_path / "machine-runtime"))
+        ensure_local_agent_active(cfg, reason="submit", machine_runtime=_runtime(tmp_path / "machine-runtime"))
     command = str(error.value).partition("run '")[2].removesuffix("'.")
     assert shlex.split(command) == [
         "qexp",
@@ -53,7 +59,7 @@ def test_registered_project_does_not_start_a_second_machine_agent(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "legacy-runtime")
-    runtime = MachineRuntime(tmp_path / "machine-runtime")
+    runtime = _runtime(tmp_path / "machine-runtime")
     runtime.add_binding(cfg.shared_root, cfg.machine_name)
     monkeypatch.setattr(
         "qqtools.plugins.qexp.agent.lifecycle.get_machine_agent_status",
@@ -65,7 +71,7 @@ def test_registered_project_does_not_start_a_second_machine_agent(
 
 def test_pending_machine_replacement_is_a_named_activation_failure(tmp_path: Path) -> None:
     cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "legacy-runtime")
-    runtime = MachineRuntime(tmp_path / "machine-runtime")
+    runtime = _runtime(tmp_path / "machine-runtime")
     runtime.add_binding(cfg.shared_root, cfg.machine_name)
     archive = runtime.paths["archives"] / "replacement"
     atomic_replace(
@@ -94,7 +100,7 @@ def test_activation_named_start_error_retries_without_replacing_identity(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "legacy-runtime")
-    runtime = MachineRuntime(tmp_path / "machine-runtime")
+    runtime = _runtime(tmp_path / "machine-runtime")
     runtime.add_binding(cfg.shared_root, cfg.machine_name)
     monkeypatch.setattr(
         "qqtools.plugins.qexp.activation._ensure_machine_agent_started",
@@ -118,7 +124,7 @@ def test_activation_unexpected_errors_are_not_downgraded(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, error: Exception
 ) -> None:
     cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "legacy-runtime")
-    runtime = MachineRuntime(tmp_path / "machine-runtime")
+    runtime = _runtime(tmp_path / "machine-runtime")
     runtime.add_binding(cfg.shared_root, cfg.machine_name)
     monkeypatch.setattr(
         "qqtools.plugins.qexp.activation._ensure_machine_agent_started",
@@ -132,8 +138,7 @@ def test_activation_unexpected_errors_are_not_downgraded(
 def test_restart_is_blocked_before_stopping_during_machine_replacement(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    runtime = MachineRuntime(tmp_path / "machine-runtime")
-    initialize_machine(runtime, "gpu-1")
+    runtime = _runtime(tmp_path / "machine-runtime")
     runtime.paths["replacement_transaction"].write_text("{}", encoding="utf-8")
     monkeypatch.setattr(
         "qqtools.plugins.qexp.agent.lifecycle._stop_machine_agent_locked",
@@ -146,7 +151,7 @@ def test_restart_is_blocked_before_stopping_during_machine_replacement(
 
 def test_concurrent_activation_starts_only_one_machine_agent(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "legacy-runtime")
-    runtime = MachineRuntime(tmp_path / "machine-runtime")
+    runtime = _runtime(tmp_path / "machine-runtime")
     runtime.add_binding(cfg.shared_root, cfg.machine_name)
     is_running = False
     starts = 0
@@ -182,7 +187,7 @@ def test_concurrent_activation_starts_only_one_machine_agent(tmp_path: Path, mon
 
 def test_activation_accepts_an_agent_that_wins_during_startup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "legacy-runtime")
-    runtime = MachineRuntime(tmp_path / "machine-runtime")
+    runtime = _runtime(tmp_path / "machine-runtime")
     runtime.add_binding(cfg.shared_root, cfg.machine_name)
     status_reads = 0
 

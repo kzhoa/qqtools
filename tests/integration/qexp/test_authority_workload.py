@@ -25,6 +25,7 @@ import pytest
 from qqtools.plugins.qexp import init_shared_root, submit
 from qqtools.plugins.qexp.agent.context import MachineRuntime
 from qqtools.plugins.qexp.agent.lifecycle import stop_machine_agent
+from qqtools.plugins.qexp.agent.setup import initialize_machine
 from qqtools.plugins.qexp.runtime.paths import attempt_path, local_paths
 from qqtools.plugins.qexp.runtime.resources.reservations import active_reservations
 from qqtools.plugins.qexp.runtime.store import atomic_replace, read_json
@@ -81,6 +82,7 @@ def test_authority_workload(tmp_path, monkeypatch, request):
     gpu_count = profile["bindings"] * profile["attempts_per_binding"]
     monkeypatch.setenv("QEXP_VISIBLE_GPUS", ",".join(map(str, range(gpu_count))))
     runtime = MachineRuntime(tmp_path / "machine-runtime")
+    initialize_machine(runtime, "gpu-1", agent_mode="daemon")
     cases = []
     for project in range(profile["bindings"]):
         root = tmp_path / f"project-{project}"

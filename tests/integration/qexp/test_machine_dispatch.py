@@ -6,6 +6,7 @@ import pytest
 from qqtools.plugins.qexp import init_shared_root, submit
 from qqtools.plugins.qexp.agent.context import MachineRuntime
 from qqtools.plugins.qexp.agent.lifecycle import dispatch_machine_cycle_locked
+from qqtools.plugins.qexp.agent.setup import initialize_machine
 from qqtools.plugins.qexp.doctor import repair_metadata
 from qqtools.plugins.qexp.runtime.resources.reservations import (
     ReservationIdentity,
@@ -36,6 +37,7 @@ def test_full_capacity_skips_scheduler_work_but_runs_maintenance(
 ) -> None:
     cfg = init_shared_root(tmp_path / "project" / ".qexp", "gpu-1")
     runtime = MachineRuntime(tmp_path / "machine-runtime")
+    initialize_machine(runtime, "gpu-1", agent_mode="on_demand")
     binding = runtime.add_binding(cfg.shared_root, cfg.machine_name)
     reservation = reserve(
         runtime.root,
@@ -75,6 +77,7 @@ def test_full_capacity_skips_scheduler_work_but_runs_maintenance(
 def test_full_capacity_advances_resident_resumable_maintenance(tmp_path: Path) -> None:
     cfg = init_shared_root(tmp_path / "project" / ".qexp", "gpu-1")
     runtime = MachineRuntime(tmp_path / "machine-runtime")
+    initialize_machine(runtime, "gpu-1", agent_mode="on_demand")
     binding = runtime.add_binding(cfg.shared_root, cfg.machine_name)
     repair_metadata(cfg, reservation_runtime_root=runtime.root, max_work_items=1)
     maintenance_root = cfg.shared_root / "operations" / "maintenance-v1"
@@ -115,6 +118,7 @@ def test_stale_reservation_is_released_before_capacity_gate(tmp_path: Path) -> N
     stale_value["task"]["state"] = {"projection": "failed", "reason": "test_failure"}
     atomic_replace(stale_path, stale_value)
     runtime = MachineRuntime(tmp_path / "machine-runtime")
+    initialize_machine(runtime, "gpu-1", agent_mode="on_demand")
     binding = runtime.add_binding(cfg.shared_root, cfg.machine_name)
     reservation = reserve(
         runtime.root,
@@ -168,6 +172,7 @@ def test_starting_recovery_uses_exact_active_reservation(tmp_path: Path) -> None
     cfg = init_shared_root(tmp_path / "project" / ".qexp", "gpu-1")
     task = submit(cfg, ["echo", "recover"], working_dir=work_dir)
     runtime = MachineRuntime(tmp_path / "machine-runtime")
+    initialize_machine(runtime, "gpu-1", agent_mode="on_demand")
     binding = runtime.add_binding(cfg.shared_root, cfg.machine_name)
     attempt = claim_task(
         cfg,
@@ -215,6 +220,7 @@ def test_starting_recovery_rejects_mismatched_active_reservation(tmp_path: Path)
     cfg = init_shared_root(tmp_path / "project" / ".qexp", "gpu-1")
     task = submit(cfg, ["echo", "recover"], working_dir=work_dir)
     runtime = MachineRuntime(tmp_path / "machine-runtime")
+    initialize_machine(runtime, "gpu-1", agent_mode="on_demand")
     binding = runtime.add_binding(cfg.shared_root, cfg.machine_name)
     attempt = claim_task(
         cfg,
@@ -245,6 +251,7 @@ def test_reservation_verification_error_is_fail_closed_and_project_isolated(
 ) -> None:
     cfg = init_shared_root(tmp_path / "project" / ".qexp", "gpu-1")
     runtime = MachineRuntime(tmp_path / "machine-runtime")
+    initialize_machine(runtime, "gpu-1", agent_mode="on_demand")
     binding = runtime.add_binding(cfg.shared_root, cfg.machine_name)
     reservation = reserve(
         runtime.root,

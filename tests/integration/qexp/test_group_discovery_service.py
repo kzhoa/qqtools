@@ -7,6 +7,7 @@ import pytest
 
 from qqtools.plugins.qexp import submit
 from qqtools.plugins.qexp.agent.context import MachineRuntime
+from qqtools.plugins.qexp.agent.setup import initialize_machine
 from qqtools.plugins.qexp.runtime.group_discovery.coverage import GroupCoverage
 from qqtools.plugins.qexp.runtime.group_discovery.driver import ProjectionDriver
 from qqtools.plugins.qexp.runtime.group_discovery.service import (
@@ -146,6 +147,7 @@ def test_real_background_worker_advances_registered_group(tmp_path):
     cfg = isolated_group(tmp_path, tail=1)
     source_file(submission_path(cfg.shared_root, "batch"), operation="batch")
     runtime = MachineRuntime(tmp_path / "machine")
+    initialize_machine(runtime, "gpu-1", agent_mode="on_demand")
     runtime.add_binding(cfg.shared_root, cfg.machine_name)
     worker = MachineGroupDiscoveryWorker(runtime)
     worker.start()
@@ -221,6 +223,7 @@ def test_agent_lifecycle_uses_typed_group_service_and_exits_when_idle(tmp_path):
 
     cfg = isolated_group(tmp_path, tail=0)
     runtime = MachineRuntime(tmp_path / "machine")
+    initialize_machine(runtime, "gpu-1", agent_mode="on_demand")
     runtime.add_binding(cfg.shared_root, cfg.machine_name)
     program = r"""
 import sys

@@ -16,6 +16,7 @@ import pytest
 from qqtools.plugins.qexp import init_shared_root, submit
 from qqtools.plugins.qexp.agent.context import MachineRuntime
 from qqtools.plugins.qexp.agent.lifecycle import get_machine_agent_status, start_machine_agent, stop_machine_agent
+from qqtools.plugins.qexp.agent.setup import initialize_machine
 from qqtools.plugins.qexp.progress_policy import set_progress_policy
 from qqtools.plugins.qexp.runtime.progress import shared_progress_path
 from qqtools.plugins.qexp.runtime.tasks import load_task
@@ -93,6 +94,7 @@ def test_independent_viewers_do_not_control_training_and_default_viewers_exit_te
     cfg = init_shared_root(project_root / ".qexp", "gpu-1", agent_mode="daemon", runtime_root=tmp_path / "legacy")
     set_progress_policy(cfg, 1)
     runtime = MachineRuntime(tmp_path / "machine-runtime")
+    initialize_machine(runtime, "gpu-1", agent_mode="daemon")
     runtime.ensure_binding(cfg.shared_root, "gpu-1")
     ready, finish = tmp_path / "ready", tmp_path / "finish"
     command = [

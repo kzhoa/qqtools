@@ -6,6 +6,8 @@ from pathlib import Path
 import pytest
 
 from qqtools.plugins.qexp import init_shared_root, submit
+from qqtools.plugins.qexp.agent.context import MachineRuntime
+from qqtools.plugins.qexp.agent.setup import initialize_machine
 from qqtools.plugins.qexp.commands.group import (
     change_worker,
     create_group,
@@ -232,11 +234,11 @@ def test_writer_resolves_namespace_after_acquiring_schema_lock(project, monkeypa
 
 
 def test_empty_project_dispatch_remains_idle_after_namespace_activation(project, tmp_path):
-    from qqtools.plugins.qexp.agent.context import MachineRuntime
     from qqtools.plugins.qexp.agent.dispatch_loop import dispatch_machine_cycle
 
     cfg = project
     runtime = MachineRuntime(tmp_path / "machine")
+    initialize_machine(runtime, "gpu-1", agent_mode="on_demand")
     runtime.add_binding(cfg.shared_root, cfg.machine_name)
     assert activate(cfg)
     result = dispatch_machine_cycle(runtime, available_gpus=[])
@@ -278,11 +280,11 @@ def test_lost_ready_floor_rejects_task_writes(project, damage):
 
 
 def test_machine_status_separates_capture_from_group_activation(project, tmp_path, monkeypatch):
-    from qqtools.plugins.qexp.agent.context import MachineRuntime
     from qqtools.plugins.qexp.agent.lifecycle import get_machine_agent_status
 
     cfg = project
     runtime = MachineRuntime(tmp_path / "machine")
+    initialize_machine(runtime, "gpu-1", agent_mode="on_demand")
     runtime.add_binding(cfg.shared_root, cfg.machine_name)
     before = get_machine_agent_status(runtime)["projects"][0]
     assert before["group_authority"]["state"] == "waiting"

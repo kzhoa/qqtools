@@ -192,6 +192,7 @@ def test_upgrade_discovery_lock_does_not_withhold_healthy_peer(tmp_path: Path) -
     executor = ProjectIOExecutor(runtime)
     executor.begin_epoch()
     controller = ProjectIOController(runtime, executor)
+    runtime.working_set.reconcile(bindings, revision=revision)
     from qqtools.plugins.qexp.runtime.locks import exclusive
 
     try:
@@ -200,18 +201,16 @@ def test_upgrade_discovery_lock_does_not_withhold_healthy_peer(tmp_path: Path) -
             deadline = time.monotonic() + 8.0
             while time.monotonic() < deadline:
                 controller.advance_upgrade_work(bindings, revision)
-                requests = executor.unresolved_requests()
                 if (
-                    runtime.upgrade_discovery_complete is False
-                    and healthy.project_id not in runtime.upgrade_admission_blocked_projects
-                    and any(request.project_id == blocked.project_id for request in requests)
+                    runtime.upgrade_discovery_complete
+                    and blocked.project_id in runtime.upgrade_pending_projects
+                    and healthy.project_id not in runtime.upgrade_pending_projects
                 ):
                     break
                 time.sleep(0.02)
             else:
                 raise AssertionError("healthy upgrade summary was withheld by another Project's lock")
-            assert blocked.project_id in runtime.upgrade_admission_blocked_projects
-            assert blocked.project_id in runtime.upgrade_idle_blocked_projects
+            assert healthy.project_id not in runtime.upgrade_admission_blocked_projects
             assert executor.status_view()["active_worker_count"] <= 4
         deadline = time.monotonic() + 10.0
         while time.monotonic() < deadline:
