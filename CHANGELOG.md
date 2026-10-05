@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+## v1.3.26
+
+- fix: make qexp restart readiness use explicit termination-convergence evidence,
+  preserve valid integer exit results including signals, and surface bounded repair
+  diagnostics instead of leaving affected Projects indefinitely recovering.
+- feat: improve finite qexp status and configuration output readability, including
+  selectable and paginated Group status listings.
+- breaking: purge the completed 1.3.22 machine-inventory, global-agent-residency,
+  enrollment-CLI, and notification-policy compatibility transitions.
+
 ## v1.3.25
 
 - compat: defer the final purge of the 1.3.22 machine-enrollment and notification
