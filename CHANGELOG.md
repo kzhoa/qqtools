@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- feat: give launched qexp Attempts durable holder-bound ownership, preserving exact running
+  processes across agent restarts and expired historical leases; suppress historical deadline-only
+  termination decisions without replaying signals or discarding evidence.
+- fix: unblock qexp startup after exact runner-termination evidence has converged.
+- compat: align the first durable-ownership and timeout-retirement release with 1.3.27,
+  extending legacy removal to 1.3.28 and temporary-transition purge to 1.3.29. Preserve direct
+  rolling upgrades from 1.3.23, 1.3.25, and 1.3.26 without interrupting training; see the
+  [upgrade guide](docs/spec/qexp_upgrade_guide.md#durable-attempt-ownership-rollout).
+
 ## v1.3.26
 
 - fix: make qexp restart readiness use explicit termination-convergence evidence,

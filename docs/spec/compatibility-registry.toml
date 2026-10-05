@@ -6,22 +6,37 @@ component = "qexp.timeout-decision-retirement"
 kind = "runtime_protocol"
 status = "compatibility_active"
 summary = "Suppress and retire historical deadline-only termination decisions without replaying their signals or erasing their evidence."
+# Entered the unreleased 1.3.26 development tree after tag v1.3.26; first ships in 1.3.27.
 introduced_in = "1.3.26"
 legacy_removed_in = "1.3.27"
 transition_purged_in = "1.3.28"
 marker = "QQTOOLS-COMPAT-0022"
 owner = "qexp.runtime.termination_retirement"
-verification = ["tests/integration/qexp/test_project_io_supervision_termination.py", "tests/integration/qexp/test_lease_hardening.py"]
+verification = ["tests/integration/qexp/test_project_io_supervision_termination.py", "tests/integration/qexp/test_lease_hardening.py", "tests/fixtures/qexp_progress_rollout.py"]
 normal_level = "L1"
 recovery_level = "L1"
-source_versions = ["1.3.23", "1.3.25"]
-target_version = "1.3.26"
-mixed_version_range = ["1.3.23-1.3.26.x"]
+source_versions = ["1.3.23", "1.3.25", "1.3.26"]
+target_version = "1.3.27"
+mixed_version_range = ["1.3.23-1.3.27.x"]
 normal_commands = ["python -m pip install --upgrade qqtools", "qexp agent restart"]
 machine_status_command = "qexp admin upgrade status"
 recovery_command = "qexp admin upgrade advance"
 workload_continuity = true
 interruption_budget_seconds = 1.0
+
+[[items.extensions]]
+field = "legacy_removed_in"
+from = "1.3.27"
+to = "1.3.28"
+approved_in = "1.3.27"
+reason = "The implementation landed after tag v1.3.26 and first ships in 1.3.27; retain the initial rolling-upgrade window and running legacy Attempt support."
+
+[[items.extensions]]
+field = "transition_purged_in"
+from = "1.3.28"
+to = "1.3.29"
+approved_in = "1.3.27"
+reason = "Preserve a separate retirement release after legacy removal moves to 1.3.28; permanent historical import and retirement evidence remain supported."
 
 [[items]]
 id = "QQTOOLS-COMPAT-0021"
@@ -29,22 +44,37 @@ component = "qexp.durable-attempt-ownership"
 kind = "runtime_protocol"
 status = "compatibility_active"
 summary = "Convert supported post-launch bounded-lease Attempts to durable holder-bound ownership while old peers retain compatible reads."
+# Entered the unreleased 1.3.26 development tree after tag v1.3.26; first ships in 1.3.27.
 introduced_in = "1.3.26"
 legacy_removed_in = "1.3.27"
 transition_purged_in = "1.3.28"
 marker = "QQTOOLS-COMPAT-0021"
 owner = "qexp.runtime.durable_ownership"
-verification = ["tests/integration/qexp/test_scheduling_recovery_regressions.py", "tests/integration/qexp/test_project_io_controller.py", "tests/integration/qexp/test_agent_lifecycle_independence.py"]
+verification = ["tests/integration/qexp/test_scheduling_recovery_regressions.py", "tests/integration/qexp/test_project_io_controller.py", "tests/integration/qexp/test_agent_lifecycle_independence.py", "tests/fixtures/qexp_progress_rollout.py"]
 normal_level = "L1"
 recovery_level = "L1"
-source_versions = ["1.3.23", "1.3.25"]
-target_version = "1.3.26"
-mixed_version_range = ["1.3.23-1.3.26.x"]
+source_versions = ["1.3.23", "1.3.25", "1.3.26"]
+target_version = "1.3.27"
+mixed_version_range = ["1.3.23-1.3.27.x"]
 normal_commands = ["python -m pip install --upgrade qqtools", "qexp agent restart"]
 machine_status_command = "qexp admin upgrade status"
 recovery_command = "qexp admin upgrade advance"
 workload_continuity = true
 interruption_budget_seconds = 1.0
+
+[[items.extensions]]
+field = "legacy_removed_in"
+from = "1.3.27"
+to = "1.3.28"
+approved_in = "1.3.27"
+reason = "The implementation landed after tag v1.3.26 and first ships in 1.3.27; retain the initial rolling-upgrade window and running legacy Attempt support."
+
+[[items.extensions]]
+field = "transition_purged_in"
+from = "1.3.28"
+to = "1.3.29"
+approved_in = "1.3.27"
+reason = "Preserve a separate retirement release after legacy removal moves to 1.3.28; permanent historical import and retirement evidence remain supported."
 
 [[items]]
 id = "QQTOOLS-COMPAT-0020"

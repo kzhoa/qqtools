@@ -1,7 +1,7 @@
 ---
 doc_type: spec
 status: active
-updated_at: 2026-10-04
+updated_at: 2026-10-05
 archived_at:
 ---
 
@@ -675,17 +675,19 @@ qqtools 1.3.15.
 
 ## Durable Attempt ownership rollout
 
-Targets 1.3.26 through 1.3.28 support direct machine-rolling upgrades from the source rows below.
+Durable Attempt ownership first ships in 1.3.27; the published 1.3.26 package does not include it.
+Targets 1.3.27 through 1.3.29 support direct machine-rolling upgrades from the source rows below.
 Install the target package and restart each machine's global agent one machine at a time. Do not
 drain training, wait for idle GPUs, run per-Project repair, or install an intermediate qqtools
 release.
 
-| Source package and persisted data | 1.3.26 | 1.3.27 | 1.3.28 |
+| Source package and persisted data | 1.3.27 | 1.3.28 | 1.3.29 |
 | --- | --- | --- | --- |
 | 1.3.23 | supported | supported | supported |
 | 1.3.25 | supported | supported | supported |
-| 1.3.26 | same-version restart | supported | supported |
-| 1.3.27 | no downgrade | same-version restart | supported |
+| 1.3.26 | supported | supported | supported |
+| 1.3.27 | same-version restart | supported | supported |
+| 1.3.28 | no downgrade | same-version restart | supported |
 
 At launch authorization, the Task records a durable ownership receipt and changes the Attempt from
 a revocable pre-launch lease to `holder_bound`. A restarted agent validates the same process and
@@ -705,9 +707,11 @@ active durable owner may run `qexp task retry TASK --supersede-attempt ATTEMPT`;
 old process may still run and write outputs, does not stop it, and keeps its reservation until exact
 absence is verified.
 
-Temporary legacy-writer and timeout-retirement adapters follow the compatibility registry through
-1.3.28. The permanent source-evidence importer, ownership receipts, exact identity checks, and
-historical retirement interpretation remain supported after temporary cleanup.
+Temporary legacy-writer and timeout-retirement adapters remain active for 1.3.27. The registry
+records legacy removal in 1.3.28 and temporary-transition purge in 1.3.29; cleanup requires evidence
+that supported upgrades and running legacy Attempts remain safe. The permanent source-evidence
+importer, ownership receipts, exact identity checks, and historical retirement interpretation
+remain supported after temporary cleanup.
 
 ## Task history pagination
 
