@@ -36,7 +36,6 @@ from ..machine_dispatch_plan import (
 )
 from ..machine_state import publish_machine_snapshots, publish_machine_stop_snapshot
 from ..notification_cleanup import cleanup_credentials
-from ..notification_migration import notification_migration_status
 from ..notifications import notification_runtime
 from ..project_maintenance import maintain_project, reconcile_reservation
 from ..runtime.group_namespace import inspect_group_authority
@@ -160,10 +159,6 @@ def get_machine_agent_status(
         )
     except Exception:
         diagnostics = None
-    try:
-        notification_migration = notification_migration_status(machine_runtime)
-    except (OSError, RuntimeError, ValueError):
-        notification_migration = {"state": "unavailable", "pending": True}
     waiting_for_first_registration = bool(process_status.get("waiting_for_first_registration")) if running else False
     inventory_by_binding = {(entry.project_id, entry.shared_root): entry for entry in inventory_entries}
     projects = []
@@ -284,7 +279,6 @@ def get_machine_agent_status(
         "registry_revision": revision,
         "projects": projects,
         "upgrade": upgrade,
-        "notification_migration": notification_migration,
         "gpu_policy": gpu_policy,
         "project_io_isolation": project_io_isolation,
         "warnings": list(gpu_policy.get("warnings", [])),

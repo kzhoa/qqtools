@@ -270,18 +270,14 @@ def _policy_references(root: Path, notifications_fd: int, *, scan_limit: int | N
     records = [load_policy_unlocked(root, "global")]
     records.extend(load_policy_unlocked(root, "project", project_id) for project_id in sorted(project_ids))
     referenced_ids: set[str] = set()
-    unresolved_conflict = False
     for record in records:
-        legacy = record.get("legacy")
-        if isinstance(legacy, dict) and legacy.get("status") in {"legacy_conflict", "source_invalid"}:
-            unresolved_conflict = True
         override = record["override"]
         if override is None:
             continue
         destination = override.get("destination")
         if isinstance(destination, dict) and destination.get("source") == "private_file":
             referenced_ids.add(destination["credential_id"])
-    return referenced_ids, unresolved_conflict
+    return referenced_ids, False
 
 
 def _keep_smallest(heap: list[tuple[int, str]], credential_id: str, limit: int) -> None:

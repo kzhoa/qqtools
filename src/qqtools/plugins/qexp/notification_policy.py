@@ -25,8 +25,6 @@ _OVERRIDE_FIELDS = frozenset({"enabled", "timeout_seconds", "destination"})
 _DESTINATION_COMMON_FIELDS = frozenset({"provider", "source", "signing"})
 _PRIVATE_DESTINATION_FIELDS = _DESTINATION_COMMON_FIELDS | {"credential_id"}
 _ENV_DESTINATION_FIELDS = _DESTINATION_COMMON_FIELDS | {"webhook_env"}
-_LEGACY_FIELDS = frozenset({"fingerprint", "imported_revision", "status"})
-_PRESERVE_LEGACY = object()
 
 
 def _runtime_root_path(runtime_root: Path) -> Path:
@@ -218,9 +216,7 @@ def _read_private_json(path: Path, scope: str) -> dict[str, Any] | None:
         raise ValueError("notification policy JSON is malformed.") from None
     if not isinstance(value, dict):
         raise ValueError("notification policy record has missing or unknown fields.")
-    fields = set(value)
-    expected_fields = _POLICY_FIELDS | ({"legacy"} if scope == "project" and "legacy" in fields else set())
-    if fields != expected_fields:
+    if set(value) != _POLICY_FIELDS:
         raise ValueError("notification policy record has missing or unknown fields.")
     if type(value["schema_version"]) is not int or value["schema_version"] != _SCHEMA_VERSION:
         raise ValueError("notification policy schema_version is unsupported.")
@@ -233,29 +229,7 @@ def _read_private_json(path: Path, scope: str) -> dict[str, Any] | None:
             override = validate_override(override)
         except (TypeError, ValueError):
             raise ValueError("notification policy override is malformed.") from None
-    result = {"schema_version": _SCHEMA_VERSION, "revision": revision, "override": override}
-    if "legacy" in value:
-        result["legacy"] = _validate_legacy_metadata(value["legacy"])
-    return result
-
-
-def _validate_legacy_metadata(value: Any) -> dict[str, Any]:
-    if not isinstance(value, dict) or set(value) != _LEGACY_FIELDS:
-        raise ValueError("notification policy legacy metadata is malformed.")
-    fingerprint = value["fingerprint"]
-    imported_revision = value["imported_revision"]
-    status = value["status"]
-    if fingerprint is not None and not isinstance(fingerprint, str):
-        raise ValueError("notification policy legacy fingerprint is invalid.")
-    if type(imported_revision) is not int or imported_revision < 0:
-        raise ValueError("notification policy legacy imported_revision is invalid.")
-    if not isinstance(status, str) or status not in {"ready", "legacy_conflict", "source_invalid"}:
-        raise ValueError("notification policy legacy status is invalid.")
-    return {
-        "fingerprint": fingerprint,
-        "imported_revision": imported_revision,
-        "status": status,
-    }
+    return {"schema_version": _SCHEMA_VERSION, "revision": revision, "override": override}
 
 
 def _unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -364,8 +338,6 @@ def replace_policy_unlocked(
     expected_revision: int,
     override: dict | None,
     project_id: str | None = None,
-    *,
-    legacy: dict[str, Any] | None | object = _PRESERVE_LEGACY,
 ) -> dict[str, Any]:
     """Replace one policy while policy_guard(runtime_root) is held by the caller."""
     root = _runtime_root_path(runtime_root)
@@ -373,11 +345,6 @@ def replace_policy_unlocked(
     if type(expected_revision) is not int or expected_revision < 0:
         raise ValueError("expected_revision must be a nonnegative integer.")
     candidate = None if override is None else validate_override(override)
-    if legacy is not _PRESERVE_LEGACY:
-        if scope != "project":
-            raise ValueError("legacy metadata is supported only for project policy.")
-        if legacy is not None:
-            legacy = _validate_legacy_metadata(legacy)
     _validate_runtime_root(root, missing_ok=False)
     directory = _open_private_directory(root / "notifications", create=False)
     if directory is None:
@@ -394,11 +361,6 @@ def replace_policy_unlocked(
         "revision": expected_revision + 1,
         "override": candidate,
     }
-    if legacy is _PRESERVE_LEGACY:
-        if "legacy" in current:
-            updated["legacy"] = current["legacy"]
-    elif legacy is not None:
-        updated["legacy"] = legacy
     _write_policy(path, updated)
     return updated
 
@@ -409,8 +371,6 @@ def replace_policy(
     expected_revision: int,
     override: dict | None,
     project_id: str | None = None,
-    *,
-    legacy: dict[str, Any] | None | object = _PRESERVE_LEGACY,
 ) -> dict[str, Any]:
     """Compare and atomically replace one policy, retaining resets as tombstones."""
     root = _runtime_root_path(runtime_root)
@@ -419,19 +379,7 @@ def replace_policy(
         raise ValueError("expected_revision must be a nonnegative integer.")
     if override is not None:
         validate_override(override)
-    if legacy is not _PRESERVE_LEGACY:
-        if scope != "project":
-            raise ValueError("legacy metadata is supported only for project policy.")
-        if legacy is not None:
-            _validate_legacy_metadata(legacy)
     if not _validate_runtime_root(root, missing_ok=False):
         raise ValueError("runtime_root must be an existing directory.")
     with policy_guard(root):
-        return replace_policy_unlocked(
-            root,
-            scope,
-            expected_revision,
-            override,
-            project_id,
-            legacy=legacy,
-        )
+        return replace_policy_unlocked(root, scope, expected_revision, override, project_id)

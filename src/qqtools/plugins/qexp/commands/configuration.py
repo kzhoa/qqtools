@@ -18,14 +18,6 @@ from ..launch_policy import (
     validate_launch_handoff_timeout_seconds,
 )
 from ..lease import LeasePolicy, lease_policy_path, load_lease_policy, reset_lease_policy, save_lease_policy
-from ..notification_config import (
-    default_notifications,
-    load_notifications_strict,
-    reset_notifications,
-    update_notifications,
-    validate_notifications,
-    write_shared_feishu_webhook,
-)
 from ..progress_policy import (
     reset_progress_policy,
     set_progress_policy,
@@ -54,18 +46,6 @@ _LEASE_NUMERIC_FIELDS = frozenset(
     }
 )
 _LEASE_STRING_FIELDS = frozenset({"lease_loss_action"})
-_NOTIFICATION_FIELDS = frozenset({"enabled"})
-_FEISHU_FIELDS = frozenset(
-    {
-        "enabled",
-        "webhook_env",
-        "credential_source",
-        "shared_webhook",
-        "acknowledge_shared_secret_risk",
-        "secret_env",
-        "timeout_seconds",
-    }
-)
 _AGENT_FIELDS = frozenset({"name", "agent_mode", "log_max_bytes"})
 
 
@@ -135,12 +115,6 @@ def _field_value(values: Mapping[str, Any], section: str, field: str, provider: 
     if section == "lease":
         nested = values.get("lease_policy")
         return nested.get(field) if isinstance(nested, Mapping) else None
-    if section == "notifications" and provider is not None:
-        providers = values.get("providers")
-        nested = providers.get(provider) if isinstance(providers, Mapping) else None
-        return nested.get(field) if isinstance(nested, Mapping) else None
-    if section == "notifications" and field == "enabled":
-        return values.get("enabled")
     return values.get(field)
 
 
@@ -153,12 +127,6 @@ def _changed_fields(
 ) -> list[str]:
     changed: list[str] = []
     for field, requested_value in requested.items():
-        # The actual shared webhook is intentionally never loaded for output.
-        # Supplying one always represents a write, even when the redacted view
-        # cannot compare its bytes with the previous value.
-        if field == "shared_webhook":
-            changed.append(field)
-            continue
         if _field_value(before, section, field, provider) != _field_value(after, section, field, provider):
             changed.append(field)
         elif requested_value is not None and _field_value(after, section, field, provider) is None:
@@ -178,9 +146,6 @@ def _requested_changed_fields(
     """Compare requested values with the current effective policy values."""
     changed: list[str] = []
     for field, requested_value in requested.items():
-        if field == "shared_webhook":
-            changed.append(field)
-            continue
         normalized = requested_value
         if section == "lease" and field == "clock_provider_priority":
             normalized = _normalize_clock_provider_priority(requested_value)
@@ -216,11 +181,8 @@ def _reset_changed_fields(
     after: Mapping[str, Any],
     provider: str | None,
 ) -> list[str]:
-    if section == "notifications" and provider is None and before.get("providers") != after.get("providers"):
-        return ["providers"]
     candidates = {
         "lease": _LEASE_FIELDS,
-        "notifications": _NOTIFICATION_FIELDS | _FEISHU_FIELDS,
         "progress": {"interval_seconds"},
         "tmux": {"enabled"},
         "launch-handoff": {"timeout_seconds"},
@@ -245,50 +207,9 @@ def _show_lease(cfg: RootConfig) -> dict[str, Any]:
     return _lease_values(load_lease_policy(cfg), source="configured" if path.exists() else "default")
 
 
-def _redact_notifications(value: Mapping[str, Any]) -> dict[str, Any]:
-    result: dict[str, Any] = {
-        "enabled": value.get("enabled", False),
-        "providers": {},
-    }
-    providers = value.get("providers", {})
-    if not isinstance(providers, dict):
-        raise ValueError("notifications.providers must be an object")
-    for name, raw in providers.items():
-        if isinstance(raw, dict):
-            redacted = dict(raw)
-            redacted_fields: list[str] = []
-            for secret_field in tuple(redacted):
-                normalized = str(secret_field).lower()
-                if normalized in {"webhook", "shared_webhook", "secret", "signing_secret", "token", "password"} or (
-                    "secret" in normalized and not normalized.endswith("_env")
-                ):
-                    redacted.pop(secret_field, None)
-                    redacted_fields.append(str(secret_field))
-            if redacted_fields:
-                # Tell operators why a credential is absent without exposing
-                # its value.  Environment variable names remain visible as
-                # non-secret source metadata (for example ``secret_env``).
-                redacted["redacted_fields"] = sorted(redacted_fields)
-            result["providers"][name] = redacted
-        else:
-            result["providers"][name] = raw
-    return result
-
-
-def _show_notifications(cfg: RootConfig) -> dict[str, Any]:
-    configured = load_notifications_strict(cfg)
-    value = default_notifications() if configured is None else configured
-    result = _redact_notifications(value)
-    result["source"] = "configured" if configured is not None else "default"
-    result["applies_to"] = "future_notifications"
-    return result
-
-
 def _show_project(section: str, cfg: RootConfig) -> dict[str, Any]:
     if section == "lease":
         return _show_lease(cfg)
-    if section == "notifications":
-        return _show_notifications(cfg)
     if section == "progress":
         return show_progress_policy(cfg)
     if section == "tmux":
@@ -343,6 +264,10 @@ def show_config(
         values["source"] = "default" if values.get("provenance") == "default" else "configured"
         values["applies_to"] = "new_agent_processes"
         return _result("show", name, "global", values)
+    if name == "notifications":
+        from .notifications import show_notifications
+
+        return show_notifications(runtime, "project", _require_project_cfg(cfg))
     return _result("show", name, "project", _show_project(name, _require_project_cfg(cfg)))
 
 
@@ -405,87 +330,6 @@ def _validate_bool(value: object, field: str) -> bool:
     return value
 
 
-def _set_notifications_global(cfg: RootConfig, values: Mapping[str, object]) -> dict[str, Any]:
-    _validate_keys(values, _NOTIFICATION_FIELDS, "notifications")
-    enabled = _validate_bool(values["enabled"], "notifications.enabled")
-    update_notifications(cfg, lambda current: {**current, "enabled": enabled})
-    return _show_notifications(cfg)
-
-
-def _set_notifications_provider(
-    cfg: RootConfig,
-    provider: str,
-    values: Mapping[str, object],
-) -> dict[str, Any]:
-    _validate_keys(values, _FEISHU_FIELDS, "feishu")
-    if "enabled" in values:
-        _validate_bool(values["enabled"], "feishu.enabled")
-    if "acknowledge_shared_secret_risk" in values:
-        _validate_bool(
-            values["acknowledge_shared_secret_risk"],
-            "feishu.acknowledge_shared_secret_risk",
-        )
-    if "shared_webhook" in values:
-        webhook = values["shared_webhook"]
-        if not isinstance(webhook, str) or not webhook:
-            raise ValueError("shared Feishu webhook must be a non-empty string")
-        if values.get("credential_source") != "shared_file":
-            raise ValueError("feishu.shared_webhook requires credential_source=shared_file")
-        if values.get("acknowledge_shared_secret_risk") is not True:
-            raise ValueError("feishu.shared_webhook requires acknowledge_shared_secret_risk=true")
-    if values.get("credential_source") == "shared_file" and (values.get("acknowledge_shared_secret_risk") is not True):
-        raise ValueError("feishu.credential_source shared_file requires acknowledge_shared_secret_risk=true")
-
-    # Validate the existing section and the complete provider value before writing a
-    # separately stored secret.
-    current = load_notifications_strict(cfg) or default_notifications()
-    shared_webhook = values.get("shared_webhook")
-
-    current_providers = dict(current["providers"])
-    candidate_provider = dict(
-        current_providers.get(
-            provider,
-            {
-                "enabled": False,
-                "webhook_env": "QEXP_FEISHU_WEBHOOK",
-                "secret_env": None,
-                "timeout_seconds": 5,
-                "credential_source": "env",
-            },
-        )
-    )
-    for name in ("enabled", "webhook_env", "credential_source", "secret_env", "timeout_seconds"):
-        if name in values:
-            candidate_provider[name] = values[name]
-    validate_notifications({"enabled": current["enabled"], "providers": {provider: candidate_provider}})
-
-    def update_provider(current: dict[str, Any]) -> dict[str, Any]:
-        providers = dict(current["providers"])
-        provider_value = dict(
-            providers.get(
-                provider,
-                {
-                    "enabled": False,
-                    "webhook_env": "QEXP_FEISHU_WEBHOOK",
-                    "secret_env": None,
-                    "timeout_seconds": 5,
-                    "credential_source": "env",
-                },
-            )
-        )
-        for name in ("enabled", "webhook_env", "credential_source", "secret_env", "timeout_seconds"):
-            if name in values:
-                provider_value[name] = values[name]
-        providers[provider] = provider_value
-        # Provider changes intentionally preserve the global switch.
-        return {**current, "providers": providers}
-
-    if shared_webhook is not None:
-        write_shared_feishu_webhook(cfg, shared_webhook)
-    update_notifications(cfg, update_provider)
-    return _show_notifications(cfg)
-
-
 def _set_agent(runtime: MachineRuntime, values: Mapping[str, object]) -> dict[str, Any]:
     _validate_keys(values, _AGENT_FIELDS, "agent")
     if "name" in values and not isinstance(values["name"], str):
@@ -530,44 +374,6 @@ def _validate_set_options(
         current = load_lease_policy(_require_project_cfg(cfg))
         LeasePolicy(**{**asdict(current), **normalized})
         return
-    if section == "notifications":
-        if provider is None:
-            _validate_keys(options, _NOTIFICATION_FIELDS, "notifications")
-            _validate_bool(options.get("enabled"), "notifications.enabled")
-            return
-        _validate_keys(options, _FEISHU_FIELDS, "feishu")
-        if "enabled" in options:
-            _validate_bool(options["enabled"], "feishu.enabled")
-        if "acknowledge_shared_secret_risk" in options:
-            _validate_bool(options["acknowledge_shared_secret_risk"], "feishu.acknowledge_shared_secret_risk")
-        if "shared_webhook" in options:
-            webhook = options["shared_webhook"]
-            if not isinstance(webhook, str) or not webhook:
-                raise ValueError("shared Feishu webhook must be a non-empty string")
-            if options.get("credential_source") != "shared_file":
-                raise ValueError("feishu.shared_webhook requires credential_source=shared_file")
-            if options.get("acknowledge_shared_secret_risk") is not True:
-                raise ValueError("feishu.shared_webhook requires acknowledge_shared_secret_risk=true")
-        if options.get("credential_source") == "shared_file" and (
-            options.get("acknowledge_shared_secret_risk") is not True
-        ):
-            raise ValueError("feishu.credential_source shared_file requires acknowledge_shared_secret_risk=true")
-        current = load_notifications_strict(_require_project_cfg(cfg)) or default_notifications()
-        providers = current.get("providers", {})
-        current_provider = providers.get(provider, {}) if isinstance(providers, Mapping) else {}
-        candidate_provider = {
-            "enabled": False,
-            "webhook_env": "QEXP_FEISHU_WEBHOOK",
-            "secret_env": None,
-            "timeout_seconds": 5,
-            "credential_source": "env",
-            **(dict(current_provider) if isinstance(current_provider, Mapping) else {}),
-        }
-        for field in ("enabled", "webhook_env", "credential_source", "secret_env", "timeout_seconds"):
-            if field in options:
-                candidate_provider[field] = options[field]
-        validate_notifications({"enabled": current["enabled"], "providers": {provider: candidate_provider}})
-        return
     if section == "progress":
         _validate_keys(options, frozenset({"interval_seconds"}), "progress")
         validate_interval_seconds(options.get("interval_seconds"))
@@ -593,6 +399,12 @@ def set_config(
     name = _require_section(section)
     _validate_provider(name, provider)
     options = _values_mapping(values)
+    if name == "notifications":
+        from .notifications import set_notifications
+
+        if provider not in {None, "feishu"}:
+            raise ValueError(f"unknown notification provider {provider!r}")
+        return set_notifications(runtime, "project", cfg=_require_project_cfg(cfg), **options)
     _validate_set_options(name, options, provider=provider, cfg=cfg)
     if name == "agent":
         if provider is not None:
@@ -621,12 +433,6 @@ def set_config(
         if provider is not None:
             raise ValueError("provider is not supported for lease")
         result = _set_lease(project_cfg, options)
-    elif name == "notifications":
-        result = (
-            _set_notifications_provider(project_cfg, provider, options)
-            if provider is not None
-            else _set_notifications_global(project_cfg, options)
-        )
     elif name == "progress":
         if provider is not None:
             raise ValueError("provider is not supported for progress")
@@ -659,6 +465,12 @@ def reset_config(
     _validate_provider(name, provider)
     if name == "agent":
         raise ValueError("agent configuration cannot be reset")
+    if name == "notifications":
+        from .notifications import reset_notifications
+
+        if provider not in {None, "feishu"}:
+            raise ValueError(f"unknown notification provider {provider!r}")
+        return reset_notifications(runtime, "project", cfg=_require_project_cfg(cfg))
 
     project_cfg = _require_project_cfg(cfg)
     before = _show_project(name, project_cfg)
@@ -667,8 +479,6 @@ def reset_config(
             raise ValueError("provider is not supported for lease")
         _assert_no_active_claim(project_cfg)
         result = _lease_values(reset_lease_policy(project_cfg), source="default")
-    elif name == "notifications":
-        result = _show_notifications_after_notification_reset(project_cfg, provider)
     elif name == "progress":
         if provider is not None:
             raise ValueError("provider is not supported for progress")
@@ -690,14 +500,6 @@ def reset_config(
         "outcome": "updated" if changed_fields else "no_change",
         "changed_fields": changed_fields,
     }
-
-
-def _show_notifications_after_notification_reset(
-    cfg: RootConfig,
-    provider: str | None,
-) -> dict[str, Any]:
-    reset_notifications(cfg, provider=provider)
-    return _show_notifications(cfg)
 
 
 __all__ = [

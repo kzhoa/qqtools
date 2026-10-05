@@ -81,7 +81,7 @@ def test_project_disable_and_reset_do_not_change_global_or_other_project(tmp_pat
     assert main(_invoke(root, "notifications", "reset", "--scope", "project", "--project", str(first_root))) == 0
     _result(capsys)
     assert resolve_policy(root, first_id)["enabled"] is True
-    assert load_policy(root, "project", first_id)["revision"] == 3
+    assert load_policy(root, "project", first_id)["revision"] == 2
 
 
 def test_missing_identity_fails_before_staging_or_policy_mutation(tmp_path, capsys, monkeypatch):
@@ -111,8 +111,8 @@ def test_global_show_reports_retention_without_writing(tmp_path, capsys, monkeyp
     assert retention_path.read_bytes() == original
     assert main(["--machine-runtime-root", str(root), "notifications", "show"]) == 0
     text = capsys.readouterr().out
-    assert "Retention:" in text
-    assert "retained" in text
+    assert "Retention\n" in text
+    assert "Retained" in text
 
 
 def test_global_show_on_fresh_runtime_does_not_create_policy_storage(tmp_path, capsys, monkeypatch):

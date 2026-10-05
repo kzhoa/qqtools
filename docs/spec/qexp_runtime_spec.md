@@ -144,16 +144,8 @@ seven days after last reference removal. Unknown reachability retains credential
 records still use an atomic claimed key and provide at-most-one automatic HTTP send attempt,
 without retry or exactly-once delivery guarantees.
 
-During the 1.3.22–1.3.23 mixed-version window, a new reader reconciles older Project-machine
-notification records under the Project-machine lock before the runtime policy lock. A changed old
-source after a canonical Project edit records a conflict and blocks that Project's notification,
-not Task supervision or another Project. Old binaries retain their original shared-file behavior
-and cannot read new global policy. Restarting the global agent on each upgraded machine performs
-bounded registered-Project discovery without draining running training; an inaccessible Project
-stays pending. `qexp notifications resolve --scope project --prefer canonical|legacy` acknowledges
-the current source under both locks. Version 1.3.23 removes old input aliases for new writers but
-retains old-writer reconciliation; version 1.3.24 removes online watching but retains a historical
-importer for declared old data. Continuing pre-1.3.22 writers after the 1.3.24 cutoff is unsupported.
+Notification configuration uses only the canonical private MachineRuntime policy. Shared legacy
+notification records, their migration command, and mixed-writer conflict states are unsupported.
 
 ## 3. Deployment Model
 
@@ -1764,24 +1756,11 @@ and the attached directory identities. Every descriptor closes before return.
 An ambiguous partial write remains `outcome_unknown` until exact worker absence
 permits a fenced retry against the shared projection state.
 
-`notification_service` reconciles one registered Project's legacy notification
-configuration through background admission. Requests contain only the machine
-name; results contain only `ready`, `conflict`, `source_invalid`, or `blocked`.
-Shared source capture finishes before acquiring the private notification-policy
-lock. Within that lock, repeated executor and registry fences are local-only;
-no shared registration/configuration reads or network calls are permitted.
-Credentials remain in owner-only private storage and never enter transport
-records. Existing policy revisions and legacy fingerprints own replay, including
-mixed-writer conflicts and invalid-source recovery. Missing workers or fenced
-results after possible private publication remain ambiguous until exact absence
-allows an idempotent retry. The global agent does not start a separate shared-I/O
-notification thread. Local aged-credential cleanup is bounded and uses a
-nonblocking policy lock, so it cannot wait for an isolated worker.
-Terminal notification hooks reuse this captured-scope transaction rather than
-constructing another MachineRuntime owner or verifying a binding under local
-registry locks. Their shared-capture and pre-delivery fences remain distinct
-from the local-only private-publication fence. Existing at-most-once delivery
-claims, exact terminal replay and stale-registration suppression are unchanged.
+Terminal notification hooks resolve only the canonical private policy. Captured
+Project identity avoids creating another MachineRuntime owner in isolated workers,
+and the pre-delivery fence preserves exact terminal replay and stale-registration
+suppression. Local aged-credential cleanup remains bounded and uses a nonblocking
+policy lock.
 
 Admission polling replays executor resolution archives at the turn opening and
 before final grants. Intermediate polling still reconciles current workers and

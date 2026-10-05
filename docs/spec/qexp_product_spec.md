@@ -115,10 +115,6 @@ write eligibility expires; local PID or runtime-path observations cannot shorten
 failed migration must not mark the project migrated or release or overwrite resources belonging to
 another project.
 
-The retired `agent add-project`, `list-projects`, `enable-project`, `disable-project`, and
-`remove-project` spellings do not forward to the new operations. During their registered
-compatibility window they fail with migration guidance to the corresponding `project` command.
-
 ## Machine setup, Project enrollment, and image reuse
 
 One local MachineRuntime owns one random runtime ID, one mutable global `agent.name`, one global
@@ -707,11 +703,6 @@ isolated Project-I/O admission as scheduling and other maintenance. A blocked
 Project cannot hold the controller in an index read or cleanup syscall. Existing
 shared build checkpoints survive agent restart; no new pagination format,
 user migration step, or machine-local copy of Task history is introduced.
-Automatic legacy notification reconciliation uses the same isolated background
-service. A blocked Project source does not prevent healthy Projects importing
-their settings. Existing conflict resolution and invalid-source statuses remain
-unchanged; credentials stay in private MachineRuntime storage, not executor
-requests/results. This maintenance does not send notifications itself.
 The isolated registration service retains automatic reactivation for an expired
 registration still owned by the exact same Machine/runtime and generation.
 It cannot overwrite a successor registration or revive an orphaned Attempt;

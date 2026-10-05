@@ -12,7 +12,6 @@ from .. import notification_credentials, notification_policy, notification_resol
 from ..agent.context import MachineRuntime
 from ..config_types import RootConfig
 from ..notification_cleanup import cleanup_credentials, credential_retention_status, mark_reference
-from ..notification_reconciliation import reconcile_legacy
 from ..notifications.feishu import FeishuNotifier, NotificationTransportError
 from ..runtime.store import CASConflict
 
@@ -38,7 +37,6 @@ def _target(runtime: MachineRuntime, scope: str, cfg: RootConfig | None) -> tupl
         context = runtime.verified_execution_context(cfg.shared_root)
     except (OSError, RuntimeError, ValueError) as exc:
         raise ValueError(str(exc)) from exc
-    reconcile_legacy(runtime, context.cfg)
     return runtime.root, context.binding.project_id, context.cfg
 
 

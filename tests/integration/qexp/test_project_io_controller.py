@@ -4006,7 +4006,7 @@ def test_outer_admission_turn_selects_across_public_service_calls(
         with controller.admission_turn():
             # Background is discovered first, but validation already spent the
             # first authority opportunity. Primary must receive the next one.
-            controller.advance_notification_maintenance(bindings, revision)
+            controller.advance_observation_maintenance(bindings, revision)
             controller.advance_scheduler_observations(bindings, revision, lane="gpu", admission_role="primary")
             controller.advance_registration_renewals(bindings, revision, renewal_horizon_seconds=10.0)
             assert executor.unresolved_requests() == ()

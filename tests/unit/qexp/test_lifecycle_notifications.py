@@ -3,7 +3,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from qqtools.plugins.qexp.notification_config import validate_notifications
+from qqtools.plugins.qexp.notification_policy import validate_override
 from qqtools.plugins.qexp.notifications import NotificationHook, notification_key
 from qqtools.plugins.qexp.notifications.feishu import FeishuNotifier, NotificationTransportError
 
@@ -32,12 +32,12 @@ def test_notification_key_is_stable_and_phase_specific():
 
 @pytest.mark.parametrize("timeout, valid", [(True, False), (0.49, False), (0.5, True), (30, True), (30.01, False)])
 def test_feishu_timeout_validation(timeout, valid):
-    value = {"enabled": True, "providers": {"feishu": {"enabled": True, "timeout_seconds": timeout}}}
+    value = {"enabled": True, "timeout_seconds": timeout}
     if valid:
-        assert validate_notifications(value)["providers"]["feishu"]["timeout_seconds"] == timeout
+        assert validate_override(value)["timeout_seconds"] == timeout
     else:
         with pytest.raises(ValueError):
-            validate_notifications(value)
+            validate_override(value)
 
 
 def test_feishu_payload_and_business_success():

@@ -7,7 +7,7 @@ import pytest
 from qqtools.plugins.qexp import init_shared_root, submit
 from qqtools.plugins.qexp.agent.context import MachineRuntime
 from qqtools.plugins.qexp.agent.lifecycle import MachineAgentStartError, MachineAgentStopError
-from qqtools.plugins.qexp.agent.setup import initialize_machine
+from qqtools.plugins.qexp.agent.setup import initialize_machine, register_projects
 from qqtools.plugins.qexp.cli.entrypoint import main
 from qqtools.plugins.qexp.commands.group import create_group
 from qqtools.plugins.qexp.layout import load_context, runtime_pid_path
@@ -514,19 +514,16 @@ def test_raw_and_continuous_task_commands_reject_format_before_project_reads(
     assert main(["--machine-runtime-root", str(tmp_path / "machine-runtime"), *argv]) == 2
 
 
-def test_init_legacy_diagnostic_does_not_emit_a_contract_error(tmp_path: Path, capsys):
-    assert main(["init", "--machine", "gpu-1", "--runtime-root", str(tmp_path / "runtime")]) == 2
-
-    captured = capsys.readouterr()
-    assert "QQTOOLS-COMPAT-0014" in captured.err
-    assert "returned no structured output" not in captured.err
-    assert captured.out == ""
-
-
 def test_agent_start_rejects_legacy_persistent_flag(tmp_path: Path):
     cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")
     with pytest.raises(SystemExit):
         main([*_base_args(cfg), "agent", "start", "--persistent"])
+
+
+def test_init_rejects_project_runtime_root_after_cutover(tmp_path: Path, capsys) -> None:
+    assert main(["--runtime-root", str(tmp_path / "runtime"), "init", "--machine", "gpu-1"]) == 2
+    captured = capsys.readouterr()
+    assert "does not accept --runtime-root" in captured.err
 
 
 def test_submit_requests_local_agent_activation(tmp_path: Path, monkeypatch):
@@ -800,10 +797,12 @@ def test_read_only_task_list_does_not_initialize_machine_runtime(
 def test_legacy_project_requires_explicit_migration(tmp_path: Path, monkeypatch, capsys) -> None:
     cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "legacy-runtime")
     runtime_root = tmp_path / "machine-runtime"
+    initialize_machine(MachineRuntime(runtime_root), "gpu-1")
     record_path = cfg.shared_root / "machines" / cfg.machine_name / "machine.json"
     record = json.loads(record_path.read_text(encoding="utf-8"))
     record["machine"].pop("agent_runtime")
     record_path.write_text(json.dumps(record), encoding="utf-8")
+    register_projects(MachineRuntime(runtime_root), [cfg.shared_root], machine_name="gpu-1")
     base = [*_base_args(cfg), "--machine-runtime-root", str(runtime_root), "agent"]
     monkeypatch.setattr(
         "qqtools.plugins.qexp.cli.local_handlers.ensure_machine_agent_started",

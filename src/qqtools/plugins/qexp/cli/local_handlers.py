@@ -94,12 +94,6 @@ LOCAL_HANDLERS = frozenset(
         "admin_migrate_schema6_resume",
         "admin_migrate_agent",
         "admin_repair",
-        "retired_add-project",
-        "retired_list-projects",
-        "retired_enable-project",
-        "retired_disable-project",
-        "retired_remove-project",
-        "retired_migrate-project",
     }
 )
 
@@ -427,16 +421,8 @@ def dispatch_local(
         exit_code = 0 if result["outcome"] == "healthy" else 1
         return CommandOutcome(exit_code, CliOutput(OutputKind.MACHINE_IDENTITY_DIAGNOSIS, result))
     if handler == "init":
-        # QQTOOLS-COMPAT-0014: the former project-bound init spelling is
-        # retained only as a bounded diagnostic during the transition.
-        if args.init_shared_root or args.runtime_root or args.cpu_lane_capacity is not None:
-            print(
-                "qexp: QQTOOLS-COMPAT-0014: qexp init is machine-only. "
-                "Use 'qexp project init PATH' to create shared Project truth, then "
-                "'qexp project register PATH --machine NAME' to enroll it.",
-                file=sys.stderr,
-            )
-            return CommandOutcome(2)
+        if args.runtime_root is not None:
+            raise CliUsageError("qexp init does not accept --runtime-root; use --machine-runtime-root instead.")
         target_name = args.init_machine or args.machine
         if not target_name:
             raise CliUsageError("init requires explicit --machine NAME.")
@@ -566,22 +552,6 @@ def dispatch_local(
         result = agent_config_payload(runtime)
         result["action"] = "updated" if changed else "shown"
         return CommandOutcome(0, CliOutput(OutputKind.AGENT_CONFIG, result))
-    if handler.startswith("retired_"):
-        # QQTOOLS-COMPAT-0014: retired executing routes fail before any
-        # runtime/configuration resolution or state creation.
-        replacement = {
-            "add-project": "qexp project register PATH",
-            "list-projects": "qexp project list",
-            "enable-project": "qexp project enable SELECTOR",
-            "disable-project": "qexp project disable SELECTOR",
-            "remove-project": "qexp project remove SELECTOR",
-            "migrate-project": "qexp admin migrate agent --project PATH --machine NAME",
-        }[handler.removeprefix("retired_")]
-        print(
-            f"qexp: QQTOOLS-COMPAT-0014: retired command; use '{replacement}'.",
-            file=sys.stderr,
-        )
-        return CommandOutcome(2)
     if handler in {"agent_start", "agent_run"}:
         runtime = MachineRuntime(args.machine_runtime_root)
         if handler == "agent_run":

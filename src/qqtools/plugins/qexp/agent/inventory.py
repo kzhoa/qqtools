@@ -164,47 +164,24 @@ def _encode(revision: int, entries: Iterable[ProjectInventoryEntry]) -> dict[str
     }
 
 
-def _legacy_inventory(runtime: Any) -> list[ProjectInventoryEntry]:
-    # QQTOOLS-COMPAT-0012: import registry-v1 bindings once and retain their
-    # effective names as unresolved intent; name equality never proves origin.
-    try:
-        _revision, bindings = runtime.load_registry()
-    except (OSError, RuntimeError, ValueError, KeyError, TypeError):
-        return []
-    return [
-        ProjectInventoryEntry(
-            project_id=binding.project_id,
-            shared_root=binding.shared_root,
-            enabled=binding.enabled,
-            name_source="unresolved",
-            name_override=binding.machine_name,
-            _canonical_paths=True,
-        )
-        for binding in bindings
-    ]
-
-
 def ensure_inventory(runtime: Any, *, require_initialized: bool = True) -> tuple[int, list[ProjectInventoryEntry]]:
-    """Load inventory and import an existing registry exactly once."""
+    """Load the inventory, creating an empty canonical record when absent."""
     machine_runtime = _as_runtime(runtime)
     if require_initialized:
         machine_runtime.require_initialized()
     path = _inventory_path(machine_runtime)
     if path.exists():
         return _decode(read_json(path))
-    if not machine_runtime.has_identity and machine_runtime.paths["registry"].exists():
-        machine_runtime.ensure_compatibility_identity()
-    imported = _legacy_inventory(machine_runtime) if machine_runtime.paths["registry"].exists() else []
     if getattr(machine_runtime, "_inventory_lock_depth", 0):
         if path.exists():
             return _decode(read_json(path))
-        atomic_replace(path, _encode(0, imported))
-        return 0, imported
+        atomic_replace(path, _encode(0, ()))
+        return 0, []
     with machine_runtime.inventory_guard():
         if path.exists():
             return _decode(read_json(path))
-        atomic_replace(path, _encode(0, imported))
-        return 0, imported
+        atomic_replace(path, _encode(0, ()))
+        return 0, []
 
 
 def load_inventory(runtime: Any, *, require_initialized: bool = True) -> tuple[int, list[ProjectInventoryEntry]]:

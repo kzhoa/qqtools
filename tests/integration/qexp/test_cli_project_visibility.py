@@ -65,7 +65,6 @@ _CONDITIONAL_PROJECT_LEAVES = [
     ["notifications", "test", "--scope", "project", "--format=json"],
     ["notifications", "set", "--scope", "project", "--enabled", "--format=json"],
     ["notifications", "reset", "--scope", "project", "--format=json"],
-    ["notifications", "resolve", "--scope", "project", "--prefer", "canonical", "--format=json"],
 ]
 
 
@@ -219,7 +218,7 @@ def test_human_status_integrates_implicit_source_while_json_uses_stderr(
     assert main([*_runtime_args(tmp_path), "status"]) == 0
     human = capsys.readouterr()
     assert human.err == ""
-    assert f"Project: {cfg.project_root} (from parent directory)" in human.out
+    assert f"Path: {cfg.project_root} (from parent directory)" in human.out
     assert "Selection source:" not in human.out
 
     assert main([*_runtime_args(tmp_path), "status", "--format=json"]) == 0

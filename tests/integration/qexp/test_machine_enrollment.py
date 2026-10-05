@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from qqtools.plugins.qexp.agent.context import MachineRuntime
+from qqtools.plugins.qexp.agent.setup import initialize_machine, register_projects
 from qqtools.plugins.qexp.cli.entrypoint import main
 from qqtools.plugins.qexp.layout import load_root_config
 from qqtools.plugins.qexp.runtime.store import atomic_replace, read_json
@@ -283,45 +284,6 @@ def test_explicit_adoption_rejects_active_registration(tmp_path: Path, capsys: p
     assert read_json(registration_path)["registration"]["generation"] == original["registration_generation"]
 
 
-def test_legacy_registry_migrates_to_unresolved_inventory_without_changing_binding(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    from qqtools.plugins.qexp.machine_config import init_shared_root
-
-    runtime_root = tmp_path / "machine"
-    cfg = init_shared_root(tmp_path / "project" / ".qexp", "legacy-name", runtime_root=tmp_path / "legacy")
-    runtime = MachineRuntime(runtime_root)
-    binding = runtime.add_binding(cfg.shared_root, cfg.machine_name)
-    generation = binding.registration_generation
-
-    assert main(_invoke(runtime_root, "project", "list", "--format=json")) == 0
-    project = _json(capsys)["projects"][0]
-    assert project["name_source"] == "unresolved"
-    assert project["machine_name"] == "legacy-name"
-    assert runtime.load_registry()[1][0].registration_generation == generation
-
-    assert main(_invoke(runtime_root, "project", "register", "--from-pool", "--format=json")) == 2
-    assert _json(capsys)["projects"][0]["reason"] == "name_source_unresolved"
-
-    assert (
-        main(
-            _invoke(
-                runtime_root,
-                "project",
-                "register",
-                str(cfg.project_root),
-                "--name-source",
-                "explicit",
-                "--format=json",
-            )
-        )
-        == 0
-    )
-    confirmed = _json(capsys)["projects"][0]
-    assert confirmed["name_source"] == "explicit"
-    assert runtime.load_registry()[1][0].registration_generation == generation
-
-
 def test_agent_start_rejects_a_registered_project_that_becomes_legacy(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -332,7 +294,8 @@ def test_agent_start_rejects_a_registered_project_that_becomes_legacy(
     runtime_root = tmp_path / "machine"
     cfg = init_shared_root(tmp_path / "project" / ".qexp", "g1", runtime_root=tmp_path / "legacy")
     runtime = MachineRuntime(runtime_root)
-    runtime.add_binding(cfg.shared_root, cfg.machine_name)
+    initialize_machine(runtime, "g1")
+    register_projects(runtime, [cfg.shared_root], machine_name="g1")
     record_path = cfg.shared_root / "machines" / cfg.machine_name / "machine.json"
     record = json.loads(record_path.read_text(encoding="utf-8"))
     record["machine"].pop("agent_runtime")
@@ -477,27 +440,3 @@ def test_detachment_rejects_malformed_runner_evidence(tmp_path: Path, capsys: py
     malformed = _json(capsys)["error"]
     assert malformed["code"] == "operational_failure"
     assert "live or ambiguous" in malformed["message"]
-
-
-@pytest.mark.parametrize(
-    ("legacy", "replacement"),
-    [
-        (("agent", "add-project"), "qexp project register"),
-        (("agent", "list-projects"), "qexp project list"),
-        (("agent", "enable-project", "id"), "qexp project enable"),
-        (("agent", "disable-project", "id"), "qexp project disable"),
-        (("agent", "remove-project", "id"), "qexp project remove"),
-        (("agent", "migrate-project", "id"), "qexp admin migrate agent"),
-    ],
-)
-def test_retired_project_commands_are_nonexecuting_diagnostics(
-    tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
-    legacy: tuple[str, ...],
-    replacement: str,
-) -> None:
-    assert main(_invoke(tmp_path / "machine", *legacy)) == 2
-    captured = capsys.readouterr()
-    assert "QQTOOLS-COMPAT-0014" in captured.err
-    assert replacement in captured.err
-    assert not (tmp_path / "machine").exists()

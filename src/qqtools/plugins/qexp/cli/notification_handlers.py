@@ -9,7 +9,6 @@ from typing import Any
 from ..agent.context import MachineRuntime
 from ..commands import notifications as notification_commands
 from ..config_types import RootConfig
-from ..notification_reconciliation import resolve_legacy_conflict
 from .errors import CliOperationalError, CliUsageError
 from .outcome import CommandOutcome
 from .output import CliOutput, OutputKind
@@ -71,12 +70,6 @@ def dispatch_notifications(
             )
         elif action == "reset":
             result = notification_commands.reset_notifications(selected_runtime, args.scope, cfg=cfg)
-        elif action == "resolve":
-            if cfg is None:
-                raise CliUsageError("Notification legacy conflicts exist only in project scope; use --scope project.")
-            resolve_legacy_conflict(selected_runtime, cfg, prefer=args.prefer)
-            result = notification_commands.show_notifications(selected_runtime, "project", cfg=cfg)
-            result.update({"action": "resolve", "outcome": "resolved", "preferred": args.prefer})
         else:
             raise CliUsageError("Unknown notification operation.")
     except ValueError as exc:
@@ -107,24 +100,12 @@ def dispatch_config_notifications(
             raise CliUsageError("Unknown notification provider; only feishu is supported.")
         if args.secret_env is not None and args.unset_secret_env:
             raise CliUsageError("--secret-env and --unset-secret-env are mutually exclusive")
-        if args.shared_webhook is not None and args.webhook_stdin:
-            raise CliUsageError("--shared-webhook and --webhook-stdin are mutually exclusive")
-        if args.credential_source == "shared_file" and not args.acknowledge_shared_secret_risk:
-            raise CliUsageError("Legacy shared_file input requires --acknowledge-shared-secret-risk.")
-        if (args.shared_webhook is not None or args.webhook_stdin) and (
-            args.credential_source != "shared_file" or not args.acknowledge_shared_secret_risk
-        ):
-            raise CliUsageError("Legacy shared webhook input requires shared_file and explicit risk acknowledgement.")
-        if args.credential_source == "env" and args.shared_webhook is not None:
-            raise CliUsageError("--shared-webhook cannot be combined with env source.")
-        webhook = args.shared_webhook
+        webhook = None
         if args.webhook_stdin:
             webhook = sys.stdin.readline().rstrip("\r\n")
             if not webhook:
                 raise CliUsageError("--webhook-stdin requires a non-empty first input line")
         webhook_env = args.webhook_env
-        if args.credential_source == "env" and webhook_env is None:
-            webhook_env = "QEXP_FEISHU_WEBHOOK"
         try:
             result = notification_commands.set_notifications(
                 selected_runtime,
@@ -139,9 +120,4 @@ def dispatch_config_notifications(
             )
         except ValueError as exc:
             raise CliUsageError(str(exc)) from exc
-        if webhook is not None:
-            result["note"] = (
-                "Legacy shared-webhook input was converted to a private MachineRuntime credential; "
-                "the old shared webhook file was not updated."
-            )
     return CommandOutcome(0, CliOutput(OutputKind.CONFIG, result))

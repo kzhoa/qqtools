@@ -210,7 +210,6 @@ def _validate_binding(
         "upgrade_service",
         "submission_control_service",
         "observation_service",
-        "notification_service",
         "group_service_probe",
         "group_service_advance",
         "progress_projection",
@@ -952,22 +951,11 @@ def _authority_terminal_publish(
             if not _claim_binding_is_current(request, runtime_root, cfg):
                 raise _BindingAuthorityChanged
 
-        def notification_local_fence() -> None:
-            epoch = _read_epoch(paths)
-            expected_epoch = active_executor_epoch if replay_only else request.executor_epoch
-            if not epoch.active or epoch.runtime_id != request.runtime_id or epoch.executor_epoch != expected_epoch:
-                raise _ExecutorEpochFenced
-            if not _registry_binding_is_current(request, runtime_root):
-                raise _BindingAuthorityChanged
-            write_possible[0] = True
-
         try:
             with (
                 notification_runtime(
                     runtime_root,
                     project_id=request.project_id,
-                    before_shared_capture=notification_fence,
-                    before_local_write=notification_local_fence,
                 ),
                 notification_delivery_fence(notification_fence),
                 fenced_mutations(cfg.shared_root, notification_fence),
@@ -2192,55 +2180,6 @@ def _observation_service(
         owner.close()
 
 
-def _notification_service(
-    request: ProjectIORequest, runtime_root: Path, paths: dict[str, Path], write_possible: list[bool]
-) -> dict[str, Any]:
-    """Capture shared legacy truth before the narrow private bookkeeping transaction."""
-    from ..notification_policy import NotificationPolicyBusyError
-    from ..notification_reconciliation import (
-        LegacyConflictError,
-        LegacySourceBusyError,
-        LegacySourceInvalidError,
-        reconcile_captured_legacy,
-    )
-
-    cfg = load_root_config(Path(request.canonical_shared_root), request.parameters["machine_name"])
-
-    def before_local_write() -> None:
-        epoch = _read_epoch(paths)
-        if not epoch.active or epoch.runtime_id != request.runtime_id or epoch.executor_epoch != request.executor_epoch:
-            raise _ExecutorEpochFenced
-        if not _registry_binding_is_current(request, runtime_root):
-            raise _BindingAuthorityChanged
-        write_possible[0] = True
-
-    def before_shared_capture() -> None:
-        # Recheck registration under its shared machine fence, never the policy lock.
-        epoch = _read_epoch(paths)
-        if not epoch.active or epoch.runtime_id != request.runtime_id or epoch.executor_epoch != request.executor_epoch:
-            raise _ExecutorEpochFenced
-        if not _claim_binding_is_current(request, runtime_root, cfg):
-            raise _BindingAuthorityChanged
-
-    try:
-        reconcile_captured_legacy(
-            runtime_root,
-            cfg,
-            request.project_id,
-            before_shared_capture=before_shared_capture,
-            before_local_write=before_local_write,
-        )
-    except (_ExecutorEpochFenced, _BindingAuthorityChanged):
-        raise
-    except LegacyConflictError:
-        return {"state": "conflict"}
-    except LegacySourceInvalidError:
-        return {"state": "source_invalid"}
-    except (LegacySourceBusyError, NotificationPolicyBusyError):
-        return {"state": "blocked"}
-    return {"state": "ready"}
-
-
 def _recovery_admission(
     request: ProjectIORequest, runtime_root: Path, paths: dict[str, Path], write_possible: list[bool]
 ) -> dict[str, Any]:
@@ -2995,7 +2934,6 @@ def _publish_result(
                 "upgrade_service",
                 "submission_control_service",
                 "observation_service",
-                "notification_service",
                 "progress_projection",
                 "recovery_source_hold",
                 "recovery_admission",
@@ -3222,8 +3160,6 @@ def _run(
                 evidence = _submission_control_service(request, root, paths, upgrade_write_possible)
             elif request.operation_kind == "observation_service":
                 evidence = _observation_service(request, root, paths, upgrade_write_possible)
-            elif request.operation_kind == "notification_service":
-                evidence = _notification_service(request, root, paths, upgrade_write_possible)
             elif request.operation_kind in {"group_service_probe", "group_service_advance"}:
                 before_shared_mutation = (
                     _group_service_mutation_fence(request, root, paths, upgrade_write_possible)
@@ -3399,7 +3335,6 @@ def _run(
                 "upgrade_service",
                 "submission_control_service",
                 "observation_service",
-                "notification_service",
                 "progress_projection",
                 "recovery_source_hold",
                 "recovery_admission",
@@ -3645,7 +3580,6 @@ def _run(
             "upgrade_service",
             "submission_control_service",
             "observation_service",
-            "notification_service",
             "progress_projection",
             "recovery_source_hold",
             "recovery_admission",

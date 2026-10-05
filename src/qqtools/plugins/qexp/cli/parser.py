@@ -210,10 +210,6 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--project", help="Project directory or its .qexp control directory.")
-    # Parse the former root-position spelling only far enough to provide the
-    # bounded QQTOOLS-COMPAT-0014 diagnostic.  It is intentionally hidden from
-    # help and never participates in ordinary Project selection.
-    parser.add_argument("--shared-root", dest="compat_shared_root", help=argparse.SUPPRESS)
     parser.add_argument("--machine", help="Assert the local logical machine identity.")
     parser.add_argument("--runtime-root", help="Override the project-local runtime root.")
     parser.add_argument("--machine-runtime-root", help="Override the machine-global runtime root.")
@@ -228,18 +224,16 @@ def build_parser() -> argparse.ArgumentParser:
             "separate; use qexp project register PATH after creating shared truth."
         ),
     )
-    init.add_argument("--shared-root", dest="init_shared_root")
     init.add_argument("--machine", dest="init_machine")
     init.add_argument("--agent-mode", choices=("on_demand", "daemon"))
     init.add_argument("--detach-old-runtime", action="store_true")
     init.add_argument("--yes", action="store_true")
-    init.add_argument("--cpu-lane-capacity", type=int)
     _add_output_format(init)
     bind_command(
         init,
         handler="init",
         context=ContextKind.MACHINE,
-        modes={OutputMode.FINITE, OutputMode.DIAGNOSTIC},
+        modes=OutputMode.FINITE,
         output_kinds=OutputKind.MACHINE_INIT,
     )
 
@@ -769,28 +763,6 @@ def build_parser() -> argparse.ArgumentParser:
         modes=OutputMode.FINITE,
         output_kinds=OutputKind.AGENT_CONFIG,
     )
-    for legacy_name in (
-        "add-project",
-        "list-projects",
-        "enable-project",
-        "disable-project",
-        "remove-project",
-        "migrate-project",
-    ):
-        legacy = agent_sub.add_parser(
-            legacy_name,
-            help="Retired non-executing compatibility diagnostic for Project enrollment commands.",
-        )
-        legacy.add_argument("legacy_selector", nargs="?")
-        if legacy_name == "add-project":
-            legacy.add_argument("--adopt-existing", action="store_true")
-        bind_command(
-            legacy,
-            handler=f"retired_{legacy_name}",
-            context=ContextKind.NONE,
-            modes=OutputMode.DIAGNOSTIC,
-            output_kinds=(),
-        )
     agent_config = agent_sub.add_parser("config", help="Inspect or set machine-wide agent resources.")
     agent_config_sub = agent_config.add_subparsers(dest="agent_config_resource", required=True)
     gpus = agent_config_sub.add_parser("gpus", help="Inspect or change GPU admission policy.")
@@ -955,25 +927,6 @@ def build_parser() -> argparse.ArgumentParser:
         output_kinds=OutputKind.CONFIG,
     )
 
-    notification_resolve = notifications_sub.add_parser(
-        "resolve", help="Resolve a notification configuration conflict."
-    )
-    notification_resolve.add_argument(
-        "--scope",
-        choices=("global", "project"),
-        default="global",
-        help=notification_scope_help,
-    )
-    notification_resolve.add_argument("--prefer", choices=("canonical", "legacy"), required=True)
-    _add_output_format(notification_resolve)
-    bind_command(
-        notification_resolve,
-        handler="notifications_resolve",
-        context=ContextKind.MACHINE,
-        modes=OutputMode.FINITE,
-        output_kinds=OutputKind.CONFIG,
-    )
-
     config = commands.add_parser(
         "config",
         help="Inspect or set typed Project and global agent configuration.",
@@ -1014,12 +967,9 @@ def build_parser() -> argparse.ArgumentParser:
     config_set.add_argument("--clock-provider-priority")
     config_set.add_argument("--renewal-commit-margin-seconds", type=float)
     config_set.add_argument("--webhook-env")
-    config_set.add_argument("--credential-source", choices=("env", "shared_file"))
     config_set.add_argument("--webhook-stdin", action="store_true")
-    config_set.add_argument("--acknowledge-shared-secret-risk", action="store_true")
     config_set.add_argument("--secret-env")
     config_set.add_argument("--unset-secret-env", action="store_true")
-    config_set.add_argument("--shared-webhook")
     _add_output_format(config_set)
     bind_command(
         config_set,

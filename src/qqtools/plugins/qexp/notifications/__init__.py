@@ -15,7 +15,6 @@ from typing import Any
 from ..agent.context import MachineRuntime
 from ..config_types import RootConfig
 from ..events import write_notification_diagnostic
-from ..notification_reconciliation import LegacyConflictError, reconcile_captured_legacy, reconcile_legacy
 from ..notification_resolver import NotificationResolutionError, resolve_delivery, resolve_policy
 from ..runtime.paths import shared_paths
 from ..runtime.records import validate_identifier
@@ -31,8 +30,6 @@ _delivery_fence: ContextVar[Callable[[], None] | None] = ContextVar("qexp_notifi
 @dataclass(frozen=True, slots=True)
 class _CapturedProjectScope:
     project_id: str
-    before_shared_capture: Callable[[], None] | None
-    before_local_write: Callable[[], None] | None
 
 
 _captured_project_scope: ContextVar[_CapturedProjectScope | None] = ContextVar(
@@ -45,23 +42,12 @@ def notification_runtime(
     runtime_root: Path,
     *,
     project_id: str | None = None,
-    before_shared_capture: Callable[[], None] | None = None,
-    before_local_write: Callable[[], None] | None = None,
 ) -> Iterator[None]:
-    """Select private storage, optionally using a worker's captured Project scope.
-
-    Captured scopes must recheck shared registration under the shared source lock.
-    Their local-write fence must not access shared storage beneath the policy lock.
-    Callers without a captured scope retain normal MachineRuntime verification.
-    """
+    """Select private storage, optionally using a worker's captured Project identity."""
     scope = None
     if project_id is not None:
         validate_identifier(project_id, "project_id")
-        if not callable(before_shared_capture) or not callable(before_local_write):
-            raise ValueError("captured notification scope requires both shared and local fences.")
-        scope = _CapturedProjectScope(project_id, before_shared_capture, before_local_write)
-    elif before_shared_capture is not None or before_local_write is not None:
-        raise ValueError("notification scope fences require a captured project_id.")
+        scope = _CapturedProjectScope(project_id)
     token = _selected_runtime_root.set(runtime_root)
     scope_token = _captured_project_scope.set(scope)
     try:
@@ -143,22 +129,13 @@ class NotificationHook:
             if scope is None:
                 runtime = MachineRuntime(_selected_runtime_root.get())
                 runtime_root = runtime.root
-                project_id = reconcile_legacy(runtime, cfg)
+                project_id = runtime.verified_execution_context(cfg.shared_root).binding.project_id
             else:
                 runtime_root = _selected_runtime_root.get()
                 if runtime_root is None:
                     raise ValueError("captured notification scope requires private runtime storage.")
-                project_id = reconcile_captured_legacy(
-                    runtime_root,
-                    cfg,
-                    scope.project_id,
-                    before_shared_capture=scope.before_shared_capture,
-                    before_local_write=scope.before_local_write,
-                )
+                project_id = scope.project_id
             effective = resolve_policy(runtime_root, project_id)
-        except LegacyConflictError:
-            _safe_diagnostic(cfg, "notification_skipped", event, key, "legacy_conflict", "skipped")
-            return
         except Exception:
             _safe_diagnostic(cfg, "notification_skipped", event, key, "invalid_config", "skipped")
             return

@@ -914,27 +914,11 @@ def test_terminal_worker_delivers_once_including_replay_after_truth_commit(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, has_committed_before_hook: bool, is_replaced: bool
 ) -> None:
     from qqtools.plugins.qexp import notifications
-    from qqtools.plugins.qexp.notification_config import update_notifications, write_shared_feishu_webhook
+    from qqtools.plugins.qexp.commands.notifications import setup_notifications
 
     running = _running_attempt(tmp_path)
-    update_notifications(
-        running.cfg,
-        lambda current: {
-            **current,
-            "enabled": True,
-            "providers": {
-                "feishu": {
-                    "enabled": True,
-                    "credential_source": "shared_file",
-                    "webhook_env": "UNUSED_WEBHOOK_ENV",
-                    "secret_env": None,
-                    "timeout_seconds": 5,
-                }
-            },
-        },
-    )
     webhook = "https://open.feishu.cn/open-apis/bot/v2/hook/worker-private-test"
-    write_shared_feishu_webhook(running.cfg, webhook)
+    setup_notifications(running.runtime, "project", cfg=running.cfg, webhook=webhook, unsigned=True)
     calls = []
 
     class Notifier:

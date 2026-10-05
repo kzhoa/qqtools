@@ -421,35 +421,6 @@ class MachineRuntime:
         if create_identity and not self.paths["identity"].exists():
             atomic_replace(self.paths["identity"], {"machine_runtime": {"instance_id": uuid.uuid4().hex}})
 
-    def ensure_compatibility_identity(self) -> str:
-        """Synthesize an identity only for an existing pre-feature registry."""
-        if self.has_identity:
-            return self.instance_id
-        if not self.paths["registry"].exists():
-            raise RuntimeError("qexp machine runtime is uninitialized; run 'qexp init --machine NAME'.")
-        try:
-            value = read_json(self.paths["registry"])
-            bindings = value.get("registry", {}).get("bindings", [])
-        except (OSError, TypeError, ValueError):
-            bindings = []
-        preserved = next(
-            (
-                item.get("runtime_instance_id")
-                for item in bindings
-                if isinstance(item, dict)
-                and isinstance(item.get("runtime_instance_id"), str)
-                and item["runtime_instance_id"]
-            ),
-            None,
-        )
-        self.ensure_layout()
-        if isinstance(preserved, str) and len(preserved) == 64:
-            atomic_replace(
-                self.paths["identity"],
-                {"machine_runtime": {"instance_id": preserved, "runtime_id": preserved, "compatibility": True}},
-            )
-        return self.instance_id
-
     def project_paths(self, project_id: str) -> dict[str, Path]:
         return machine_project_paths(self.root, project_id)
 

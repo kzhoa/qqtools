@@ -71,7 +71,6 @@ _OUTCOME_UNKNOWN_ON_WORKER_EXIT = frozenset(
         "upgrade_service",
         "submission_control_service",
         "observation_service",
-        "notification_service",
         "group_service_advance",
         "progress_projection",
         "recovery_source_hold",
@@ -886,19 +885,6 @@ class ProjectIOExecutor:
             source_revisions=None,
         )
 
-    def prepare_notification_service(self, binding: object, registry_revision: int) -> ProjectIORequest:
-        """Capture shared legacy configuration without transporting credentials."""
-        return self._prepare_request(
-            binding,
-            registry_revision,
-            "notification_service",
-            {"machine_name": getattr(binding, "machine_name", None)},
-            source_revisions=None,
-        )
-
-    def reset_ambiguous_notification_service_for_retry(self, request_id: str, request: ProjectIORequest) -> bool:
-        return self._reset_ambiguous_request_for_retry(request_id, request, operation_kind="notification_service")
-
     def prepare_progress_projection(
         self,
         binding: object,
@@ -1092,11 +1078,6 @@ class ProjectIOExecutor:
     def resolve_stale_progress_projection(self, request_id: str, request: ProjectIORequest) -> bool:
         if request.operation_kind != "progress_projection":
             raise ValueError("stale progress resolution requires progress_projection")
-        return self._resolve_stale_request(request_id, request)
-
-    def resolve_stale_notification_service(self, request_id: str, request: ProjectIORequest) -> bool:
-        if request.operation_kind != "notification_service":
-            raise ValueError("stale notification resolution requires notification_service.")
         return self._resolve_stale_request(request_id, request)
 
     def reset_ambiguous_observation_service_for_retry(self, request_id: str, request: ProjectIORequest) -> bool:

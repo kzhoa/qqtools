@@ -24,7 +24,7 @@ def test_initial_recovery_admission_precedes_background_without_starving_other_f
     recovery = ServiceIntent(owner, "background", "recovery_admission", ())
     ordinary = [
         ServiceIntent(owner, "background", kind, ())
-        for kind in ("activation_observe", "notification_service", "submission_control_service")
+        for kind in ("activation_observe", "observation_service", "submission_control_service")
     ]
     executed = []
     for _ in range(8):
@@ -62,7 +62,7 @@ def test_progress_publish_continuation_runs_once_before_ordinary_background_rota
     owner = _intent("a").owner
     observe = ServiceIntent(owner, "background", "progress_projection", ("epoch-1", "progress", "attempt-1", "observe"))
     publish = ServiceIntent(owner, "background", "progress_projection", ("epoch-1", "progress", "attempt-1", "publish"))
-    ordinary = ServiceIntent(owner, "background", "notification_service", ("epoch-1",))
+    ordinary = ServiceIntent(owner, "background", "observation_service", ("epoch-1",))
     executed = []
 
     admission.begin([owner], blocked=(), free_slots=1)
@@ -160,7 +160,7 @@ def test_newly_blocked_owner_cannot_hide_healthy_work_in_remaining_slots():
     due = ServiceIntent(owner, "authority", "registration_renew", (), deadline=9.0)
     critical = ServiceIntent(owner, "primary", "scheduler_claim", ("epoch", "attempt"), "gpu_primary")
     healthy_background = [
-        ServiceIntent(_intent(project).owner, "background", "notification_service", ())
+        ServiceIntent(_intent(project).owner, "background", "observation_service", ())
         for project in ("healthy-a", "healthy-b")
     ]
     intents = [due, critical, *healthy_background]
@@ -212,7 +212,7 @@ def test_due_authority_burst_cannot_phase_lock_background_behind_primary():
         for index, owner in enumerate(owners)
     ]
     ordinary_primary = [ServiceIntent(owner, "primary", "scheduler_observe", (), "cpu_primary") for owner in owners]
-    background = [ServiceIntent(owner, "background", "notification_service", ()) for owner in owners]
+    background = [ServiceIntent(owner, "background", "observation_service", ()) for owner in owners]
     intents = [*due, *critical, *ordinary_primary, *background]
     executed = []
 
@@ -260,7 +260,7 @@ def test_prepared_critical_chain_precedes_discovery_for_three_grants_then_yields
     owner = _intent("a").owner
     critical = ServiceIntent(owner, "primary", operation_kind, ("epoch-1",), "gpu_primary")
     discovery = ServiceIntent(owner, "primary", "scheduler_observe", ("epoch-1",), "gpu_borrow")
-    background = ServiceIntent(owner, "background", "notification_service", ("epoch-1",))
+    background = ServiceIntent(owner, "background", "observation_service", ("epoch-1",))
     executed = []
     for _ in range(6):
         admission.begin([owner], blocked=(), free_slots=1)
@@ -290,7 +290,7 @@ def test_failing_critical_actions_spend_the_bounded_preference():
     admission = ProjectIOAdmission()
     owner = _intent("a").owner
     critical = ServiceIntent(owner, "primary", "scheduler_launch_authorize", ("epoch-1",))
-    background = ServiceIntent(owner, "background", "notification_service", ("epoch-1",))
+    background = ServiceIntent(owner, "background", "observation_service", ("epoch-1",))
     executed = []
 
     def fail():
@@ -322,7 +322,7 @@ def test_critical_credit_does_not_survive_epoch_or_binding_replacement(transitio
         admission.finish()
     new_owner = owner if transition == "epoch" else (*owner[:2], "new-generation")
     new_critical = ServiceIntent(new_owner, "primary", "scheduler_claim", ("epoch-2",), "gpu_primary")
-    background = ServiceIntent(new_owner, "background", "notification_service", ("epoch-2",))
+    background = ServiceIntent(new_owner, "background", "observation_service", ("epoch-2",))
     admission.begin([new_owner], blocked=(), free_slots=1)
     _offer_all(admission, [background, new_critical], executed)
     admission.finish()
@@ -382,7 +382,7 @@ def test_spent_critical_chain_uses_normal_class_cycle_without_ordinary_primary()
     admission = ProjectIOAdmission()
     owner = _intent("a").owner
     critical = ServiceIntent(owner, "primary", "scheduler_launch_authorize", ("epoch", "attempt"), "cpu_primary")
-    background = ServiceIntent(owner, "background", "notification_service", ("epoch", "notify"))
+    background = ServiceIntent(owner, "background", "observation_service", ("epoch", "notify"))
     executed = []
 
     for _ in range(9):
@@ -406,7 +406,7 @@ def test_critical_flood_serves_discovery_and_background_beyond_the_candidate_win
         for intent in (
             ServiceIntent(owner, "primary", "scheduler_claim", ("epoch-1",), "gpu_primary"),
             ServiceIntent(owner, "primary", "scheduler_observe", ("epoch-1",), "cpu_primary"),
-            ServiceIntent(owner, "background", "notification_service", ("epoch-1",)),
+            ServiceIntent(owner, "background", "observation_service", ("epoch-1",)),
         )
     ]
     for _ in range(400):
@@ -422,7 +422,7 @@ def test_critical_flood_serves_discovery_and_background_beyond_the_candidate_win
         if all(
             (owner, kind) in served
             for owner in owners
-            for kind in ("scheduler_claim", "scheduler_observe", "notification_service")
+            for kind in ("scheduler_claim", "scheduler_observe", "observation_service")
         ):
             break
     else:
@@ -638,7 +638,7 @@ def test_later_attempt_gets_fresh_credit_after_global_yield():
     admission.offer(next_claim, partial(executed.append, next_claim))
     admission.finish()
 
-    background = ServiceIntent(owner, "background", "notification_service", ("epoch", "notify"))
+    background = ServiceIntent(owner, "background", "observation_service", ("epoch", "notify"))
     admission.begin([owner], blocked=(), free_slots=1)
     admission.offer(background, partial(executed.append, background))
     admission.offer(next_claim, partial(executed.append, next_claim))
@@ -656,7 +656,7 @@ def test_continuous_new_attempts_cannot_reset_global_critical_burst():
     admission = ProjectIOAdmission()
     owner = _intent("a").owner
     ordinary = ServiceIntent(owner, "primary", "scheduler_observe", ("epoch", "observe"), "cpu_primary")
-    background = ServiceIntent(owner, "background", "notification_service", ("epoch", "notify"))
+    background = ServiceIntent(owner, "background", "observation_service", ("epoch", "notify"))
     executed = []
 
     for attempt_number in range(1, 5):
@@ -700,7 +700,7 @@ def test_new_attempt_has_independent_credit_after_prior_attempt_exhaustion():
         admission.finish()
 
     ordinary = ServiceIntent(owner, "primary", "scheduler_observe", ("epoch", "observe"), "cpu_primary")
-    background = ServiceIntent(owner, "background", "notification_service", ("epoch", "notify"))
+    background = ServiceIntent(owner, "background", "observation_service", ("epoch", "notify"))
     for intent in (ordinary, background):
         admission.begin([owner], blocked=(), free_slots=1)
         admission.offer(intent, partial(executed.append, intent))

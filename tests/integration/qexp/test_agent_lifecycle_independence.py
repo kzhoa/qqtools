@@ -22,6 +22,7 @@ from qqtools.plugins.qexp.agent.lifecycle import (
     stop_machine_agent,
 )
 from qqtools.plugins.qexp.agent.project_io_executor import ProjectIOExecutor
+from qqtools.plugins.qexp.agent.setup import initialize_machine
 from qqtools.plugins.qexp.layout import machine_state_path
 from qqtools.plugins.qexp.runtime.paths import attempt_path, local_paths, machine_runtime_paths, shared_paths
 from qqtools.plugins.qexp.runtime.project_activation import publish_project_activation
@@ -39,6 +40,12 @@ pytestmark = [pytest.mark.integration, pytest.mark.machine_lab]
 CONVERGENCE_BUDGET_SECONDS = 15.0
 PROCESS_START_BUDGET_SECONDS = 15.0
 POLL_INTERVAL_SECONDS = 0.01
+
+
+def _initialized_runtime(root: Path, *, agent_mode: str = "on_demand") -> MachineRuntime:
+    runtime = MachineRuntime(root)
+    initialize_machine(runtime, "gpu-1", agent_mode=agent_mode)
+    return runtime
 
 
 @pytest.fixture(autouse=True)
@@ -130,7 +137,7 @@ def _create_case(
     project_root = tmp_path / "project"
     shared_root = project_root / ".qexp"
     cfg = init_shared_root(shared_root, "gpu-1", agent_mode="daemon", runtime_root=tmp_path / "legacy")
-    runtime = MachineRuntime(tmp_path / "machine-runtime")
+    runtime = _initialized_runtime(tmp_path / "machine-runtime", agent_mode="daemon")
     runtime.ensure_binding(shared_root, "gpu-1")
     marker = tmp_path / "launch-count"
     command = [
@@ -221,7 +228,7 @@ def _wait_terminal(cfg, task_id: str) -> object:
 
 def test_real_agent_two_hung_worker_primary_and_renewal_qualification(tmp_path: Path) -> None:
     """Qualify the published two-hung-worker/default-loop latency baseline."""
-    runtime = MachineRuntime(tmp_path / "machine-runtime")
+    runtime = _initialized_runtime(tmp_path / "machine-runtime", agent_mode="daemon")
     healthy_cfg = init_shared_root(
         tmp_path / "healthy" / ".qexp",
         "gpu-1",
@@ -323,7 +330,7 @@ raise SystemExit(code)
 """
 background_operations = {
     "upgrade_service", "submission_control_service", "observation_service",
-    "notification_service", "machine_snapshot_publish", "activation_observe",
+    "machine_snapshot_publish", "activation_observe",
     "activation_consumer_register", "activation_consumer_ack",
 }
 blocked_worker_wrapper = r"""
@@ -534,7 +541,6 @@ run_machine_agent_loop(root, available_gpus=[0])
             "upgrade_service",
             "submission_control_service",
             "observation_service",
-            "notification_service",
             "machine_snapshot_publish",
             "activation_observe",
             "activation_consumer_register",
@@ -580,7 +586,7 @@ def test_real_agent_healthy_binding_scale_preserves_incumbent_progress(
     """Qualify mixed scheduling, supervision, and background progress at scale."""
     from qqtools.plugins.qexp.lease import LeasePolicy, save_lease_policy
 
-    runtime = MachineRuntime(tmp_path / "machine-runtime")
+    runtime = _initialized_runtime(tmp_path / "machine-runtime", agent_mode="daemon")
     case_deadline = time.monotonic() + 600
 
     def remaining_seconds():
@@ -767,7 +773,7 @@ def test_li02_offline_completion_preserves_exit_results(tmp_path: Path, monkeypa
     monkeypatch.setenv("QEXP_VISIBLE_GPUS", "0,1")
     project_root = tmp_path / "project"
     cfg = init_shared_root(project_root / ".qexp", "gpu-1", agent_mode="daemon", runtime_root=tmp_path / "legacy")
-    runtime = MachineRuntime(tmp_path / "machine-runtime")
+    runtime = _initialized_runtime(tmp_path / "machine-runtime", agent_mode="daemon")
     binding = runtime.ensure_binding(cfg.shared_root, "gpu-1")[0]
     paths = local_paths(runtime.project_paths(binding.project_id)["root"])
     branches = []
@@ -848,7 +854,7 @@ def test_agent_projects_both_progress_versions_through_isolated_transactions(tmp
 
     project_root = tmp_path / "project"
     cfg = init_shared_root(project_root / ".qexp", "gpu-1", agent_mode="daemon", runtime_root=tmp_path / "legacy")
-    runtime = MachineRuntime(tmp_path / "machine-runtime")
+    runtime = _initialized_runtime(tmp_path / "machine-runtime", agent_mode="daemon")
     binding = runtime.ensure_binding(cfg.shared_root, "gpu-1")[0]
     set_progress_policy(cfg.shared_root, 1)
     marker = tmp_path / "producer"
@@ -988,7 +994,7 @@ def test_li03_real_peer_observes_natural_lease_expiry(tmp_path: Path, is_finishe
             retry_max_seconds=0.2,
         ),
     )
-    runtime = MachineRuntime(tmp_path / "machine")
+    runtime = _initialized_runtime(tmp_path / "machine", agent_mode="daemon")
     binding = runtime.ensure_binding(cfg.shared_root, "gpu-1")[0]
     create_group(cfg, "peers")
     change_worker(cfg, "peers", "gpu-1", "add")
@@ -1090,7 +1096,7 @@ def test_li05_launch_boundary_has_no_duplicate_authorized_process(tmp_path: Path
     cfg = init_shared_root(
         tmp_path / "project" / ".qexp", "gpu-1", agent_mode="daemon", runtime_root=tmp_path / "legacy"
     )
-    runtime = MachineRuntime(tmp_path / "machine")
+    runtime = _initialized_runtime(tmp_path / "machine", agent_mode="daemon")
     runtime.ensure_binding(cfg.shared_root, "gpu-1")
     marker = tmp_path / "launch-count"
     task = submit(
@@ -1167,7 +1173,7 @@ def test_li05_agent_crash_between_process_creation_and_registration(tmp_path: Pa
     cfg = init_shared_root(
         tmp_path / "project" / ".qexp", "gpu-1", agent_mode="daemon", runtime_root=tmp_path / "legacy"
     )
-    runtime = MachineRuntime(tmp_path / "machine")
+    runtime = _initialized_runtime(tmp_path / "machine", agent_mode="daemon")
     binding = runtime.ensure_binding(cfg.shared_root, "gpu-1")[0]
     paths = local_paths(runtime.project_paths(binding.project_id)["root"])
     marker, reached, resume = (tmp_path / name for name in ("count", "created", "resume"))
@@ -1410,7 +1416,7 @@ def test_li07_cold_start_bindings_keep_identity_and_reservations_separate(
     project_count = 4
     gpu_ids = list(range(4))
     monkeypatch.setenv("QEXP_VISIBLE_GPUS", ",".join(map(str, gpu_ids)))
-    runtime = MachineRuntime(tmp_path / "machine-runtime")
+    runtime = _initialized_runtime(tmp_path / "machine-runtime", agent_mode="daemon")
     cases = [_create_li07_case(tmp_path, runtime, str(index)) for index in range(project_count)]
     process = start_machine_agent(runtime, available_gpus=gpu_ids, loop_interval=0.1)
     try:
@@ -1466,7 +1472,7 @@ def test_li07_cold_start_bindings_keep_identity_and_reservations_separate(
 def test_li07_running_agent_discovers_dynamic_bindings(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     gpu_ids = list(range(4))
     monkeypatch.setenv("QEXP_VISIBLE_GPUS", ",".join(map(str, gpu_ids)))
-    runtime = MachineRuntime(tmp_path / "machine-runtime")
+    runtime = _initialized_runtime(tmp_path / "machine-runtime", agent_mode="daemon")
     cases = [_create_li07_case(tmp_path, runtime, str(index)) for index in range(2)]
     process = start_machine_agent(runtime, available_gpus=gpu_ids, loop_interval=0.1)
     try:
@@ -1657,11 +1663,11 @@ def test_li09_public_process_entrypoint_uses_real_python_runner(tmp_path: Path) 
         _cleanup(runtime, process)
 
 
-@pytest.mark.parametrize("modes", [("on_demand", "on_demand"), ("on_demand", "daemon"), ("daemon", "on_demand")])
-def test_global_idle_policy_considers_every_binding(tmp_path: Path, modes: tuple[str, str]) -> None:
-    runtime = MachineRuntime(tmp_path / "machine")
+@pytest.mark.parametrize("global_mode", ["on_demand", "daemon"])
+def test_global_idle_policy_uses_machine_global_config(tmp_path: Path, global_mode: str) -> None:
+    runtime = _initialized_runtime(tmp_path / "machine", agent_mode=global_mode)
     configs = []
-    for index, mode in enumerate(modes):
+    for index, mode in enumerate(("daemon", "on_demand")):
         cfg = init_shared_root(
             tmp_path / str(index) / ".qexp", "gpu-1", agent_mode=mode, runtime_root=tmp_path / f"legacy-{index}"
         )
@@ -1700,7 +1706,7 @@ runpy.run_module("qqtools.plugins.qexp.agent.process", run_name="__main__")
         start_new_session=True,
     )
     try:
-        if "daemon" not in modes:
+        if global_mode == "on_demand":
             _wait_for(
                 lambda: process.poll() is not None or (runtime.root / "idle-confirmed").exists(),
                 timeout=30,
@@ -1795,7 +1801,7 @@ run_machine_agent_loop(sys.argv[1], loop_interval=0.1, available_gpus=[0])
 
 
 def test_global_idle_waits_for_unresolved_demand(tmp_path: Path) -> None:
-    runtime = MachineRuntime(tmp_path / "machine")
+    runtime = _initialized_runtime(tmp_path / "machine")
     cfg = init_shared_root(tmp_path / "project" / ".qexp", "gpu-1", runtime_root=tmp_path / "legacy")
     runtime.ensure_binding(cfg.shared_root, "gpu-1")
     reached, resolve = tmp_path / "probe", tmp_path / "resolve"
@@ -1841,7 +1847,7 @@ def test_pending_repair_prevents_idle_exit(tmp_path: Path, kind: str) -> None:
     from qqtools.plugins.qexp.agent.lifecycle import _machine_is_true_idle
     from qqtools.plugins.qexp.runtime.operation_store import active_operation_path
 
-    runtime = MachineRuntime(tmp_path / "machine")
+    runtime = _initialized_runtime(tmp_path / "machine")
     cfg = init_shared_root(tmp_path / "project" / ".qexp", "gpu-1", runtime_root=tmp_path / "legacy")
     runtime.ensure_binding(cfg.shared_root, "gpu-1")
     runtime.last_cycle_had_demand = False
@@ -1854,7 +1860,7 @@ def test_pending_repair_prevents_idle_exit(tmp_path: Path, kind: str) -> None:
 
 
 def test_failed_binding_is_not_consumed_for_idle_exit(tmp_path: Path) -> None:
-    runtime = MachineRuntime(tmp_path / "machine")
+    runtime = _initialized_runtime(tmp_path / "machine")
     cfg = init_shared_root(tmp_path / "project" / ".qexp", "gpu-1", runtime_root=tmp_path / "legacy")
     binding = runtime.ensure_binding(cfg.shared_root, "gpu-1")[0]
     reached, allow = tmp_path / "failed", tmp_path / "allow"
@@ -1889,7 +1895,7 @@ lifecycle.run_machine_agent_loop(sys.argv[1], loop_interval=0.1, available_gpus=
 
 
 def test_global_idle_does_not_reenter_registration_wait(tmp_path: Path) -> None:
-    runtime = MachineRuntime(tmp_path / "machine")
+    runtime = _initialized_runtime(tmp_path / "machine")
     cfg = init_shared_root(
         tmp_path / "project" / ".qexp", "gpu-1", agent_mode="daemon", runtime_root=tmp_path / "legacy"
     )

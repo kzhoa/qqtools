@@ -191,12 +191,6 @@ def test_every_command_leaf_retains_its_frozen_dispatch_contract() -> None:
         ),
         ("agent", "stop"): ("agent_stop", "machine", "agent-operation"),
         ("agent", "name"): ("agent_name", "machine", "agent-config"),
-        ("agent", "add-project"): ("retired_add-project", "none", "diagnostic"),
-        ("agent", "list-projects"): ("retired_list-projects", "none", "diagnostic"),
-        ("agent", "enable-project"): ("retired_enable-project", "none", "diagnostic"),
-        ("agent", "disable-project"): ("retired_disable-project", "none", "diagnostic"),
-        ("agent", "remove-project"): ("retired_remove-project", "none", "diagnostic"),
-        ("agent", "migrate-project"): ("retired_migrate-project", "none", "diagnostic"),
         ("agent", "config", "gpus", "show"): ("agent_config_gpus_show", "machine", "gpu-policy"),
         ("agent", "config", "gpus", "set"): ("agent_config_gpus_set", "machine", "gpu-policy"),
         ("agent", "config", "gpus", "reset"): ("agent_config_gpus_reset", "machine", "gpu-policy"),
@@ -207,7 +201,6 @@ def test_every_command_leaf_retains_its_frozen_dispatch_contract() -> None:
         ("notifications", "test"): ("notifications_test", "machine", "config"),
         ("notifications", "set"): ("notifications_set", "machine", "config"),
         ("notifications", "reset"): ("notifications_reset", "machine", "config"),
-        ("notifications", "resolve"): ("notifications_resolve", "machine", "config"),
         ("config", "show"): ("config_show", "section", "config"),
         ("config", "set"): ("config_set", "section", "config"),
         ("config", "reset"): ("config_reset", "section", "config"),
@@ -261,7 +254,7 @@ def test_normalized_leaf_help_matches_the_characterization_baseline() -> None:
     )
 
     assert (
-        hashlib.sha256(text.encode()).hexdigest() == "e1e68209bb6cea5e526ae62cbd8301756adb01772845424c43678146b298d796"
+        hashlib.sha256(text.encode()).hexdigest() == "ee31c9e4d11bb113dff0d7a0b94cd4bcbbfdfa4ed35fb3adf3da498948a862a2"
     )
 
 
@@ -359,9 +352,7 @@ def test_parser_leaf_modes_and_output_kinds_are_explicit() -> None:
     assert specs[("agent", "run")].modes == frozenset({OutputMode.CONTINUOUS})
     assert specs[("agent", "run")].output_kinds == frozenset()
     assert specs[("agent", "run")].audience is CommandAudience.DEBUG
-    assert specs[("init",)].modes == frozenset({OutputMode.FINITE, OutputMode.DIAGNOSTIC})
-    assert specs[("agent", "add-project")].modes == frozenset({OutputMode.DIAGNOSTIC})
-    assert specs[("agent", "add-project")].output_kinds == frozenset()
+    assert specs[("init",)].modes == frozenset({OutputMode.FINITE})
     assert specs[("task", "list")].modes == frozenset({OutputMode.FINITE})
     assert specs[("task", "list")].output_kinds == frozenset({OutputKind.TASK_LIST, OutputKind.TASK_PAGE})
 

@@ -2125,7 +2125,6 @@ def _dispatch_machine_cycle_locked(
         resident_bindings = runtime.working_set.resident_bindings()
         project_io_controller.advance_submission_control(resident_bindings, registry_revision)
         project_io_controller.advance_observation_maintenance(resident_bindings, registry_revision)
-        project_io_controller.advance_notification_maintenance(registered, registry_revision)
         project_io_controller.advance_progress_work(registered, registry_revision)
         recovery_enrollment = getattr(runtime, "recovery_enrollment", None)
         if recovery_enrollment is not None:

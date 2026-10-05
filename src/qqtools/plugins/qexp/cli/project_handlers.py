@@ -278,22 +278,11 @@ def dispatch_project(
                     "clock_provider_margin_seconds": args.clock_provider_margin_seconds,
                     "clock_provider_priority": args.clock_provider_priority,
                     "renewal_commit_margin_seconds": args.renewal_commit_margin_seconds,
-                    "webhook_env": args.webhook_env,
-                    "credential_source": args.credential_source,
-                    "secret_env": args.secret_env,
-                    "acknowledge_shared_secret_risk": args.acknowledge_shared_secret_risk or None,
-                    "shared_webhook": args.shared_webhook,
                 }.items()
                 if value is not None
             }
             if args.unset_secret_env:
                 values["secret_env"] = None
-            if args.webhook_stdin:
-                if args.credential_source != "shared_file":
-                    raise CliUsageError("--webhook-stdin requires --credential-source shared_file")
-                values["shared_webhook"] = sys.stdin.readline().rstrip("\r\n")
-                if not values["shared_webhook"]:
-                    raise CliUsageError("--webhook-stdin requires a non-empty first input line")
             try:
                 result = configuration_commands.set_config(
                     section,

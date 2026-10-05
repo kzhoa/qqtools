@@ -54,7 +54,6 @@ PROJECT_IO_OPERATIONS = frozenset(
         "upgrade_service",
         "submission_control_service",
         "observation_service",
-        "notification_service",
         "group_service_probe",
         "group_service_advance",
         "progress_projection",
@@ -730,7 +729,7 @@ def _request_parameters(operation_kind: str, value: object) -> dict[str, Any]:
     elif operation_kind == "upgrade_service":
         _require_exact_keys(parameters, frozenset({"machine_name"}), "upgrade_service parameters")
         parameters["machine_name"] = _require_identifier(parameters["machine_name"], "machine_name")
-    elif operation_kind in {"observation_service", "notification_service", "recovery_admission"}:
+    elif operation_kind in {"observation_service", "recovery_admission"}:
         _require_exact_keys(parameters, frozenset({"machine_name"}), f"{operation_kind} parameters")
         parameters["machine_name"] = _require_identifier(parameters["machine_name"], "machine_name")
     elif operation_kind == "group_service_probe":
@@ -1447,7 +1446,6 @@ def _request_fields(value: object) -> dict[str, Any]:
         "upgrade_service",
         "submission_control_service",
         "observation_service",
-        "notification_service",
         "group_service_probe",
         "group_service_advance",
         "legacy_capture_read",
@@ -1677,7 +1675,6 @@ class ProjectIOResult:
             "project_io_upgrade_service_failed",
             "project_io_submission_control_service_failed",
             "project_io_observation_service_failed",
-            "project_io_notification_service_failed",
             "project_io_progress_projection_failed",
             "project_io_legacy_capture_read_failed",
             "project_io_legacy_capture_scan_failed",
@@ -2263,10 +2260,6 @@ def _validate_evidence(request: ProjectIORequest, status: str, value: Mapping[st
             evidence = progress_evidence(
                 _json_copy(evidence), _json_copy(request.parameters), request.registration_generation
             )
-        elif request.operation_kind == "notification_service":
-            _require_exact_keys(evidence, frozenset({"state"}), "notification_service evidence")
-            if evidence["state"] not in {"ready", "conflict", "source_invalid", "blocked"}:
-                raise ValueError("Notification service state is invalid.")
         elif request.operation_kind == "group_service_probe":
             evidence = group_service_probe_evidence(evidence)
         elif request.operation_kind == "group_service_advance":

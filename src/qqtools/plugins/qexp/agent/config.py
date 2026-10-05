@@ -122,83 +122,20 @@ def _stored_config(runtime: Any) -> AgentConfig | None:
         raise RuntimeError(str(exc)) from exc
 
 
-def _legacy_mode(value: Any) -> str:
-    # QQTOOLS-COMPAT-0013: old per-binding records omitted mode, where the
-    # historical default was on_demand.  Do not guess on malformed values.
-    if value in {None, ""}:
-        return AGENT_MODE_ON_DEMAND
-    return validate_agent_mode(value)
-
-
-def _migrate_legacy_mode(runtime: Any, *, name: str, explicit_mode: str | None) -> tuple[str, str]:
-    if explicit_mode is not None:
-        return validate_agent_mode(explicit_mode), "init_explicit"
-    try:
-        _revision, bindings = runtime.load_registry()
-    except (OSError, RuntimeError, ValueError, KeyError, TypeError):
-        bindings = []
-    selected = [binding for binding in bindings if binding.enabled] or list(bindings)
-    modes: list[str] = []
-    from ..layout import load_machine_record
-
-    for binding in selected:
-        try:
-            record = load_machine_record(binding.root_config()) or {}
-        except (OSError, RuntimeError, ValueError, KeyError, TypeError) as exc:
-            raise RuntimeError(f"cannot migrate agent mode for Project {binding.project_id!r}: {exc}") from exc
-        machine = record.get("machine") if isinstance(record, dict) else None
-        mode = machine.get("agent_mode") if isinstance(machine, dict) else None
-        modes.append(_legacy_mode(mode))
-    if not modes:
-        return DEFAULT_AGENT_MODE, "default"
-    if AGENT_MODE_DAEMON in modes:
-        return AGENT_MODE_DAEMON, "legacy_enabled_bindings" if any(
-            binding.enabled for binding in bindings
-        ) else "legacy_bindings"
-    return AGENT_MODE_ON_DEMAND, "legacy_enabled_bindings" if any(
-        binding.enabled for binding in bindings
-    ) else "legacy_bindings"
-
-
 def _write_locked(runtime: Any, config: AgentConfig) -> AgentConfig:
     atomic_replace(_config_path(runtime), {"agent_config": config.to_dict()})
     return config
 
 
 def load_agent_config(runtime: Any, *, require_initialized: bool = True) -> AgentConfig:
-    """Load global config, performing one compatibility migration when needed."""
+    """Load the canonical machine-global agent configuration."""
     machine_runtime = _as_runtime(runtime)
     if require_initialized:
         machine_runtime.require_identity()
     stored = _stored_config(machine_runtime)
     if stored is not None:
         return stored
-    # A pre-feature registry is the sole read-time migration exception.  It
-    # preserves its effective runtime ID before creating the new config.
-    has_registry = machine_runtime.paths["registry"].exists()
-    if has_registry:
-        try:
-            machine_runtime.load_registry()
-        except (OSError, RuntimeError, ValueError, KeyError, TypeError) as exc:
-            raise RuntimeError("machine registry is malformed; refusing global policy migration.") from exc
-        machine_runtime.ensure_compatibility_identity()
-    elif require_initialized:
-        raise RuntimeError("qexp machine global config is missing; run 'qexp init --machine NAME'.")
-    if not machine_runtime.has_identity and not has_registry:
-        raise RuntimeError("qexp machine runtime is uninitialized; run 'qexp init --machine NAME'.")
-    if not has_registry and not require_initialized:
-        raise RuntimeError("qexp machine global agent config is missing.")
-    try:
-        _revision, bindings = machine_runtime.load_registry()
-        first_name = bindings[0].machine_name if bindings else None
-    except (OSError, RuntimeError, ValueError, KeyError, TypeError):
-        first_name = None
-    name = validate_agent_name(first_name or "machine")
-    mode, provenance = _migrate_legacy_mode(machine_runtime, name=name, explicit_mode=None)
-    config = AgentConfig(name=name, agent_mode=mode, revision=0, provenance=provenance)
-    with machine_runtime.config_guard():
-        stored = _stored_config(machine_runtime)
-        return stored if stored is not None else _write_locked(machine_runtime, config)
+    raise RuntimeError("qexp machine global config is missing; run 'qexp init --machine NAME'.")
 
 
 def read_agent_config(runtime: Any, *, require_initialized: bool = True) -> AgentConfig:
@@ -218,9 +155,8 @@ def initialize_agent_config(runtime: Any, name: str, *, agent_mode: str | None =
                 selected_mode = previous.agent_mode
                 provenance = previous.provenance
             else:
-                selected_mode, provenance = _migrate_legacy_mode(
-                    machine_runtime, name=validated_name, explicit_mode=None
-                )
+                selected_mode = DEFAULT_AGENT_MODE
+                provenance = "default"
         else:
             provenance = "init_explicit"
         revision = previous.revision + 1 if previous is not None else 0

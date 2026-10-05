@@ -182,8 +182,6 @@ def _active_mode(args: argparse.Namespace) -> OutputMode:
         return OutputMode.CONTINUOUS if bool(getattr(args, "watch", False)) else OutputMode.FINITE
     if handler == "task_logs":
         return OutputMode.CONTINUOUS if bool(getattr(args, "follow", False)) else OutputMode.RAW
-    if handler == "init" and (args.init_shared_root or args.runtime_root or args.cpu_lane_capacity is not None):
-        return OutputMode.DIAGNOSTIC
     if spec.modes == frozenset({OutputMode.DIAGNOSTIC}):
         return OutputMode.DIAGNOSTIC
     if handler == "submit" and bool(getattr(args, "quiet", False)):
@@ -389,16 +387,6 @@ def main(argv: list[str] | None = None) -> int:
                 wait_commands.parse_wait_timeout(args.timeout)
             except ValueError as exc:
                 raise CliUsageError(str(exc)) from exc
-        if getattr(args, "compat_shared_root", None) is not None:
-            # Parse the former root-position locator only far enough to give a
-            # bounded migration diagnostic.  It never participates in normal
-            # Project selection.
-            print(
-                "qexp: QQTOOLS-COMPAT-0014: --shared-root is retired; use "
-                f"'--project {shlex.quote(str(args.compat_shared_root))}'.",
-                file=sys.stderr,
-            )
-            return 2
         if handler.startswith("notifications_") and args.scope == "global":
             return _finalize_outcome(args, dispatch_notifications(args))
         if (

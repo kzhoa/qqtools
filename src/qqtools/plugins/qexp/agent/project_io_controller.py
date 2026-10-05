@@ -80,7 +80,6 @@ _SERVICE_CLASS_BY_OPERATION_KIND = {
     "upgrade_service": "background",
     "submission_control_service": "background",
     "observation_service": "background",
-    "notification_service": "background",
     "group_service_probe": "background",
     "group_service_advance": "background",
     "progress_projection": "background",
@@ -260,7 +259,6 @@ class ProjectIOController:
         self._submission_cursors: dict[_ValidationIdentity, Mapping[str, Any]] = {}
         self._submission_due: dict[_ValidationIdentity, float] = {}
         self._observation_due: dict[_ValidationIdentity, float] = {}
-        self._notification_due: dict[_ValidationIdentity, float] = {}
         self._observation_turns: dict[_ValidationIdentity, BindingTurn] = {}
         self._registration_due: dict[_ValidationIdentity, float] = {}
         self._registration_deadlines: dict[_ValidationIdentity, float] = {}
@@ -4403,37 +4401,6 @@ class ProjectIOController:
                 self._observation_due.pop(identity, None)
 
     @_admission_operation
-    def advance_notification_maintenance(self, bindings: Sequence[ProjectBinding], registry_revision: int) -> None:
-        """Reconcile registered legacy sources through the common background arbiter."""
-        status = self._poll_admission_executor()
-        epoch = status.get("executor_epoch")
-        if status.get("envelope") == "unknown" or not isinstance(epoch, str):
-            return
-        current = {
-            identity: binding
-            for binding in bindings
-            if (identity := self._binding_identity(binding, registry_revision, epoch)) is not None
-        }
-        for identity in tuple(self._notification_due):
-            if identity not in current:
-                self._notification_due.pop(identity, None)
-        parameters = {
-            binding.project_id: {}
-            for identity, binding in current.items()
-            if binding.enabled
-            and identity in self._validated
-            and binding.project_id not in self.runtime.upgrade_admission_blocked_projects
-            and self._notification_due.get(identity, 0.0) <= self._monotonic()
-        }
-        results = self._advance_activation_io(
-            "notification_service", bindings, registry_revision, parameters, require_validated=True
-        )
-        by_project = {identity.project_id: identity for identity in current}
-        for project_id, evidence in results.items():
-            if "state" in evidence:
-                self._notification_due[by_project[project_id]] = self._monotonic() + 5.0
-
-    @_admission_operation
     def advance_progress_projection(
         self,
         bindings: Sequence[ProjectBinding],
@@ -4625,8 +4592,6 @@ class ProjectIOController:
                         resolved = self.executor.resolve_stale_submission_control_service(request.request_id, request)
                     elif operation_kind == "observation_service":
                         resolved = self.executor.resolve_stale_observation_service(request.request_id, request)
-                    elif operation_kind == "notification_service":
-                        resolved = self.executor.resolve_stale_notification_service(request.request_id, request)
                     elif operation_kind == "progress_projection":
                         resolved = self.executor.resolve_stale_progress_projection(request.request_id, request)
                     elif operation_kind == "legacy_capture_read":
@@ -4702,7 +4667,6 @@ class ProjectIOController:
             if result.status == "outcome_unknown" and operation_kind in {
                 "submission_control_service",
                 "observation_service",
-                "notification_service",
                 "progress_projection",
                 "legacy_capture_read",
                 "legacy_capture_scan",
@@ -4729,10 +4693,6 @@ class ProjectIOController:
                         )
                     elif operation_kind == "observation_service":
                         reset = self.executor.reset_ambiguous_observation_service_for_retry(request.request_id, request)
-                    elif operation_kind == "notification_service":
-                        reset = self.executor.reset_ambiguous_notification_service_for_retry(
-                            request.request_id, request
-                        )
                     elif operation_kind == "progress_projection":
                         reset = self.executor.reset_ambiguous_progress_projection_for_retry(request.request_id, request)
                     elif operation_kind == "legacy_capture_read":
@@ -4931,8 +4891,6 @@ class ProjectIOController:
             elif operation_kind == "observation_service":
                 request = self.executor.prepare_observation_service(binding, registry_revision)
                 self._observation_turns[identity] = self.runtime.working_set.begin_turn(binding, "observation")
-            elif operation_kind == "notification_service":
-                request = self.executor.prepare_notification_service(binding, registry_revision)
             elif operation_kind == "progress_projection":
                 request = self.executor.prepare_progress_projection(
                     binding, registry_revision, context=parameters["context"], projection=parameters["projection"]
