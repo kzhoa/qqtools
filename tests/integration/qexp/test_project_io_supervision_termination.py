@@ -468,6 +468,122 @@ def test_termination_registration_accepts_explicit_unassigned_reservation(tmp_pa
         child.wait(timeout=5)
 
 
+@pytest.mark.parametrize("trigger", ["cancellation_requested", "holder_safe_deadline_elapsed"])
+@pytest.mark.parametrize("shared_terminal_published", [False, True])
+def test_converged_historical_termination_does_not_repeat_shared_work_or_block_startup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, trigger: str, shared_terminal_published: bool
+) -> None:
+    runtime, cfg, binding, revision, task, attempt, child, paths, manifest, _ = _running_case(tmp_path, trigger="none")
+    executor = ProjectIOExecutor(runtime)
+    executor.begin_epoch()
+    controller = ProjectIOController(runtime, executor)
+    coordinator = AttemptSupervisionCoordinator(runtime, controller)
+    try:
+        child.terminate()
+        assert child.wait(timeout=5) == -15
+        atomic_replace(
+            paths["observations"] / f"{attempt.attempt_id}.json",
+            {
+                "exit_observation": {
+                    "protocol_version": 1,
+                    "task_id": task.task_id,
+                    "attempt_id": attempt.attempt_id,
+                    "observed_exit_code": child.returncode,
+                    "observed_at": utc_now(),
+                }
+            },
+        )
+        _until(lambda: controller.advance_binding_validation([binding], revision), bool)
+
+        def settle_exit():
+            coordinator.advance_terminal_completions([binding], revision)
+            return (
+                load_task(cfg, task.task_id).state["projection"] == "failed"
+                and read_json(manifest)["process"]["observed_state"] == "exited"
+                and not reservation_snapshot(runtime.root).active
+                and not executor.has_unfinished_work()
+            )
+
+        if shared_terminal_published:
+            _until(settle_exit, bool)
+        else:
+            process_envelope = read_json(manifest)
+            process_envelope["process"].update(
+                observed_state="exited", observed_exit_code=child.returncode, observed_exited_at=utc_now()
+            )
+            atomic_replace(manifest, process_envelope)
+            reconciler = local_exit_reconciliation.LocalExitReconciler(
+                runtime.project_paths(binding.project_id)["root"],
+                reservation_runtime_root=runtime.root,
+                project_id=binding.project_id,
+            )
+            try:
+                reconciler.reconcile_observation(paths["observations"] / f"{attempt.attempt_id}.json")
+            finally:
+                reconciler.close()
+            assert not reservation_snapshot(runtime.root).active
+            assert load_task(cfg, task.task_id).state["projection"] == "running"
+        process = project_io_supervision._read_terminal_process_record(
+            manifest, runtime.project_paths(binding.project_id)["root"], binding
+        )
+        assert process is not None
+        candidate = coordinator._new_termination_candidate(
+            binding, coordinator._initial_reconciliation_signature(binding, revision), manifest, process
+        )
+        candidate.trigger = trigger
+        decision_id = project_io_supervision._termination_decision_id(candidate, trigger)
+        local_cfg = project_io_supervision._termination_local_config(runtime, binding)
+        decision = create_decision(
+            local_cfg,
+            task_id=task.task_id,
+            attempt_id=attempt.attempt_id,
+            fencing_token=attempt.current_fencing_token,
+            process=process.record,
+            authority_outcome=trigger,
+            reason=trigger,
+            decision_id=decision_id,
+        )
+        # QQTOOLS-COMPAT-0022: include the confirmed old timeout image whose
+        # nonzero runner exit belongs to natural-exit supervision.
+        decision.update(
+            state="confirmed",
+            shared_commitment="committed",
+            confirmation="identity_absent",
+            signal_attempts=[{"at": utc_now(), "signal": "SIGTERM"}],
+        )
+        decision_file = paths["termination_decisions"] / attempt.attempt_id / f"{decision_id}.json"
+        atomic_replace(decision_file, {"termination_decision": decision})
+        coordinator.close()
+        coordinator = AttemptSupervisionCoordinator(runtime, controller)
+
+        def reject_repeated_shared_work(*_args, **_kwargs):
+            raise AssertionError("converged termination must not request shared terminal work")
+
+        with monkeypatch.context() as guarded:
+            guarded.setattr(controller, "advance_authority_terminal_observations", reject_repeated_shared_work)
+            guarded.setattr(controller, "advance_authority_terminal_publications", reject_repeated_shared_work)
+            guarded.setattr(coordinator, "_advance_termination_signals", reject_repeated_shared_work)
+            for _ in range(8):
+                coordinator.advance_terminations([binding], revision)
+                assert not coordinator._termination_candidates
+                coordinator._advance_initial_reconciliation([binding], revision)
+
+        assert coordinator.initially_reconciled(binding, revision)
+        assert not executor.has_unfinished_work()
+        assert read_json(manifest)["process"] == process.record
+        assert read_json(decision_file)["termination_decision"] == decision
+        # Delegating the runner result must still publish shared terminal truth
+        # after a crash between local completion and shared publication.
+        _until(settle_exit, bool)
+        assert load_task(cfg, task.task_id).state == {"projection": "failed", "reason": "nonzero_exit"}
+    finally:
+        coordinator.close()
+        executor.shutdown()
+        if child.poll() is None:
+            child.kill()
+        child.wait(timeout=5)
+
+
 def test_termination_directory_scan_retains_earlier_deferred_attempt(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

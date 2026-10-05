@@ -4484,6 +4484,26 @@ class AttemptSupervisionCoordinator:
                     if refreshed is not None:
                         candidate.convergence = refreshed
 
+            if candidate.convergence.state == "converged":
+                try:
+                    exit_observation = _read_terminal_exit_observation(
+                        paths["observations"] / f"{candidate.parameters['attempt_id']}.json",
+                        paths["root"],
+                        candidate.parameters["task_id"],
+                        candidate.parameters["attempt_id"],
+                    )
+                except _TERMINATION_SOURCE_ERRORS:
+                    continue
+                if (
+                    exit_observation is not None
+                    and exit_observation.exit_code == candidate.convergence.manifest_exit_code
+                ):
+                    # Natural-exit supervision owns this exact runner result.
+                    # Local convergence alone cannot retire a signal-only
+                    # completion whose shared terminal publication is pending.
+                    self._termination_candidates.pop(key, None)
+                    selected_candidates.pop(key, None)
+
         # Obtain one exact active observation for the selected candidates.
         observation_results: Mapping[str, Mapping[str, Any]] = {}
         candidates_by_project: dict[str, tuple[tuple[str, str], _TerminationCandidate]] = {}

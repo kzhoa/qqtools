@@ -3869,6 +3869,12 @@ reconciliation. Preferred progress continuations retain the ordinary background 
 position, so continuous reporting cannot starve upgrade discovery or other service families.
 These rules preserve the protected lifecycle-independence workflow across package upgrades.
 
+A locally converged confirmed termination with a matching immutable runner exit observation
+leaves termination replay and delegates its exact terminal result to natural-exit supervision.
+Repeated discovery of that retained history cannot create new termination observation requests
+or block startup admission. Signal-only completions without a runner exit observation still
+require their existing shared terminal publication proof.
+
 Before step 7, every start, restart, and foreground run obtains raw GPU inventory and validates an
 explicit persisted or inherited allowlist. Configured IDs absent from a successful inventory do
 not prevent startup: only the discovered intersection is visible, and a durable
