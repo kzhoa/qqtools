@@ -22,7 +22,8 @@ from qqtools.plugins.qexp.agent.lifecycle import (
     stop_machine_agent,
 )
 from qqtools.plugins.qexp.agent.project_io_executor import ProjectIOExecutor
-from qqtools.plugins.qexp.agent.setup import initialize_machine
+from qqtools.plugins.qexp.agent.setup import initialize_machine, register_projects
+from qqtools.plugins.qexp.config_types import RootConfig
 from qqtools.plugins.qexp.layout import machine_state_path
 from qqtools.plugins.qexp.runtime.paths import attempt_path, local_paths, machine_runtime_paths, shared_paths
 from qqtools.plugins.qexp.runtime.project_activation import publish_project_activation
@@ -46,6 +47,11 @@ def _initialized_runtime(root: Path, *, agent_mode: str = "on_demand") -> Machin
     runtime = MachineRuntime(root)
     initialize_machine(runtime, "gpu-1", agent_mode=agent_mode)
     return runtime
+
+
+def _register_project(runtime: MachineRuntime, cfg: RootConfig):
+    register_projects(runtime, [cfg.shared_root], machine_name=cfg.machine_name)
+    return runtime.ensure_binding(cfg.shared_root, cfg.machine_name)[0]
 
 
 @pytest.fixture(autouse=True)
@@ -138,7 +144,7 @@ def _create_case(
     shared_root = project_root / ".qexp"
     cfg = init_shared_root(shared_root, "gpu-1", agent_mode="daemon", runtime_root=tmp_path / "legacy")
     runtime = _initialized_runtime(tmp_path / "machine-runtime", agent_mode="daemon")
-    runtime.ensure_binding(shared_root, "gpu-1")
+    _register_project(runtime, cfg)
     marker = tmp_path / "launch-count"
     command = [
         sys.executable,
@@ -235,7 +241,7 @@ def test_real_agent_two_hung_worker_primary_and_renewal_qualification(tmp_path: 
         agent_mode="daemon",
         runtime_root=tmp_path / "healthy-legacy",
     )
-    healthy = runtime.ensure_binding(healthy_cfg.shared_root, "gpu-1")[0]
+    healthy = _register_project(runtime, healthy_cfg)
     blocked: list[tuple[object, object, Path, Path]] = []
     for index in range(2):
         cfg = init_shared_root(
@@ -244,7 +250,7 @@ def test_real_agent_two_hung_worker_primary_and_renewal_qualification(tmp_path: 
             agent_mode="daemon",
             runtime_root=tmp_path / f"blocked-{index}-legacy",
         )
-        binding = runtime.ensure_binding(cfg.shared_root, "gpu-1")[0]
+        binding = _register_project(runtime, cfg)
         schema = shared_paths(cfg.shared_root)["schema"] / "version.json"
         blocked.append((cfg, binding, schema, schema.with_suffix(".qualification-held")))
     set_cpu_lane_capacity(runtime.root, capacity=1)
@@ -607,7 +613,7 @@ def test_real_agent_healthy_binding_scale_preserves_incumbent_progress(
             # must complete one isolated renewal, while dedicated short-lease
             # tests retain the default-cadence saturation and expiry coverage.
             save_lease_policy(cfg, LeasePolicy(ttl_seconds=14_400, renew_interval_seconds=7_200.0))
-        runtime.ensure_binding(cfg.shared_root, "gpu-1")
+        _register_project(runtime, cfg)
         configs.append(cfg)
     set_cpu_lane_capacity(runtime.root, capacity=min(4, binding_count))
     if intent_window == 64:
@@ -774,7 +780,7 @@ def test_li02_offline_completion_preserves_exit_results(tmp_path: Path, monkeypa
     project_root = tmp_path / "project"
     cfg = init_shared_root(project_root / ".qexp", "gpu-1", agent_mode="daemon", runtime_root=tmp_path / "legacy")
     runtime = _initialized_runtime(tmp_path / "machine-runtime", agent_mode="daemon")
-    binding = runtime.ensure_binding(cfg.shared_root, "gpu-1")[0]
+    binding = _register_project(runtime, cfg)
     paths = local_paths(runtime.project_paths(binding.project_id)["root"])
     branches = []
     for name, exit_code, phase in (("success", 0, "succeeded"), ("failure", 7, "failed")):
@@ -855,7 +861,7 @@ def test_agent_projects_both_progress_versions_through_isolated_transactions(tmp
     project_root = tmp_path / "project"
     cfg = init_shared_root(project_root / ".qexp", "gpu-1", agent_mode="daemon", runtime_root=tmp_path / "legacy")
     runtime = _initialized_runtime(tmp_path / "machine-runtime", agent_mode="daemon")
-    binding = runtime.ensure_binding(cfg.shared_root, "gpu-1")[0]
+    binding = _register_project(runtime, cfg)
     set_progress_policy(cfg.shared_root, 1)
     marker = tmp_path / "producer"
     command = [
@@ -995,7 +1001,7 @@ def test_li03_real_peer_observes_natural_lease_expiry(tmp_path: Path, is_finishe
         ),
     )
     runtime = _initialized_runtime(tmp_path / "machine", agent_mode="daemon")
-    binding = runtime.ensure_binding(cfg.shared_root, "gpu-1")[0]
+    binding = _register_project(runtime, cfg)
     create_group(cfg, "peers")
     change_worker(cfg, "peers", "gpu-1", "add")
     change_worker(cfg, "peers", "gpu-2", "add")
@@ -1097,7 +1103,7 @@ def test_li05_launch_boundary_has_no_duplicate_authorized_process(tmp_path: Path
         tmp_path / "project" / ".qexp", "gpu-1", agent_mode="daemon", runtime_root=tmp_path / "legacy"
     )
     runtime = _initialized_runtime(tmp_path / "machine", agent_mode="daemon")
-    runtime.ensure_binding(cfg.shared_root, "gpu-1")
+    _register_project(runtime, cfg)
     marker = tmp_path / "launch-count"
     task = submit(
         cfg,
@@ -1174,7 +1180,7 @@ def test_li05_agent_crash_between_process_creation_and_registration(tmp_path: Pa
         tmp_path / "project" / ".qexp", "gpu-1", agent_mode="daemon", runtime_root=tmp_path / "legacy"
     )
     runtime = _initialized_runtime(tmp_path / "machine", agent_mode="daemon")
-    binding = runtime.ensure_binding(cfg.shared_root, "gpu-1")[0]
+    binding = _register_project(runtime, cfg)
     paths = local_paths(runtime.project_paths(binding.project_id)["root"])
     marker, reached, resume = (tmp_path / name for name in ("count", "created", "resume"))
     task = submit(
@@ -1359,7 +1365,7 @@ run_machine_agent_loop(root, loop_interval=0.1, available_gpus=[0])
 def _create_li07_case(tmp_path: Path, runtime: MachineRuntime, name: str):
     root = tmp_path / name
     cfg = init_shared_root(root / ".qexp", "gpu-1", agent_mode="daemon", runtime_root=root / "legacy")
-    binding = runtime.ensure_binding(cfg.shared_root, "gpu-1")[0]
+    binding = _register_project(runtime, cfg)
     marker, finish = root / "launch-count", root / "finish"
     command = [
         sys.executable,
@@ -1672,7 +1678,7 @@ def test_global_idle_policy_uses_machine_global_config(tmp_path: Path, global_mo
             tmp_path / str(index) / ".qexp", "gpu-1", agent_mode=mode, runtime_root=tmp_path / f"legacy-{index}"
         )
         configs.append(cfg)
-        runtime.ensure_binding(cfg.shared_root, "gpu-1")
+        _register_project(runtime, cfg)
     script = """
 import runpy
 from pathlib import Path
@@ -1803,7 +1809,7 @@ run_machine_agent_loop(sys.argv[1], loop_interval=0.1, available_gpus=[0])
 def test_global_idle_waits_for_unresolved_demand(tmp_path: Path) -> None:
     runtime = _initialized_runtime(tmp_path / "machine")
     cfg = init_shared_root(tmp_path / "project" / ".qexp", "gpu-1", runtime_root=tmp_path / "legacy")
-    runtime.ensure_binding(cfg.shared_root, "gpu-1")
+    _register_project(runtime, cfg)
     reached, resolve = tmp_path / "probe", tmp_path / "resolve"
     script = """
 import sys
@@ -1849,7 +1855,7 @@ def test_pending_repair_prevents_idle_exit(tmp_path: Path, kind: str) -> None:
 
     runtime = _initialized_runtime(tmp_path / "machine")
     cfg = init_shared_root(tmp_path / "project" / ".qexp", "gpu-1", runtime_root=tmp_path / "legacy")
-    runtime.ensure_binding(cfg.shared_root, "gpu-1")
+    _register_project(runtime, cfg)
     runtime.last_cycle_had_demand = False
     assert _machine_is_true_idle(runtime, has_consumed_binding=True)
     path = active_operation_path(cfg, kind, "pending")
@@ -1862,7 +1868,7 @@ def test_pending_repair_prevents_idle_exit(tmp_path: Path, kind: str) -> None:
 def test_failed_binding_is_not_consumed_for_idle_exit(tmp_path: Path) -> None:
     runtime = _initialized_runtime(tmp_path / "machine")
     cfg = init_shared_root(tmp_path / "project" / ".qexp", "gpu-1", runtime_root=tmp_path / "legacy")
-    binding = runtime.ensure_binding(cfg.shared_root, "gpu-1")[0]
+    binding = _register_project(runtime, cfg)
     reached, allow = tmp_path / "failed", tmp_path / "allow"
     script = """
 import sys
@@ -1887,7 +1893,7 @@ lifecycle.run_machine_agent_loop(sys.argv[1], loop_interval=0.1, available_gpus=
         runtime.remove_binding(binding.project_id)
         with pytest.raises(subprocess.TimeoutExpired):
             process.wait(timeout=1)
-        runtime.ensure_binding(cfg.shared_root, "gpu-1")
+        _register_project(runtime, cfg)
         allow.touch()
         assert process.wait(timeout=10) == 0
     finally:
@@ -1899,7 +1905,7 @@ def test_global_idle_does_not_reenter_registration_wait(tmp_path: Path) -> None:
     cfg = init_shared_root(
         tmp_path / "project" / ".qexp", "gpu-1", agent_mode="daemon", runtime_root=tmp_path / "legacy"
     )
-    binding = runtime.ensure_binding(cfg.shared_root, "gpu-1")[0]
+    binding = _register_project(runtime, cfg)
     consumed = tmp_path / "consumed"
     script = """
 import sys
