@@ -6,7 +6,41 @@ from collections.abc import Mapping
 from typing import Any
 
 from .core import OutputContract, OutputKind
-from .primitives import _details, _mapping, _operation
+from .primitives import _details, _mapping, _operation, _present, _section, _value
+
+
+def _label(key: object) -> str:
+    acronyms = {"gpu": "GPU", "id": "ID", "ids": "IDs", "tmux": "TMUX", "ttl": "TTL"}
+    words = [acronyms.get(word, word) for word in str(key).split("_")]
+    if words and words[0] not in acronyms.values():
+        words[0] = words[0].capitalize()
+    return " ".join(words)
+
+
+def _render_values(values: object, *, indent: str = "  ") -> str:
+    if not isinstance(values, Mapping):
+        return f"{indent}{_value(values)}"
+    lines: list[str] = []
+    for key, item in values.items():
+        if not _present(item):
+            continue
+        label = _label(key)
+        if isinstance(item, Mapping):
+            nested = _render_values(item, indent=indent + "  ")
+            if nested:
+                lines.extend((f"{indent}{label}", nested))
+        else:
+            lines.append(f"{indent}{label}: {_value(item)}")
+    return "\n".join(lines)
+
+
+def _values_section(title: str, values: object, *, omit: frozenset[str] = frozenset()) -> str:
+    if not _present(values):
+        return ""
+    if isinstance(values, Mapping) and omit:
+        values = {key: item for key, item in values.items() if key not in omit}
+    body = _render_values(values)
+    return f"{title}\n{body}" if body else ""
 
 
 def _render_named_operation(result: Mapping[str, Any], default_action: str) -> str:
@@ -37,14 +71,16 @@ def _render_section(name: str, value: Mapping[str, Any]) -> str:
             )
         )
     values = value.get("effective_values", value.get("values"))
-    return _details(
+    summary = _section(
+        f"Configuration: {name}",
         (
-            ("Section", name),
             ("Scope", value.get("scope")),
             ("Source", value.get("source")),
             ("Applies to", value.get("applies_to")),
-            ("Values", values),
-        )
+        ),
+    )
+    return "\n\n".join(
+        item for item in (summary, _values_section("Values", values, omit=frozenset({"source", "applies_to"}))) if item
     )
 
 
@@ -82,16 +118,28 @@ def _render_config(result: Mapping[str, Any], _presentation: Mapping[str, object
             )
         )
     if result.get("section"):
-        return _details(
+        summary = _section(
+            "Configuration",
             (
                 ("Action", result.get("action", "show")),
                 ("Section", result.get("section")),
                 ("Scope", result.get("scope")),
                 ("Source", result.get("source")),
                 ("Applies to", result.get("applies_to")),
-                ("Values", result.get("effective_values", result.get("values"))),
-                ("Retention", result.get("retention")),
+            ),
+        )
+        return "\n\n".join(
+            item
+            for item in (
+                summary,
+                _values_section(
+                    "Values",
+                    result.get("effective_values", result.get("values")),
+                    omit=frozenset({"source", "applies_to"}),
+                ),
+                _values_section("Retention", result.get("retention")),
             )
+            if item
         )
     return _render_named_operation(result, "config")
 

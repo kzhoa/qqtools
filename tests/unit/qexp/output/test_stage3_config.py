@@ -32,6 +32,33 @@ def test_config_show_exposes_provenance_scope_and_application_timing(tmp_path: P
     assert json.loads(render(CliOutput(OutputKind.CONFIG, result), "json")) == result
 
 
+def test_config_show_expands_nested_values_into_readable_sections() -> None:
+    result = {
+        "action": "show",
+        "section": "lease",
+        "scope": "project",
+        "source": "configured",
+        "applies_to": "new_claims",
+        "effective_values": {
+            "lease_policy": {
+                "ttl_seconds": 120,
+                "clock_provider_priority": ["chrony", "linux_adjtimex"],
+            },
+            "revision": 3,
+        },
+    }
+
+    human = render(CliOutput(OutputKind.CONFIG, result), "human")
+
+    assert "Configuration\n  Action: show\n  Section: lease" in human
+    assert "Values\n  Lease policy\n    TTL seconds: 120" in human
+    assert "Clock provider priority: chrony, linux_adjtimex" in human
+    assert "  Revision: 3" in human
+    assert "Values:" not in human
+    assert "Retention" not in human
+    assert json.loads(render(CliOutput(OutputKind.CONFIG, result), "json")) == result
+
+
 def test_config_mutation_distinguishes_changed_from_no_change(tmp_path: Path) -> None:
     cfg = _cfg(tmp_path)
 

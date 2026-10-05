@@ -556,6 +556,38 @@ def release_cpu_if_matches(runtime_root: Path, identity: Any, reason: str) -> bo
         return True
 
 
+def release_termination_if_matches(runtime_root: Path, identity: Any, reason: str) -> bool:
+    """Release one exact active or provisional CPU reservation, including replay pairs."""
+    paths = local_paths(runtime_root)
+    filename = f"{identity.reservation_id}.json"
+    with exclusive(paths["locks"] / "cpu-lane.lock"):
+        active = paths["cpu_active"] / filename
+        provisional = paths["cpu_provisional"] / filename
+        released = paths["cpu_released"] / filename
+        present = [path for path in (active, provisional, released) if path.exists()]
+        if not present:
+            return False
+        records: dict[Path, dict[str, Any]] = {}
+        for path in present:
+            value = read_json(path)
+            reservation = value.get("reservation", {})
+            expected = "active" if path == active else "provisional" if path == provisional else "released"
+            if reservation.get("state") != expected or not identity.exactly_matches(reservation):
+                return False
+            records[path] = value
+        if active.exists() and provisional.exists():
+            return False
+        if released.exists() and not active.exists() and not provisional.exists():
+            return True
+        source = active if active.exists() else provisional
+        value = records[source]
+        reservation = value["reservation"]
+        reservation.update({"state": "released", "released_at": utc_now(), "release_reason": reason})
+        atomic_replace(released, value)
+        source.unlink(missing_ok=True)
+        return True
+
+
 def retag_cpu_if_matches(
     runtime_root: Path,
     identity: Any,

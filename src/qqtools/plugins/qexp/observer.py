@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
+import json
 import math
 from datetime import datetime, timezone
 from pathlib import Path
@@ -30,6 +33,8 @@ from .task_list_observation import enrich_task_rows
 from .task_observation import task_tmux_observation_label
 
 _TERMINAL_PHASES = frozenset({"succeeded", "failed", "cancelled"})
+_GROUP_CURSOR_FIELDS = frozenset({"v", "after", "dispatch", "worker_state", "attention"})
+_GROUP_CURSOR_VERSION = 1
 
 
 class CurrentObservationError(RuntimeError):
@@ -531,6 +536,148 @@ def inspect_task(cfg: RootConfig, task_id: str) -> dict[str, Any]:
 def list_groups(cfg: RootConfig) -> list[dict[str, Any]]:
     with schema_reader_lock(cfg.shared_root):
         return iter_published_groups(cfg.shared_root)
+
+
+def _group_needs_attention(item: dict[str, Any]) -> bool:
+    group = item.get("group", {})
+    if not isinstance(group, dict):
+        return True
+    workers = group.get("worker_set", {})
+    return bool(
+        group.get("dispatch_state") != "active"
+        or group.get("pending_submission_commit")
+        or group.get("reason")
+        or not isinstance(workers, dict)
+        or any(not isinstance(worker, dict) or worker.get("state") != "active" for worker in workers.values())
+    )
+
+
+def _group_matches(
+    item: dict[str, Any],
+    *,
+    dispatch: str | None,
+    worker_state: str | None,
+    attention: bool,
+) -> bool:
+    group = item.get("group", {})
+    if not isinstance(group, dict):
+        return attention
+    if dispatch is not None and group.get("dispatch_state") != dispatch:
+        return False
+    workers = group.get("worker_set", {})
+    if worker_state is not None and (
+        not isinstance(workers, dict)
+        or not any(isinstance(worker, dict) and worker.get("state") == worker_state for worker in workers.values())
+    ):
+        return False
+    return not attention or _group_needs_attention(item)
+
+
+def _encode_group_cursor(
+    after: str,
+    *,
+    dispatch: str | None,
+    worker_state: str | None,
+    attention: bool,
+) -> str:
+    payload = {
+        "after": after,
+        "attention": attention,
+        "dispatch": dispatch,
+        "v": _GROUP_CURSOR_VERSION,
+        "worker_state": worker_state,
+    }
+    encoded = json.dumps(payload, ensure_ascii=True, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    return base64.urlsafe_b64encode(encoded).decode("ascii").rstrip("=")
+
+
+def _decode_group_cursor(
+    cursor: str,
+    *,
+    dispatch: str | None,
+    worker_state: str | None,
+    attention: bool,
+) -> str:
+    if not isinstance(cursor, str) or not cursor or len(cursor) > 4096 or "=" in cursor:
+        raise ValueError("group cursor is invalid; restart without --cursor.")
+    try:
+        raw = cursor.encode("ascii")
+        decoded = base64.b64decode(raw + b"=" * (-len(raw) % 4), altchars=b"-_", validate=True)
+        if base64.urlsafe_b64encode(decoded).decode("ascii").rstrip("=") != cursor:
+            raise ValueError("non-canonical cursor")
+        payload = json.loads(decoded.decode("utf-8"))
+    except (UnicodeEncodeError, UnicodeDecodeError, binascii.Error, json.JSONDecodeError, ValueError) as exc:
+        raise ValueError("group cursor is invalid; restart without --cursor.") from exc
+    if not isinstance(payload, dict) or frozenset(payload) != _GROUP_CURSOR_FIELDS:
+        raise ValueError("group cursor is invalid; restart without --cursor.")
+    if (
+        type(payload.get("v")) is not int
+        or payload["v"] != _GROUP_CURSOR_VERSION
+        or not isinstance(payload.get("after"), str)
+        or not payload["after"]
+        or type(payload.get("attention")) is not bool
+        or payload.get("dispatch") != dispatch
+        or payload.get("worker_state") != worker_state
+        or payload.get("attention") is not attention
+    ):
+        raise ValueError("group cursor does not match the selected filters; restart without --cursor.")
+    return payload["after"]
+
+
+def list_groups_page(
+    cfg: RootConfig,
+    *,
+    page_size: int = 50,
+    cursor: str | None = None,
+    dispatch: str | None = None,
+    worker_state: str | None = None,
+    attention: bool = False,
+) -> dict[str, Any]:
+    """Return one live, Group-name-ordered page with filter-bound continuation."""
+    if type(page_size) is not int or not 1 <= page_size <= 1000:
+        raise ValueError("page_size must be an integer from 1 through 1000.")
+    if dispatch not in {None, "active", "paused"}:
+        raise ValueError("dispatch must be active or paused.")
+    if worker_state not in {None, "active", "draining", "removing"}:
+        raise ValueError("worker_state must be active, draining, or removing.")
+    if type(attention) is not bool:
+        raise ValueError("attention must be a boolean.")
+    after = (
+        _decode_group_cursor(
+            cursor,
+            dispatch=dispatch,
+            worker_state=worker_state,
+            attention=attention,
+        )
+        if cursor is not None
+        else None
+    )
+    groups = sorted(list_groups(cfg), key=lambda item: str(item.get("group", {}).get("name", "")))
+    matches = [
+        item
+        for item in groups
+        if isinstance(item.get("group", {}).get("name"), str)
+        and (after is None or item["group"]["name"] > after)
+        and _group_matches(item, dispatch=dispatch, worker_state=worker_state, attention=attention)
+    ]
+    items = matches[:page_size]
+    has_more = len(matches) > page_size
+    next_cursor = (
+        _encode_group_cursor(
+            items[-1]["group"]["name"],
+            dispatch=dispatch,
+            worker_state=worker_state,
+            attention=attention,
+        )
+        if has_more and items
+        else None
+    )
+    return {
+        "items": items,
+        "next_cursor": next_cursor,
+        "consistency": "live",
+        "stop_reason": "page_full" if has_more else "exhausted",
+    }
 
 
 def list_group_machines(cfg: RootConfig, name: str, *, reservation_runtime_root: Path | None = None) -> dict[str, Any]:

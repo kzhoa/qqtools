@@ -18,6 +18,7 @@ from .primitives import (
     _required_bool,
     _required_mapping,
     _required_sequence,
+    _section,
     _sequence,
     _table,
     _task_summary,
@@ -214,33 +215,45 @@ def _render_task_show(result: Mapping[str, Any], presentation: Mapping[str, obje
             progress_version=progress_version,
         )
     diagnostics = _progress_diagnostics(result) if presentation.get("details") else ()
-    return _details(
-        (
-            ("Task ID", task.get("task_id")),
-            ("Name", task.get("name")),
-            ("Command", command),
-            ("GPUs", spec.get("requested_gpus")),
-            ("Group", task.get("group_name")),
-            ("Dependencies", task.get("depends_on_task_ids")),
-            ("TMUX observer override", result.get("observation", {}).get("tmux_override")),
+    sections = [
+        _section(
+            "Task",
+            (
+                ("Task ID", task.get("task_id")),
+                ("Name", task.get("name")),
+                ("State", state.get("projection")),
+                ("Reason", state.get("reason")),
+                ("Group", task.get("group_name")),
+            ),
         ),
-        (
-            ("State", state.get("projection")),
-            ("Original submitting machine", submission.get("original_submitting_machine")),
-            ("Home machine", placement.get("home_machine")),
-            ("Current Attempt", current_attempt.get("attempt_number") if current_attempt else None),
-            ("Attempt phase", current_attempt.get("phase") if current_attempt else None),
-            ("Execution machines", execution_machines if terminal else None),
-            ("Queue scope", runtime.get("queue_scope")),
-            ("Control", control.get("cancellation_operation_id")),
-            ("Attempts", len(attempts)),
-            ("Reason", state.get("reason")),
-            ("Dependency gate", result.get("dependency_gate")),
-            ("Exit code", current_attempt.get("exit_code") if terminal else None),
+        _section(
+            "Execution",
+            (
+                ("Original submitting machine", submission.get("original_submitting_machine")),
+                ("Home machine", placement.get("home_machine")),
+                ("Current Attempt", current_attempt.get("attempt_number") if current_attempt else None),
+                ("Attempt phase", current_attempt.get("phase") if current_attempt else None),
+                ("Execution machines", execution_machines if terminal else None),
+                ("Queue scope", runtime.get("queue_scope")),
+                ("Control", control.get("cancellation_operation_id")),
+                ("Attempts", len(attempts)),
+                ("Exit code", current_attempt.get("exit_code") if terminal else None),
+            ),
         ),
-        progress_fields,
-        diagnostics,
-    )
+        _section(
+            "Configuration",
+            (
+                ("GPUs", spec.get("requested_gpus")),
+                ("Dependencies", task.get("depends_on_task_ids")),
+                ("Dependency gate", result.get("dependency_gate")),
+                ("TMUX observer override", result.get("observation", {}).get("tmux_override")),
+            ),
+        ),
+        _section("Progress", progress_fields),
+        _section("Progress diagnostics", diagnostics),
+        f"Command\n  {command}" if command else "",
+    ]
+    return "\n\n".join(section for section in sections if section)
 
 
 def _render_task_watch(result: Mapping[str, Any], presentation: Mapping[str, object]) -> str:

@@ -14,6 +14,7 @@ from .primitives import (
     _required,
     _required_mapping,
     _required_sequence,
+    _section,
     _sequence,
     _table,
     _task_summary,
@@ -130,10 +131,11 @@ def _group_fields(result: Mapping[str, Any], presentation: Mapping[str, object])
     return tuple(zip(labels, _group_values(result, presentation), strict=True))
 
 
-def _render_group_list(result: Sequence[Mapping[str, Any]], _presentation: Mapping[str, object]) -> str:
-    if not result:
+def _render_group_list(result: Mapping[str, Any], presentation: Mapping[str, object]) -> str:
+    items = result["items"]
+    if not items:
         return "No Groups."
-    return _table(
+    rendered = _table(
         (
             "Group",
             "Admission",
@@ -153,15 +155,74 @@ def _render_group_list(result: Sequence[Mapping[str, Any]], _presentation: Mappi
                 values[6],
                 values[7],
             )
-            for item in result
+            for item in items
             for values in (_group_values(item, {}),)
         ],
         empty_message="No Groups.",
     )
+    lines = [rendered]
+    if result.get("next_cursor") is not None:
+        lines.append(f"Stop reason: {result['stop_reason']}")
+    command = presentation.get("continuation_command")
+    if command is not None:
+        lines.append(f"Continue with: {_value(command)}")
+    return "\n".join(lines)
 
 
 def _render_group_show(result: Mapping[str, Any], presentation: Mapping[str, object]) -> str:
-    return _details(_group_fields(result, presentation))
+    group = result.get("group", {})
+    group = group if isinstance(group, Mapping) else {}
+    worker_set = group.get("worker_set", {})
+    abnormal_workers = (
+        [
+            f"{machine}={worker.get('state')}"
+            for machine, worker in sorted(worker_set.items())
+            if isinstance(worker, Mapping) and worker.get("state") not in {None, "active"}
+        ]
+        if isinstance(worker_set, Mapping)
+        else []
+    )
+    dispatch = group.get("dispatch_state")
+    attention = (
+        ("Dispatch", dispatch if dispatch not in {None, "active"} else None),
+        ("Workers", abnormal_workers),
+        ("Reason", group.get("reason") or result.get("reason")),
+    )
+    cancellation = result.get("cancellation_operation")
+    worker_control = result.get("worker_control")
+    operations = (
+        (
+            "Cancellation",
+            f"{cancellation.get('operation_id')} ({cancellation.get('state')})"
+            if isinstance(cancellation, Mapping)
+            else None,
+        ),
+        (
+            "Worker control",
+            (
+                f"{worker_control.get('operation_id')} ({worker_control.get('state')}; "
+                f"{worker_control.get('machine_name')})"
+            )
+            if isinstance(worker_control, Mapping)
+            else None,
+        ),
+    )
+    values = dict(_group_fields(result, presentation))
+    sections = [
+        _section("Group", (("Name", values["Group"]), ("Admission", values["Admission"]), ("Dispatch", dispatch))),
+        _section("Attention required", attention),
+        _section(
+            "Current workload",
+            (
+                ("Workers", values["Workers"]),
+                ("Task summary", values["Task summary"]),
+                ("Queue summary", values["Queue summary"]),
+                ("Control operation", values["Control operation"]),
+            ),
+        ),
+        _section("Recent operations", operations),
+    ]
+    return "\n\n".join(section for section in sections if section)
 
 
 def _render_group_operation(result: Mapping[str, Any], presentation: Mapping[str, object]) -> str:
@@ -241,9 +302,17 @@ def _validate_group_record(value: Any, label: str) -> None:
 
 
 def _validate_group_list(result: Any) -> None:
-    groups = _sequence(result, "group-list payload")
+    page = _mapping(result, "group-list payload")
+    groups = _required_sequence(page, "items", "group-list payload")
     for index, item in enumerate(groups):
         _validate_group_record(item, f"group-list payload[{index}]")
+    cursor = _required(page, "next_cursor", "group-list payload")
+    if cursor is not None and not isinstance(cursor, str):
+        raise TypeError("group-list payload.next_cursor must be a string or null")
+    if _required(page, "consistency", "group-list payload") != "live":
+        raise ValueError("group-list payload.consistency must be live")
+    if _required(page, "stop_reason", "group-list payload") not in {"page_full", "exhausted"}:
+        raise ValueError("group-list payload.stop_reason must be page_full or exhausted")
 
 
 def _validate_group_show(result: Any) -> None:

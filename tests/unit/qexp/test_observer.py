@@ -2,6 +2,8 @@ import math
 from datetime import datetime, timezone
 from pathlib import Path
 
+import pytest
+
 from qqtools.plugins.qexp import observer
 from qqtools.plugins.qexp.config_types import RootConfig
 from qqtools.plugins.qexp.runtime.records import SCHEMA_VERSION, TaskRecord
@@ -48,6 +50,70 @@ def _task(task_id: str, *, projection: str = "queued") -> TaskRecord:
             },
         }
     )
+
+
+def _group(name: str, *, dispatch: str = "active", worker_state: str = "active") -> dict[str, object]:
+    return {
+        "meta": {"schema_version": SCHEMA_VERSION, "revision": 1},
+        "group": {
+            "name": name,
+            "admission_state": "open",
+            "dispatch_state": dispatch,
+            "pending_submission_commit": None,
+            "worker_set": {"gpu-1": {"state": worker_state}},
+        },
+    }
+
+
+def test_group_pages_are_name_ordered_and_filter_bound(monkeypatch, tmp_path: Path) -> None:
+    cfg = RootConfig(tmp_path / ".qexp", tmp_path, "gpu-1", tmp_path / "runtime")
+    groups = [_group("group-c"), _group("group-a"), _group("group-b", dispatch="paused")]
+    monkeypatch.setattr(observer, "list_groups", lambda _cfg: groups)
+
+    first = observer.list_groups_page(cfg, page_size=2)
+    second = observer.list_groups_page(cfg, page_size=2, cursor=first["next_cursor"])
+
+    assert [item["group"]["name"] for item in first["items"]] == ["group-a", "group-b"]
+    assert first["stop_reason"] == "page_full"
+    assert isinstance(first["next_cursor"], str)
+    assert [item["group"]["name"] for item in second["items"]] == ["group-c"]
+    assert second["next_cursor"] is None
+    assert second["stop_reason"] == "exhausted"
+
+    with pytest.raises(ValueError, match="does not match"):
+        observer.list_groups_page(cfg, page_size=2, cursor=first["next_cursor"], dispatch="paused")
+
+
+def test_group_page_defaults_to_fifty_items(monkeypatch, tmp_path: Path) -> None:
+    cfg = RootConfig(tmp_path / ".qexp", tmp_path, "gpu-1", tmp_path / "runtime")
+    monkeypatch.setattr(observer, "list_groups", lambda _cfg: [_group(f"group-{index:03}") for index in range(51)])
+
+    page = observer.list_groups_page(cfg)
+
+    assert len(page["items"]) == 50
+    assert page["stop_reason"] == "page_full"
+    assert isinstance(page["next_cursor"], str)
+
+
+def test_group_page_filters_intersect_and_attention_finds_abnormal_workers(monkeypatch, tmp_path: Path) -> None:
+    cfg = RootConfig(tmp_path / ".qexp", tmp_path, "gpu-1", tmp_path / "runtime")
+    groups = [
+        _group("healthy"),
+        _group("paused", dispatch="paused"),
+        _group("removing", worker_state="removing"),
+        _group("paused-removing", dispatch="paused", worker_state="removing"),
+    ]
+    monkeypatch.setattr(observer, "list_groups", lambda _cfg: groups)
+
+    attention = observer.list_groups_page(cfg, attention=True)
+    selected = observer.list_groups_page(cfg, dispatch="paused", worker_state="removing", attention=True)
+
+    assert [item["group"]["name"] for item in attention["items"]] == [
+        "paused",
+        "paused-removing",
+        "removing",
+    ]
+    assert [item["group"]["name"] for item in selected["items"]] == ["paused-removing"]
 
 
 def test_list_tasks_stops_reading_after_limit(monkeypatch, tmp_path: Path) -> None:

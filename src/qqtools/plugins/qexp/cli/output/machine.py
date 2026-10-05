@@ -6,7 +6,7 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 
 from .core import OutputContract, OutputKind
-from .primitives import _details, _mapping, _required, _required_mapping, _sequence, _table, _task_summary
+from .primitives import _details, _mapping, _required, _required_mapping, _section, _sequence, _table, _task_summary
 
 
 def _machine_values(item: Mapping[str, Any], tasks: Sequence[Mapping[str, Any]] = ()) -> tuple[Any, ...]:
@@ -20,15 +20,20 @@ def _machine_values(item: Mapping[str, Any], tasks: Sequence[Mapping[str, Any]] 
     task_summary = item.get("task_summary")
     if task_summary is None and tasks:
         task_summary = _task_summary(tasks, machine=machine)
+    freshness = state.get("freshness")
+    gpu_is_current = freshness not in {"stale", "stopped", "missing"}
+    reason = item.get("reason") or (policy.get("warnings") if policy.get("warnings") else None)
+    if reason is None and freshness in {"stale", "stopped", "missing"}:
+        reason = "resource observation is not current"
     return (
         machine,
-        state.get("freshness"),
+        freshness,
         agent.get("observed_state", agent.get("agent_state")),
-        gpu.get("free_gpu_ids", gpu.get("unreserved")),
-        gpu.get("reserved_gpu_ids", gpu.get("reserved")),
-        policy.get("draining_gpu_ids"),
+        gpu.get("free_gpu_ids", gpu.get("unreserved")) if gpu_is_current else None,
+        gpu.get("reserved_gpu_ids", gpu.get("reserved")) if gpu_is_current else None,
+        policy.get("draining_gpu_ids") if gpu_is_current else None,
         task_summary,
-        item.get("reason") or (policy.get("warnings") if policy.get("warnings") else None),
+        reason,
     )
 
 
@@ -84,46 +89,58 @@ def _render_status(result: Mapping[str, Any], presentation: Mapping[str, object]
         else (project.get("path") if isinstance(project, Mapping) else project)
     )
     sections = [
-        (
-            ("Outcome", result.get("status")),
-            ("Project", project_path),
-            ("Project ID", project.get("project_id") if isinstance(project, Mapping) else None),
+        _section(
+            "Project",
             (
-                "Selection source",
-                None
-                if is_implicit_presentation
-                else project.get("selection_source")
-                if isinstance(project, Mapping)
-                else None,
+                ("Outcome", result.get("status")),
+                ("Path", project_path),
+                ("Project ID", project.get("project_id") if isinstance(project, Mapping) else None),
+                (
+                    "Selection source",
+                    None
+                    if is_implicit_presentation
+                    else project.get("selection_source")
+                    if isinstance(project, Mapping)
+                    else None,
+                ),
             ),
         ),
-        (
-            ("Participation", participation_state),
-            ("Participation reason", participation_reason),
-            ("Agent", agent_state),
-            ("Configured agent mode", configured_mode),
-            ("Observed agent mode", observed_mode if observed_mode != configured_mode else None),
-            ("Task observation", task_state),
-            ("Task observation reason", task_reason),
+        _section(
+            "Current state",
+            (
+                ("Participation", participation_state),
+                ("Participation reason", str(participation_reason).replace("_", " ") if participation_reason else None),
+                ("Agent", agent_state),
+                ("Configured agent mode", configured_mode),
+                ("Observed agent mode", observed_mode if observed_mode != configured_mode else None),
+                ("Task observation", task_state),
+                ("Task observation reason", str(task_reason).replace("_", " ") if task_reason else None),
+            ),
         ),
     ]
     if actions and (participation_state not in {"registered", "complete"} or task_state not in {"ready", "available"}):
-        sections.append((("Next actions", actions),))
+        sections.append(_section("Next actions", tuple(("Run", action) for action in actions)))
     warnings = result.get("warnings") or []
     if warnings:
-        sections.append((("Warnings", warnings),))
+        sections.append(_section("Warnings", tuple(("Warning", warning) for warning in warnings)))
     scheduler = result.get("scheduler_diagnostics")
     if isinstance(scheduler, Mapping):
         sections.append(
-            (
-                ("Scheduling diagnostics", scheduler.get("status")),
-                ("Scheduling coverage", scheduler.get("coverage")),
-                ("Scheduling observed", scheduler.get("observed_at")),
-                ("Active scheduling findings", scheduler.get("active_count")),
-                ("Scheduling reason", scheduler.get("reason")),
+            _section(
+                "Scheduling diagnostics",
+                (
+                    ("State", scheduler.get("status")),
+                    ("Coverage", scheduler.get("coverage")),
+                    ("Observed", scheduler.get("observed_at")),
+                    ("Active findings", scheduler.get("active_count")),
+                    (
+                        "Reason",
+                        str(scheduler.get("reason")).replace("_", " ") if scheduler.get("reason") else None,
+                    ),
+                ),
             )
         )
-    return _details(*sections)
+    return "\n\n".join(section for section in sections if section)
 
 
 def _render_machine_show(result: Mapping[str, Any], _presentation: Mapping[str, object]) -> str:

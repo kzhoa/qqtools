@@ -20,6 +20,7 @@ from qqtools.plugins.qexp.runtime.resources.reservations import (
     classify_executor_offer,
     release,
     release_executor_offer,
+    release_termination_if_matches,
     reservation_snapshot,
     reserve,
 )
@@ -319,6 +320,53 @@ def test_cpu_executor_offer_release_replays_exact_cross_directory_crash_image(tm
     assert release_executor_offer(runtime.root, identity, "definitive_no_claim")
     assert classify_executor_offer(runtime.root, identity) == "matching_released"
     assert not (local_paths(runtime.root)["cpu_provisional"] / f"{identity.reservation_id}.json").exists()
+
+
+@pytest.mark.parametrize("is_cpu", [False, True])
+def test_termination_release_replays_exact_provisional_released_pair(tmp_path: Path, is_cpu: bool) -> None:
+    runtime = _runtime(tmp_path)
+    if is_cpu:
+        initialize_cpu_lane_capacity(runtime.root, capacity=1)
+        record = reserve_cpu(
+            runtime.root,
+            "task-cpu",
+            1,
+            attempt_id="task-cpu-attempt-1",
+            fencing_token=1,
+            project_id="project-a",
+            shared_root="/shared/project-a/.qexp",
+            machine_name="gpu-1",
+            **_owner(),
+        )["reservation"]
+        source_lane, released_lane = "cpu_provisional", "cpu_released"
+    else:
+        record = reserve(
+            runtime.root,
+            "task-gpu",
+            [0],
+            attempt_id="task-gpu-attempt-1",
+            fencing_token=1,
+            project_id="project-a",
+            shared_root="/shared/project-a/.qexp",
+            machine_name="gpu-1",
+            **_owner(),
+        )["reservation"]
+        source_lane, released_lane = "provisional", "released"
+    identity = ReservationIdentity.from_record(record)
+    released = {
+        "reservation": {
+            **record,
+            "state": "released",
+            "released_at": "2026-10-05T00:00:00Z",
+            "release_reason": "local_termination_confirmed",
+        }
+    }
+    paths = local_paths(runtime.root)
+    atomic_replace(paths[released_lane] / f"{identity.reservation_id}.json", released)
+
+    assert release_termination_if_matches(runtime.root, identity, "local_termination_confirmed")
+    assert not (paths[source_lane] / f"{identity.reservation_id}.json").exists()
+    assert (paths[released_lane] / f"{identity.reservation_id}.json").exists()
 
 
 def test_legacy_reservation_identity_matching_remains_backward_compatible(tmp_path: Path) -> None:

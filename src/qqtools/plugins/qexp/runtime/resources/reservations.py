@@ -751,6 +751,46 @@ def release_if_matches(
         return True
 
 
+def release_termination_if_matches(
+    runtime_root: Path,
+    identity: ReservationIdentity,
+    reason: str,
+) -> bool:
+    """Release one exact active or provisional reservation, including replay pairs."""
+    if identity.cpu_slots is not None:
+        from .cpu_lane import release_termination_if_matches as release_cpu_termination_if_matches
+
+        return release_cpu_termination_if_matches(runtime_root, identity, reason)
+    paths = local_paths(runtime_root)
+    with exclusive(paths["locks"] / "gpu-reservations.lock"):
+        filename = f"{identity.reservation_id}.json"
+        active = paths["active"] / filename
+        provisional = paths["provisional"] / filename
+        released = paths["released"] / filename
+        present = [path for path in (active, provisional, released) if path.exists()]
+        if not present:
+            return False
+        records: dict[Path, dict[str, Any]] = {}
+        for path in present:
+            value = read_json(path)
+            reservation = value.get("reservation", {})
+            expected = "active" if path == active else "provisional" if path == provisional else "released"
+            if reservation.get("state") != expected or not identity.exactly_matches(reservation):
+                return False
+            records[path] = value
+        if active.exists() and provisional.exists():
+            return False
+        if released.exists() and not active.exists() and not provisional.exists():
+            return True
+        source = active if active.exists() else provisional
+        value = records[source]
+        reservation = value["reservation"]
+        reservation.update({"state": "released", "released_at": utc_now(), "release_reason": reason})
+        atomic_replace(released, value)
+        source.unlink(missing_ok=True)
+        return True
+
+
 def reserved_gpu_ids(runtime_root: Path) -> set[int]:
     paths = local_paths(runtime_root)
     active = {gpu for value in _reservation_values(paths["active"]) for gpu in value["reservation"]["gpu_ids"]}

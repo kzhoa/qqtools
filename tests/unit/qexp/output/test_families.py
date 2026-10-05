@@ -192,9 +192,82 @@ def test_agent_status_renders_project_io_isolation_only_when_degraded() -> None:
         "human",
     )
 
-    assert "Project I/O isolation" in degraded
-    assert "project-a" in degraded
-    assert "Project I/O isolation" not in healthy
+    assert "Attention required\n  Project I/O isolation status: degraded" in degraded
+    assert "  Blocking projects: project-a" in degraded
+    assert "  Workers (active / overdue / exit unverified): 1 / 1 / 0" in degraded
+    assert "Attention required" not in healthy
+
+
+def test_agent_status_groups_diagnostics_for_human_scanning() -> None:
+    payload = {
+        "action": "status",
+        "machine_runtime_root": "/machine-runtime",
+        "agent_state": "active",
+        "pid": 17,
+        "registry_revision": 0,
+        "projects": [],
+        "upgrade": {"projects": []},
+        "diagnostics": {
+            "instance_id": "current-instance",
+            "state": "available",
+            "log_path": "/tmp/agent.log",
+            "log_available": True,
+            "capture_mode": "detached",
+            "capture_health": "healthy",
+            "summary": {"startup_outcome": "started", "signal_attempts": "none"},
+            "last_exit": {
+                "reason": "stopped_by_signal",
+                "handled_signal": 15,
+                "cleanup_outcome": "succeeded",
+                "instance_id": "previous-instance",
+                "cleanup_steps": {"control_plane_stop": "outcome=succeeded"},
+            },
+            "last_exit_source": "last_exit",
+            "last_exit_stale": True,
+            "coverage": {"evicted_count": 0, "unresolved_evicted_through": 0},
+        },
+        "scheduler_diagnostics": {
+            "schema_version": 1,
+            "status": "available",
+            "coverage": "incomplete",
+            "truncated": False,
+            "reason": "probe_data_unavailable",
+            "observed_at": "2026-10-05T01:42:07Z",
+            "active_count": 0,
+        },
+    }
+
+    rendered = render(CliOutput(OutputKind.AGENT_STATUS, payload), "human")
+
+    assert "Diagnostics\n  State: available\n  Capture: detached\n  Capture health: healthy" in rendered
+    assert "Current startup\n  Startup outcome: started\n  Signal attempts: none" in rendered
+    assert "Previous exit (stale)\n  Source: last_exit\n  Reason: stopped_by_signal" in rendered
+    assert "  Handled signal: 15\n  Cleanup: succeeded\n  Instance: previous-instance" in rendered
+    assert "  Full details: qexp agent status --format json" in rendered
+    assert "Cleanup steps" not in rendered
+    assert "Diagnostic coverage\n  Evicted count: 0\n  Unresolved evicted through: 0" in rendered
+    assert "Scheduling diagnostics\n  State: available\n  Coverage: incomplete" in rendered
+    assert "  Reason: probe_data_unavailable" in rendered
+    assert json.loads(render(CliOutput(OutputKind.AGENT_STATUS, payload), "json")) == payload
+
+
+def test_agent_status_omits_previous_exit_section_without_exit_evidence() -> None:
+    payload = {
+        "action": "status",
+        "machine_runtime_root": "/machine-runtime",
+        "agent_state": "active",
+        "pid": 17,
+        "registry_revision": 0,
+        "projects": [],
+        "upgrade": {"projects": []},
+        "diagnostics": {"state": "available", "last_exit": None, "last_exit_source": None},
+    }
+
+    rendered = render(CliOutput(OutputKind.AGENT_STATUS, payload), "human")
+
+    assert "Diagnostics\n  State: available" in rendered
+    assert "Previous exit" not in rendered
+    assert "Full details" not in rendered
 
 
 def test_standalone_gpu_policy_still_requires_runtime_root() -> None:

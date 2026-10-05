@@ -102,6 +102,28 @@ def _task_page_output(
     return CliOutput(OutputKind.TASK_PAGE, page, presentation)
 
 
+def _group_page_output(
+    cfg: RootConfig,
+    args: argparse.Namespace,
+    page: dict[str, object],
+    page_size: int,
+) -> CliOutput[object]:
+    """Render a Group page with a shell-safe continuation command."""
+    presentation: dict[str, object] = {}
+    next_cursor = page.get("next_cursor")
+    if args.format == "human" and next_cursor is not None:
+        command = ["qexp", "--project", str(cfg.shared_root), "group", "list"]
+        if args.dispatch is not None:
+            command.extend(("--dispatch", args.dispatch))
+        if args.worker_state is not None:
+            command.extend(("--worker-state", args.worker_state))
+        if args.attention:
+            command.append("--attention")
+        command.extend(("--page-size", str(page_size), "--cursor", str(next_cursor)))
+        presentation["continuation_command"] = shlex.join(command)
+    return CliOutput(OutputKind.GROUP_LIST, page, presentation)
+
+
 def _duration_seconds(value: str) -> int:
     matched = re.fullmatch(r"([0-9]+)([smh])", value)
     if not matched:
@@ -502,8 +524,19 @@ def dispatch_project(
             kind = OutputKind.GROUP_STATE_CHANGE
             result = {"action": "create", "outcome": "completed", **result}
         elif handler == "group_list":
-            result = observer.list_groups(cfg)
-            kind = OutputKind.GROUP_LIST
+            page_size = _parse_page_size(args.page_size)
+            try:
+                result = observer.list_groups_page(
+                    cfg,
+                    page_size=page_size,
+                    cursor=args.cursor,
+                    dispatch=args.dispatch,
+                    worker_state=args.worker_state,
+                    attention=args.attention,
+                )
+            except ValueError as exc:
+                raise ObservationError("invalid_argument", str(exc), 2) from exc
+            return CommandOutcome(0, _group_page_output(cfg, args, result, page_size))
         elif handler == "group_show":
             result = group_commands.show_group(cfg, args.name)
             kind = OutputKind.GROUP_SHOW

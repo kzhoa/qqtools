@@ -52,6 +52,14 @@ def _details(*sections: Sequence[tuple[str, Any]]) -> str:
     return "\n\n".join(rendered_sections)
 
 
+def _section(title: str, fields: Sequence[tuple[str, Any]]) -> str:
+    """Render one titled, indented human-facing detail section."""
+    body = _details(fields)
+    if not body:
+        return ""
+    return f"{title}\n" + "\n".join(f"  {line}" for line in body.splitlines())
+
+
 def _operation(action: Any, status: Any, fields: Sequence[tuple[str, Any]]) -> str:
     return _details((("Action", action), ("Status", status), *fields))
 
@@ -122,6 +130,7 @@ __all__ = [
     "_required_int",
     "_required_mapping",
     "_required_sequence",
+    "_section",
     "_sequence",
     "_table",
     "_task_summary",

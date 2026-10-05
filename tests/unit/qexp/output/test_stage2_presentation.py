@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 from qqtools.plugins.qexp.cli.output import CliOutput, OutputKind, render
 
 
@@ -37,13 +39,43 @@ def test_task_list_prioritizes_daily_fields_and_stays_terminal_width() -> None:
 
 def test_empty_inventory_messages_are_resource_specific() -> None:
     assert "No Tasks" in _human(OutputKind.TASK_LIST, [])
-    assert "No Groups" in _human(OutputKind.GROUP_LIST, [])
+    assert "No Groups" in _human(
+        OutputKind.GROUP_LIST,
+        {"items": [], "next_cursor": None, "consistency": "live", "stop_reason": "exhausted"},
+    )
     projects = _human(
         OutputKind.PROJECT_LIST,
         {"revision": 0, "inventory_revision": 0, "registry_revision": 0, "projects": []},
     )
     assert "No enrolled Projects" in projects
     assert "qexp project register PATH" in projects
+
+
+def test_group_page_renders_stop_reason_and_continuation() -> None:
+    payload = {
+        "items": [
+            {
+                "group": {
+                    "name": "experiment",
+                    "admission_state": "open",
+                    "dispatch_state": "active",
+                    "worker_set": {"gpu-1": {"state": "active"}},
+                }
+            }
+        ],
+        "next_cursor": "opaque-token",
+        "consistency": "live",
+        "stop_reason": "page_full",
+    }
+    output = render(
+        CliOutput(OutputKind.GROUP_LIST, payload, {"continuation_command": "qexp group list --cursor opaque-token"}),
+        "human",
+    )
+
+    assert "experiment" in output
+    assert "Stop reason: page_full" in output
+    assert "Continue with: qexp group list --cursor opaque-token" in output
+    assert json.loads(render(CliOutput(OutputKind.GROUP_LIST, payload), "json")) == payload
 
 
 def test_wait_timeout_omits_irrelevant_terminal_rows_and_states_no_mutation() -> None:
@@ -141,6 +173,24 @@ def test_machine_list_and_show_are_bounded_sections_not_mapping_dumps() -> None:
     assert "{'" not in detail
 
 
+def test_machine_list_does_not_present_stale_gpu_observations_as_free_capacity() -> None:
+    stale = {
+        "machine": {"machine_name": "gpu-stale"},
+        "state": {
+            "freshness": "stale",
+            "agent": {"agent": {"observed_state": "idle"}},
+            "gpu": {"gpu": {"free_gpu_ids": [7], "reserved_gpu_ids": []}},
+        },
+    }
+
+    output = _human(OutputKind.MACHINES, [stale])
+    row = output.splitlines()[-1]
+
+    assert "gpu-stale" in row
+    assert "  7  " not in row
+    assert "resource observation is not current" in row
+
+
 def test_restart_reports_process_replacement_and_pending_readiness() -> None:
     output = _human(
         OutputKind.AGENT_OPERATION,
@@ -208,6 +258,63 @@ def test_task_show_selects_the_authoritative_attempt_not_lexicographic_tail() ->
 
     assert "Current Attempt: 10" in output
     assert "Exit code: 10" in output
+    assert all(section in output for section in ("Task\n", "Execution\n", "Configuration\n", "Progress\n", "Command\n"))
+    assert output.index("State: failed") < output.index("Command\n")
+    assert output.endswith("python train.py")
+
+
+def test_group_show_highlights_abnormal_state_and_existing_operations() -> None:
+    output = _human(
+        OutputKind.GROUP_SHOW,
+        {
+            "group": {
+                "name": "experiment",
+                "admission_state": "open",
+                "dispatch_state": "paused",
+                "worker_set": {
+                    "gpu-1": {"state": "active"},
+                    "gpu-2": {"state": "removing"},
+                },
+            },
+            "cancellation_operation": {"operation_id": "cancel-1", "state": "completed"},
+            "worker_control": {
+                "operation_id": "remove-1",
+                "state": "completed",
+                "machine_name": "gpu-2",
+            },
+        },
+    )
+
+    assert "Attention required\n  Dispatch: paused\n  Workers: gpu-2=removing" in output
+    assert "Recent operations\n  Cancellation: cancel-1 (completed)" in output
+    assert "Worker control: remove-1 (completed; gpu-2)" in output
+
+
+def test_project_status_groups_state_actions_and_scheduler_diagnostics() -> None:
+    payload = {
+        "status": "complete",
+        "project": {"path": "/work/project", "project_id": "project-1", "selection_source": "explicit"},
+        "local_participation": {"state": "registered"},
+        "local_agent": {"state": "active", "configured_mode": "on_demand"},
+        "task_observation": {"state": "absent", "reason": "projection_missing"},
+        "next_actions": ["qexp task list --project /work/project", "qexp machine list --project /work/project"],
+        "scheduler_diagnostics": {
+            "status": "available",
+            "coverage": "incomplete",
+            "observed_at": "2026-10-05T00:00:00Z",
+            "active_count": 0,
+            "reason": "probe_data_unavailable",
+        },
+    }
+
+    output = _human(OutputKind.STATUS, payload)
+
+    assert "Project\n  Outcome: complete\n  Path: /work/project" in output
+    assert "Current state\n  Participation: registered" in output
+    assert "Task observation reason: projection missing" in output
+    assert output.count("  Run: qexp") == 2
+    assert "Scheduling diagnostics\n  State: available\n  Coverage: incomplete" in output
+    assert "Reason: probe data unavailable" in output
 
 
 def test_agent_status_counts_write_eligible_projects_without_false_blockers() -> None:

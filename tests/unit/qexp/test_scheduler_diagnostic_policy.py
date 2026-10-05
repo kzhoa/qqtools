@@ -132,16 +132,17 @@ def test_publication_policy_preserves_order_defaults_and_explicit_malformed_find
     ]
 
 
-def test_publication_policy_stops_after_first_three_mapping_probes() -> None:
-    raw = tuple({"identity": _decision_identity(lane=f"gpu_{index}"), "coverage": "complete"} for index in range(4))
+def test_publication_policy_stops_after_first_four_mapping_probes() -> None:
+    raw = tuple({"identity": _decision_identity(lane=f"gpu_{index}"), "coverage": "complete"} for index in range(5))
 
     selected = list(iter_publication_probes(raw))
 
-    assert len(selected) == 3
+    assert len(selected) == 4
     assert [probe.decision.identity["resource_lane"] for probe in selected if probe.decision is not None] == [
         "gpu_0",
         "gpu_1",
         "gpu_2",
+        "gpu_3",
     ]
 
 

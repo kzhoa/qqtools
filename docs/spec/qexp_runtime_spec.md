@@ -3661,6 +3661,30 @@ Every qexp-initiated signal has a local durable decision under
 `termination-decisions/<attempt-id>/<decision-id>.json`. Its irreversible sequence is
 `pending -> signal_committed -> sigterm_sent -> sigkill_sent -> confirmed`.
 
+The process manifest's `observed_exit_code` is the subprocess wait result, not a termination
+marker. Its permanent type is `int | null`: exact integers, including zero, positive failures, and
+negative signal results, are retained; `null` means only that no trustworthy wait result is
+available. Boolean, floating-point, string, and container values are invalid. The separate
+termination-decision field with the same name remains nullable decision metadata and is not the
+process exit result or convergence authority.
+
+Restart readiness and authority retirement classify each durable termination decision as
+`converged`, `repairable`, or `invalid`. Convergence requires one exact confirmed and committed
+decision, an `identity_absent | process_absent` confirmation, an exited manifest with a valid UTC
+timestamp and valid exit result, absent recorded process-group and registered wrapper identities,
+an exact immutable registration, a matching immutable exit observation when one exists, and either
+no assigned reservation or one exact released GPU or CPU reservation. An exact active or
+provisional reservation, an incomplete manifest, or a decision still progressing through its
+monotonic state machine is repairable. Malformed, contradictory, stale, identity-mismatched, or
+conflicting reservation evidence is invalid and keeps readiness closed.
+
+Repair authority follows the classification. A decision that is not confirmed may advance only
+through the existing decision state machine. Only an exact confirmed decision may complete the
+manifest and release its exact owned reservation, under the evidence and Attempt control locks
+with fresh identity and fencing checks. Completing those effects preserves any known integer exit
+result. Filesystem or process-inspection unavailability, lock contention, and ambiguous writes are
+deferred execution outcomes; they do not create an invalid evidence classification and are retried.
+
 Only agent or a doctor holding the local Attempt control lock may issue a qexp signal. The runner's
 `wait()` result is an exit observation only; it never confirms a termination decision. `confirmed`
 is written only after the recorded PGID and start-time identity is absent. For normal authority

@@ -25,6 +25,32 @@ from .primitives import (
 CpuLanePayload = Mapping[str, Any]
 
 
+def _status_section(title: str, fields: Sequence[tuple[str, Any]]) -> str:
+    """Render an indented section for human-readable agent status."""
+    details = _details(fields)
+    if not details:
+        return ""
+    return f"{title}\n" + "\n".join(f"  {line}" for line in details.splitlines())
+
+
+def _status_mapping_fields(value: Any) -> list[tuple[str, Any]]:
+    """Expand a diagnostic mapping into readable status fields."""
+    if not isinstance(value, Mapping):
+        return []
+    fields: list[tuple[str, Any]] = []
+    for key, item in value.items():
+        label = str(key).replace("_", " ").capitalize()
+        if label.endswith(" id"):
+            label = f"{label[:-3]} ID"
+        if isinstance(item, Mapping):
+            for nested_key, nested_item in item.items():
+                nested_label = str(nested_key).replace("_", " ").capitalize()
+                fields.append((f"{label} / {nested_label}", nested_item))
+        else:
+            fields.append((label, item))
+    return fields
+
+
 def _project_readiness(project: Mapping[str, Any]) -> tuple[bool, Any, Any]:
     """Return the ready decision, displayed state, and actionable reason."""
     status = project.get("status")
@@ -102,60 +128,81 @@ def _render_agent_status(result: Mapping[str, Any], _presentation: Mapping[str, 
         rendered = f"{rendered}\n\nStop reason: {result.get('stop_reason')}"
     project_io = result.get("project_io_isolation")
     if isinstance(project_io, Mapping) and project_io.get("envelope") != "healthy":
-        project_io_details = _details(
+        project_io_details = _status_section(
+            "Attention required",
             (
-                ("Project I/O isolation", project_io.get("envelope")),
+                ("Project I/O isolation status", project_io.get("envelope")),
+                ("Blocking projects", project_io.get("blocking_project_ids")),
+                ("Oldest overdue request", project_io.get("oldest_overdue_at")),
+                ("Free executor slots", project_io.get("free_slot_count")),
                 ("Executor epoch", project_io.get("executor_epoch")),
                 (
-                    "Workers active / overdue / exit-unverified",
+                    "Workers (active / overdue / exit unverified)",
                     f"{project_io.get('active_worker_count')} / {project_io.get('overdue_worker_count')} / "
                     f"{project_io.get('exit_unverified_worker_count')}",
                 ),
                 ("Unreaped workers", project_io.get("unreaped_worker_count")),
-                ("Free executor slots", project_io.get("free_slot_count")),
-                ("Oldest overdue request", project_io.get("oldest_overdue_at")),
-                ("Blocking Projects", project_io.get("blocking_project_ids")),
-            )
+            ),
         )
         if project_io_details:
             rendered = f"{rendered}\n\n{project_io_details}" if rendered else project_io_details
     diagnostics = result.get("diagnostics")
     if isinstance(diagnostics, Mapping):
-        diagnostic_details = _details(
-            (
-                ("Diagnostic instance", diagnostics.get("instance_id")),
-                ("Diagnostics state", diagnostics.get("state")),
-                ("Diagnostic log", diagnostics.get("log_path")),
-                ("Persistent log available", diagnostics.get("log_available")),
+        last_exit = diagnostics.get("last_exit")
+        last_exit = last_exit if isinstance(last_exit, Mapping) else {}
+        diagnostic_sections = [
+            _status_section(
+                "Diagnostics",
                 (
-                    "Configured log rotation",
-                    diagnostics.get("configured_log_max_size", diagnostics.get("configured_log_max_bytes")),
+                    ("State", diagnostics.get("state")),
+                    ("Capture", diagnostics.get("capture_mode")),
+                    ("Capture health", diagnostics.get("capture_health")),
+                    ("Log", diagnostics.get("log_path")),
+                    ("Persistent log available", diagnostics.get("log_available")),
+                    ("Instance", diagnostics.get("instance_id")),
+                    (
+                        "Log rotation (configured)",
+                        diagnostics.get("configured_log_max_size", diagnostics.get("configured_log_max_bytes")),
+                    ),
+                    (
+                        "Log rotation (effective)",
+                        diagnostics.get("effective_log_max_size", diagnostics.get("effective_log_max_bytes")),
+                    ),
                 ),
+            ),
+            _status_section("Current startup", _status_mapping_fields(diagnostics.get("summary"))),
+            _status_section(
+                "Previous exit (stale)" if diagnostics.get("last_exit_stale") else "Previous exit",
                 (
-                    "Effective log rotation",
-                    diagnostics.get("effective_log_max_size", diagnostics.get("effective_log_max_bytes")),
+                    ("Source", diagnostics.get("last_exit_source")),
+                    ("Reason", last_exit.get("reason")),
+                    ("Handled signal", last_exit.get("handled_signal")),
+                    ("Cleanup", last_exit.get("cleanup_outcome")),
+                    ("Instance", last_exit.get("instance_id")),
+                    (
+                        "Full details",
+                        "qexp agent status --format json"
+                        if last_exit or diagnostics.get("last_exit_source") is not None
+                        else None,
+                    ),
                 ),
-                ("Capture mode", diagnostics.get("capture_mode")),
-                ("Capture health", diagnostics.get("capture_health")),
-                ("Current diagnostic summary", diagnostics.get("summary")),
-                ("Last exit", diagnostics.get("last_exit")),
-                ("Last exit source", diagnostics.get("last_exit_source")),
-                ("Diagnostic coverage", diagnostics.get("coverage")),
-                ("Last exit stale", diagnostics.get("last_exit_stale")),
-            )
-        )
+            ),
+            _status_section("Diagnostic coverage", _status_mapping_fields(diagnostics.get("coverage"))),
+        ]
+        diagnostic_details = "\n\n".join(section for section in diagnostic_sections if section)
         if diagnostic_details:
             rendered = f"{rendered}\n\n{diagnostic_details}" if rendered else diagnostic_details
     scheduler = result.get("scheduler_diagnostics")
     if isinstance(scheduler, Mapping):
-        scheduler_details = _details(
+        scheduler_details = _status_section(
+            "Scheduling diagnostics",
             (
-                ("Scheduling diagnostics", scheduler.get("status")),
-                ("Scheduling coverage", scheduler.get("coverage")),
-                ("Scheduling observed", scheduler.get("observed_at")),
-                ("Active scheduling findings", scheduler.get("active_count")),
-                ("Scheduling reason", scheduler.get("reason")),
-            )
+                ("State", scheduler.get("status")),
+                ("Coverage", scheduler.get("coverage")),
+                ("Observed", scheduler.get("observed_at")),
+                ("Active findings", scheduler.get("active_count")),
+                ("Reason", scheduler.get("reason")),
+            ),
         )
         if scheduler_details:
             rendered = f"{rendered}\n\n{scheduler_details}" if rendered else scheduler_details

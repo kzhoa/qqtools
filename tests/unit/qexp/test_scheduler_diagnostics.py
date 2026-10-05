@@ -14,6 +14,7 @@ from qqtools.plugins.qexp.agent.dispatch_loop import (
     PrimaryDemandProbe,
     _enablement_reconciliation_probe,
     _scheduler_diagnostic_probe,
+    _termination_convergence_probe,
 )
 from qqtools.plugins.qexp.agent.inventory import InventoryReconciliation, ProjectInventoryEntry
 from qqtools.plugins.qexp.agent.scheduler_diagnostics import SchedulerDiagnosticStore
@@ -90,6 +91,65 @@ def test_unresolved_primary_probe_records_borrow_blocking_decision_without_dupli
     assert diagnostic["source_revision"] == {"registry_revision": 7}
     assert diagnostic["coverage"] == "incomplete"
     assert [item["identity"]["reason_code"] for item in diagnostic["findings"]] == ["ready_index_unreadable"]
+
+
+def test_termination_convergence_finding_is_bounded_and_resolves(tmp_path: Path) -> None:
+    runtime = MachineRuntime(tmp_path / "machine-runtime")
+    binding = ProjectBinding(
+        project_id="project-a",
+        shared_root=tmp_path / "project" / ".qexp",
+        machine_name="gpu-1",
+        registration_generation="registration-1",
+        runtime_instance_id=runtime.instance_id,
+        runtime_root=str(runtime.root),
+    )
+
+    class Coordinator:
+        findings: tuple[dict[str, object], ...] = (
+            {
+                "project_id": binding.project_id,
+                "registration_generation": binding.registration_generation,
+                "attempt_id": "task-a-attempt-1",
+                "state": "invalid",
+                "reason": "termination_exit_observation_mismatch",
+            },
+        )
+
+        def read_termination_convergence_diagnostics(self, *_args, **_kwargs):
+            return self.findings
+
+    coordinator = Coordinator()
+    blocked_probe = _termination_convergence_probe(runtime, coordinator, [binding], 9)
+    finding = blocked_probe["findings"][0]
+
+    assert finding["identity"] == {
+        "producer": "termination_convergence",
+        "reason_code": "termination_exit_observation_mismatch",
+        "component": "scheduler",
+        "stage": "reconciliation",
+        "check": "termination_convergence",
+        "scope_type": "project_attempt",
+        "runtime_id": runtime.instance_id,
+        "project_id": binding.project_id,
+        "registration_generation": binding.registration_generation,
+        "attempt_id": "task-a-attempt-1",
+        "registry_revision": 9,
+    }
+    assert finding["details"] == {
+        "diagnostic_code": "termination_exit_observation_mismatch",
+        "progress": "invalid",
+    }
+
+    store = SchedulerDiagnosticStore(runtime)
+    store.publish_cycle({}, {}, (blocked_probe,), {}, observed_at="2026-09-28T00:00:00Z")
+    active = store.active_view(producer="termination_convergence")
+    assert active["total"] == 1
+    assert active["items"][0]["identity"]["attempt_id"] == "task-a-attempt-1"
+
+    coordinator.findings = ()
+    converged_probe = _termination_convergence_probe(runtime, coordinator, [binding], 9)
+    assert store.reconcile_cycle((converged_probe,), resolved_at="2026-09-28T00:01:00Z")
+    assert store.active_view(producer="termination_convergence")["items"] == []
 
 
 def test_enablement_reconciliation_finding_coalesces_and_resolves_after_exact_convergence(

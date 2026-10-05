@@ -1,7 +1,7 @@
 ---
 doc_type: spec
 status: active
-updated_at: 2026-09-29
+updated_at: 2026-10-05
 archived_at:
 ---
 
@@ -1825,6 +1825,17 @@ separate `Scheduling diagnostics` section. Project status reads only the selecte
 binding summary within its existing bounded-read budget. Agent status reads only
 the machine summary and never enumerates dormant Project truth.
 
+Termination restart findings use this bounded scheduling-diagnostics channel. Human and JSON
+views expose a stable reason plus Project and Attempt identity; they do not include commands,
+environment values, process records, or unbounded stored content. Stable reasons include
+`termination_exit_code_invalid`, `termination_exit_observation_mismatch`,
+`termination_process_identity_present`, `termination_reservation_release_pending`, and
+`termination_reservation_conflict`. Release pending is repairable and remains visible until the
+guarded idempotent effect settles. Invalid evidence remains visible and keeps that Project in
+`authority_recovering`; temporary read, identity-inspection, lock, or ambiguous-write failures are
+reported as unavailable or deferred work rather than persisted as invalid evidence. These
+diagnostics are derived observations and grant no repair, signal, release, or claim authority.
+
 ## 15. Product Boundaries
 
 ### 15.1 One Shared Root Per Project
@@ -2192,6 +2203,26 @@ retry. It performs direct bounded Task, selected-Attempt, and dependency reads. 
 - `qexp group cancel`
 - `qexp group retry`
 - `qexp group worker list | add | set | drain | resume | remove`
+
+`qexp group list` returns one Group-name-ascending live page and defaults to 50
+Groups. `--page-size N` accepts 1–1000 and `--cursor TOKEN` continues a prior
+page. JSON contains `items`, `next_cursor`, `consistency: "live"`, and
+`stop_reason` (`page_full` or `exhausted`). Cursors are opaque and bind the
+selected filters; changing a filter requires restarting without a cursor.
+
+Compatibility decision (2026-10-05): the default human result changes from an
+unbounded table to the first bounded page, and the default JSON result changes
+from a bare array to the page object above. This is an intentional permanent
+CLI contract change approved to prevent unbounded status output; JSON callers
+read `items` and follow `next_cursor` until it is null. No legacy output mode or
+temporary compatibility shim is retained.
+
+`--dispatch active|paused` selects one dispatch state, while `--worker-state
+active|draining|removing` selects Groups containing at least one matching
+worker. `--attention` selects Groups with paused dispatch, a non-active worker,
+a pending submission commit, or a recorded reason.
+Filters combine by intersection. Human pages with more results print a
+shell-safe continuation command.
 
 ### 16.4 Agent Commands
 

@@ -357,6 +357,68 @@ def _scheduler_diagnostic_probe(
     }
 
 
+def _termination_convergence_probe(
+    runtime: MachineRuntime,
+    coordinator: AttemptSupervisionCoordinator,
+    bindings: Sequence[ProjectBinding],
+    registry_revision: int,
+) -> dict[str, object]:
+    """Translate bounded termination convergence results into derived diagnostics."""
+    source_revision = {"registry_revision": registry_revision}
+    raw_findings = coordinator.read_termination_convergence_diagnostics(bindings, registry_revision)
+    findings: list[dict[str, object]] = []
+    for raw in raw_findings:
+        identity = {
+            "producer": "termination_convergence",
+            "reason_code": raw["reason"],
+            "component": "scheduler",
+            "stage": "reconciliation",
+            "check": "termination_convergence",
+            "scope_type": "project_attempt",
+            "runtime_id": runtime.instance_id,
+            "project_id": raw["project_id"],
+            "registration_generation": raw["registration_generation"],
+            "attempt_id": raw["attempt_id"],
+            "registry_revision": registry_revision,
+        }
+        findings.append(
+            {
+                "identity": identity,
+                "severity": "fault" if raw["state"] == "invalid" else "wait",
+                "source_revision": source_revision,
+                "details": {
+                    "diagnostic_code": raw["reason"],
+                    "progress": raw["state"],
+                },
+            }
+        )
+    is_converged = not findings
+    return {
+        "identity": {
+            "producer": "termination_convergence",
+            "reason_code": ("termination_convergence_complete" if is_converged else "termination_convergence_pending"),
+            "component": "scheduler",
+            "stage": "reconciliation",
+            "check": "termination_convergence",
+            "scope_type": "machine",
+            "runtime_id": runtime.instance_id,
+            "registry_revision": registry_revision,
+        },
+        "outcome": "converged" if is_converged else "blocked",
+        "coverage": "complete",
+        "source_revision": source_revision,
+        "details": {"progress": "converged" if is_converged else "blocked"},
+        "findings": findings,
+        "covered_bindings": [
+            {
+                "project_id": binding.project_id,
+                "registration_generation": binding.registration_generation,
+            }
+            for binding in bindings
+        ],
+    }
+
+
 @dataclass(frozen=True, slots=True)
 class _PendingLaunchHandoff:
     cfg: RootConfig
@@ -1584,7 +1646,20 @@ def _dispatch_isolated_machine_cycle(
     }
     for binding in validated_bindings:
         if binding.project_id not in authority_ready:
-            result_by_project[binding.project_id]["status"] = "authority_recovering"
+            item = result_by_project[binding.project_id]
+            item["status"] = "authority_recovering"
+            diagnostics = coordinator.read_termination_convergence_diagnostics(
+                [binding],
+                registry_revision,
+                limit=1,
+            )
+            if diagnostics:
+                diagnostic = diagnostics[0]
+                item["termination_convergence"] = {
+                    "state": diagnostic["state"],
+                    "reason": diagnostic["reason"],
+                    "attempt_id": diagnostic["attempt_id"],
+                }
     validated_bindings = [binding for binding in validated_bindings if binding.project_id in authority_ready]
     binding_by_project = {binding.project_id: binding for binding in validated_bindings}
     blocked_projects = set(runtime.upgrade_admission_blocked_projects)
@@ -1984,7 +2059,18 @@ def _dispatch_isolated_machine_cycle(
     if getattr(runtime, "pending_launch_handoffs", {}):
         runtime.last_cycle_had_demand = True
     runtime.last_cycle_validated_project_ids = frozenset(validated_configs)
-    runtime.last_scheduler_diagnostic_probes = ()
+    diagnostic_probes: list[dict[str, object]] = []
+    if runtime.last_enablement_reconciliation_probe is not None:
+        diagnostic_probes.append(runtime.last_enablement_reconciliation_probe)
+    diagnostic_probes.append(
+        _termination_convergence_probe(
+            runtime,
+            coordinator,
+            reconciliation_bindings,
+            registry_revision,
+        )
+    )
+    runtime.last_scheduler_diagnostic_probes = tuple(diagnostic_probes)
     return results
 
 

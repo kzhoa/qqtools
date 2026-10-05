@@ -577,7 +577,20 @@ def build_parser() -> argparse.ArgumentParser:
         modes=OutputMode.FINITE,
         output_kinds=OutputKind.GROUP_STATE_CHANGE,
     )
-    group_list = group_sub.add_parser("list", help="List Groups in the selected Project.")
+    group_list = group_sub.add_parser("list", help="List one bounded page of Groups in the selected Project.")
+    group_list.add_argument("--page-size", default=None, help="Groups per page, from 1 through 1000 (default: 50).")
+    group_list.add_argument("--cursor", help="Opaque continuation cursor from a previous Group page.")
+    group_list.add_argument("--dispatch", choices=("active", "paused"), help="Select one dispatch state.")
+    group_list.add_argument(
+        "--worker-state",
+        choices=("active", "draining", "removing"),
+        help="Select Groups containing a worker in this state.",
+    )
+    group_list.add_argument(
+        "--attention",
+        action="store_true",
+        help="Select Groups with paused dispatch, non-active workers, pending submission, or a reason.",
+    )
     _add_output_format(group_list)
     bind_command(
         group_list,

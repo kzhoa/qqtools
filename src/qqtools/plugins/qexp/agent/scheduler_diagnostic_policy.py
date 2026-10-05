@@ -36,6 +36,7 @@ _IDENTITY_FIELDS = frozenset(
         "sequence_end",
         "registry_revision",
         "ready_revision",
+        "attempt_id",
     }
 )
 
@@ -171,7 +172,7 @@ def _iter_probe_mappings(
             continue
         yield value
         accepted += 1
-        if accepted >= 3:
+        if accepted >= 4:
             break
 
 
@@ -225,7 +226,7 @@ def _publication_probe(probe: Mapping[str, object]) -> PublicationProbe:
 def iter_publication_probes(
     probes: Sequence[Mapping[str, object]] | Mapping[str, object] | None,
 ) -> Iterator[PublicationProbe]:
-    """Lazily normalize at most the first three mapping probes."""
+    """Lazily normalize at most the first four mapping probes."""
     for probe in _iter_probe_mappings(probes):
         yield _publication_probe(probe)
 
@@ -254,6 +255,7 @@ def resolution_queries(
     normalized = tuple(_iter_probe_mappings(probes))
     complete_lanes: list[Mapping[str, object]] = []
     complete_enablement: list[Mapping[str, object]] = []
+    complete_termination: list[Mapping[str, object]] = []
     current_digests: set[str] = set()
     for probe in normalized:
         identity = probe.get("identity")
@@ -274,6 +276,8 @@ def resolution_queries(
             complete_lanes.append(probe)
         if identity.get("producer") == "enablement_reconciliation" and isinstance(runtime_id, str):
             complete_enablement.append(probe)
+        if identity.get("producer") == "termination_convergence" and isinstance(runtime_id, str):
+            complete_termination.append(probe)
     plans: list[ResolutionQuery] = []
     if complete_enablement:
         plans.append(
@@ -288,6 +292,14 @@ def resolution_queries(
             ResolutionQuery(
                 producer="primary_probe",
                 probes=tuple(complete_lanes),
+                current_finding_digests=frozenset(current_digests),
+            )
+        )
+    if complete_termination:
+        plans.append(
+            ResolutionQuery(
+                producer="termination_convergence",
+                probes=tuple(complete_termination),
                 current_finding_digests=frozenset(current_digests),
             )
         )
@@ -344,7 +356,7 @@ def _matching_probe(
     *,
     lane: str | None,
 ) -> Mapping[str, object] | None:
-    if query.producer == "enablement_reconciliation":
+    if query.producer in {"enablement_reconciliation", "termination_convergence"}:
         return None
     selected: Mapping[str, object] | None = None
     for probe in query.probes:
@@ -398,6 +410,14 @@ def select_resolution_candidate(
         if diagnostic_identity_digest(identity) in query.current_finding_digests:
             continue
         if query.producer == "enablement_reconciliation":
+            for probe in query.probes:
+                if not _valid_resolution_probe(probe):
+                    continue
+                candidate = _matches_candidate(item, probe)
+                if candidate is not None:
+                    return candidate
+            continue
+        if query.producer == "termination_convergence":
             for probe in query.probes:
                 if not _valid_resolution_probe(probe):
                     continue

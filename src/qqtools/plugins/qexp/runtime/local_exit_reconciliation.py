@@ -9,7 +9,12 @@ from .authority_scan import EvidenceScan
 from .paths import local_paths
 from .process_evidence import inspect_group_identity
 from .records import utc_now
-from .resources.reservations import ReservationIdentity, release_if_matches, reservation_snapshot
+from .resources.reservations import (
+    ReservationIdentity,
+    release_if_matches,
+    release_termination_if_matches,
+    reservation_snapshot,
+)
 from .store import atomic_replace, iter_json, read_json
 
 
@@ -213,12 +218,12 @@ class LocalExitReconciler:
                 state, identity = matches[0]
             elif (
                 len(matches) == 2
-                and {state for state, _identity in matches} == {"active", "released"}
+                and {state for state, _identity in matches} in ({"active", "released"}, {"provisional", "released"})
                 and matches[0][1] == matches[1][1]
             ):
                 # Exact duplicate locations are the recoverable boundary after
-                # released truth was replaced but before active truth was unlinked.
-                state = "active"
+                # released truth was replaced but before source truth was unlinked.
+                state = next(state for state, _identity in matches if state != "released")
                 identity = matches[0][1]
             else:
                 return False
@@ -230,11 +235,9 @@ class LocalExitReconciler:
                 or identity.fencing_token != process.get("fencing_token")
             ):
                 return False
-            if state == "released":
-                return True
-            if state != "active":
+            if state not in {"active", "provisional", "released"}:
                 return False
-            return release_if_matches(
+            return release_termination_if_matches(
                 self.reservation_runtime_root,
                 identity,
                 "local_termination_confirmed",
