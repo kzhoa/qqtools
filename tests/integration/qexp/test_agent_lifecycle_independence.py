@@ -23,6 +23,7 @@ from qqtools.plugins.qexp.agent.lifecycle import (
 )
 from qqtools.plugins.qexp.agent.project_io_executor import ProjectIOExecutor
 from qqtools.plugins.qexp.agent.setup import initialize_machine, register_projects
+from qqtools.plugins.qexp.commands.group import change_worker, create_group
 from qqtools.plugins.qexp.config_types import RootConfig
 from qqtools.plugins.qexp.layout import machine_state_path
 from qqtools.plugins.qexp.runtime.paths import attempt_path, local_paths, machine_runtime_paths, shared_paths
@@ -34,7 +35,8 @@ from qqtools.plugins.qexp.runtime.tasks import load_task
 from qqtools.plugins.qexp.scheduler import expire_claim
 from qqtools.plugins.qexp.tmux import is_libtmux_available
 from tests.fixtures.qexp_legacy_ownership import persist_legacy_orphan
-from tests.helpers.qexp.lifecycle import LifecycleBranch, LifecycleLab, wait_all
+from tests.helpers.qexp.lifecycle import LifecycleBranch, LifecycleDeadline, LifecycleLab, wait_all
+from tests.helpers.qexp.resources import TestResourceScope
 from tests.helpers.qexp.worker_diagnostics import describe_project_io_workers
 
 pytestmark = [pytest.mark.integration, pytest.mark.machine_lab]
@@ -736,6 +738,137 @@ def _cleanup(runtime: MachineRuntime, process: subprocess.Popen) -> None:
         if process.poll() is None:
             process.kill()
     process.wait(timeout=5)
+
+
+def test_stopped_home_task_is_offered_and_executed_by_only_helper_agent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = tmp_path / "project"
+    cfg = init_shared_root(project / ".qexp", "g2", runtime_root=tmp_path / "bootstrap")
+    create_group(cfg, "elapsed")
+    change_worker(cfg, "elapsed", "g8", "add")
+    home_scope = TestResourceScope.create(tmp_path / "hosts", "g2")
+    helper_scope = TestResourceScope.create(tmp_path / "hosts", "g8")
+    home_runtime = MachineRuntime(home_scope.runtime_root)
+    initialize_machine(home_runtime, "g2", agent_mode="daemon")
+    register_projects(home_runtime, [cfg.shared_root], machine_name="g2")
+    helper_runtime = MachineRuntime(helper_scope.runtime_root)
+    initialize_machine(helper_runtime, "g8", agent_mode="daemon")
+    register_projects(helper_runtime, [cfg.shared_root], machine_name="g8")
+    home_lab = LifecycleLab(home_runtime, [0])
+    helper_lab = LifecycleLab(helper_runtime, [0])
+    marker = tmp_path / "helper-executed"
+    started = marker.with_suffix(".started")
+    finish = marker.with_suffix(".finish")
+
+    def start_host(lab, scope):
+        # Independent TMPDIR/HOME simulate separate hosts before child import,
+        # including separate machine-wide scheduler authority locks.
+        with monkeypatch.context() as patch:
+            environment = scope.child_environment()
+            for name in (
+                "TMPDIR",
+                "TMP",
+                "TEMP",
+                "HOME",
+                "XDG_CACHE_HOME",
+                "XDG_CONFIG_HOME",
+                "XDG_DATA_HOME",
+                "TMUX_TMPDIR",
+                "QEXP_MACHINE_RUNTIME_ROOT",
+            ):
+                patch.setenv(name, environment[name])
+            process = lab.start_agent()
+        scope.record_resource("participant", {"pid": process.pid, "process_group_id": process.pid})
+
+    try:
+        startup_deadline = LifecycleDeadline.after(30)
+        start_host(home_lab, home_scope)
+        start_host(helper_lab, helper_scope)
+        wait_all(
+            {
+                "group-authority-active": lambda: (
+                    get_machine_agent_status(helper_runtime)["projects"][0]["group_authority"]["state"] == "active"
+                ),
+                "home-recovery-captured": lambda: (
+                    get_machine_agent_status(home_runtime)["projects"][0]["recovery_capture"]["state"] == "captured"
+                ),
+                "helper-recovery-captured": lambda: (
+                    get_machine_agent_status(helper_runtime)["projects"][0]["recovery_capture"]["state"] == "captured"
+                ),
+            },
+            deadline=startup_deadline,
+            stage="initial-registration-preparation",
+        )
+        home_lab.stop_agent()
+        helper_lab.stop_agent()
+        assert not get_machine_agent_status(home_runtime)["is_running"]
+        task = submit(
+            cfg,
+            [
+                sys.executable,
+                "-c",
+                "from pathlib import Path\nimport time\n"
+                f"started=Path({str(started)!r})\n"
+                "started.write_text(str(int(started.read_text()) + 1) if started.exists() else '1')\n"
+                "deadline=time.monotonic()+60\n"
+                f"while not Path({str(finish)!r}).exists():\n"
+                "    if time.monotonic()>deadline: raise SystemExit(99)\n"
+                "    time.sleep(0.01)\n"
+                f"Path({str(marker)!r}).write_text('executed')\n",
+            ],
+            working_dir=project,
+            group="elapsed",
+            sharing_mode="spillover",
+            offer_after_seconds=0,
+        )
+        assert task.placement_runtime["queue_scope"] == "home"
+        helper_lab.add_branch(LifecycleBranch("elapsed", cfg, task, started))
+        launch_deadline = LifecycleDeadline.after(30)
+        start_host(helper_lab, helper_scope)
+        helper_lab.wait_running(
+            deadline=launch_deadline,
+            on_timeout=lambda: {
+                "task": load_task(cfg, task.task_id).to_dict(),
+                "helper": get_machine_agent_status(helper_runtime),
+            },
+        )
+        terminal_deadline = LifecycleDeadline.after(15)
+        finish.touch()
+        helper_lab.wait_terminal(
+            {"elapsed": "succeeded"},
+            deadline=terminal_deadline,
+            on_timeout=lambda: {
+                "task": load_task(cfg, task.task_id).to_dict(),
+                "helper": get_machine_agent_status(helper_runtime),
+            },
+        )
+        stored = load_task(cfg, task.task_id)
+        assert stored.placement_runtime["offered_by"] == "g8"
+        assert stored.placement_runtime["offer_reason"] == "elapsed"
+        attempt = read_json(attempt_path(cfg.shared_root, task.task_id, 1))["attempt"]
+        assert attempt["machine_name"] == "g8"
+        assert stored.attempt_control["next_attempt_number"] == 2
+        assert started.read_text() == "1"
+        assert marker.read_text() == "executed"
+        assert not get_machine_agent_status(home_runtime)["is_running"]
+        deadline = shared_paths(cfg.shared_root)["offer_deadlines"] / f"{task.task_id}.json"
+        assert not deadline.exists() and not deadline.is_symlink()
+        wait_all(
+            {"helper-reservations-released": lambda: not active_reservations(helper_runtime.root)},
+            deadline=terminal_deadline,
+        )
+    finally:
+        finish.touch()
+        try:
+            helper_lab.close()
+        finally:
+            home_lab.close()
+            for scope in (helper_scope, home_scope):
+                for socket in scope.tmux_root.rglob("*"):
+                    if socket.is_socket():
+                        subprocess.run(["tmux", "-S", str(socket), "kill-server"], capture_output=True, timeout=5)
+            assert TestResourceScope.cleanup_violations(tmp_path) == []
 
 
 @pytest.mark.parametrize("is_sighup", [False, True], ids=["agent-stop", "sighup"])

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -7,7 +8,7 @@ import pytest
 
 from qqtools.plugins.qexp import init_shared_root, submit
 from qqtools.plugins.qexp.commands import task as task_commands
-from qqtools.plugins.qexp.commands.group import create_group
+from qqtools.plugins.qexp.commands.group import change_worker, create_group
 from qqtools.plugins.qexp.lease import ClockCapability, ClockObservation, LeasePolicy, clock_capability
 from qqtools.plugins.qexp.runtime import submission_plan
 from qqtools.plugins.qexp.runtime.availability import transitions as availability_runtime
@@ -60,23 +61,26 @@ def test_unqualified_clock_creates_holder_bound_claim(tmp_path: Path, monkeypatc
     assert claim["lease_expires_at"] is None
 
 
-def test_elapsed_offer_requires_conservative_two_host_proof(tmp_path: Path, monkeypatch):
+@pytest.mark.parametrize("evaluator", ["home", "helper"])
+def test_elapsed_offer_requires_conservative_two_host_proof(tmp_path: Path, monkeypatch, evaluator):
     cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
     create_group(cfg, "g")
+    change_worker(cfg, "g", "g8", "add")
+    evaluator_cfg = cfg if evaluator == "home" else replace(cfg, machine_name="g8", runtime_root=tmp_path / "helper")
     task = submit(cfg, ["echo", "ok"], group="g", sharing_mode="private")
     start = datetime(2026, 8, 6, tzinfo=timezone.utc)
     creator = ClockObservation(
         observation_id="creator",
         provider="chrony",
         observed_at=start.isoformat(),
-        monotonic_observed_at=1.0,
+        monotonic_observed_at=1_000_000.0,
         boot_id="creator-boot",
         lower_error_seconds=-0.7,
         upper_error_seconds=0.7,
         max_drift_rate=0.0,
         provider_margin_seconds=0.0,
     )
-    monkeypatch.setattr(availability_runtime, "clock_evidence", lambda _cfg: (creator, start, 2.0))
+    monkeypatch.setattr(availability_runtime, "clock_evidence", lambda _cfg: (creator, start, 1_000_001.0))
     task_commands.share(cfg, task.task_id, after_seconds=10)
     reader = ClockObservation(
         observation_id="reader",
@@ -94,14 +98,14 @@ def test_elapsed_offer_requires_conservative_two_host_proof(tmp_path: Path, monk
         "clock_evidence",
         lambda _cfg: (reader, start + timedelta(seconds=11), 2.0),
     )
-    task_commands.offer(cfg, task.task_id, reason="elapsed")
+    task_commands.offer(evaluator_cfg, task.task_id, reason="elapsed")
     assert load_task(cfg, task.task_id).placement_runtime["queue_scope"] == "home"
     monkeypatch.setattr(
         availability_runtime,
         "clock_evidence",
         lambda _cfg: (reader, start + timedelta(seconds=12), 2.0),
     )
-    task_commands.offer(cfg, task.task_id, reason="elapsed")
+    task_commands.offer(evaluator_cfg, task.task_id, reason="elapsed")
     assert load_task(cfg, task.task_id).placement_runtime["queue_scope"] == "shared"
 
 

@@ -88,12 +88,16 @@ def test_due_deadline_cursor_rotates_past_first_bounded_batch(tmp_path: Path):
     for index in range(65):
         atomic_replace(root / f"task-{index:03d}.json", {"offer_deadline": {"task_id": str(index)}})
 
-    first = list(offer_deadlines.iter_due_deadline_paths(cfg))
-    second = list(offer_deadlines.iter_due_deadline_paths(cfg))
-
-    assert len(first) == 64
-    assert len(second) == 1
-    assert {path.name for path in first + second} == {f"task-{index:03d}.json" for index in range(65)}
+    found = set()
+    # A candidate yields its home's turn; the next sweep resumes that home.
+    # One candidate call and one root-wrap call suffice per retained record.
+    for _ in range(2 * 65 + 1):
+        batch = list(offer_deadlines.iter_due_deadline_paths(cfg))
+        assert len(batch) <= 64
+        found.update(path.name for path in batch)
+        if len(found) == 65:
+            break
+    assert found == {f"task-{index:03d}.json" for index in range(65)}
 
 
 def test_share_without_helpers_replaces_stale_private_fallback_with_group(tmp_path: Path):

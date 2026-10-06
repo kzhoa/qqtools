@@ -230,8 +230,6 @@ def advance_due_offer(
         return DueOfferProgress("noop", "task_not_queued", task_id)
     if task.claim_control.get("active_claim"):
         return DueOfferProgress("noop", "claim_active", task_id)
-    if task.placement_policy["home_machine"] != cfg.machine_name:
-        return DueOfferProgress("noop", "not_home_machine", task_id)
     if not offer_due(task):
         return DueOfferProgress("noop", "deadline_not_due", task_id)
     with fenced_mutations(cfg.shared_root, before_shared_mutation):

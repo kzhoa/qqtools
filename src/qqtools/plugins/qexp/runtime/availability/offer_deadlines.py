@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import heapq
 import os
-import stat
 from contextlib import nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
@@ -13,10 +12,11 @@ from typing import Any, Iterator
 from ...config_types import RootConfig
 from ..directory_capture import read_directory_entry
 from ..locks import schema_lock, task_lock
-from ..paths import local_paths, shared_paths, task_path
+from ..paths import shared_paths, task_path
 from ..project_activation import project_activation_transaction
 from ..records import TaskRecord, validate_identifier
 from ..store import atomic_replace, check_mutation_fence, iter_json, read_json, read_json_limited
+from .offer_deadline_scan import iter_due_deadline_paths as iter_due_deadline_paths
 
 _MAX_REBUILD_TASK_BYTES = 1_048_576
 
@@ -37,48 +37,6 @@ def _active_deadline_path(cfg: RootConfig, task: TaskRecord) -> Path:
         / task.placement_policy["home_machine"]
         / bucket
         / f"{task.task_id}.json"
-    )
-
-
-def _deadline_cursor_path(cfg: RootConfig) -> Path:
-    return local_paths(cfg.runtime_root)["maintenance_cursors"] / "offer_deadlines.json"
-
-
-def _load_deadline_cursor(cfg: RootConfig) -> dict[str, Any]:
-    try:
-        value = read_json(_deadline_cursor_path(cfg)).get("offer_deadline_cursor", {})
-        if isinstance(value, dict) and value.get("version") == 2:
-            cursor = {
-                "bucket_offset": value.get("bucket_offset", 0),
-                "bucket_name": value.get("bucket_name"),
-                "entry_offset": value.get("entry_offset", 0),
-            }
-            if (
-                type(cursor["bucket_offset"]) is int
-                and cursor["bucket_offset"] >= 0
-                and (cursor["bucket_name"] is None or isinstance(cursor["bucket_name"], str))
-                and type(cursor["entry_offset"]) is int
-                and cursor["entry_offset"] >= 0
-            ):
-                return cursor
-    except (FileNotFoundError, OSError, TypeError, ValueError):
-        pass
-    # QQTOOLS-COMPAT-0020: accept the former lexical checkpoint and start a
-    # bounded directory-cursor sweep rather than rebuilding it by enumeration.
-    return {"bucket_offset": 0, "bucket_name": None, "entry_offset": 0}
-
-
-def _save_deadline_cursor(cfg: RootConfig, cursor: dict[str, Any]) -> None:
-    atomic_replace(
-        _deadline_cursor_path(cfg),
-        {
-            "offer_deadline_cursor": {
-                "version": 2,
-                "bucket_offset": cursor["bucket_offset"],
-                "bucket_name": cursor["bucket_name"],
-                "entry_offset": cursor["entry_offset"],
-            }
-        },
     )
 
 
@@ -284,82 +242,6 @@ def reconcile_deadline_index(cfg: RootConfig, task_id: str, *, blocking: bool = 
             sync_deadline_index(cfg, task)
         after = stable.exists() or stable.is_symlink()
         return True, before != after or after
-
-
-def iter_due_deadline_paths(cfg: RootConfig, *, limit: int = 64) -> Iterator[Path]:
-    """Yield bounded due records for this home machine from time buckets only."""
-    if limit <= 0:
-        raise ValueError("deadline limit must be positive.")
-    home = shared_paths(cfg.shared_root)["offer_deadlines_active"] / cfg.machine_name
-    if not home.exists():
-        return
-    current_bucket = datetime.now(timezone.utc).strftime("%Y%m%d%H")
-    cursor = _load_deadline_cursor(cfg)
-    yielded = 0
-    scanned = 0
-    wrapped_home = False
-    max_scan = max(64, limit * 8)
-    while scanned < max_scan and yielded < limit:
-        bucket_name = cursor["bucket_name"]
-        if bucket_name is None:
-            try:
-                name, next_offset = read_directory_entry(home, cursor["bucket_offset"])
-            except FileNotFoundError:
-                return
-            if name is None:
-                if wrapped_home or yielded:
-                    _save_deadline_cursor(cfg, cursor)
-                    return
-                cursor.update({"bucket_offset": 0, "bucket_name": None, "entry_offset": 0})
-                wrapped_home = True
-                continue
-            scanned += 1
-            cursor["bucket_offset"] = next_offset
-            bucket = home / name
-            if len(name) != 10 or not name.isascii() or not name.isdecimal() or name > current_bucket:
-                _save_deadline_cursor(cfg, cursor)
-                continue
-            try:
-                metadata = bucket.lstat()
-            except FileNotFoundError:
-                _save_deadline_cursor(cfg, cursor)
-                continue
-            if stat.S_ISDIR(metadata.st_mode):
-                cursor["bucket_name"] = name
-                cursor["entry_offset"] = 0
-            elif stat.S_ISLNK(metadata.st_mode):
-                raise OSError(f"offer deadline bucket is a symlink: {bucket}")
-            _save_deadline_cursor(cfg, cursor)
-            continue
-
-        bucket = home / bucket_name
-        try:
-            name, next_offset = read_directory_entry(bucket, cursor["entry_offset"])
-        except FileNotFoundError:
-            name = None
-            next_offset = cursor["entry_offset"]
-        if name is None:
-            cursor["bucket_name"] = None
-            cursor["entry_offset"] = 0
-            _save_deadline_cursor(cfg, cursor)
-            continue
-        scanned += 1
-        cursor["entry_offset"] = next_offset
-        path = bucket / name
-        if name.endswith(".json"):
-            try:
-                metadata = path.lstat()
-            except FileNotFoundError:
-                _save_deadline_cursor(cfg, cursor)
-                continue
-            if stat.S_ISLNK(metadata.st_mode):
-                raise OSError(f"offer deadline entry is a symlink: {path}")
-            _save_deadline_cursor(cfg, cursor)
-            if stat.S_ISREG(metadata.st_mode):
-                yielded += 1
-                yield path
-        else:
-            _save_deadline_cursor(cfg, cursor)
 
 
 def iter_flat_deadline_paths(cfg: RootConfig, *, limit: int = 64) -> Iterator[Path]:

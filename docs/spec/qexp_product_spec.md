@@ -1,7 +1,7 @@
 ---
 doc_type: spec
 status: active
-updated_at: 2026-10-05
+updated_at: 2026-10-06
 archived_at:
 ---
 
@@ -989,8 +989,9 @@ Supported controls:
 
 - `qexp task share <task-id>` makes a grouped Task immediately available to eligible Group
   helpers while retaining home eligibility.
-- `qexp task share <task-id> --after 10m` records a bounded deadline. The home agent offers it
-  only after current clock evidence proves the deadline has elapsed.
+- `qexp task share <task-id> --after 10m` records a bounded deadline. An authorized Group
+  worker offers it only after current clock evidence proves the deadline has elapsed,
+  even when the home agent is stopped.
 - `qexp task share <task-id> --with g2 --with g3` restricts helper eligibility to active Group
   workers. The home machine must not be listed because it remains eligible by definition.
 - `qexp task unshare <task-id>` resets policy to private, queue scope to home, and clears
@@ -1018,6 +1019,10 @@ directly allocate a Task to a remote machine.
 Elapsed-time offering does not require a central coordinator. Task commit persists
 `queued_home_at` and `offer_eligible_at`. Any active Group worker agent may scan due
 spillover Tasks and attempt a revisioned `queued_home -> queued_shared` transition.
+The home may also evaluate while draining. A different evaluator must be an active
+worker in that Task's Group; draining, removed, and non-member helpers cannot offer it.
+Membership is checked under the Group and Task locks. An ungrouped Task retains its
+supported home-only evaluator and cannot be offered by a helper.
 
 Rules:
 
@@ -1030,6 +1035,11 @@ Rules:
   a derived due-time index
 - bounded clock skew may slightly change the first-refusal duration but cannot broaden
   placement authorization
+- the evaluator compares its own conservative UTC lower bound with the deadline UTC
+  upper bound derived from persisted creator evidence; machines' monotonic instants
+  are never compared, and zero delay still requires proof after submission commit
+- offering does not assign a claim or broaden fallback restrictions; normal shared
+  scheduling chooses the subsequent execution machine
 
 ### 9.5 Claims
 

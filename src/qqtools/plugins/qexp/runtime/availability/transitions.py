@@ -219,6 +219,25 @@ def _group_data(cfg: RootConfig, task: TaskRecord) -> dict[str, Any] | None:
     return group
 
 
+def _validate_elapsed_evaluator(cfg: RootConfig, task: TaskRecord, group: dict[str, Any] | None) -> None:
+    """Require the evaluator to be the home or an active Group worker."""
+    home = task.placement_policy["home_machine"]
+    if cfg.machine_name == home:
+        if group is not None:
+            worker = group["group"]["worker_set"].get(home)
+            if not worker or worker.get("state") not in {"active", "draining"}:
+                raise ValueError(f"Task home machine {home!r} is not an active or draining Group worker.")
+        return
+    if group is None:
+        raise ValueError(
+            f"Task {task.task_id!r} is local-only because it does not belong to a Group. "
+            "Submit the work to a Group to let other machines help."
+        )
+    worker = group["group"]["worker_set"].get(cfg.machine_name)
+    if not worker or worker.get("state") != "active":
+        raise ValueError(f"elapsed offer evaluator {cfg.machine_name!r} is not an active Group worker.")
+
+
 def _group_cancel_blocked(group: dict[str, Any], task: TaskRecord) -> bool:
     sequence = task.group_membership_sequence or 0
     for barrier in group["group"].get("cancellation_barriers", []):
@@ -460,15 +479,17 @@ def apply_availability_transition(
             stack.enter_context(task_lock(cfg.shared_root, request.task_id))
             task = load_task(cfg, request.task_id)
             group = _group_data(cfg, task)
+            # Cross-home indexes contain advisory records from unrelated Groups.
+            # Reject new unauthorized probes without creating blocked journals;
+            # existing completed operations retain their replay path below.
+            if request.action == "elapsed_offer" and not operation_exists(cfg, "availability", operation_id):
+                _validate_elapsed_evaluator(cfg, task, group)
             operation_id, operation = _create_operation(cfg, request, operation_id=operation_id)
             completed = _completed_operation_result(cfg, request, operation_id, operation, task, group)
             if completed is not None:
                 return completed
             if request.action == "elapsed_offer":
-                if task.placement_policy["home_machine"] != cfg.machine_name:
-                    result = _make_result(request.action, task, group, operation_id, idempotent=True)
-                    _update_operation(cfg, operation, state="completed", result=result)
-                    return result
+                _validate_elapsed_evaluator(cfg, task, group)
                 if not elapsed_offer_is_proven(cfg, task):
                     result = _make_result(request.action, task, group, operation_id, idempotent=True)
                     offer_deadlines.sync_deadline_index(cfg, task)
@@ -479,7 +500,10 @@ def apply_availability_transition(
                     f"Task {task.task_id!r} is local-only because it does not belong to a Group. "
                     "Submit the work to a Group to let other machines help."
                 )
-            if request.action == "manual_offer" and task.placement_policy["sharing_mode"] != "spillover":
+            if (
+                request.action in {"manual_offer", "elapsed_offer"}
+                and task.placement_policy["sharing_mode"] != "spillover"
+            ):
                 raise ValueError("private Tasks cannot be offered to shared workers; use task share.")
             _validate_common(cfg, task, group)
             before = {

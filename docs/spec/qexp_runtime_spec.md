@@ -1,7 +1,7 @@
 ---
 doc_type: spec
 status: active
-updated_at: 2026-10-04
+updated_at: 2026-10-06
 archived_at:
 ---
 
@@ -21,9 +21,12 @@ clock evidence and permits reclaim only at `expiry + holder_bound + reclaimer_bo
 `holder_bound` has null lease evidence, can only be supervised or restarted by its holder
 machine with matching process identity, and never expires, enters remote Recovery, or receives
 an automatic successor. Timed offers persist the complete creator observation and the creator
-monotonic instant corresponding to their deadline; the home agent projects that evidence through
-its drift bound, then commits only when its current UTC lower bound reaches the resulting deadline
-upper bound. The proof and transition are revalidated under the Task authority lock. User-driven
+monotonic instant corresponding to their deadline. The authorized evaluator projects the persisted
+creator observation through its drift bound to the creator's deadline monotonic instant, deriving
+the deadline UTC upper bound. It commits only when its own current UTC lower bound reaches that
+upper bound. Monotonic instants from different machines are never compared, and the home agent need
+not be running. The proof, Group membership, and transition are revalidated under the Group and
+Task authority locks. User-driven
 share and offer are not elapsed-time authority operations.
 
 Schema-5 cutover is fully drained, backed up and fsynced before final schema-6 configuration is
@@ -3077,8 +3080,8 @@ The manifest does not accept `on_overload`, `min_local_wait_seconds`,
 `max_offer_per_cycle`, or `cooldown_seconds` in the first release.
 
 `after_seconds` is either `null` or a non-negative integer. `null` disables elapsed-time
-offering while retaining manual offer capability; zero permits immediate shared-pool
-eligibility after commit.
+offering while retaining manual offer capability; zero permits elapsed-offer evaluation
+after commit, subject to conservative clock proof and authoritative checks.
 
 Task commit persists:
 
@@ -3089,21 +3092,62 @@ offer_eligible_at = queued_home_at + after_seconds
 
 The advisory deadline record lives at
 `indexes/offer-deadlines/active/<home-machine>/<utc-hour>/<task-id>.json`; the flat path remains an
-exact compatibility locator. A home agent consumes only its due UTC-hour buckets, with at most 64
-records per maintenance slice. Removing the final record removes its empty bucket. Synchronization
+exact compatibility locator. Each evaluator scans across home directories and due UTC-hour
+buckets. The scanner yields at most its caller's record limit (default 64); normal maintenance
+processes one advisory candidate per cycle. A call permits at most `max(64, limit * 8)` directory
+read attempts across home, bucket, and record levels, counting future or irrelevant entries and
+end-of-directory reads. Each visited home receives at most eight reads within that budget and
+yields its turn on quota exhaustion or a returned candidate. No Task enumeration or full home
+or bucket materialization is required. Each bounded directory read skips at most two dot entries,
+so raw directory-entry work is also bounded by three times the read budget. Removing the final
+record removes its empty bucket. Synchronization
 compares the complete payload first and does not rewrite or fsync unchanged content.
 
+The local version-3 root cursor saves the next home position. Separate per-home checkpoints
+are loaded and saved lazily, retaining bucket and record positions. Both checkpoints are
+persisted before yielding a candidate, so even a caller stopping immediately resumes at the
+next home. A home selected on the last available read is deferred to the next call rather
+than losing its turn. End of the root sweep resets the root cursor. A call with no candidates
+may wrap at most twice within the same shared budget, allowing retained candidates to be
+rechecked after an unproven offer without an extra idle cycle. Once it has yielded a candidate,
+root EOF ends that call to avoid duplicate candidates in one traversal. End of a home's
+bucket list resets that home's checkpoint and ends its turn. Missing directories or vanished
+entries are skipped. Replaced home or bucket identities reset their checkpoints. Directory
+cookies are advisory: entries inserted behind them are revisited after wraparound. Symlinks at
+every scanned level are rejected. Obsolete local cursors restart from a bounded checkpoint
+without rebuilding shared indexes (QQTOOLS-COMPAT-0020).
+
+For a fixed finite set of homes, each sweep gives every home a finite turn regardless of
+continued appends within another home. For a fixture containing only `H` home directories
+at the root and budget `B`, a sweep costs at most
+`9 * H + 1` directory reads (one home entry plus eight reads per home, and root EOF).
+A deterministic fixture with a due candidate reachable in two reads (one due bucket and one
+record) therefore discovers it within `2 * ceil((9 * H + 1) / (B - 1)) + 2` calls from a fresh
+cursor. This conservatively allows a full second sweep if the first turn is cut short by the
+total budget, as well as last-read deferral and root EOF. Larger home-local prefixes resume
+over later turns.
+
 Any active Group worker may scan due-time indexes, but the index is advisory. Offering
-acquires the Task lock and validates authoritative Task truth:
+acquires Group then Task lock and validates authoritative Task truth:
 
 - Task is committed
 - Task projection is queued
 - queue scope is home
 - no active claim exists
 - sharing mode is spillover
-- manual request is authorized or current time is at/after `offer_eligible_at`
+- manual request is authorized or conservative creator/evaluator clock proof establishes
+  that `offer_eligible_at` has elapsed
+- grouped Task home membership is active or draining; the home evaluator may be draining,
+  but a different evaluator must be an active worker in the Task's Group
+- ungrouped work may only be evaluated by its home, preserving local-only claim behavior
+
+New elapsed probes validate evaluator membership under those locks before creating a
+durable availability operation. Rejected advisory records from another Group or a draining
+helper create no blocked journal or maintenance obligation. Verified completed-operation
+replay remains idempotent even if the original evaluator subsequently drains.
 
 The winning transition sets queue scope to shared and records reason, actor, and time.
+It does not assign execution placement or broaden the fallback claim constraint.
 Repeated offers succeed idempotently without increasing Task revision. A concurrent claim,
 cancel, cleanup, worker drain, share, unshare, manual offer, or elapsed offer linearizes
 through the same Task lock and only one state change can win.
