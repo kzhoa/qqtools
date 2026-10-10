@@ -3916,8 +3916,18 @@ These rules preserve the protected lifecycle-independence workflow across packag
 A locally converged confirmed termination with a matching immutable runner exit observation
 leaves termination replay and delegates its exact terminal result to natural-exit supervision.
 Repeated discovery of that retained history cannot create new termination observation requests
-or block startup admission. Signal-only completions without a runner exit observation still
-require their existing shared terminal publication proof.
+or block startup admission. When shared truth is already `cancelled / terminated_by_agent`
+with a null exit result, natural-exit supervision acknowledges that exact settled result using
+a distinct immutable termination-observation proof. The proof binds the observed Task revision,
+Attempt digest, execution and reservation identities, and the confirmed committed local
+signal decision ID and digest. It requires the existing positive process-absence, registration,
+matching runner observation, and resource-settlement proofs. The shared null result and later
+local integer exit result remain separate observations; neither rewrites the other. Settled
+historical Attempts need not match a successor Task's projection and cannot modify that successor.
+The local evidence guard revalidates the decision digest before applying any remaining manifest
+effect. Missing or conflicting safety evidence keeps the obligation pending. This proof adds no
+persisted format, retry permission, or new signal authority. Signal-only completions without a
+runner exit observation still require their existing shared terminal publication proof.
 
 Before step 7, every start, restart, and foreground run obtains raw GPU inventory and validates an
 explicit persisted or inherited allowlist. Configured IDs absent from a successful inventory do

@@ -1839,6 +1839,13 @@ guarded idempotent effect settles. Invalid evidence remains visible and keeps th
 reported as unavailable or deferred work rather than persisted as invalid evidence. These
 diagnostics are derived observations and grant no repair, signal, release, or claim authority.
 
+A safely finalized historical agent termination may retain a cancelled result with no shared
+exit code even when the owning machine later observes a signal exit such as `-15`. Restart
+reconciliation preserves both observations and allows unrelated queued work to dispatch after
+process absence and resource cleanup are proven. Completion of this recovery does not make a
+cancelled Task eligible for ordinary retry; unknown termination causality does not become
+retry authority.
+
 ## 15. Product Boundaries
 
 ### 15.1 One Shared Root Per Project

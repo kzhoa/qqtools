@@ -36,6 +36,7 @@ from ..runtime.termination import (
     read_timeout_retirement,
     retirement_matches_decision,
     suppress_timeout_decision,
+    termination_decision_digest,
     update_decision,
     update_timeout_retirement,
 )
@@ -51,8 +52,10 @@ from .project_io_protocol import PROJECT_IO_CAPACITY, ProjectIORequest, authorit
 from .project_io_terminal_proof import (
     TerminalObservationProof,
     TerminalPublicationProof,
+    TerminationObservationProof,
     build_terminal_observation_proof,
     build_terminal_publication_proof,
+    build_termination_observation_proof,
     matches_terminal_lifecycle_event,
     matches_terminal_observation_identity,
     terminal_proof_matches_candidate,
@@ -1430,7 +1433,8 @@ def _termination_terminal_observation_proof(
         not isinstance(evidence, Mapping)
         or evidence.get("outcome") not in {"already_terminal", "settled_terminal"}
         or evidence.get("attempt_phase") != phase
-        or evidence.get("task_phase") != phase
+        or (evidence.get("outcome") == "already_terminal" and evidence.get("task_phase") != phase)
+        or (evidence.get("outcome") == "settled_terminal" and evidence.get("task_phase") is None)
         or evidence.get("execution_machine_name") != candidate.binding.machine_name
         or evidence.get("reservation_machine_name") != candidate.binding.machine_name
         or evidence.get("attempt_result_reason") != reason
@@ -1693,7 +1697,7 @@ def _is_active_terminal_publication_fallback(
 
 def _apply_terminal_local_effects(
     candidate: _TerminalCandidate,
-    proof: TerminalObservationProof | TerminalPublicationProof,
+    proof: TerminalObservationProof | TerminalPublicationProof | TerminationObservationProof,
     paths: Mapping[str, Path],
     reconciler: LocalExitReconciler,
 ) -> str:
@@ -1729,6 +1733,18 @@ def _apply_terminal_local_effects(
         ):
             return "invalid"
         exact_evidence = True
+        if type(proof) is TerminationObservationProof:
+            decision_file = paths["termination_decisions"] / attempt_id / f"{proof.decision_id}.json"
+            if not validate_evidence_path(decision_file, paths["root"]):
+                return "invalid"
+            envelope = read_json_limited(decision_file, max_bytes=65_536, record_type="termination_decision")
+            decision = envelope.get("termination_decision")
+            if (
+                set(envelope) != {"termination_decision"}
+                or not isinstance(decision, Mapping)
+                or termination_decision_digest(decision) != proof.decision_digest
+            ):
+                return "invalid"
         if candidate.post_update_process_identity == process.identity:
             pass
         elif (
@@ -3382,6 +3398,11 @@ class AttemptSupervisionCoordinator:
                 transition,
             )
             observation_proof = _is_terminal_observation_proof(observation_evidence, candidate)
+            if observation_proof is None:
+                try:
+                    observation_proof = self._is_termination_observation_proof(observation_evidence, candidate)
+                except _TERMINATION_SOURCE_ERRORS:
+                    continue
             proof = publication_proof if publication_proof is not None else observation_proof
             if proof is None:
                 continue
@@ -3460,6 +3481,45 @@ class AttemptSupervisionCoordinator:
             process_path=process_path,
             parameters=parameters,
             process_identity=process.identity,
+        )
+
+    def _is_termination_observation_proof(
+        self,
+        evidence: Mapping[str, Any] | None,
+        candidate: _TerminalCandidate,
+    ) -> TerminationObservationProof | None:
+        """Acknowledge existing shared termination without deriving a new result."""
+        if not isinstance(evidence, Mapping) or evidence.get("attempt_result_reason") != "terminated_by_agent":
+            return None
+        paths = machine_project_paths(self.runtime.root, candidate.binding.project_id)
+        process = _read_terminal_process_record(candidate.process_path, paths["root"], candidate.binding)
+        if (
+            process is None
+            or process.parameters != {key: value for key, value in candidate.parameters.items() if key != "mode"}
+            or process.identity not in {candidate.process_identity, candidate.post_update_process_identity}
+        ):
+            return None
+        found = self._find_termination_decision_for_process(
+            candidate.binding, candidate.binding_signature, paths, candidate.process_path, process
+        )
+        if found is None:
+            return None
+        decision_file, decision = found
+        convergence = self._termination_convergence_for_decision(
+            candidate.binding, paths, candidate.binding_signature, decision_file, process=process, decision=decision
+        )
+        if (
+            convergence is None
+            or convergence.state != "converged"
+            or convergence.manifest_exit_code != candidate.exit_code
+        ):
+            return None
+        return build_termination_observation_proof(
+            evidence=evidence,
+            parameters=candidate.parameters,
+            machine_name=candidate.binding.machine_name,
+            exit_code=candidate.exit_code,
+            decision=decision,
         )
 
     def _find_termination_decision_for_process(

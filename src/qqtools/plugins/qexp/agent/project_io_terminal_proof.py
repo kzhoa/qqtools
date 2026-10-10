@@ -6,6 +6,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
+from ..runtime.termination import termination_decision_digest
 from .project_io_protocol import authority_terminal_transition_digest
 
 _TERMINAL_IDENTITY_FIELDS = (
@@ -54,6 +55,15 @@ class TerminalObservationProof:
 
 
 @dataclass(frozen=True, slots=True)
+class TerminationObservationProof(TerminalObservationProof):
+    """Immutable proof of a shared termination result and local exit."""
+
+    decision_id: str
+    decision_digest: str
+    shared_exit_code: int | None
+
+
+@dataclass(frozen=True, slots=True)
 class TerminalPublicationProof:
     """Immutable proof of an accepted terminal publication."""
 
@@ -75,7 +85,7 @@ class TerminalPublicationProof:
     transition_digest: str
 
 
-TerminalProof = TerminalObservationProof | TerminalPublicationProof
+TerminalProof = TerminalObservationProof | TerminationObservationProof | TerminalPublicationProof
 
 
 def has_exact_terminal_revisions(value: object) -> bool:
@@ -358,6 +368,112 @@ def build_terminal_observation_proof(
     return TerminalObservationProof(outcome=outcome, **values)
 
 
+def build_termination_observation_proof(
+    *,
+    evidence: Mapping[str, Any] | None,
+    parameters: Mapping[str, Any],
+    machine_name: str,
+    exit_code: int,
+    decision: Mapping[str, Any] | None,
+) -> TerminationObservationProof | None:
+    """Build a proof that shared termination truth acknowledges one local exit."""
+    if (
+        not isinstance(evidence, Mapping)
+        or not isinstance(parameters, Mapping)
+        or not isinstance(decision, Mapping)
+        or parameters.get("mode") != "active"
+        or evidence.get("outcome") not in _TERMINAL_OBSERVATION_OUTCOMES
+        or not matches_terminal_observation_identity(evidence, parameters, machine_name)
+    ):
+        return None
+
+    outcome = evidence["outcome"]
+    phase = "cancelled"
+    reason = "terminated_by_agent"
+    termination_result = "terminated"
+    if (
+        evidence.get("attempt_phase") != phase
+        or evidence.get("attempt_result_reason") != reason
+        or evidence.get("attempt_exit_code") is not None
+        or evidence.get("execution_machine_name") != machine_name
+        or evidence.get("reservation_machine_name") != machine_name
+        or evidence.get("termination_result") != termination_result
+        or (outcome == "already_terminal" and evidence.get("task_phase") != phase)
+        or (outcome == "settled_terminal" and evidence.get("task_phase") is None)
+    ):
+        return None
+
+    decision_id = decision.get("decision_id")
+    process_identity = parameters.get("process_identity")
+    if (
+        not isinstance(decision_id, str)
+        or not decision_id
+        or decision.get("task_id") != parameters.get("task_id")
+        or decision.get("attempt_id") != parameters.get("attempt_id")
+        or type(decision.get("decision_token")) is not int
+        or decision.get("decision_token") != parameters.get("fencing_token")
+        or decision.get("state") != "confirmed"
+        or decision.get("shared_commitment") != "committed"
+        or decision.get("confirmation") not in {"identity_absent", "process_absent"}
+        or not isinstance(process_identity, Mapping)
+    ):
+        return None
+
+    process_group_id = process_identity.get("process_group_id")
+    process_group_start_time_ticks = process_identity.get("process_group_start_time_ticks")
+    if (
+        type(process_group_id) is not int
+        or process_group_id < 1
+        or type(process_group_start_time_ticks) is not int
+        or process_group_start_time_ticks < 0
+        or type(decision.get("process_group_id")) is not int
+        or type(decision.get("process_group_start_time_ticks")) is not int
+        or decision.get("process_group_id") != process_group_id
+        or decision.get("process_group_start_time_ticks") != process_group_start_time_ticks
+    ):
+        return None
+
+    authority_outcome = decision.get("authority_outcome")
+    if (
+        authority_outcome not in {"cancellation_requested", "holder_safe_deadline_elapsed"}
+        or decision.get("reason") != authority_outcome
+    ):
+        return None
+    signal_attempts = decision.get("signal_attempts")
+    if (
+        not isinstance(signal_attempts, list)
+        or not signal_attempts
+        or any(
+            not isinstance(attempt, Mapping) or attempt.get("signal") not in {"SIGTERM", "SIGKILL"}
+            for attempt in signal_attempts
+        )
+    ):
+        return None
+    try:
+        decision_digest = termination_decision_digest(decision)
+    except (TypeError, ValueError):
+        return None
+
+    values = _terminal_proof_kwargs(
+        parameters=parameters,
+        machine_name=machine_name,
+        exit_code=exit_code,
+        source_revisions=evidence.get("source_revisions"),
+        phase=phase,
+        reason=reason,
+        termination_result=termination_result,
+    )
+    if values is None:
+        return None
+    return TerminationObservationProof(
+        outcome=outcome,
+        decision_id=decision_id,
+        decision_digest=decision_digest,
+        shared_exit_code=None,
+        **values,
+    )
+
+
 def build_terminal_publication_proof(
     *,
     evidence: Mapping[str, Any] | None,
@@ -472,7 +588,22 @@ def terminal_proof_matches_candidate(
     exit_code: int,
 ) -> bool:
     """Return whether an immutable proof matches the current terminal candidate."""
-    if type(proof) is TerminalObservationProof:
+    if type(proof) is TerminationObservationProof:
+        if (
+            proof.outcome not in _TERMINAL_OBSERVATION_OUTCOMES
+            or proof.mode != "active"
+            or proof.phase != "cancelled"
+            or proof.reason != "terminated_by_agent"
+            or proof.termination_result != "terminated"
+            or proof.shared_exit_code is not None
+            or not isinstance(proof.decision_id, str)
+            or not proof.decision_id
+            or not isinstance(proof.decision_digest, str)
+            or len(proof.decision_digest) != 64
+            or any(character not in "0123456789abcdef" for character in proof.decision_digest)
+        ):
+            return False
+    elif type(proof) is TerminalObservationProof:
         if proof.outcome not in _TERMINAL_OBSERVATION_OUTCOMES:
             return False
     elif type(proof) is TerminalPublicationProof:
@@ -482,7 +613,9 @@ def terminal_proof_matches_candidate(
         return False
     if not isinstance(parameters, Mapping):
         return False
-    if type(proof) is TerminalObservationProof and proof.outcome == "settled_terminal" and proof.mode == "active":
+    if type(proof) is TerminationObservationProof:
+        target = ("cancelled", "terminated_by_agent", "terminated")
+    elif type(proof) is TerminalObservationProof and proof.outcome == "settled_terminal" and proof.mode == "active":
         target = terminal_transition_target(
             mode=parameters.get("mode"),
             exit_code=exit_code,
@@ -518,6 +651,9 @@ def terminal_proof_matches_candidate(
 
 
 __all__ = [
+    "TerminationObservationProof",
+    "TerminalProof",
+    "build_termination_observation_proof",
     "build_terminal_observation_proof",
     "build_terminal_publication_proof",
     "build_terminal_transition",
