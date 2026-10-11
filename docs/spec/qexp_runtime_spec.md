@@ -824,6 +824,26 @@ Attempt rules:
 - a recovery CAS may issue a new token for the same orphaned Attempt
 - every older token remains in immutable history and loses write authority
 
+### 8.4.1 Cancelled Attempt retry diagnostics
+
+The ordinary retry transaction acquires the existing Group/Task authority locks
+and reloads Task and its current Attempt. A cancelled Task cannot transition to
+queued. Active ownership, absent or nonterminal Attempt truth is reported as
+`termination_recovery_pending`; malformed/unreadable or contradictory terminal
+identity is `termination_evidence_conflict`. Exact cancelled terminal records with
+`result.reason = terminated_by_agent` return `unsupported_evidence`, because the
+retained records lack immutable cancellation history. Other cancelled execution
+returns `retry_not_eligible`.
+
+These are diagnostic rejections: Task revision, fencing, current/next Attempt
+identity, frozen specification and Attempt result remain unchanged. Cancelled
+retry diagnosis precedes ready-generation reservation and creates no queue state.
+No successor or new persisted receipt is emitted.
+Existing exact terminal cleanup proceeds independently; eligibility diagnostics
+neither replay signals nor release resources. A future historical import/retry
+protocol needs a separate public compatibility decision and an independently
+retained cause/intent authority before introducing a writer.
+
 ### 8.5 Submission Operation Truth
 
 Submission Operation truth lives at:

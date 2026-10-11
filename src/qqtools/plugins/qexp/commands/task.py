@@ -702,6 +702,35 @@ def retry(cfg: RootConfig, task_id: str, *, supersede_attempt: str | None = None
     from ..scheduler import authority_locks
 
     initial = load_task(cfg, task_id)
+    if initial.state["projection"] == "cancelled":
+        with authority_locks(cfg, initial):
+            task = load_task(cfg, task_id)
+            if task.state["projection"] == "cancelled":
+                from ..runtime.historical_retry import HistoricalRetryError, reject_cancelled_retry
+
+                if is_cleanup_blocked(task) or has_cleanup_operation(cfg, task.task_id):
+                    raise HistoricalRetryError(
+                        "termination_recovery_pending",
+                        task_id,
+                        task.attempt_control.get("current_attempt_id"),
+                        "Task cleanup is unresolved; inspect recovery before any replacement execution",
+                    )
+
+                number = task.attempt_control.get("current_attempt_number")
+                current = None
+                if type(number) is int and number > 0:
+                    try:
+                        current = AttemptRecord.from_dict(read_json(attempt_path(cfg.shared_root, task_id, number)))
+                    except FileNotFoundError:
+                        pass
+                    except (OSError, KeyError, TypeError, ValueError, AttributeError) as exc:
+                        raise HistoricalRetryError(
+                            "termination_evidence_conflict",
+                            task_id,
+                            task.attempt_control.get("current_attempt_id"),
+                            "current Attempt evidence is unreadable or malformed; preserve it and investigate",
+                        ) from exc
+                reject_cancelled_retry(task, current)
     reserved_generation = initial.ready_generation + 1
     reference = reserve_ready_generation(
         cfg,

@@ -27,7 +27,7 @@ from ..doctor import repair_metadata, resolve_verify_exit_code, verify_integrity
 from ..progress_policy import validate_interval_seconds
 from ..runtime import group_observation_policy
 from ..runtime.observation.api import ObservationError
-from .errors import CliUsageError
+from .errors import CliOperationalError, CliUsageError
 from .outcome import CommandOutcome
 from .output import CliOutput, OutputKind
 
@@ -356,7 +356,16 @@ def dispatch_project(
                 raise CliUsageError("--quiet cannot be combined with --format json.")
             ensure_local_agent_active(cfg, reason="task-retry", **get_lifecycle_kwargs())
             supersede_attempt = getattr(args, "supersede_attempt", None)
-            task_value = task_commands.retry(cfg, args.task_id, supersede_attempt=supersede_attempt)
+            from ..runtime.historical_retry import HistoricalRetryError
+
+            try:
+                task_value = task_commands.retry(cfg, args.task_id, supersede_attempt=supersede_attempt)
+            except HistoricalRetryError as exc:
+                raise CliOperationalError(
+                    str(exc),
+                    code=exc.reason,
+                    next_action=shlex.join(["qexp", "task", "show", exc.task_id, "--project", str(cfg.project_root)]),
+                ) from exc
             if args.quiet:
                 print(task_value.task_id)
             else:

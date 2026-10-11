@@ -1,7 +1,7 @@
 ---
 doc_type: spec
 status: active
-updated_at: 2026-10-06
+updated_at: 2026-10-11
 archived_at:
 ---
 
@@ -20,6 +20,28 @@ and the winning machine's clock capability decides authority mode. Users can use
 share`, `share --after 10m`, repeated `--with`, and `qexp task unshare`; `task offer` remains
 the immediate operation for an existing spillover policy. Doctor and agent status show provider,
 full/local-safe capability, authority mode, and exact blocked reasons.
+
+## Historical termination diagnostics
+
+Cleanup and retry authority are separate decisions. Exact terminal convergence
+may settle process, claim, and reservation obligations while the historical cause
+remains unknown. Current writers never terminate launch-authorized work because a
+lease deadline elapsed. Retained agent terminations do not contain immutable
+cancellation history and are ineligible for same-Task retry.
+
+`qexp task retry TASK_ID --project PATH --format json` rejects cancelled Tasks
+without rewriting Task or Attempt history or allocating a successor. Its finite
+error names the Task and blocking Attempt and includes a `task show` next action.
+`unsupported_evidence` identifies retained agent termination with missing historical
+intent proof; `retry_not_eligible` identifies other cancelled execution;
+`termination_recovery_pending` identifies unresolved ownership or missing terminal
+Attempt evidence; `termination_evidence_conflict` identifies contradictory or
+unreadable records. Human output reports the same reason and next action.
+
+Exit code, heartbeat age, missing cancellation fields, and manually inserted
+receipts never grant retry authority. Missing cause history alone does not block
+safe cleanup or admission of unrelated work. Ordinary failed/orphaned retry and
+explicit active-Attempt supersession retain their existing contracts.
 
 ## 1. Purpose
 
