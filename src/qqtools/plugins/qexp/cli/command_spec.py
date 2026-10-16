@@ -69,7 +69,12 @@ def _detailed_help(parser: argparse.ArgumentParser, spec: CommandSpec) -> str:
         )
     elif spec.handler == "init":
         scope = "The MachineRuntime selected by --machine-runtime-root."
-        prerequisite = "Pass an explicit --machine NAME; no Project selection is used."
+        prerequisite = (
+            "Pass an explicit --machine NAME to create or replace the local identity; no Project selection is used."
+        )
+    elif spec.handler == "project_register":
+        scope = "The local MachineRuntime's Project registration inventory."
+        prerequisite = "Pass --machine NAME to select the Project registration name; this is setup naming."
     elif spec.handler == "admin_repair":
         scope = "Selected MachineRuntime identity for identity --dry-run; one explicit Project for metadata repair."
         prerequisite = (
@@ -90,6 +95,20 @@ def _detailed_help(parser: argparse.ArgumentParser, spec: CommandSpec) -> str:
     else:
         scope = "Local command context."
         prerequisite = "No implicit Project mutation is performed."
+
+    if spec.handler in {"init", "project_register"}:
+        identity = "Setup naming: --machine NAME identifies the local machine for this setup operation."
+    elif spec.handler.startswith("admin_migrate_"):
+        identity = "Migration identity: --machine NAME retains its migration-specific meaning."
+    elif spec.handler in {"project_init", "use"}:
+        identity = "Setup/context operation; machine identity assertions do not apply."
+    elif spec.handler == "submit":
+        identity = (
+            "Identity assertion: optionally pass --expect-machine NAME; --machine remains a compatibility alias. "
+            "--home-machine NAME selects Task placement and does not start a remote agent."
+        )
+    else:
+        identity = "Identity assertion: optionally pass --expect-machine NAME; --machine remains a compatibility alias."
 
     activates = spec.handler in {
         "task_retry",
@@ -191,6 +210,7 @@ def _detailed_help(parser: argparse.ArgumentParser, spec: CommandSpec) -> str:
         (
             f"Scope: {scope}",
             f"Prerequisite: {prerequisite}",
+            f"Identity: {identity}",
             f"Activation: {activation}",
             f"Output: {output}",
             f"Example: {example}",

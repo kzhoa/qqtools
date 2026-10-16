@@ -12,6 +12,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+from ..agent.config import load_agent_config
 from ..agent.context import ExecutionContext, MachineRuntime, ProjectBindingRequiredError
 from ..agent.identity import MachineRuntimeIdentityError
 from ..commands import context as context_commands
@@ -88,6 +89,7 @@ def _raw_wait_task_id(argv: list[str]) -> str | None:
     """Recover the wait Task ID for parser errors without running argparse again."""
     option_values = {
         "--project",
+        "--expect-machine",
         "--machine",
         "--runtime-root",
         "--machine-runtime-root",
@@ -216,11 +218,51 @@ def _finalize_outcome(
 
 def _machine_assertion(args: argparse.Namespace) -> str | None:
     """Return the caller's identity assertion after checking duplicate inputs."""
-    flag_value = getattr(args, "machine", None)
+    flag_value = getattr(args, "expect_machine", None)
+    if flag_value is None:
+        flag_value = getattr(args, "machine", None)
     environment_value = os.environ.get("QEXP_MACHINE")
     if flag_value is not None and environment_value is not None and flag_value != environment_value:
-        raise CliUsageError(f"--machine {flag_value!r} conflicts with QEXP_MACHINE {environment_value!r}.")
+        raise CliUsageError(f"--expect-machine {flag_value!r} conflicts with QEXP_MACHINE {environment_value!r}.")
     return flag_value if flag_value is not None else environment_value
+
+
+def _validate_machine_assertion(args: argparse.Namespace) -> None:
+    """Check a machine-global assertion before a local handler can mutate state."""
+    handler = args.command_spec.handler
+    if handler in {
+        "init",
+        "project_init",
+        "project_register",
+        "use",
+        "admin_repair",
+        "admin_migrate_schema",
+        "admin_migrate_agent",
+        "admin_migrate_schema6_attest",
+    }:
+        return
+    is_agent_config = handler.startswith("config_") and getattr(args, "section", None) == "agent"
+    if args.command_spec.context is not ContextKind.MACHINE and not is_agent_config:
+        return
+    explicit_assertion = getattr(args, "expect_machine", None)
+    if explicit_assertion is None:
+        explicit_assertion = getattr(args, "machine", None)
+    if explicit_assertion is None:
+        # QEXP_MACHINE remains an assertion source only on the Project paths
+        # where it already applied before this CLI spelling change.
+        return
+    assertion = _machine_assertion(args)
+    assert assertion is not None
+    runtime = MachineRuntime(getattr(args, "machine_runtime_root", None))
+    try:
+        actual = load_agent_config(runtime).name
+    except RuntimeError as exc:
+        raise CliOperationalError(str(exc)) from exc
+    if assertion != actual:
+        raise CliUsageError(
+            f"Machine identity assertion expected {assertion!r}, but the actual local agent identity is {actual!r}. "
+            "--expect-machine is an assertion; it does not select, rename, or contact another machine."
+        )
 
 
 def _requires_verified_binding(args: argparse.Namespace) -> bool:
@@ -254,7 +296,7 @@ def _resolve_cfg(
         verified_machine = execution_context.cfg.machine_name
         if assertion is not None and assertion != verified_machine:
             raise CliUsageError(
-                f"Local project binding is {verified_machine!r}, but --machine asserted {assertion!r}.\n"
+                f"Local project binding is {verified_machine!r}, but --expect-machine asserted {assertion!r}.\n"
                 f"Use '--home-machine {assertion}' to select Task placement."
             )
         return execution_context.cfg, execution_context
@@ -268,8 +310,16 @@ def _resolve_cfg(
     if execution_context is not None:
         verified_machine = execution_context.cfg.machine_name
         if assertion is not None and assertion != verified_machine:
-            raise CliUsageError(f"Local project binding is {verified_machine!r}, but --machine asserted {assertion!r}.")
+            raise CliUsageError(
+                f"Local project binding is {verified_machine!r}, but --expect-machine asserted {assertion!r}."
+            )
         return execution_context.cfg, execution_context
+
+    if getattr(args, "_expect_machine_explicit", False):
+        raise CliUsageError(
+            "--expect-machine cannot verify a Project identity without a local binding; omit the assertion for "
+            "read-only observation or run 'qexp project register <PATH>' first."
+        )
 
     # Read-only project observation must remain possible without a local binding. The sentinel is
     # never used as an authority source because this branch is not used for mutations.
@@ -367,6 +417,7 @@ def main(argv: list[str] | None = None) -> int:
         project_presentation, presentation_deferred = _present_selection(selection, args, invocation_cwd)
 
     try:
+        _validate_machine_assertion(args)
         _validate_task_list_options(args)
         explicit_format = any(token == "--format" or token.startswith("--format=") for token in raw_argv)
         if explicit_format and handler == "agent_run":

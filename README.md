@@ -214,9 +214,10 @@ register one Project explicitly with `qexp project register PATH --machine NAME 
 An actively eligible registration still blocks takeover. Ordinary `project register` never adopts
 another runtime's registration.
 
-`--machine` is a project-local logical worker name and, for operational commands, a compatibility
-assertion against the local MachineRuntime binding. It is not the Task target. Use
-`--home-machine` to place a Task independently:
+`--expect-machine NAME` is an optional assertion for operational commands: it checks the local
+MachineRuntime identity before the command runs. The older `--machine NAME` spelling remains an
+equivalent compatibility alias on those commands. Neither spelling selects a Task target or a
+remote machine. Use `--home-machine` to place a Task independently:
 
 ```bash
 # Run on g3; only the registered g4 Project machine may claim this private Task.

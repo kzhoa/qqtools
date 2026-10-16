@@ -932,8 +932,10 @@ Submission rules:
   reinterpreted as inheritance and disables attachment with a bounded diagnostic
 - YAML formatting, key order, and manifest path are not semantic input
 - explicit `--group` overrides manifest `group.name`; omission of both selects no Group
-- `--machine` and `QEXP_MACHINE` are identity assertions only; they must match the verified local
-  binding and cannot select Task placement
+- `--expect-machine`, its `--machine` compatibility alias, and `QEXP_MACHINE` are identity
+  assertions only; they must match the verified local binding and cannot select Task placement.
+  Equal CLI aliases normalize to one assertion, while conflicting aliases or an environment
+  conflict fail before mutation
 - `submit --home-machine` resolves `current` to the verified submitting machine; a non-current
   home requires a matching current-generation shared Project machine record but does not trigger
   remote activation or write target-machine local state

@@ -448,6 +448,7 @@ def test_agent_run_reports_foreground_start(tmp_path: Path, monkeypatch, capsys)
     from qqtools.plugins.qexp.agent.context import MachineRuntime
 
     runtime = MachineRuntime(tmp_path / "machine-runtime")
+    initialize_machine(runtime, "gpu-1")
     runtime.add_binding(cfg.shared_root, cfg.machine_name)
     received = []
 
@@ -465,6 +466,7 @@ def test_agent_run_reports_foreground_start(tmp_path: Path, monkeypatch, capsys)
 def test_agent_run_already_running_is_operational(tmp_path: Path, monkeypatch, capsys) -> None:
     cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")
     runtime = MachineRuntime(tmp_path / "machine-runtime")
+    initialize_machine(runtime, "gpu-1")
     runtime.add_binding(cfg.shared_root, cfg.machine_name)
     monkeypatch.setattr(
         "qqtools.plugins.qexp.agent.lifecycle.run_machine_agent_loop",

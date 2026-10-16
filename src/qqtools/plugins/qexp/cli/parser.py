@@ -16,6 +16,20 @@ from .output import OutputKind
 _PAGINATION_JSON_PARSE_MODE = False
 _SUBMISSION_JSON_PARSE_MODE = False
 _JSON_PARSE_MODE = False
+_MACHINE_ASSERTION_OPTIONS = frozenset({"--expect-machine", "--machine"})
+_ORDINARY_COMMANDS = frozenset(
+    {"status", "task", "group", "machine", "agent", "notifications", "config", "admin", "submit"}
+)
+_SETUP_HANDLERS = frozenset(
+    {
+        "init",
+        "project_init",
+        "project_register",
+        "use",
+        "admin_migrate_agent",
+        "admin_migrate_schema6_attest",
+    }
+)
 
 
 class _PaginationParseError(RuntimeError):
@@ -42,15 +56,24 @@ class _QexpArgumentParser(argparse.ArgumentParser):
             raise _JsonParseError(message)
         super().error(message)
 
-    def parse_args(self, args: list[str] | None = None, namespace: argparse.Namespace | None = None):
+    def parse_args(
+        self, args: list[str] | None = None, namespace: argparse.Namespace | None = None
+    ) -> argparse.Namespace:
         raw = list(sys.argv[1:] if args is None else args)
         conflict = _common_option_conflict(raw)
         if conflict is not None:
             self.error(conflict)
-        return super().parse_args(raw, namespace)
+        parsed = super().parse_args(raw, namespace)
+        setup_error = _setup_machine_assertion_error(parsed, raw)
+        if setup_error is not None:
+            self.error(setup_error)
+        parsed._expect_machine_explicit = _raw_option_present(raw, "--expect-machine")
+        return _normalize_machine_assertion(parsed)
 
 
-_COMMON_OPTIONS = frozenset({"--project", "--machine", "--runtime-root", "--machine-runtime-root", "--format"})
+_COMMON_OPTIONS = frozenset(
+    {"--project", "--expect-machine", "--machine", "--runtime-root", "--machine-runtime-root", "--format"}
+)
 
 
 def _normalized_common_value(name: str, value: str) -> str:
@@ -91,12 +114,61 @@ def _common_option_conflict(argv: list[str]) -> str | None:
             index += 1
             continue
         normalized = _normalized_common_value(name, value)
-        previous = values.get(name)
+        conflict_name = "--expect-machine" if name in _MACHINE_ASSERTION_OPTIONS else name
+        previous = values.get(conflict_name)
         if previous is not None and previous != normalized:
-            return f"conflicting values for {name}: {previous!r} and {value!r}."
-        values[name] = normalized
+            return f"conflicting values for {conflict_name}: {previous!r} and {value!r}."
+        values[conflict_name] = normalized
         index += 1
     return None
+
+
+def _raw_option_present(argv: list[str], option: str) -> bool:
+    """Return whether an option occurs before a submit payload separator."""
+    stop = len(argv)
+    try:
+        submit_index = argv.index("submit")
+        stop = argv.index("--", submit_index + 1)
+    except ValueError:
+        pass
+    return any(token == option or token.startswith(f"{option}=") for token in argv[:stop])
+
+
+def _setup_machine_assertion_error(args: argparse.Namespace, raw: list[str]) -> str | None:
+    """Reject the ordinary assertion spelling on setup-only commands."""
+    if not _raw_option_present(raw, "--expect-machine"):
+        return None
+    command_spec = getattr(args, "command_spec", None)
+    handler = getattr(command_spec, "handler", None)
+    if handler not in _SETUP_HANDLERS and not str(handler).startswith("admin_migrate_"):
+        return None
+    if handler == "init":
+        return "qexp init accepts --machine NAME as setup naming; identity assertions are not valid here."
+    if handler == "project_register":
+        return (
+            "qexp project register accepts --machine NAME as the registration name; identity assertions are not "
+            "valid here."
+        )
+    if handler == "project_init":
+        return "qexp project init does not accept a machine identity option."
+    if handler.startswith("admin_migrate_"):
+        return "qexp legacy migration accepts --machine NAME for migration identity; assertions are not valid here."
+    return "qexp use does not accept a machine identity assertion."
+
+
+def _normalize_machine_assertion(args: argparse.Namespace) -> argparse.Namespace:
+    """Expose one assertion destination while retaining legacy handler fields."""
+    if getattr(args, "command", None) not in _ORDINARY_COMMANDS:
+        return args
+    assertion = getattr(args, "expect_machine", None)
+    if assertion is None:
+        assertion = getattr(args, "machine", None)
+    if assertion is not None:
+        args.expect_machine = assertion
+        # A few existing local handlers still consume the legacy destination.
+        # Keep it synchronized while entrypoint validation uses expect_machine.
+        args.machine = assertion
+    return args
 
 
 def _is_paginated_json_argv(argv: list[str]) -> bool:
@@ -177,13 +249,30 @@ def _add_common_options(parser: argparse.ArgumentParser, *, include_format: bool
     """Allow common context options at every ordinary command level."""
     options = (
         ("--project", {"help": "Project directory or its .qexp control directory."}),
-        ("--machine", {"help": "Assert the local logical machine identity."}),
         ("--runtime-root", {"help": "Override the project-local runtime root."}),
         ("--machine-runtime-root", {"help": "Override the machine-global runtime root."}),
     )
     for option, kwargs in options:
         if option not in parser._option_string_actions:
             parser.add_argument(option, default=argparse.SUPPRESS, **kwargs)
+    command_spec = parser.get_default("command_spec")
+    handler = getattr(command_spec, "handler", None)
+    is_setup_handler = handler in _SETUP_HANDLERS or str(handler).startswith("admin_migrate_")
+    if is_setup_handler and "--machine" not in parser._option_string_actions:
+        parser.add_argument(
+            "--machine",
+            default=argparse.SUPPRESS,
+            help="Machine name used by this setup, context, or migration command.",
+        )
+    if "--expect-machine" not in parser._option_string_actions and "--machine" not in parser._option_string_actions:
+        parser.add_argument(
+            "--expect-machine",
+            "--machine",
+            dest="expect_machine",
+            metavar="NAME",
+            default=argparse.SUPPRESS,
+            help="Assert the selected local machine identity (--machine is a compatibility alias).",
+        )
     # Foreground debugging intentionally has no finite structured result.
     # Keep the option absent even when this recursive helper visits the leaf.
     path = parser.prog.rsplit(" ", 2)[-2:]
@@ -201,16 +290,27 @@ def build_parser() -> argparse.ArgumentParser:
     parser = _QexpArgumentParser(
         prog="qexp",
         description=(
-            "qexp schema-6 experiment queue. Project commands use --project; --machine asserts local identity, "
-            "while --home-machine selects Task placement. Selecting placement does not remotely start an agent."
+            "qexp schema-6 experiment queue. Ordinary commands use --expect-machine NAME as an identity assertion "
+            "(--machine is a compatibility alias), while --home-machine selects Task placement. Selecting "
+            "placement does not remotely start an agent."
         ),
         epilog=(
-            "Machine setup: qexp init --machine NAME. Create shared truth with qexp project init PATH, "
-            "then enroll it with qexp project register PATH. qexp use only saves local CLI fallback context."
+            "Machine setup: qexp init --machine NAME creates or replaces the local identity. Create shared truth "
+            "with qexp project init PATH, then enroll it with qexp project register PATH --machine NAME. "
+            "qexp use only saves local CLI fallback context."
         ),
     )
     parser.add_argument("--project", help="Project directory or its .qexp control directory.")
-    parser.add_argument("--machine", help="Assert the local logical machine identity.")
+    parser.add_argument(
+        "--expect-machine",
+        metavar="NAME",
+        help="Identity assertion for ordinary commands; checks the selected local machine.",
+    )
+    parser.add_argument(
+        "--machine",
+        metavar="NAME",
+        help="Compatibility alias for --expect-machine on ordinary commands; setup commands use it for naming.",
+    )
     parser.add_argument("--runtime-root", help="Override the project-local runtime root.")
     parser.add_argument("--machine-runtime-root", help="Override the machine-global runtime root.")
     parser.add_argument("--format", choices=("human", "json"), default="human")
@@ -220,11 +320,17 @@ def build_parser() -> argparse.ArgumentParser:
         "init",
         help="Initialize or replace the machine runtime.",
         description=(
-            "Initialize the local machine identity and global agent policy. Project creation and enrollment are "
-            "separate; use qexp project register PATH after creating shared truth."
+            "Initialize the local machine identity and global agent policy. Use --machine NAME as the setup name; "
+            "identity assertions apply only to ordinary commands. Project creation and enrollment are separate; "
+            "use qexp project register PATH after creating shared truth."
         ),
     )
-    init.add_argument("--machine", dest="init_machine")
+    init.add_argument(
+        "--machine",
+        dest="init_machine",
+        metavar="NAME",
+        help="Local machine identity to create or replace during setup.",
+    )
     init.add_argument("--agent-mode", choices=("on_demand", "daemon"))
     init.add_argument("--detach-old-runtime", action="store_true")
     init.add_argument("--yes", action="store_true")
@@ -253,10 +359,22 @@ def build_parser() -> argparse.ArgumentParser:
         modes=OutputMode.FINITE,
         output_kinds=OutputKind.PROJECT_OPERATION,
     )
-    project_register = project_sub.add_parser("register", help="Enroll explicit Projects or saved inventory entries.")
+    project_register = project_sub.add_parser(
+        "register",
+        help="Enroll explicit Projects or saved inventory entries using a registration name.",
+        description=(
+            "Enroll explicit Projects or saved inventory entries. The --machine NAME option selects the local "
+            "Project registration name; it is a setup name, not an identity assertion."
+        ),
+    )
     project_register.add_argument("paths", nargs="*")
     project_register.add_argument("--from-pool", action="store_true")
-    project_register.add_argument("--machine", dest="project_machine")
+    project_register.add_argument(
+        "--machine",
+        dest="project_machine",
+        metavar="NAME",
+        help="Local Project registration name selected during setup.",
+    )
     project_register.add_argument("--name-source", choices=("default", "explicit"))
     project_register.add_argument(
         "--adopt-existing",

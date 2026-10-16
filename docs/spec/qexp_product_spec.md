@@ -1435,7 +1435,8 @@ Rules:
 - single-Task command submission must not require YAML
 - mode-specific options are rejected before activation or publication
 - Group is optional for ad hoc Tasks
-- `--machine` is the verified local identity assertion; `--home-machine` selects Task placement
+- `--expect-machine` is the canonical verified local identity assertion; `--machine` remains an
+  equivalent compatibility alias on ordinary commands. `--home-machine` selects Task placement
   and defaults to the verified current machine
 - a private Task is executable only by its home machine; a non-current private home requires a
   valid current-generation Project machine record and does not require a Group
@@ -1906,10 +1907,18 @@ Projects on one physical server may use different machine names while the one gl
 one shared GPU resource pool.
 
 Operational commands derive the submitting machine from the unique local `MachineRuntime` binding
-for the canonical shared root and stable Project ID. `--machine` and `QEXP_MACHINE` are
-compatibility assertions only; a mismatch fails before project mutation and suggests
-`--home-machine` for placement intent. Saved-context machine/runtime fields and standalone
-`--runtime-root` inputs do not select operational identity or local resource ownership.
+for the canonical shared root and stable Project ID. `--expect-machine` is the canonical optional
+identity assertion; `--machine` remains an equivalent compatibility alias, and `QEXP_MACHINE`
+remains an environment assertion source. A mismatch reports the expected and actual names, fails
+before mutation, and suggests `--home-machine` for placement intent where applicable. Saved-context
+machine/runtime fields and standalone `--runtime-root` inputs do not select operational identity or
+local resource ownership.
+
+Alias values are normalized across command levels before duplicate validation. Repeated equal
+values are accepted; conflicting `--expect-machine` and `--machine` values are usage errors before
+dispatch. `init --machine NAME` continues to create or replace the machine-global identity, while
+`project register --machine NAME` selects the Project registration name. Those setup options are
+not assertions and do not accept the `--expect-machine` spelling.
 
 Ordinary Project commands resolve `--project PATH`, `QEXP_SHARED_ROOT`, the nearest initialized
 Project in the current-directory ancestry, then saved context. A directory and its `.qexp` control

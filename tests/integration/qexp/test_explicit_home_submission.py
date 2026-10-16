@@ -7,6 +7,7 @@ import pytest
 
 from qqtools.plugins.qexp import init_shared_root
 from qqtools.plugins.qexp.agent.context import MachineRuntime
+from qqtools.plugins.qexp.agent.setup import initialize_machine
 from qqtools.plugins.qexp.cli.entrypoint import main
 from qqtools.plugins.qexp.commands.task import submit as submit_task
 from qqtools.plugins.qexp.layout import load_context
@@ -254,6 +255,38 @@ def test_environment_machine_assertion_must_match_local_binding(
     assert not list((shared_root / "tasks").glob("*.json"))
 
 
+def test_expect_machine_checks_project_binding_name_when_it_differs_from_global_agent(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    shared_root = tmp_path / ".qexp"
+    init_shared_root(shared_root, "project-gpu", runtime_root=tmp_path / "legacy-runtime")
+    runtime = MachineRuntime(tmp_path / "machine-runtime")
+    initialize_machine(runtime, "global-gpu")
+    runtime.add_binding(shared_root, "project-gpu")
+
+    assert (
+        main(
+            _args(
+                shared_root,
+                runtime,
+                "submit",
+                "--expect-machine",
+                "project-gpu",
+                "--no-activate",
+                "--quiet",
+                "--",
+                "echo",
+                "ok",
+            )
+        )
+        == 0
+    )
+    capsys.readouterr()
+
+    assert main(_args(shared_root, runtime, "status", "--expect-machine", "global-gpu")) == 2
+    assert "Local project binding is 'project-gpu'" in capsys.readouterr().err
+
+
 @pytest.mark.parametrize(
     "argv",
     [["--help"], ["submit", "--help"]],
@@ -291,7 +324,7 @@ def test_machine_assertion_conflict_fails_before_mutation_even_without_activatio
         )
         == 2
     )
-    assert "Local project binding is 'g3', but --machine asserted 'g4'." in capsys.readouterr().err
+    assert "Local project binding is 'g3', but --expect-machine asserted 'g4'." in capsys.readouterr().err
     assert not list((shared_root / "tasks").glob("*.json"))
     assert not list((shared_root / "operations" / "submissions").glob("*.json"))
 
