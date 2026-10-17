@@ -1,7 +1,7 @@
 ---
 doc_type: spec
 status: active
-updated_at: 2026-10-16
+updated_at: 2026-10-17
 archived_at:
 ---
 
@@ -739,9 +739,20 @@ possible partial effects remain fail-closed and replay from that journal.
 `qexp agent status --format json` may include a bounded `project_io_isolation` object with protocol
 and executor epoch, capacity and free-slot counts, active/overdue/exit-unverified counts, any
 retained unreaped-worker count, the supported hang limit, `healthy | degraded | exceeded | unknown`
-envelope state, oldest overdue time, and at most four blocking Project IDs. Human status adds a
-concise section when degraded or when the existing detailed status view requests it. Stable
-diagnostic reasons are
+envelope state, oldest overdue time, and at most four blocking Project IDs. The envelope describes
+health, worker and slot counts describe activity, and neither signal alone establishes whether the
+executor is quiescent. `healthy` requires an active verified epoch with no overdue,
+exit-unverified, unreaped, or protocol-invalid evidence; prepared, responsive active, and
+completed-but-unconsumed requests remain healthy activity. `degraded` covers an inactive epoch, one
+or two overdue requests, or verified stop-targeted workers that remain unreaped. More than two
+overdue requests are `exceeded`. Unverifiable executor, reconciliation, or process-identity
+evidence is `unknown` and takes precedence over the other classifications.
+
+`blocking_project_ids` contains only Projects safely associated with the condition that makes
+health non-healthy. Ordinary in-flight work is never labelled blocking, and a full executor whose
+four workers remain within the ten-second allowance is busy but healthy. Human status places only
+`degraded`, `exceeded`, and `unknown` beneath `Attention required`; healthy occupied capacity may
+appear separately as `Project I/O activity` with state `in progress`. Stable diagnostic reasons are
 `project_io_overdue`, `project_io_capacity_saturated`, `project_io_envelope_exceeded`,
 `project_io_result_stale`, `project_io_worker_exit_unverified`, and
 `project_io_protocol_invalid`.
@@ -749,9 +760,12 @@ diagnostic reasons are
 Readiness keeps its existing meaning. An overdue Project captured by one `agent start` invocation
 remains not ready, so that invocation still times out and exits nonzero. If the detached process
 started, the agent remains active, reports the blocking Project/request, and continues serving
-healthy peers. Active, overdue, exit-unverified, or unreconciled executor work prevents on-demand
-idle exit. Disablement blocks new scheduling and maintenance admission for that binding but does not
-cancel a blocked syscall, discard process evidence, release ambiguous capacity, or suppress
+healthy peers. Quiescence is evaluated independently from the health envelope. Prepared requests,
+active workers, published but unconsumed results, exit-unverified or unreaped workers, an inactive
+epoch, and unknown reconciliation all prevent on-demand idle exit, including when the health
+envelope is `healthy`. Only an active verified epoch with no unresolved transport work is
+quiescent. Disablement blocks new scheduling and maintenance admission for that binding but does
+not cancel a blocked syscall, discard process evidence, release ambiguous capacity, or suppress
 supervision/recovery for existing Attempts.
 
 ### 6.7 Machine GPU Admission Policy

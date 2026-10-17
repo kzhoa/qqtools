@@ -25,10 +25,12 @@ from qqtools.plugins.qexp.agent.project_io_protocol import (
     PROJECT_IO_MAX_RECORD_BYTES,
     PROJECT_IO_MAX_RESOLVED_BYTES,
     PROJECT_IO_MAX_RESOLVED_RECORDS,
+    PROJECT_IO_OVERDUE_SECONDS,
     ProjectIOProcess,
     ProjectIOResult,
 )
 from qqtools.plugins.qexp.agent.setup import initialize_machine
+from qqtools.plugins.qexp.cli.output import CliOutput, OutputKind, render
 from qqtools.plugins.qexp.runtime import project_activation as project_activation_module
 from qqtools.plugins.qexp.runtime.locks import exclusive
 from qqtools.plugins.qexp.runtime.paths import local_paths, shared_paths
@@ -230,18 +232,165 @@ def test_idle_requires_consumption_of_returning_executor_work(tmp_path: Path) ->
         assert not executor.has_unfinished_work()
         request = executor.prepare_validate_binding(binding, revision)
         assert executor.has_unfinished_work()
+        assert executor.status_view()["envelope"] == "healthy"
 
         executor.start(request.request_id)
-        assert executor.status_view()["envelope"] == "degraded"
+        assert executor.status_view()["envelope"] == "healthy"
         assert executor.has_unfinished_work()
         result = _wait_for_result(executor, request.request_id)
         assert result.status == "completed"
+        assert executor.status_view()["envelope"] == "healthy"
         assert executor.has_unfinished_work()
 
         assert _wait_for_consumed(executor, request).status == "completed"
         assert not executor.has_unfinished_work()
     finally:
         executor.shutdown()
+
+
+@pytest.mark.parametrize("request_count", [1, 2])
+def test_status_marks_only_overdue_prepared_requests_as_degraded(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    request_count: int,
+) -> None:
+    runtime = MachineRuntime(tmp_path / "machine")
+    initialize_machine(runtime, "gpu-1")
+    bindings = [_registered(tmp_path, f"project-{index}", runtime)[1] for index in range(request_count)]
+    revision, _bindings = runtime.load_registry()
+    executor = ProjectIOExecutor(runtime)
+    executor.begin_epoch()
+    requests = [executor.prepare_validate_binding(binding, revision) for binding in bindings]
+    captured_now = max(project_io_executor_module._timestamp_seconds(request.prepared_at) for request in requests)
+    captured_now += PROJECT_IO_OVERDUE_SECONDS + 1.0
+    time_reads = 0
+
+    def read_time() -> float:
+        nonlocal time_reads
+        time_reads += 1
+        return captured_now + time_reads
+
+    monkeypatch.setattr(project_io_executor_module.time, "time", read_time)
+
+    status = executor.status_view()
+
+    assert time_reads == 1
+    assert status["envelope"] == "degraded"
+    assert status["active_worker_count"] == 0
+    assert status["overdue_worker_count"] == request_count
+    assert status["oldest_overdue_at"] == min(request.prepared_at for request in requests)
+    assert set(status["blocking_project_ids"]) == {request.project_id for request in requests}
+    assert executor.has_unfinished_work()
+
+
+def test_status_keeps_request_healthy_at_exact_overdue_threshold(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = MachineRuntime(tmp_path / "machine")
+    initialize_machine(runtime, "gpu-1")
+    _cfg, binding, revision = _registered(tmp_path, "project", runtime)
+    executor = ProjectIOExecutor(runtime)
+    executor.begin_epoch()
+    request = executor.prepare_validate_binding(binding, revision)
+    prepared_at = project_io_executor_module._timestamp_seconds(request.prepared_at)
+    monkeypatch.setattr(
+        project_io_executor_module.time,
+        "time",
+        lambda: prepared_at + PROJECT_IO_OVERDUE_SECONDS,
+    )
+
+    status = executor.status_view()
+
+    assert status["envelope"] == "healthy"
+    assert status["overdue_worker_count"] == 0
+    assert status["oldest_overdue_at"] is None
+    assert status["blocking_project_ids"] == []
+    assert executor.has_unfinished_work()
+
+
+def test_unverified_identity_takes_precedence_over_exceeded_overdue_status(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = MachineRuntime(tmp_path / "machine")
+    initialize_machine(runtime, "gpu-1")
+    bindings = [_registered(tmp_path, f"project-{index}", runtime)[1] for index in range(3)]
+    revision, _bindings = runtime.load_registry()
+    executor = ProjectIOExecutor(runtime)
+    executor.begin_epoch()
+    requests = [executor.prepare_validate_binding(binding, revision) for binding in bindings]
+    process = ProjectIOProcess(requests[0], 2_000_000_000, 1, requests[0].prepared_at, "running")
+    executor._write_record(
+        executor._record_path("processes", requests[0].request_id),
+        process.to_dict(),
+        "project_io_process",
+    )
+    captured_now = max(project_io_executor_module._timestamp_seconds(request.prepared_at) for request in requests)
+    monkeypatch.setattr(
+        project_io_executor_module.time,
+        "time",
+        lambda: captured_now + PROJECT_IO_OVERDUE_SECONDS + 1.0,
+    )
+    monkeypatch.setattr(
+        project_io_executor_module,
+        "inspect_process_identity",
+        lambda *_args: project_io_executor_module._PROCESS_UNVERIFIED,
+    )
+
+    status = executor.status_view()
+
+    assert status["envelope"] == "unknown"
+    assert status["overdue_worker_count"] == 3
+    assert status["exit_unverified_worker_count"] == 1
+    assert set(status["blocking_project_ids"]) == {request.project_id for request in requests}
+
+
+def test_stop_targeted_live_worker_is_degraded_and_blocks_quiescence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = MachineRuntime(tmp_path / "machine")
+    initialize_machine(runtime, "gpu-1")
+    _cfg, binding, revision = _registered(tmp_path, "project", runtime)
+    executor = ProjectIOExecutor(runtime)
+    executor.begin_epoch()
+    request = executor.prepare_validate_binding(binding, revision)
+    process = ProjectIOProcess(request, 2_000_000_000, 1, request.prepared_at, "stop_targeted")
+    executor._write_record(
+        executor._record_path("processes", request.request_id),
+        process.to_dict(),
+        "project_io_process",
+    )
+    monkeypatch.setattr(
+        project_io_executor_module,
+        "inspect_process_identity",
+        lambda *_args: project_io_executor_module._PROCESS_LIVE,
+    )
+
+    status = executor.status_view()
+
+    assert status["envelope"] == "degraded"
+    assert status["active_worker_count"] == 1
+    assert status["unreaped_worker_count"] == 1
+    assert status["blocking_project_ids"] == [binding.project_id]
+    assert executor.has_unfinished_work()
+
+
+def test_inactive_epoch_with_unresolved_request_is_degraded_and_non_quiescent(tmp_path: Path) -> None:
+    runtime = MachineRuntime(tmp_path / "machine")
+    initialize_machine(runtime, "gpu-1")
+    _cfg, binding, revision = _registered(tmp_path, "project", runtime)
+    executor = ProjectIOExecutor(runtime)
+    executor.begin_epoch()
+    executor.prepare_validate_binding(binding, revision)
+
+    executor.fence_epoch()
+    status = executor.status_view()
+
+    assert status["envelope"] == "degraded"
+    assert status["blocking_project_ids"] == [binding.project_id]
+    assert executor.has_unfinished_work()
 
 
 @pytest.mark.parametrize("evidence", ["none", "requests", "processes", "results", "symlink"])
@@ -2562,7 +2711,10 @@ def test_prepare_does_not_resolve_the_project_root(tmp_path: Path, monkeypatch: 
     assert request.canonical_shared_root == str(binding.shared_root)
 
 
-def test_blocked_project_worker_does_not_block_healthy_peer_and_capacity_stays_bounded(tmp_path: Path) -> None:
+def test_blocked_project_worker_does_not_block_healthy_peer_and_capacity_stays_bounded(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     runtime = MachineRuntime(tmp_path / "machine")
     initialize_machine(runtime, "gpu-1")
     blocked_cfg, blocked, revision = _registered(tmp_path, "blocked", runtime)
@@ -2584,14 +2736,51 @@ def test_blocked_project_worker_does_not_block_healthy_peer_and_capacity_stays_b
     status = executor.status_view()
     assert status["active_worker_count"] == 1
     assert status["free_slot_count"] == 3
-    assert status["blocking_project_ids"] == [blocked.project_id]
+    assert status["envelope"] == "healthy"
+    assert status["blocking_project_ids"] == []
+    human_status = render(
+        CliOutput(
+            OutputKind.AGENT_STATUS,
+            {
+                "action": "status",
+                "machine_runtime_root": str(runtime.root),
+                "agent_state": "active",
+                "pid": os.getpid(),
+                "registry_revision": revision,
+                "projects": [],
+                "upgrade": {"projects": []},
+                "project_io_isolation": status,
+            },
+        ),
+        "human",
+    )
+    assert "Attention required" not in human_status
+    assert "Project I/O activity\n  State: in progress" in human_status
+    assert "Blocking projects" not in human_status
+
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            project_io_executor_module.time,
+            "time",
+            lambda: (
+                project_io_executor_module._timestamp_seconds(blocked_request.prepared_at)
+                + PROJECT_IO_OVERDUE_SECONDS
+                + 1.0
+            ),
+        )
+        overdue = executor.status_view()
+    assert overdue["envelope"] == "degraded"
+    assert overdue["blocking_project_ids"] == [blocked.project_id]
 
     executor.shutdown()
     stopped = executor.status_view()
     assert stopped["active_worker_count"] + stopped["exit_unverified_worker_count"] <= 1
 
 
-def test_four_blocked_workers_prevent_a_fifth_request(tmp_path: Path) -> None:
+def test_four_blocked_workers_prevent_a_fifth_request(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     runtime = MachineRuntime(tmp_path / "machine")
     initialize_machine(runtime, "gpu-1")
     bindings = []
@@ -2616,7 +2805,19 @@ def test_four_blocked_workers_prevent_a_fifth_request(tmp_path: Path) -> None:
     status = executor.status_view()
     assert status["active_worker_count"] == 4
     assert status["free_slot_count"] == 0
-    assert len(status["blocking_project_ids"]) == 4
+    assert status["envelope"] == "healthy"
+    assert status["blocking_project_ids"] == []
+    with monkeypatch.context() as patch:
+        captured_now = max(project_io_executor_module._timestamp_seconds(request.prepared_at) for request in requests)
+        patch.setattr(
+            project_io_executor_module.time,
+            "time",
+            lambda: captured_now + PROJECT_IO_OVERDUE_SECONDS + 1.0,
+        )
+        overdue = executor.status_view()
+    assert overdue["envelope"] == "exceeded"
+    assert overdue["overdue_worker_count"] == 4
+    assert len(overdue["blocking_project_ids"]) == 4
     rss_kib = []
     descriptor_counts = []
     for child in executor._children.values():

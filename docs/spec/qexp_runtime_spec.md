@@ -1,7 +1,7 @@
 ---
 doc_type: spec
 status: active
-updated_at: 2026-10-16
+updated_at: 2026-10-17
 archived_at:
 ---
 
@@ -2249,8 +2249,10 @@ Executor initialization precedes startup reconciliation. Readiness still require
 acknowledgement, authority validation, and initial scheduler reconciliation for every enabled
 inventory entry captured by that invocation. An overdue captured entry remains pending and causes
 the existing bounded start wait to return nonzero, while a successfully started detached agent may
-serve healthy peers. Active, overdue, exit-unverified, or unreconciled executor work blocks
-on-demand idle exit.
+serve healthy peers. Executor quiescence is independent of its health envelope. Prepared requests,
+live workers, published but unconsumed results, exit-unverified or unreaped workers, inactive
+epochs, and unknown reconciliation block on-demand idle exit. Only an active verified epoch with no
+unresolved request, process, or result records is quiescent.
 
 Final authority-idle certification binds a bounded local evidence census to the
 exact activation turn and executor epoch. Directory metadata alone is not an
@@ -2277,7 +2279,27 @@ The bounded `project_io_isolation` status projection contains `protocol_version`
 `supported_hang_limit`, `envelope`, nullable `oldest_overdue_at`, and at most four
 `blocking_project_ids`. `unreaped_worker_count` counts stop-targeted workers whose PID/start-time
 absence is not yet proven; it may overlap active, overdue, or exit-unverified classifications and is
-not an additional capacity category. Scheduler diagnostics use
+not an additional capacity category. One wall-clock observation determines overdue counts,
+`oldest_overdue_at`, the envelope, and blocking Project membership for each projection.
+
+The envelope is a health classification, not an activity or quiescence signal. Its precedence is
+`unknown`, `exceeded`, `degraded`, then `healthy`. Unverifiable executor records, reconciliation, or
+process identity are `unknown`. More than two overdue requests are `exceeded`; one or two overdue
+requests, an inactive epoch, or verified stop-targeted live workers are `degraded`. Otherwise the
+active verified epoch is `healthy`, including while requests are prepared, responsive workers are
+active, results await consumption, or all four slots are occupied. A result-less request becomes
+overdue only after the version-1 ten-second allowance. `blocking_project_ids` is bounded and
+deduplicated from requests implicated in the non-healthy condition; ordinary unresolved activity is
+not blocking, and unverifiable evidence is not guessed. Human output reserves `Attention required`
+for non-healthy envelopes and may show healthy occupied capacity as `Project I/O activity` with
+state `in progress`.
+
+Status payload validation preserves the exact version-1 field set and rejects contradictions:
+non-`unknown` health requires an executor epoch; the oldest-overdue timestamp exists exactly when
+the overdue count is nonzero; healthy health has no abnormal count or blocking Project; verifiable
+health applies the supported-hang threshold; and worker counts cannot exceed occupied slots.
+Capacity saturation remains a scheduling diagnostic and does not itself change health. Scheduler
+diagnostics use
 `project_io_overdue`, `project_io_capacity_saturated`, `project_io_envelope_exceeded`,
 `project_io_result_stale`, `project_io_worker_exit_unverified`, and
 `project_io_protocol_invalid`; identity includes runtime, epoch, request, Project, registration,

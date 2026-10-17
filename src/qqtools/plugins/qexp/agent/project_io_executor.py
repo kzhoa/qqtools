@@ -2670,63 +2670,63 @@ class ProjectIOExecutor:
 
     def status_view(self) -> dict[str, Any]:
         """Return a read-only, bounded status projection without touching Project roots."""
+        now = time.time()
         if self._reconciliation_unknown:
             return self._unknown_status()
         try:
             epoch = self._load_epoch()
             requests, processes, results = self._scan_records()
+            if epoch is None:
+                return self._unknown_status()
+            active_count = 0
+            overdue_requests: list[ProjectIORequest] = []
+            exit_unverified_count = 0
+            unreaped_count = 0
+            blocking_project_ids: list[str] = []
+            unknown = False
+            for request_id, request in requests.items():
+                abnormal = False
+                if request_id not in results and now - _timestamp_seconds(request.prepared_at) > (
+                    PROJECT_IO_OVERDUE_SECONDS
+                ):
+                    overdue_requests.append(request)
+                    abnormal = True
+                process = processes.get(request_id)
+                if process is not None:
+                    state = inspect_process_identity(process.pid, process.start_time_ticks)
+                    if state == _PROCESS_LIVE:
+                        active_count += 1
+                        if process.state == "stop_targeted":
+                            unreaped_count += 1
+                            abnormal = True
+                    elif state == _PROCESS_UNVERIFIED:
+                        exit_unverified_count += 1
+                        unknown = True
+                        abnormal = True
+                        if process.state == "stop_targeted":
+                            unreaped_count += 1
+                    elif state != _PROCESS_ABSENT:
+                        raise ProjectIOProtocolError("executor process identity is unverifiable.")
+                if not epoch.active:
+                    abnormal = True
+                if abnormal and request.project_id not in blocking_project_ids:
+                    if len(blocking_project_ids) >= PROJECT_IO_CAPACITY:
+                        continue
+                    blocking_project_ids.append(request.project_id)
+            overdue_count = len(overdue_requests)
+            if unknown:
+                envelope = "unknown"
+            elif overdue_count > PROJECT_IO_SUPPORTED_HANG_LIMIT:
+                envelope = "exceeded"
+            elif not epoch.active or overdue_count > 0 or unreaped_count > 0:
+                envelope = "degraded"
+            else:
+                envelope = "healthy"
         except (OSError, RuntimeError, ValueError, KeyError, TypeError, ProjectIOProtocolError):
             return self._unknown_status()
-        if epoch is None:
-            return self._unknown_status()
-        now = time.time()
-        active_count = 0
-        overdue_requests: list[ProjectIORequest] = []
-        exit_unverified_count = 0
-        unreaped_count = 0
-        blocking_project_ids: list[str] = []
-        unknown = False
-        for request_id, request in requests.items():
-            if request.project_id not in blocking_project_ids and len(blocking_project_ids) < PROJECT_IO_CAPACITY:
-                blocking_project_ids.append(request.project_id)
-            if request_id not in results and now - _timestamp_seconds(request.prepared_at) > PROJECT_IO_OVERDUE_SECONDS:
-                overdue_requests.append(request)
-            process = processes.get(request_id)
-            if process is None:
-                continue
-            state = inspect_process_identity(process.pid, process.start_time_ticks)
-            if state == _PROCESS_LIVE:
-                active_count += 1
-                if process.state == "stop_targeted":
-                    unreaped_count += 1
-            elif state == _PROCESS_UNVERIFIED:
-                exit_unverified_count += 1
-                unknown = True
-                if process.state == "stop_targeted":
-                    unreaped_count += 1
-        overdue_count = len(overdue_requests)
-        if epoch is None:
-            envelope = "unknown"
-            executor_epoch = None
-        elif unknown:
-            envelope = "unknown"
-            executor_epoch = epoch.executor_epoch
-        elif not epoch.active or requests:
-            envelope = "degraded"
-            executor_epoch = epoch.executor_epoch
-        elif overdue_count > PROJECT_IO_SUPPORTED_HANG_LIMIT:
-            envelope = "exceeded"
-            executor_epoch = epoch.executor_epoch
-        else:
-            envelope = "healthy"
-            executor_epoch = epoch.executor_epoch
-        # A third overdue request exceeds the supported envelope even though it
-        # remains bounded by the four fixed slots.
-        if overdue_count > PROJECT_IO_SUPPORTED_HANG_LIMIT and envelope != "unknown":
-            envelope = "exceeded"
         return {
             "protocol_version": PROJECT_IO_PROTOCOL_VERSION,
-            "executor_epoch": executor_epoch,
+            "executor_epoch": epoch.executor_epoch,
             "capacity": PROJECT_IO_CAPACITY,
             "active_worker_count": active_count,
             "overdue_worker_count": overdue_count,
@@ -2757,8 +2757,17 @@ class ProjectIOExecutor:
         }
 
     def has_unfinished_work(self) -> bool:
-        """Keep idle exit blocked unless the executor has a healthy empty epoch."""
-        return self.status_view()["envelope"] != "healthy"
+        """Return whether validated executor evidence still contains transport work."""
+        if self._reconciliation_unknown:
+            return True
+        try:
+            epoch = self._load_epoch()
+            if epoch is None or not epoch.active:
+                return True
+            requests, processes, results = self._scan_records()
+        except (OSError, RuntimeError, ValueError, KeyError, TypeError, ProjectIOProtocolError):
+            return True
+        return bool(requests or processes or results)
 
     def has_ready_result(self) -> bool:
         """Return whether a published result can be consumed without waiting on its worker."""

@@ -28,6 +28,25 @@ def _gpu_policy_view() -> dict[str, object]:
     }
 
 
+def _project_io_isolation(**overrides: object) -> dict[str, object]:
+    isolation: dict[str, object] = {
+        "protocol_version": 1,
+        "executor_epoch": "a" * 32,
+        "capacity": 4,
+        "active_worker_count": 0,
+        "overdue_worker_count": 0,
+        "exit_unverified_worker_count": 0,
+        "unreaped_worker_count": 0,
+        "free_slot_count": 4,
+        "supported_hang_limit": 2,
+        "envelope": "healthy",
+        "oldest_overdue_at": None,
+        "blocking_project_ids": [],
+    }
+    isolation.update(overrides)
+    return isolation
+
+
 def test_control_plane_next_action_reserves_restart_for_lane_failures() -> None:
     restart = _control_plane_next_action({}, {"state": "stopped"}, {"state": "healthy"})
     assert restart == "inspect qexp agent diagnostics active, then run qexp agent restart"
@@ -159,7 +178,7 @@ def test_agent_status_accepts_nested_gpu_policy_view_without_runtime_root() -> N
     assert json.loads(render(CliOutput(OutputKind.AGENT_STATUS, payload), "json")) == payload
 
 
-def test_agent_status_renders_project_io_isolation_only_when_degraded() -> None:
+def test_agent_status_separates_project_io_health_from_activity() -> None:
     base = {
         "action": "status",
         "machine_runtime_root": "/machine-runtime",
@@ -169,45 +188,140 @@ def test_agent_status_renders_project_io_isolation_only_when_degraded() -> None:
         "projects": [],
         "upgrade": {"projects": []},
     }
-    isolation = {
-        "protocol_version": 1,
-        "executor_epoch": "a" * 32,
-        "capacity": 4,
-        "active_worker_count": 1,
-        "overdue_worker_count": 1,
-        "exit_unverified_worker_count": 0,
-        "unreaped_worker_count": 0,
-        "free_slot_count": 3,
-        "supported_hang_limit": 2,
-        "envelope": "degraded",
-        "oldest_overdue_at": "2026-09-28T00:00:00Z",
-        "blocking_project_ids": ["project-a"],
-    }
+    isolation = _project_io_isolation(
+        active_worker_count=1,
+        overdue_worker_count=1,
+        free_slot_count=3,
+        supported_hang_limit=2,
+        envelope="degraded",
+        oldest_overdue_at="2026-09-28T00:00:00Z",
+        blocking_project_ids=["project-a"],
+    )
 
     degraded = render(CliOutput(OutputKind.AGENT_STATUS, {**base, "project_io_isolation": isolation}), "human")
-    healthy = render(
+    active = render(
         CliOutput(
             OutputKind.AGENT_STATUS,
             {
                 **base,
-                "project_io_isolation": {
-                    **isolation,
-                    "active_worker_count": 0,
-                    "overdue_worker_count": 0,
-                    "free_slot_count": 4,
-                    "envelope": "healthy",
-                    "oldest_overdue_at": None,
-                    "blocking_project_ids": [],
-                },
+                "project_io_isolation": _project_io_isolation(
+                    active_worker_count=4,
+                    free_slot_count=0,
+                ),
             },
         ),
+        "human",
+    )
+    empty = render(
+        CliOutput(OutputKind.AGENT_STATUS, {**base, "project_io_isolation": _project_io_isolation()}),
         "human",
     )
 
     assert "Attention required\n  Project I/O isolation status: degraded" in degraded
     assert "  Blocking projects: project-a" in degraded
     assert "  Workers (active / overdue / exit unverified): 1 / 1 / 0" in degraded
-    assert "Attention required" not in healthy
+    assert "Attention required" not in active
+    assert "Project I/O activity\n  State: in progress" in active
+    assert "  Active workers: 4" in active
+    assert "  Free executor slots: 0" in active
+    assert "Blocking projects" not in active
+    assert "Project I/O activity" not in empty
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"executor_epoch": None}, "executor_epoch"),
+        (
+            {
+                "overdue_worker_count": 1,
+                "oldest_overdue_at": "2026-09-28T00:00:00Z",
+            },
+            "healthy",
+        ),
+        ({"exit_unverified_worker_count": 1, "free_slot_count": 3}, "healthy"),
+        ({"unreaped_worker_count": 1, "free_slot_count": 3}, "healthy"),
+        ({"blocking_project_ids": ["project-a"]}, "healthy"),
+        ({"envelope": "degraded", "overdue_worker_count": 1, "free_slot_count": 3}, "oldest_overdue_at"),
+        (
+            {
+                "envelope": "degraded",
+                "oldest_overdue_at": "2026-09-28T00:00:00Z",
+            },
+            "oldest_overdue_at",
+        ),
+        (
+            {
+                "envelope": "exceeded",
+                "overdue_worker_count": 2,
+                "oldest_overdue_at": "2026-09-28T00:00:00Z",
+                "free_slot_count": 2,
+            },
+            "exceeded",
+        ),
+        (
+            {
+                "envelope": "degraded",
+                "overdue_worker_count": 3,
+                "oldest_overdue_at": "2026-09-28T00:00:00Z",
+                "free_slot_count": 1,
+            },
+            "supported_hang_limit",
+        ),
+        (
+            {
+                "envelope": "degraded",
+                "exit_unverified_worker_count": 1,
+                "free_slot_count": 3,
+            },
+            "exit_unverified_worker_count",
+        ),
+        ({"active_worker_count": 2, "free_slot_count": 3}, "occupied"),
+        (
+            {
+                "envelope": "unknown",
+                "active_worker_count": 1,
+                "exit_unverified_worker_count": 1,
+                "free_slot_count": 3,
+            },
+            "occupied",
+        ),
+        (
+            {
+                "envelope": "degraded",
+                "overdue_worker_count": 2,
+                "oldest_overdue_at": "2026-09-28T00:00:00Z",
+                "free_slot_count": 3,
+            },
+            "overdue_worker_count",
+        ),
+        (
+            {
+                "envelope": "degraded",
+                "unreaped_worker_count": 2,
+                "free_slot_count": 3,
+            },
+            "unreaped_worker_count",
+        ),
+    ],
+)
+def test_agent_status_rejects_inconsistent_project_io_isolation(
+    overrides: dict[str, object],
+    message: str,
+) -> None:
+    payload = {
+        "action": "status",
+        "machine_runtime_root": "/machine-runtime",
+        "agent_state": "active",
+        "pid": 17,
+        "registry_revision": 0,
+        "projects": [],
+        "upgrade": {"projects": []},
+        "project_io_isolation": _project_io_isolation(**overrides),
+    }
+
+    with pytest.raises(ValueError, match=message):
+        render(CliOutput(OutputKind.AGENT_STATUS, payload), "json")
 
 
 def test_agent_status_groups_diagnostics_for_human_scanning() -> None:

@@ -164,7 +164,7 @@ def _render_agent_status(result: Mapping[str, Any], _presentation: Mapping[str, 
     if result.get("stop_reason") is not None:
         rendered = f"{rendered}\n\nStop reason: {result.get('stop_reason')}"
     project_io = result.get("project_io_isolation")
-    if isinstance(project_io, Mapping) and project_io.get("envelope") != "healthy":
+    if isinstance(project_io, Mapping) and project_io.get("envelope") in {"degraded", "exceeded", "unknown"}:
         project_io_details = _status_section(
             "Attention required",
             (
@@ -179,6 +179,21 @@ def _render_agent_status(result: Mapping[str, Any], _presentation: Mapping[str, 
                     f"{project_io.get('exit_unverified_worker_count')}",
                 ),
                 ("Unreaped workers", project_io.get("unreaped_worker_count")),
+            ),
+        )
+        if project_io_details:
+            rendered = f"{rendered}\n\n{project_io_details}" if rendered else project_io_details
+    elif (
+        isinstance(project_io, Mapping)
+        and project_io.get("envelope") == "healthy"
+        and project_io.get("free_slot_count") < project_io.get("capacity")
+    ):
+        project_io_details = _status_section(
+            "Project I/O activity",
+            (
+                ("State", "in progress"),
+                ("Active workers", project_io.get("active_worker_count")),
+                ("Free executor slots", project_io.get("free_slot_count")),
             ),
         )
         if project_io_details:
@@ -711,6 +726,47 @@ def _validate_project_io_isolation(value: Any) -> None:
         raise TypeError(f"{label}.blocking_project_ids contains an invalid ID")
     if len(set(projects)) != len(projects):
         raise ValueError(f"{label}.blocking_project_ids must not contain duplicates")
+
+    envelope = isolation["envelope"]
+    overdue_count = isolation["overdue_worker_count"]
+    exit_unverified_count = isolation["exit_unverified_worker_count"]
+    unreaped_count = isolation["unreaped_worker_count"]
+    if envelope != "unknown" and epoch is None:
+        raise ValueError(f"{label}.executor_epoch is required for a non-unknown envelope")
+    if envelope == "healthy":
+        for key in ("overdue_worker_count", "exit_unverified_worker_count", "unreaped_worker_count"):
+            if isolation[key] != 0:
+                raise ValueError(f"{label}.envelope=healthy is inconsistent with {label}.{key}")
+        if oldest is not None:
+            raise ValueError(f"{label}.envelope=healthy is inconsistent with {label}.oldest_overdue_at")
+        if projects:
+            raise ValueError(f"{label}.envelope=healthy is inconsistent with {label}.blocking_project_ids")
+    elif (overdue_count > 0) != (oldest is not None):
+        raise ValueError(
+            f"{label}.oldest_overdue_at and {label}.overdue_worker_count must describe the same overdue state"
+        )
+    if exit_unverified_count > 0 and envelope != "unknown":
+        raise ValueError(f"{label}.exit_unverified_worker_count requires {label}.envelope='unknown'")
+    if envelope != "unknown":
+        if overdue_count > isolation["supported_hang_limit"] and envelope != "exceeded":
+            raise ValueError(
+                f"{label}.overdue_worker_count exceeds {label}.supported_hang_limit but envelope is not 'exceeded'"
+            )
+        if envelope == "exceeded" and overdue_count <= isolation["supported_hang_limit"]:
+            raise ValueError(
+                f"{label}.envelope='exceeded' requires {label}.overdue_worker_count to exceed "
+                f"{label}.supported_hang_limit"
+            )
+    occupied_slots = isolation["capacity"] - isolation["free_slot_count"]
+    if isolation["active_worker_count"] + exit_unverified_count > occupied_slots:
+        raise ValueError(
+            f"{label}.active_worker_count and {label}.exit_unverified_worker_count exceed occupied slots "
+            f"derived from {label}.free_slot_count"
+        )
+    if overdue_count > occupied_slots:
+        raise ValueError(f"{label}.overdue_worker_count exceeds occupied slots derived from {label}.free_slot_count")
+    if unreaped_count > occupied_slots:
+        raise ValueError(f"{label}.unreaped_worker_count exceeds occupied slots derived from {label}.free_slot_count")
 
 
 def _validate_scheduler_diagnostics(result: Any) -> None:
