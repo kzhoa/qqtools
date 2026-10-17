@@ -2323,7 +2323,7 @@ def test_heartbeat_snapshot_queue_does_not_claim_registration_publication(tmp_pa
 def test_dispatch_consumes_heartbeat_snapshot_intent_through_isolated_worker(tmp_path):
     cfg = init_shared_root(tmp_path / "project" / ".qexp", "gpu-1", runtime_root=tmp_path / "legacy")
     runtime = MachineRuntime(tmp_path / "machine")
-    runtime.add_binding(cfg.shared_root, cfg.machine_name)
+    binding = runtime.add_binding(cfg.shared_root, cfg.machine_name)
     executor = ProjectIOExecutor(runtime)
     executor.begin_epoch()
     runtime.project_io_executor = executor
@@ -2340,14 +2340,26 @@ def test_dispatch_consumes_heartbeat_snapshot_intent_through_isolated_worker(tmp
         plane._publish_heartbeat()
         assert plane._heartbeat_snapshot["observation_status"] == "queued"
         deadline = time.monotonic() + 10.0
-        while not heartbeat_path.exists() and time.monotonic() < deadline:
+        publication = {"items": []}
+        while time.monotonic() < deadline:
             dispatch_machine_cycle_locked(runtime, available_gpus=[], supervise=False, publish_snapshots=False)
+            controller = runtime.project_io_controller
+            publication = controller.machine_snapshot_health_view(limit=8)
+            if heartbeat_path.exists() and publication["items"] and publication["items"][0]["stage"] == "published":
+                break
             time.sleep(0.02)
         assert heartbeat_path.exists(), {
             "workers": describe_project_io_workers(executor),
             "working_set": runtime.working_set.snapshot(),
             "snapshot_intent": runtime.machine_snapshot_intent(),
         }
+        assert publication["total"] == 1
+        assert publication["omitted_count"] == 0
+        assert publication["items"][0]["project_id"] == binding.project_id
+        assert publication["items"][0]["registration_generation"] == binding.registration_generation
+        assert publication["items"][0]["operation_kind"] == "machine_snapshot_publish"
+        assert publication["items"][0]["stage"] == "published"
+        assert publication["items"][0]["last_published_at"] is not None
     finally:
         executor.shutdown()
 

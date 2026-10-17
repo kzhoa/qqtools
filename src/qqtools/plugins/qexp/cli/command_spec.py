@@ -151,7 +151,10 @@ def _detailed_help(parser: argparse.ArgumentParser, spec: CommandSpec) -> str:
             "Finite process-replacement result; readiness may remain pending and is observed with `qexp agent status`."
         )
     elif spec.handler in {"status", "agent_status"}:
-        output = "Finite status result with configured mode, distinct observed mode, and readiness evidence."
+        output = (
+            "Finite status result with configured mode, distinct observed mode, readiness evidence, and "
+            "control-plane health; an active process alone does not certify heartbeat health."
+        )
     elif OutputMode.FINITE in spec.modes:
         output = "Finite result supports --format human or --format json."
     else:

@@ -4266,6 +4266,12 @@ def test_blocked_snapshot_publication_does_not_delay_healthy_peer(tmp_path: Path
         assert healthy_completion["outcome"] == "published"
         assert machine_state_path(healthy_cfg, "agent.json").exists()
         assert executor.status_view()["active_worker_count"] == 1
+        publication_by_project = {
+            item["project_id"]: item for item in controller.machine_snapshot_health_view(limit=8)["items"]
+        }
+        assert publication_by_project[healthy.project_id]["stage"] == "published"
+        assert publication_by_project[blocked.project_id]["stage"] == "started"
+        assert publication_by_project[blocked.project_id]["worker_elapsed_seconds"] is not None
     finally:
         blocked_machine_record.unlink()
         blocked_machine_record.write_bytes(original)

@@ -5,9 +5,10 @@ from __future__ import annotations
 import math
 import threading
 import time
+import traceback
 from collections.abc import Iterator
 from contextlib import contextmanager
-from typing import Any
+from typing import Any, Callable, Mapping
 
 from ..authority import AuthoritySupervisor
 from ..authority import AuthoritySupervisor as _AuthoritySupervisor
@@ -32,13 +33,41 @@ from ..runtime.store import atomic_replace
 from ..runtime.work_budget import RuntimeDiagnostics, activate_diagnostics, diagnostic_increment
 from . import helpers as _helpers
 from .context import MachineRuntime, ProjectBinding
+from .control_plane_health import ControlPlaneHealth
 from .deadlines import advance_deadline
 from .helpers import _read_pid
 from .project_io_controller import ProjectIOController
 from .recovery_capture import recovery_owner
+from .scheduler_diagnostics import SchedulerDiagnosticStore
 
 STARTUP_AUTHORITY_POLL_SECONDS = 1.0
 _INITIAL_CONTROL_PLANE_BINDINGS = 64
+_SCHEDULER_DIAGNOSTIC_READ_LIMIT = 32
+_HEARTBEAT_FINDING_REASONS = frozenset(
+    {
+        "heartbeat_thread_stopped",
+        "heartbeat_cycle_stalled",
+        "heartbeat_repeated_failure",
+        "heartbeat_diagnostic_coverage_loss",
+        "project_snapshot_overdue",
+    }
+)
+
+
+class ControlPlaneStopBlockedError(RuntimeError):
+    """A control-plane thread remained alive after a bounded stop attempt."""
+
+    def __init__(self, *, instance_id: str, heartbeat_thread_alive: bool, authority_thread_alive: bool) -> None:
+        self.reason = "recovery_blocked"
+        self.instance_id = instance_id
+        self.heartbeat_thread_alive = heartbeat_thread_alive
+        self.authority_thread_alive = authority_thread_alive
+        self.authority_liveness = authority_thread_alive
+        super().__init__(
+            "recovery_blocked: control-plane stop left live thread(s) "
+            f"instance_id={instance_id!r} heartbeat_thread_alive={heartbeat_thread_alive} "
+            f"authority_thread_alive={authority_thread_alive}"
+        )
 
 
 @contextmanager
@@ -62,6 +91,8 @@ class _MachineControlPlane:
         started_at: str,
         available_gpus: list[int] | None,
         scheduler_wakeup: threading.Event | None = None,
+        private_log: Callable[[str], None] | None = None,
+        publish_instance_evidence: Callable[[Mapping[str, object]], bool] | None = None,
     ) -> None:
         if not math.isfinite(loop_interval) or loop_interval <= 0:
             raise ValueError("control-plane interval must be finite and positive")
@@ -72,6 +103,16 @@ class _MachineControlPlane:
         self._started_at = started_at
         self._available_gpus = list(available_gpus) if available_gpus is not None else None
         self._scheduler_wakeup = scheduler_wakeup
+        self._private_log = private_log
+        self._publish_instance_evidence = publish_instance_evidence
+        self._health = ControlPlaneHealth(
+            self._runtime.root,
+            instance_id=self._instance_id,
+            interval_seconds=self._loop_interval,
+            private_log=private_log,
+            publish_instance_evidence=publish_instance_evidence,
+        )
+        self._scheduler_diagnostics = SchedulerDiagnosticStore(self._runtime.root)
         self._registry_revision: int | None = None
         self._stop_event = threading.Event()
         self._supervisors: dict[str, AuthoritySupervisor] = {}
@@ -99,22 +140,57 @@ class _MachineControlPlane:
 
     def start(self) -> None:
         """Publish initial liveness before starting the control loops."""
-        self._publish_heartbeat()
+        try:
+            self._publish_heartbeat()
+        except Exception as exc:
+            self._log_heartbeat_exception(exc)
         self._authority_thread.start()
         self._heartbeat_thread.start()
 
-    def stop(self) -> None:
+    def stop(self, *, join_timeout: float = 2.0) -> None:
         """Stop control loops before publishing the terminal machine snapshot."""
+        if (
+            type(join_timeout) not in {int, float}
+            or isinstance(join_timeout, bool)
+            or not math.isfinite(float(join_timeout))
+            or join_timeout < 0
+        ):
+            raise ValueError("join_timeout must be a finite nonnegative number")
         self._stop_event.set()
+        deadline = time.monotonic() + float(join_timeout)
         for thread in (self._authority_thread, self._heartbeat_thread):
-            if thread.is_alive():
-                thread.join()
+            if not thread.is_alive():
+                continue
+            remaining = max(0.0, deadline - time.monotonic())
+            thread.join(timeout=remaining)
+
+        cleanup_error: Exception | None = None
         for supervisor in self._supervisors.values():
-            supervisor.close()
+            try:
+                supervisor.close()
+            except Exception as exc:
+                cleanup_error = cleanup_error or exc
         for scan in self._eligibility_scans.values():
-            scan.close()
+            try:
+                scan.close()
+            except Exception as exc:
+                cleanup_error = cleanup_error or exc
         for supervisor in self._outage_supervisors.values():
-            supervisor.close()
+            try:
+                supervisor.close()
+            except Exception as exc:
+                cleanup_error = cleanup_error or exc
+
+        authority_thread_alive = self._authority_thread.is_alive()
+        heartbeat_thread_alive = self._heartbeat_thread.is_alive()
+        if authority_thread_alive or heartbeat_thread_alive:
+            raise ControlPlaneStopBlockedError(
+                instance_id=self._instance_id,
+                heartbeat_thread_alive=heartbeat_thread_alive,
+                authority_thread_alive=authority_thread_alive,
+            ) from cleanup_error
+        if cleanup_error is not None:
+            raise cleanup_error
 
     def _supervised_bindings(self) -> list[ProjectBinding]:
         revision, registered = self._runtime.load_registry_snapshot()
@@ -510,12 +586,229 @@ class _MachineControlPlane:
         sample["sampled_at"] = utc_now()
         sample["work_seconds"] = max(0.0, time.monotonic() - started)
         sample["interval_seconds"] = interval
+        self._health.update_authority(sample)
+        self._health.persist(heartbeat_thread_alive=self._heartbeat_thread_liveness())
         # Publish only complete snapshots. The heartbeat thread never observes
         # lists or dictionaries while the authority thread is mutating them.
         self._authority_snapshot = sample
 
+    def _heartbeat_thread_liveness(self) -> bool | None:
+        """Return actual heartbeat thread liveness when the thread has been started."""
+        thread = self._heartbeat_thread
+        if thread.ident is None:
+            return None
+        return thread.is_alive()
+
+    def monitor_health(self) -> dict[str, object]:
+        """Watch heartbeat liveness and reconcile bounded scheduler findings."""
+        heartbeat_thread_alive = self._heartbeat_thread_liveness()
+        if isinstance(heartbeat_thread_alive, bool):
+            try:
+                self._health.monitor_heartbeat(heartbeat_thread_alive)
+            except Exception:
+                self._health.record_diagnostic_coverage_loss("health_monitor")
+            else:
+                self._health.record_diagnostic_coverage_recovery("health_monitor")
+        try:
+            controller = getattr(self._runtime, "project_io_controller", None)
+            publications = (
+                controller.machine_snapshot_health_view(limit=8)
+                if isinstance(controller, ProjectIOController)
+                else {"total": 0, "omitted_count": 0, "items": []}
+            )
+            self._health.update_project_snapshot_publications(publications)
+        except Exception:
+            self._health.record_diagnostic_coverage_loss("project_snapshot_health")
+        else:
+            self._health.record_diagnostic_coverage_recovery("project_snapshot_health")
+        try:
+            self._health.persist(heartbeat_thread_alive=heartbeat_thread_alive)
+        except Exception:
+            self._health.record_diagnostic_coverage_loss("health_monitor_persistence")
+        snapshot = self._health.snapshot(heartbeat_thread_alive=heartbeat_thread_alive)
+        try:
+            self._reconcile_scheduler_findings(snapshot)
+        except Exception:
+            self._health.record_diagnostic_coverage_loss("scheduler_diagnostics")
+        else:
+            self._health.record_diagnostic_coverage_recovery("scheduler_diagnostics")
+        return self._health.snapshot(heartbeat_thread_alive=heartbeat_thread_alive)
+
+    def _reconcile_scheduler_findings(self, snapshot: Mapping[str, object]) -> None:
+        """Publish current control-plane findings and resolve exact stale records."""
+        store = self._scheduler_diagnostics
+        active = store.active_view(producer="control_plane_health", limit=_SCHEDULER_DIAGNOSTIC_READ_LIMIT)
+        self._require_scheduler_diagnostic_read(active)
+        for item in self._scheduler_items(active):
+            identity = item.get("identity")
+            if not isinstance(identity, Mapping):
+                continue
+            if identity.get("runtime_id") != self._runtime.instance_id:
+                continue
+            if identity.get("reason_code") not in _HEARTBEAT_FINDING_REASONS:
+                continue
+            if identity.get("target_id") == self._instance_id:
+                continue
+            self._resolve_scheduler_finding(store, item)
+
+        findings = self._current_scheduler_findings(snapshot)
+        for finding in findings:
+            store.observe_finding(
+                identity=finding["identity"],
+                severity="fault",
+                source_revision=finding["source_revision"],
+                details=finding["details"],
+                observed_at=finding["observed_at"],
+            )
+
+        active = store.active_view(producer="control_plane_health", limit=_SCHEDULER_DIAGNOSTIC_READ_LIMIT)
+        self._require_scheduler_diagnostic_read(active)
+        desired = [finding["identity"] for finding in findings]
+        for item in self._scheduler_items(active):
+            identity = item.get("identity")
+            if not isinstance(identity, Mapping):
+                continue
+            if identity.get("target_id") != self._instance_id:
+                continue
+            if identity.get("runtime_id") != self._runtime.instance_id:
+                continue
+            if identity.get("reason_code") not in _HEARTBEAT_FINDING_REASONS:
+                continue
+            if any(identity == candidate for candidate in desired):
+                continue
+            self._resolve_scheduler_finding(store, item)
+
+    @staticmethod
+    def _require_scheduler_diagnostic_read(view: Mapping[str, object]) -> None:
+        reason = view.get("reason")
+        if reason is not None and reason != "store_not_initialized":
+            raise OSError(f"scheduler diagnostic read unavailable: {reason}")
+
+    @staticmethod
+    def _scheduler_items(view: Mapping[str, object]) -> list[Mapping[str, object]]:
+        items = view.get("items")
+        if not isinstance(items, list):
+            return []
+        return [item for item in items if isinstance(item, Mapping)]
+
+    def _resolve_scheduler_finding(self, store: SchedulerDiagnosticStore, item: Mapping[str, object]) -> None:
+        identity = item.get("identity")
+        episode = item.get("episode")
+        observation_revision = item.get("observation_revision")
+        source_revision = item.get("source_revision")
+        if (
+            not isinstance(identity, Mapping)
+            or not isinstance(episode, str)
+            or type(observation_revision) is not int
+            or not isinstance(source_revision, Mapping)
+        ):
+            return
+        store.resolve_finding(
+            identity=identity,
+            episode=episode,
+            observation_revision=observation_revision,
+            source_revision=source_revision,
+            resolved_at=utc_now(),
+        )
+
+    def _current_scheduler_findings(self, snapshot: Mapping[str, object]) -> list[dict[str, object]]:
+        heartbeat = snapshot.get("heartbeat")
+        heartbeat = heartbeat if isinstance(heartbeat, Mapping) else {}
+        state = heartbeat.get("state")
+        reason = {
+            "stopped": "heartbeat_thread_stopped",
+            "stalled": "heartbeat_cycle_stalled",
+            "degraded": "heartbeat_repeated_failure",
+        }.get(state)
+        cycle_sequence = self._bounded_health_fact(heartbeat.get("cycle_sequence"))
+        source_revision = {
+            "cycle_sequence": cycle_sequence,
+            "consecutive_failures": self._bounded_health_fact(heartbeat.get("consecutive_failures")),
+            "missed_deadlines": self._bounded_health_fact(heartbeat.get("missed_deadlines")),
+            "coverage_loss_count": self._bounded_health_fact(heartbeat.get("diagnostic_coverage_loss_count")),
+        }
+        observed_at = utc_now()
+        findings: list[dict[str, object]] = []
+        if reason is not None:
+            findings.append(
+                {
+                    "identity": self._scheduler_finding_identity(reason),
+                    "source_revision": source_revision,
+                    "details": {"outcome": state},
+                    "observed_at": observed_at,
+                }
+            )
+        if heartbeat.get("diagnostic_coverage_degraded") is True:
+            findings.append(
+                {
+                    "identity": self._scheduler_finding_identity("heartbeat_diagnostic_coverage_loss"),
+                    "source_revision": source_revision,
+                    "details": {"coverage": "degraded"},
+                    "observed_at": observed_at,
+                }
+            )
+        publications = snapshot.get("project_snapshot_publications")
+        publication_items = publications.get("items") if isinstance(publications, Mapping) else None
+        if isinstance(publication_items, list):
+            for publication in publication_items:
+                if not isinstance(publication, Mapping) or publication.get("overdue") is not True:
+                    continue
+                registry_revision = publication.get("registry_revision")
+                failures = publication.get("consecutive_failures")
+                stage = publication.get("stage")
+                findings.append(
+                    {
+                        "identity": self._project_snapshot_finding_identity(publication),
+                        "source_revision": {
+                            "registry_revision": registry_revision if type(registry_revision) is int else 0,
+                            "consecutive_failures": failures if type(failures) is int else 0,
+                        },
+                        "details": {"progress": stage if isinstance(stage, str) else "unknown"},
+                        "observed_at": observed_at,
+                    }
+                )
+        return findings
+
+    def _project_snapshot_finding_identity(self, publication: Mapping[str, object]) -> dict[str, object]:
+        return {
+            "producer": "control_plane_health",
+            "reason_code": "project_snapshot_overdue",
+            "component": "control_plane",
+            "stage": "snapshot_publication",
+            "check": "progress",
+            "scope_type": "project_binding",
+            "runtime_id": publication.get("runtime_id", self._runtime.instance_id),
+            "target_id": publication.get("agent_instance_id", self._instance_id),
+            "project_id": publication.get("project_id"),
+            "registration_generation": publication.get("registration_generation"),
+            "registry_revision": publication.get("registry_revision"),
+            "executor_epoch": publication.get("executor_epoch"),
+            "operation_kind": "machine_snapshot_publish",
+            "request_id": publication.get("request_id") or "not_assigned",
+        }
+
+    def _scheduler_finding_identity(self, reason: str) -> dict[str, object]:
+        return {
+            "producer": "control_plane_health",
+            "reason_code": reason,
+            "component": "control_plane",
+            "stage": "heartbeat",
+            "check": "liveness",
+            "scope_type": "agent_instance",
+            "target_id": self._instance_id,
+            "runtime_id": self._runtime.instance_id,
+        }
+
+    @staticmethod
+    def _bounded_health_fact(value: object) -> int:
+        if type(value) is not int or value < 0:
+            return 0
+        return min((1 << 31) - 1, value)
+
     def _publish_authority_diagnostics(self) -> None:
         """Best-effort local diagnostics, never consulted for authority decisions."""
+        heartbeat_thread_alive = self._heartbeat_thread_liveness()
+        self._health.persist(heartbeat_thread_alive=heartbeat_thread_alive)
         snapshot = self._authority_snapshot
         if snapshot is None:
             return
@@ -528,10 +821,18 @@ class _MachineControlPlane:
         try:
             atomic_replace(
                 self._runtime.root / "authority_control_plane.json",
-                {"authority_control_plane": {**snapshot, "heartbeat": self._heartbeat_snapshot}},
+                {
+                    "authority_control_plane": {
+                        **snapshot,
+                        "heartbeat": self._heartbeat_snapshot,
+                        "control_plane_health": self._health.snapshot(heartbeat_thread_alive=heartbeat_thread_alive),
+                    }
+                },
             )
-        except OSError:
-            pass
+        except Exception:
+            self._health.record_diagnostic_coverage_loss("authority_snapshot")
+        else:
+            self._health.record_diagnostic_coverage_recovery("authority_snapshot")
 
     def _reserved_gpu_ids(self) -> set[int] | None:
         """Read occupancy without allowing a transient storage error to stop supervision."""
@@ -570,15 +871,21 @@ class _MachineControlPlane:
 
     def _publish_heartbeat(self) -> None:
         diagnostics = RuntimeDiagnostics()
-        self._heartbeat_cycle_count += 1
+        self._heartbeat_cycle_count = self._health.begin_heartbeat_cycle()
+        sequence = self._heartbeat_cycle_count
         started = time.monotonic()
         status = "raised"
         try:
             with activate_diagnostics(diagnostics):
                 status = self._publish_project_heartbeats()
+        except Exception as exc:
+            self._health.fail_heartbeat_cycle(sequence, exc)
+            raise
+        else:
+            self._health.complete_heartbeat_cycle(sequence, status)
         finally:
             self._heartbeat_snapshot = {
-                "sequence": self._heartbeat_cycle_count,
+                "sequence": sequence,
                 "sampled_at": utc_now(),
                 "work_seconds": max(0.0, time.monotonic() - started),
                 "observation_status": status,
@@ -659,6 +966,7 @@ class _MachineControlPlane:
             finished = time.monotonic()
             next_deadline, skipped = advance_deadline(deadline, interval, finished)
             self._authority_skipped_intervals += skipped
+            self._health.record_authority_missed_deadlines(skipped)
             self._authority_snapshot = {
                 **(self._authority_snapshot or {}),
                 "schedule": {
@@ -682,5 +990,28 @@ class _MachineControlPlane:
             remaining = deadline - time.monotonic()
             if remaining > 0 and self._stop_event.wait(remaining):
                 return
-            operation()
-            deadline, _ = advance_deadline(deadline, self._loop_interval, time.monotonic())
+            try:
+                operation()
+            except Exception as exc:
+                # _publish_heartbeat records the failure before propagating it;
+                # this boundary is deliberately defensive for injected or
+                # replacement operations and remains ordinary-Exception-only.
+                self._health.record_heartbeat_exception(exc)
+                self._log_heartbeat_exception(exc)
+            deadline, skipped = advance_deadline(deadline, self._loop_interval, time.monotonic())
+            self._health.record_missed_deadlines(skipped)
+
+    def _log_heartbeat_exception(self, exc: Exception) -> None:
+        """Write unrestricted exception detail only to the owner-private log."""
+        try:
+            text = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+        except BaseException:
+            text = f"{type(exc).__name__}\n"
+        if self._private_log is None:
+            return
+        try:
+            self._private_log(text)
+        except Exception:
+            self._health.record_diagnostic_coverage_loss("private_traceback")
+        else:
+            self._health.record_diagnostic_coverage_recovery("private_traceback")

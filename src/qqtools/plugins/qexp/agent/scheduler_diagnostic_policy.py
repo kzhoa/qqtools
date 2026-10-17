@@ -37,6 +37,9 @@ _IDENTITY_FIELDS = frozenset(
         "registry_revision",
         "ready_revision",
         "attempt_id",
+        "executor_epoch",
+        "operation_kind",
+        "request_id",
     }
 )
 
@@ -131,6 +134,7 @@ def canonicalize_diagnostic_identity(value: Mapping[str, object]) -> tuple[dict[
         "admission_role",
         "projection_kind",
         "maintenance_kind",
+        "operation_kind",
     }
     for key, raw in value.items():
         if key not in _IDENTITY_FIELDS:

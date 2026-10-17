@@ -163,6 +163,60 @@ def test_writer_merge_is_order_independent_and_specific_agent_failure_wins(
     assert all(item["source"] == "agent" for item in summaries)
 
 
+def test_control_plane_summary_is_persisted_without_unclassified_failure_content(
+    diagnostic_runtime: MachineRuntime,
+) -> None:
+    prepared = prepare_agent_diagnostics(
+        diagnostic_runtime,
+        instance_id="control-plane-summary",
+        capture_mode="detached",
+        log_max_bytes=MIN_LOG_MAX_BYTES,
+    )
+    prepared.close()
+
+    assert update_diagnostic_evidence(
+        diagnostic_runtime,
+        instance_id=prepared.instance_id,
+        startup_sequence=prepared.startup_sequence,
+        writer="agent",
+        revision=1,
+        evidence={
+            "control_plane": {
+                "state": "retrying",
+                "last_success_at": "2026-10-16T00:00:00Z",
+                "last_failure_at": "2026-10-16T00:00:05Z",
+                "maximum_consecutive_failures": 1,
+                "last_failure": {
+                    "reason_code": "heartbeat_cycle_exception",
+                    "cycle_sequence": 4,
+                    "sanitized": True,
+                    "exception_type": "RuntimeError",
+                    "filename": "/private/control_plane.py",
+                    "function": "_publish_heartbeat",
+                    "line": 637,
+                    "message": "secret-token",
+                },
+                "coverage_loss_count": 0,
+                "raw_path": "/private/credentials.txt",
+            }
+        },
+    )
+
+    record = read_diagnostic_record(diagnostic_runtime, prepared.instance_id)
+    assert record is not None
+    control_plane = summarize_diagnostic_record(record)["control_plane"]
+    assert control_plane["last_failure"] == {
+        "reason_code": "heartbeat_cycle_exception",
+        "cycle_sequence": 4,
+        "sanitized": True,
+        "exception_type": "RuntimeError",
+        "filename": "control_plane.py",
+        "function": "_publish_heartbeat",
+        "line": 637,
+    }
+    assert "raw_path" not in control_plane
+
+
 def test_writer_revision_is_monotonic_and_retry_is_idempotent(diagnostic_runtime: MachineRuntime) -> None:
     prepared = prepare_agent_diagnostics(
         diagnostic_runtime,

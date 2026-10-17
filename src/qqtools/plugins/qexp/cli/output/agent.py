@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import re
 from collections.abc import Mapping, Sequence
 from datetime import datetime
@@ -49,6 +50,42 @@ def _status_mapping_fields(value: Any) -> list[tuple[str, Any]]:
         else:
             fields.append((label, item))
     return fields
+
+
+def _render_affected_projects(value: object) -> str:
+    if not isinstance(value, Mapping):
+        return ""
+    raw_items = value.get("items")
+    if not isinstance(raw_items, Sequence) or isinstance(raw_items, (str, bytes)):
+        return ""
+    lines: list[str] = []
+    for item in raw_items[:8]:
+        if not isinstance(item, Mapping) or item.get("overdue") is not True:
+            continue
+        detail = str(item.get("stage"))
+        if item.get("reason_code") is not None:
+            detail += f" ({item.get('reason_code')})"
+        lines.append(f"  {item.get('project_id')}: {detail}")
+    omitted = value.get("omitted_count")
+    if lines and type(omitted) is int and omitted > 0:
+        lines.append(f"  … {omitted} additional publication entries omitted")
+    return "Affected Projects\n" + "\n".join(lines) if lines else ""
+
+
+def _control_plane_next_action(
+    control_plane: Mapping[str, Any], heartbeat: Mapping[str, Any], authority: Mapping[str, Any]
+) -> str | None:
+    if heartbeat.get("state") in {"degraded", "stalled", "stopped"} or authority.get("state") in {
+        "degraded",
+        "stalled",
+        "stopped",
+    }:
+        return "inspect qexp agent diagnostics active, then run qexp agent restart"
+    publications = control_plane.get("project_snapshot_publications")
+    items = publications.get("items") if isinstance(publications, Mapping) else None
+    if isinstance(items, Sequence) and any(isinstance(item, Mapping) and item.get("overdue") is True for item in items):
+        return "inspect qexp agent diagnostics active; restart is not required while the heartbeat remains responsive"
+    return None
 
 
 def _project_readiness(project: Mapping[str, Any]) -> tuple[bool, Any, Any]:
@@ -146,6 +183,46 @@ def _render_agent_status(result: Mapping[str, Any], _presentation: Mapping[str, 
         )
         if project_io_details:
             rendered = f"{rendered}\n\n{project_io_details}" if rendered else project_io_details
+    control_plane = result.get("control_plane_health")
+    if isinstance(control_plane, Mapping):
+        heartbeat = control_plane.get("heartbeat")
+        heartbeat = heartbeat if isinstance(heartbeat, Mapping) else {}
+        authority = control_plane.get("authority")
+        authority = authority if isinstance(authority, Mapping) else {}
+        heartbeat_failure = heartbeat.get("last_failure")
+        heartbeat_failure = heartbeat_failure if isinstance(heartbeat_failure, Mapping) else {}
+        control_plane_sections = [
+            _status_section(
+                "Control plane",
+                (
+                    ("State", control_plane.get("state")),
+                    ("Authority", authority.get("state")),
+                    (
+                        "Next action",
+                        _control_plane_next_action(control_plane, heartbeat, authority),
+                    ),
+                ),
+            ),
+            _status_section(
+                "Heartbeat",
+                (
+                    ("State", heartbeat.get("state")),
+                    ("Thread alive", heartbeat.get("thread_alive")),
+                    ("Last cycle started", heartbeat.get("last_cycle_started_at")),
+                    ("Last cycle completed", heartbeat.get("last_cycle_completed_at")),
+                    ("Last success", heartbeat.get("last_success_at")),
+                    ("Last failure", heartbeat.get("last_failure_at")),
+                    ("Consecutive failures", heartbeat.get("consecutive_failures")),
+                    ("Reason", heartbeat_failure.get("reason_code")),
+                    ("Cycle duration", heartbeat.get("cycle_duration_seconds")),
+                    ("Missed deadlines", heartbeat.get("missed_deadlines")),
+                ),
+            ),
+            _render_affected_projects(control_plane.get("project_snapshot_publications")),
+        ]
+        control_plane_details = "\n\n".join(section for section in control_plane_sections if section)
+        if control_plane_details:
+            rendered = f"{rendered}\n\n{control_plane_details}" if rendered else control_plane_details
     diagnostics = result.get("diagnostics")
     if isinstance(diagnostics, Mapping):
         last_exit = diagnostics.get("last_exit")
@@ -404,6 +481,8 @@ def _validate_agent_status(result: Any) -> None:
         _validate_gpu_policy_view(value["gpu_policy"], "agent-status payload.gpu_policy")
     if "warnings" in value:
         _sequence(value["warnings"], "agent-status payload.warnings")
+    if "control_plane_health" in value:
+        _validate_control_plane_health(value["control_plane_health"])
     if "diagnostics" in value:
         diagnostics = _mapping(value["diagnostics"], "agent-status payload.diagnostics")
         if "log_available" in diagnostics and type(diagnostics["log_available"]) is not bool:
@@ -442,6 +521,137 @@ def _validate_agent_status(result: Any) -> None:
             _required(scheduler, key, "agent-status payload.scheduler_diagnostics")
     if "project_io_isolation" in value:
         _validate_project_io_isolation(value["project_io_isolation"])
+
+
+def _validate_control_plane_health(value: Any) -> None:
+    label = "agent-status payload.control_plane_health"
+    health = _mapping(value, label)
+    state = _required(health, "state", label)
+    if state not in {"healthy", "retrying", "degraded", "stalled", "stopped", "unknown"}:
+        raise ValueError(f"{label}.state is invalid")
+    if "instance_id" in health and health["instance_id"] is not None and not isinstance(health["instance_id"], str):
+        raise TypeError(f"{label}.instance_id must be a string or null")
+    if "project_snapshot_publications" in health:
+        _validate_project_snapshot_publications(health["project_snapshot_publications"], label)
+    for lane_name in ("heartbeat", "authority"):
+        if lane_name not in health:
+            continue
+        lane = _mapping(health[lane_name], f"{label}.{lane_name}")
+        if "state" in lane and lane["state"] not in {
+            "healthy",
+            "retrying",
+            "degraded",
+            "stalled",
+            "stopped",
+            "unknown",
+        }:
+            raise ValueError(f"{label}.{lane_name}.state is invalid")
+        if "thread_alive" in lane and lane["thread_alive"] is not None and type(lane["thread_alive"]) is not bool:
+            raise TypeError(f"{label}.{lane_name}.thread_alive must be a boolean or null")
+        if (
+            "diagnostic_coverage_degraded" in lane
+            and lane["diagnostic_coverage_degraded"] is not None
+            and type(lane["diagnostic_coverage_degraded"]) is not bool
+        ):
+            raise TypeError(f"{label}.{lane_name}.diagnostic_coverage_degraded must be a boolean or null")
+        for key in (
+            "consecutive_failures",
+            "cycle_sequence",
+            "missed_deadlines",
+            "diagnostic_coverage_loss_count",
+        ):
+            if key in lane and lane[key] is not None and (type(lane[key]) is not int or lane[key] < 0):
+                raise TypeError(f"{label}.{lane_name}.{key} must be a nonnegative integer or null")
+        for key in ("cycle_duration_seconds", "effective_stale_after_seconds"):
+            if key in lane and lane[key] is not None:
+                if type(lane[key]) not in {int, float} or isinstance(lane[key], bool) or not math.isfinite(lane[key]):
+                    raise TypeError(f"{label}.{lane_name}.{key} must be finite or null")
+                if lane[key] < 0:
+                    raise ValueError(f"{label}.{lane_name}.{key} must be nonnegative")
+        for key in (
+            "last_cycle_started_at",
+            "last_cycle_completed_at",
+            "last_success_at",
+            "last_failure_at",
+        ):
+            if key in lane and lane[key] is not None and not isinstance(lane[key], str):
+                raise TypeError(f"{label}.{lane_name}.{key} must be a string or null")
+        if "last_failure" in lane and lane["last_failure"] is not None:
+            failure = _mapping(lane["last_failure"], f"{label}.{lane_name}.last_failure")
+            if "reason_code" in failure and not isinstance(failure["reason_code"], str):
+                raise TypeError(f"{label}.{lane_name}.last_failure.reason_code must be a string")
+            if "sanitized" in failure and type(failure["sanitized"]) is not bool:
+                raise TypeError(f"{label}.{lane_name}.last_failure.sanitized must be a boolean")
+        if "last_liveness_failure" in lane and lane["last_liveness_failure"] is not None:
+            failure_label = f"{label}.{lane_name}.last_liveness_failure"
+            failure = _mapping(lane["last_liveness_failure"], failure_label)
+            if failure.get("state") not in {"stalled", "stopped"}:
+                raise ValueError(f"{failure_label}.state is invalid")
+            if failure.get("reason_code") not in {"heartbeat_cycle_stalled", "heartbeat_thread_stopped"}:
+                raise ValueError(f"{failure_label}.reason_code is invalid")
+            if not isinstance(failure.get("observed_at"), str):
+                raise TypeError(f"{failure_label}.observed_at must be a string")
+            if type(failure.get("cycle_sequence")) is not int or failure["cycle_sequence"] < 0:
+                raise TypeError(f"{failure_label}.cycle_sequence must be a nonnegative integer")
+            if type(failure.get("thread_alive")) is not bool:
+                raise TypeError(f"{failure_label}.thread_alive must be a boolean")
+
+
+def _validate_project_snapshot_publications(value: Any, health_label: str) -> None:
+    label = f"{health_label}.project_snapshot_publications"
+    publications = _mapping(value, label)
+    for key in ("total", "omitted_count"):
+        item = _required(publications, key, label)
+        if type(item) is not int or item < 0:
+            raise TypeError(f"{label}.{key} must be a nonnegative integer")
+    items = _required_sequence(publications, "items", label)
+    if len(items) > 8:
+        raise ValueError(f"{label}.items must contain at most 8 entries")
+    for index, raw in enumerate(items):
+        item_label = f"{label}.items[{index}]"
+        item = _mapping(raw, item_label)
+        for key in (
+            "runtime_id",
+            "agent_instance_id",
+            "executor_epoch",
+            "project_id",
+            "registration_generation",
+        ):
+            if not isinstance(_required(item, key, item_label), str):
+                raise TypeError(f"{item_label}.{key} must be a string")
+        revision = _required(item, "registry_revision", item_label)
+        if type(revision) is not int or revision < 0:
+            raise TypeError(f"{item_label}.registry_revision must be a nonnegative integer")
+        if _required(item, "operation_kind", item_label) != "machine_snapshot_publish":
+            raise ValueError(f"{item_label}.operation_kind is invalid")
+        request_id = _required(item, "request_id", item_label)
+        if request_id is not None and not isinstance(request_id, str):
+            raise TypeError(f"{item_label}.request_id must be a string or null")
+        if _required(item, "stage", item_label) not in {
+            "intent",
+            "queued",
+            "started",
+            "result_ready",
+            "consumed",
+            "backoff",
+            "published",
+        }:
+            raise ValueError(f"{item_label}.stage is invalid")
+        for key in ("last_attempt_at", "last_published_at", "retry_at", "reason_code"):
+            field = _required(item, key, item_label)
+            if field is not None and not isinstance(field, str):
+                raise TypeError(f"{item_label}.{key} must be a string or null")
+        failures = _required(item, "consecutive_failures", item_label)
+        if type(failures) is not int or failures < 0:
+            raise TypeError(f"{item_label}.consecutive_failures must be a nonnegative integer")
+        for key in ("worker_elapsed_seconds", "effective_stale_after_seconds"):
+            field = _required(item, key, item_label)
+            if field is not None and (
+                type(field) not in {int, float} or isinstance(field, bool) or not math.isfinite(field) or field < 0
+            ):
+                raise TypeError(f"{item_label}.{key} must be finite and nonnegative or null")
+        if type(_required(item, "overdue", item_label)) is not bool:
+            raise TypeError(f"{item_label}.overdue must be a boolean")
 
 
 def _validate_project_io_isolation(value: Any) -> None:

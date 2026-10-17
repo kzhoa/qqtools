@@ -84,6 +84,7 @@ from . import helpers as _helpers
 from .config import load_agent_config
 from .context import MachineRuntime, ProjectBinding, default_machine_runtime_root
 from .control_plane import _MachineControlPlane
+from .control_plane_health import read_control_plane_health
 from .diagnostics import (
     AgentLogService,
     bounded_exception_evidence,
@@ -285,6 +286,11 @@ def get_machine_agent_status(
     }
     if diagnostics is not None:
         result["diagnostics"] = diagnostics
+    result["control_plane_health"] = read_control_plane_health(
+        machine_runtime.root,
+        instance_id=identity[1] if identity is not None else None,
+        thread_alive=None,
+    )
     try:
         result["scheduler_diagnostics"] = SchedulerDiagnosticStore(machine_runtime).summary_view()
     except Exception:
@@ -560,12 +566,20 @@ def run_machine_agent_loop(
                 started_at=started_at,
                 available_gpus=available_gpus,
                 scheduler_wakeup=scheduler_wakeup,
+                private_log=write_managed_log,
+                publish_instance_evidence=lambda evidence: publish_agent_evidence(**dict(evidence)),
             )
             control_plane.start()
             while not stop:
                 scheduler_wakeup.clear()
                 if stop:
                     break
+                try:
+                    control_plane.monitor_health()
+                except Exception:
+                    # Health persistence and scheduler diagnostics are advisory;
+                    # their failure must not stop the advancing lifecycle loop.
+                    pass
                 try:
                     project_io_executor.poll()
                 except (OSError, RuntimeError, ValueError, KeyError, TypeError):
@@ -1193,7 +1207,19 @@ def _stop_machine_agent_locked(machine_runtime: MachineRuntime, *, timeout: floa
     while _pid_start_time_ticks(pid) == start_ticks and time.monotonic() < deadline:
         time.sleep(0.05)
     if _pid_start_time_ticks(pid) == start_ticks:
-        raise MachineAgentStopError(f"machine agent {pid} did not stop within {timeout} seconds.")
+        health = read_control_plane_health(
+            machine_runtime.root,
+            instance_id=identity[1],
+            thread_alive=None,
+        )
+        heartbeat = health.get("heartbeat")
+        heartbeat = heartbeat if isinstance(heartbeat, dict) else {}
+        raise MachineAgentStopError(
+            "recovery_blocked: "
+            f"machine agent {pid} instance {identity[1]!r} did not stop within {timeout} seconds; "
+            f"heartbeat_state={heartbeat.get('state', 'unknown')!r} "
+            f"heartbeat_thread_alive={heartbeat.get('thread_alive')!r}."
+        )
     return True
 
 

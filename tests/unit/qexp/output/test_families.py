@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from qqtools.plugins.qexp.cli.output import CliOutput, OutputKind, render
+from qqtools.plugins.qexp.cli.output.agent import _control_plane_next_action
 
 
 def _gpu_policy_view() -> dict[str, object]:
@@ -25,6 +26,17 @@ def _gpu_policy_view() -> dict[str, object]:
         "warnings": [],
         "agent_running": False,
     }
+
+
+def test_control_plane_next_action_reserves_restart_for_lane_failures() -> None:
+    restart = _control_plane_next_action({}, {"state": "stopped"}, {"state": "healthy"})
+    assert restart == "inspect qexp agent diagnostics active, then run qexp agent restart"
+
+    publications = {"project_snapshot_publications": {"items": [{"overdue": True}]}}
+    retry = _control_plane_next_action(publications, {"state": "healthy"}, {"state": "healthy"})
+    assert retry == (
+        "inspect qexp agent diagnostics active; restart is not required while the heartbeat remains responsive"
+    )
 
 
 def test_submission_result_fixtures_satisfy_json_and_human_contracts() -> None:
@@ -235,6 +247,49 @@ def test_agent_status_groups_diagnostics_for_human_scanning() -> None:
             "observed_at": "2026-10-05T01:42:07Z",
             "active_count": 0,
         },
+        "control_plane_health": {
+            "instance_id": "current-instance",
+            "state": "degraded",
+            "heartbeat": {
+                "state": "retrying",
+                "thread_alive": True,
+                "last_success_at": "2026-10-05T01:41:57Z",
+                "last_failure_at": "2026-10-05T01:42:07Z",
+                "consecutive_failures": 2,
+                "last_failure": {
+                    "reason_code": "registry_unavailable",
+                    "cycle_sequence": 8,
+                    "sanitized": True,
+                },
+                "effective_stale_after_seconds": 15.0,
+            },
+            "authority": {"state": "healthy"},
+            "project_snapshot_publications": {
+                "total": 1,
+                "omitted_count": 0,
+                "items": [
+                    {
+                        "runtime_id": "runtime-1",
+                        "agent_instance_id": "current-instance",
+                        "registry_revision": 7,
+                        "executor_epoch": "executor-1",
+                        "project_id": "project-a",
+                        "registration_generation": "registration-1",
+                        "operation_kind": "machine_snapshot_publish",
+                        "request_id": "request-1",
+                        "stage": "backoff",
+                        "last_attempt_at": "2026-10-05T01:42:07Z",
+                        "last_published_at": "2026-10-05T01:41:57Z",
+                        "consecutive_failures": 2,
+                        "retry_at": "2026-10-05T01:42:12Z",
+                        "reason_code": "worker_start_failed",
+                        "worker_elapsed_seconds": None,
+                        "overdue": True,
+                        "effective_stale_after_seconds": 15.0,
+                    }
+                ],
+            },
+        },
     }
 
     rendered = render(CliOutput(OutputKind.AGENT_STATUS, payload), "human")
@@ -248,6 +303,14 @@ def test_agent_status_groups_diagnostics_for_human_scanning() -> None:
     assert "Diagnostic coverage\n  Evicted count: 0\n  Unresolved evicted through: 0" in rendered
     assert "Scheduling diagnostics\n  State: available\n  Coverage: incomplete" in rendered
     assert "  Reason: probe_data_unavailable" in rendered
+    assert "Control plane\n  State: degraded\n  Authority: healthy" in rendered
+    assert "Heartbeat\n  State: retrying\n  Thread alive: yes" in rendered
+    assert "  Consecutive failures: 2\n  Reason: registry_unavailable" in rendered
+    assert "Affected Projects\n  project-a: backoff (worker_start_failed)" in rendered
+    assert (
+        "Next action: inspect qexp agent diagnostics active; restart is not required while the heartbeat remains "
+        "responsive" in rendered
+    )
     assert json.loads(render(CliOutput(OutputKind.AGENT_STATUS, payload), "json")) == payload
 
 

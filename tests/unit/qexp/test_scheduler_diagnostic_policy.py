@@ -96,6 +96,32 @@ def _active_view(*items: Mapping[str, object], coverage: str = "complete") -> di
     return {"coverage": coverage, "items": items}
 
 
+def test_control_plane_project_publication_identity_is_complete_and_exact() -> None:
+    identity, incomplete = canonicalize_diagnostic_identity(
+        {
+            "producer": "control_plane_health",
+            "reason_code": "project_snapshot_overdue",
+            "component": "control_plane",
+            "stage": "snapshot_publication",
+            "check": "progress",
+            "scope_type": "project_binding",
+            "runtime_id": "a" * 64,
+            "target_id": "agent-instance",
+            "project_id": "project-a",
+            "registration_generation": "registration-1",
+            "registry_revision": 7,
+            "executor_epoch": "b" * 32,
+            "operation_kind": "machine_snapshot_publish",
+            "request_id": "request-1",
+        }
+    )
+
+    assert incomplete is False
+    assert identity["executor_epoch"] == "b" * 32
+    assert identity["operation_kind"] == "machine_snapshot_publish"
+    assert identity["request_id"] == "request-1"
+
+
 def test_publication_policy_preserves_order_defaults_and_explicit_malformed_finding() -> None:
     malformed = {"identity": _finding_identity()}
     valid = {

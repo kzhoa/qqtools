@@ -1,7 +1,7 @@
 ---
 doc_type: spec
 status: active
-updated_at: 2026-10-11
+updated_at: 2026-10-16
 archived_at:
 ---
 
@@ -1861,6 +1861,42 @@ guarded idempotent effect settles. Invalid evidence remains visible and keeps th
 `authority_recovering`; temporary read, identity-inspection, lock, or ambiguous-write failures are
 reported as unavailable or deferred work rather than persisted as invalid evidence. These
 diagnostics are derived observations and grant no repair, signal, release, or claim authority.
+
+### Machine-agent control-plane health
+
+An active machine-agent process does not by itself certify that its control-plane heartbeat is
+advancing. `qexp agent status` therefore exposes an additive `control_plane_health` view, separate
+from `agent_state`, with independent heartbeat and authority lanes. Human output keeps a healthy
+view compact and expands a partial failure with the heartbeat state, bounded failure evidence,
+affected Projects, and one next action. `qexp agent diagnostics active` and `history` remain the
+detailed diagnostic surface; no second diagnostic command is introduced.
+
+Heartbeat health is one of `healthy`, `retrying`, `degraded`, `stalled`, `stopped`, or `unknown`.
+The first responsive failed cycle is `retrying`. Three expected heartbeat intervals define the
+stale threshold: responsive failures beyond that last-success envelope are `degraded`, while a
+cycle that has not completed is `stalled`. `stopped` means the agent is expected to run but its
+heartbeat thread is not alive. Missing, malformed, mixed-version, or inconsistent local evidence
+is `unknown`, never healthy. A successful later cycle resolves a retrying or degraded episode.
+
+An ordinary heartbeat-cycle exception is contained at the background-loop invocation boundary and
+retried on a later monotonic deadline. It does not change scheduling, Project-write, reservation,
+runner, or Attempt authority. `BaseException` is not contained. JSON and scheduling diagnostics
+retain only stable reason codes, exception class, bounded source location, identifiers, counters,
+timestamps, durations, and a sanitization or coverage marker. Exception messages and tracebacks
+remain only in the owner-private rotating agent log.
+
+The main lifecycle loop independently checks heartbeat thread liveness and monotonic cycle age. It
+does not cancel, join, replace, or start a second live producer. A controlled restart is the V1
+recovery action. If the old process cannot stop within the bounded replacement policy, restart
+reports `recovery_blocked` with instance/liveness evidence and does not start another agent.
+Already authorized workloads retain the lifecycle-independence behavior.
+
+For each current registered binding generation, the local health view tracks the bounded
+`machine_snapshot_publish` progression through `intent`, `queued`, `started`, `result_ready`,
+`consumed`, `backoff`, and `published`. It binds evidence to runtime, agent instance, registry
+revision, registration generation, and executor epoch. Status reports only a bounded worst-first
+sample and an omitted count. A selected Project may show a matching local warning, but stale shared
+heartbeat evidence alone never declares a remote agent dead.
 
 A safely finalized historical agent termination may retain a cancelled result with no shared
 exit code even when the owning machine later observes a signal exit such as `-15`. Restart

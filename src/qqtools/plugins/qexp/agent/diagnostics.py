@@ -52,6 +52,7 @@ _AGENT_FIELDS = {
     "cleanup_outcome",
     "cleanup_steps",
     "finalized_at",
+    "control_plane",
 }
 _LAUNCHER_FIELDS = {
     "startup_outcome",
@@ -475,6 +476,31 @@ def _sanitize_exception(value: object) -> dict[str, Any] | None:
     return result
 
 
+def _sanitize_liveness_transition(value: object) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    state = value.get("state")
+    reason = _safe_token(value.get("reason_code"))
+    observed_at = _safe_timestamp(value.get("observed_at"))
+    cycle_sequence = _safe_int(value.get("cycle_sequence"), maximum=_MAX_EVICTION_COUNT)
+    thread_alive = value.get("thread_alive")
+    if (
+        state not in {"stalled", "stopped"}
+        or reason not in {"heartbeat_cycle_stalled", "heartbeat_thread_stopped"}
+        or observed_at is None
+        or cycle_sequence is None
+        or type(thread_alive) is not bool
+    ):
+        return None
+    return {
+        "state": state,
+        "reason_code": reason,
+        "observed_at": observed_at,
+        "cycle_sequence": cycle_sequence,
+        "thread_alive": thread_alive,
+    }
+
+
 def _sanitize_cleanup_steps(value: object) -> dict[str, Any] | None:
     if not isinstance(value, dict):
         return None
@@ -496,6 +522,71 @@ def _sanitize_cleanup_steps(value: object) -> dict[str, Any] | None:
                     cleaned[field] = token
             if cleaned:
                 result[step] = cleaned
+    return result
+
+
+def _sanitize_control_plane(value: object) -> dict[str, Any] | None:
+    """Keep one compact, privacy-safe control-plane evidence projection."""
+    if not isinstance(value, dict):
+        return None
+    result: dict[str, Any] = {}
+    state = value.get("state")
+    if state not in {"healthy", "retrying", "degraded", "stalled", "stopped", "unknown"}:
+        return None
+    result["state"] = state
+    for key in ("last_success_at", "last_failure_at"):
+        timestamp = _safe_timestamp(value.get(key))
+        if timestamp is not None:
+            result[key] = timestamp
+        elif key in value and value[key] is not None:
+            return None
+    maximum = _safe_int(value.get("maximum_consecutive_failures"), maximum=_MAX_EVICTION_COUNT)
+    if maximum is None:
+        return None
+    result["maximum_consecutive_failures"] = maximum
+    if "last_failure" in value:
+        failure = value["last_failure"]
+        if failure is None:
+            result["last_failure"] = None
+        else:
+            cleaned_failure = _sanitize_exception(failure)
+            if not isinstance(failure, dict):
+                return None
+            reason = _safe_token(failure.get("reason_code"))
+            cycle_sequence = _safe_int(failure.get("cycle_sequence"), maximum=_MAX_EVICTION_COUNT)
+            if reason is None or cycle_sequence is None or type(failure.get("sanitized")) is not bool:
+                return None
+            cleaned_failure = {
+                "reason_code": reason,
+                "cycle_sequence": cycle_sequence,
+                "sanitized": failure["sanitized"],
+            }
+            if "exception_type" in failure:
+                exception = _sanitize_exception(failure)
+                if exception is None:
+                    return None
+                for key in ("exception_type", "filename", "function", "line"):
+                    if key in exception:
+                        cleaned_failure[key] = exception[key]
+            result["last_failure"] = cleaned_failure
+    if "last_liveness_failure" in value:
+        liveness_failure = value["last_liveness_failure"]
+        if liveness_failure is None:
+            result["last_liveness_failure"] = None
+        else:
+            cleaned_liveness = _sanitize_liveness_transition(liveness_failure)
+            if cleaned_liveness is None:
+                return None
+            result["last_liveness_failure"] = cleaned_liveness
+    coverage = _safe_int(value.get("coverage_loss_count"), maximum=_MAX_EVICTION_COUNT)
+    if coverage is None:
+        return None
+    result["coverage_loss_count"] = coverage
+    if "coverage_degraded" in value:
+        coverage_degraded = value["coverage_degraded"]
+        if type(coverage_degraded) is not bool:
+            return None
+        result["coverage_degraded"] = coverage_degraded
     return result
 
 
@@ -579,6 +670,10 @@ def _sanitize_evidence(writer: str, evidence: dict[str, Any]) -> dict[str, Any]:
                 timestamp = _safe_timestamp(value)
                 if timestamp is not None:
                     result[key] = timestamp
+            elif key == "control_plane":
+                cleaned = _sanitize_control_plane(value)
+                if cleaned is not None:
+                    result[key] = cleaned
         elif writer == "launcher":
             if key == "startup_outcome" and value in {"spawn_failed", "started", "timed_out", "exited"}:
                 result[key] = value
@@ -670,6 +765,8 @@ def _merge_writer_evidence(writer: str, current: dict[str, Any], incoming: dict[
                     merged[key] = value
             elif key == "cleanup_steps":
                 merged[key] = _merge_cleanup_steps(merged.get(key), value)
+            elif key == "control_plane":
+                merged[key] = value
             else:
                 merged[key] = value
         elif key == "signal_attempts":
@@ -702,6 +799,8 @@ def _project_agent_fields(record: dict[str, Any], agent: dict[str, Any]) -> None
         record["capture_error"] = agent["capture_error"]
     elif "capture_error" in agent or agent.get("capture_health") == "healthy":
         record.pop("capture_error", None)
+    if isinstance(agent.get("control_plane"), dict):
+        record["control_plane"] = dict(agent["control_plane"])
 
 
 def _is_terminal(record: dict[str, Any]) -> bool:
@@ -756,6 +855,8 @@ def summarize_diagnostic_record(record: dict[str, Any]) -> dict[str, Any]:
             for key in ("exception_type", "filename", "function", "line")
             if key in primary_exception
         }
+    if isinstance(agent.get("control_plane"), dict):
+        summary["control_plane"] = dict(agent["control_plane"])
     return summary
 
 

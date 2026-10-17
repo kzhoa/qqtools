@@ -1,7 +1,7 @@
 ---
 doc_type: spec
 status: active
-updated_at: 2026-10-06
+updated_at: 2026-10-16
 archived_at:
 ---
 
@@ -2283,6 +2283,78 @@ not an additional capacity category. Scheduler diagnostics use
 `project_io_protocol_invalid`; identity includes runtime, epoch, request, Project, registration,
 operation, and relevant source revisions. Resolution requires safe consumption, fencing plus shared
 reconciliation, or proven process absence.
+
+### 9.8 Control-plane heartbeat health and publication diagnostics
+
+The MachineRuntime owns a bounded replace-in-place control-plane health record. It is derived
+diagnostic state and grants no scheduling, Project-write, claim, fencing, reservation, process, or
+recovery authority. Its identity includes the MachineRuntime ID and agent instance ID. New agent
+instances reset monotonic counters and never compare their deadlines with predecessor timestamps;
+predecessor findings become resolved history under their original identity.
+
+The record contains an aggregate state plus independent `heartbeat` and `authority` lanes. The
+heartbeat lane contains `state`, `thread_alive`, `last_cycle_started_at`,
+`last_cycle_completed_at`, `last_success_at`, `last_failure_at`, `consecutive_failures`, bounded
+`last_failure`, `cycle_sequence`, `cycle_duration_seconds`, `missed_deadlines`,
+`effective_stale_after_seconds`, and diagnostic coverage-loss counts. Live deadline decisions use
+the process monotonic clock; persisted timestamps use UTC for inspection only. Counts saturate and
+the record has a fixed encoded-size bound.
+
+The effective stale threshold is three times the configured heartbeat interval and is exposed in
+the record. A completed `queued` cycle is successful. Typed coarse results such as
+`registry_unavailable`, `capacity_unavailable`, and `gpu_policy_unavailable`, as well as an ordinary
+raised exception, are failed attempts. The first current failure is `retrying`; completed failures
+beyond the last-success threshold are `degraded`; an in-progress cycle older than the threshold is
+`stalled`; a non-live heartbeat thread while the agent is expected to run is `stopped`. Missing or
+inconsistent evidence is `unknown`. `stalled` is not used for a responsive unsuccessful cycle.
+
+The heartbeat loop catches `Exception` around one invocation, records privacy-safe failure facts,
+logs the full exception only to the private agent log, advances to the next normal deadline, and
+re-enters the ordinary current-state validation route. It does not catch `BaseException`, replay a
+stale authority decision, or invent idempotency for a partially applied Project-I/O operation.
+Diagnostic publication failure cannot stop or delay scheduling, authority renewal, or runner
+supervision; it increments bounded in-memory coverage loss that a later successful publication may
+report.
+
+The main agent lifecycle loop is the independent watchdog. Under a short health-state lock it reads
+the heartbeat thread, exact in-progress cycle, cycle ages, failures, missed deadlines, and the
+Project-I/O controller's latest snapshot-publication state. The watchdog publishes the local health
+record and reconciles scheduler findings for `heartbeat_thread_stopped`,
+`heartbeat_cycle_stalled`, `heartbeat_repeated_failure`, `project_snapshot_overdue`, and
+`heartbeat_diagnostic_coverage_loss`. Finding identity includes runtime and agent instance; Project
+findings additionally include Project ID, registration generation, registry revision, executor
+epoch, operation, and request when present. A matching later instance/cycle resolves a live stall;
+a successor instance archives predecessor findings rather than rewriting their identity.
+
+The watchdog never joins, cancels, or replaces a live heartbeat thread. `ControlPlane.stop` uses a
+bounded join. If a controlled restart cannot prove the old process absent within policy, the
+operation reports `recovery_blocked` with its instance and heartbeat liveness and does not launch a
+second producer. This behavior does not terminate or detach runners and does not release resources
+or synthesize Task or Attempt outcomes.
+
+`ProjectIOController` retains at most one current machine-snapshot publication view for each exact
+registered binding generation. Each view includes Project ID, registration generation,
+`operation_kind=machine_snapshot_publish`, nullable request ID, stage, last attempt and publication
+times, consecutive failures, nullable retry time, stable reason code, and nullable worker elapsed
+seconds. Stages are `intent`, `queued`, `started`, `result_ready`, `consumed`, `backoff`, and
+`published`; successful admission or worker start is not publication success. Entries bind the
+runtime ID, agent instance ID, registry revision, registration generation, and executor epoch and
+are discarded when that identity is no longer current. No command, environment value, credential,
+absolute user payload, traceback, or arbitrary exception representation enters this view.
+
+Agent status reads no Project roots for this feature. It reports a fixed worst-first sample and an
+omitted count, preferring overdue workers or requests, backoff, and the oldest unpublished entries.
+The existing scheduler-diagnostic active/history store provides
+detailed bounded findings and exact active-to-history resolution. The current agent-instance
+diagnostic record retains a compact terminal summary: last heartbeat success and failure, maximum
+consecutive failures, observed stopped or stalled transition, last bounded failure, and watchdog
+coverage. These are permanent additive tolerant-reader fields; older agents and readers may omit
+them, so no temporary compatibility registry item is required.
+
+Control-plane logs are transition-based: first failure after success, failure-reason change,
+stalled or stopped transition, recovery, Project publication becoming overdue, and diagnostic
+coverage loss or recovery. Repeated identical failures are summarized with a bounded suppressed
+count rather than emitted once per cycle.
 
 ## 10. Submission Protocol
 
