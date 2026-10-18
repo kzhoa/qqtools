@@ -1443,6 +1443,25 @@ qexp submit --file runs.yaml
 qexp submit --file runs.yaml --group qm9-study
 ```
 
+Task dependencies are an explicit `all-of` list. Name every independent direct
+prerequisite, but do not repeat a transitive ancestor merely to preserve
+execution order. For example, if B depends on A and C depends on B, C need only
+name B: B cannot succeed before A, so C is already ordered after both Tasks.
+Naming A on C remains valid when A is intentionally also a direct prerequisite.
+For independent A and B, a C that must wait for both must name both IDs.
+
+```text
+A ----\
+       > C    C directly depends on [A, B]
+B ----/
+
+A -> B -> C   C directly depends on [B]
+```
+
+Dependency lists never infer prerequisites from submission order, Task names,
+Group membership, or timestamps. They also do not create a live dependency on
+a Group or on Tasks added to that Group later.
+
 Rules:
 
 - exactly one input mode is required: a nonempty command after `--` or one `--file` manifest
@@ -1502,7 +1521,8 @@ Rules:
 - the command validates the complete input before commit
 - dependency validation overlays the complete submitted Task set on current truth and follows the
   dependency graph reachable from those candidates by exact Task ID; candidate references retain
-  same-Group, committed-submission, cleanup, self-dependency, and cycle checks
+  same-Project, committed-submission, cleanup, self-dependency, and cycle checks; grouped and
+  ungrouped candidates may reference grouped or ungrouped Tasks in that Project
 - unrelated retained Task history is outside ordinary submission validation and cannot make a
   fixed submission perform a Task-directory scan or fail because unrelated history is malformed;
   explicit integrity audit and repair own corruption outside the candidate-reachable graph
@@ -2256,6 +2276,10 @@ they never rewrite policies frozen into existing Attempts.
 - `qexp task share`
 - `qexp task unshare`
 - `qexp task offer`
+- `qexp task dependencies show TASK_ID`
+- `qexp task dependencies add TASK_ID --depends-on TASK_ID...`
+- `qexp task dependencies remove TASK_ID --depends-on TASK_ID...`
+- `qexp task dependencies replace TASK_ID [--depends-on TASK_ID...]`
 
 `task show --watch` is a terminal-only continuous view and rejects `--format`. `task logs` and
 `task logs --follow` are raw application-byte streams: stdout is reserved for application bytes,
@@ -2270,6 +2294,21 @@ placement, phase, claim, and GPU fields, each record includes `depends_on_task_i
 `dependency_state`, and `dependency_reasons`. The IDs are sorted; a Task with no prerequisites
 has `[]`, `ready`, and `[]` respectively. `dependency_state` is `ready`, `waiting`, `blocked`,
 or `invalid`; each reason is an object containing the prerequisite `task_id` and its reason.
+
+Dependency Task IDs are resolved only within the selected Project. An edge may cross Group
+boundaries or connect grouped and ungrouped Tasks. It grants no control over the prerequisite's
+Group: seal, pause, reopen, cancel, placement, and Worker Set actions remain scoped to each Group's
+own membership. A sealed Group's existing Tasks remain valid prerequisites; an upstream pause may
+leave downstream work waiting, while upstream failure or cancellation blocks rather than cancels
+the downstream Task. Cleanup rejects a Task while any direct dependent remains anywhere in the
+Project.
+
+Fresh Projects activate both `task-dependencies-v1` and `task-dependencies-v2`. Existing Projects
+retain v1 same-Group behavior during the machine-rolling upgrade and expose Project-wide edges only
+after compatible writers are proven and reverse cleanup coverage is active. Missing or damaged
+coverage blocks cleanup and is repaired from Task truth; it does not change dependency-gate or
+claim behavior. A process that does not support the activated v2 capability rejects the Project
+before mutation or scheduling.
 
 `task list --name NAME` uses case-sensitive exact matching inside one bounded indexed candidate
 page. Names do not become mutation identifiers. An empty result with a continuation cursor means

@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import os
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 from ..config_types import RootConfig
+from ..layout import is_task_dependencies_root, is_task_dependencies_v2_root
 from ..runtime.cleanup_maintenance import (
     _advance_cleanup_finalization_step,
     _advance_cleanup_local_step,
@@ -22,8 +23,17 @@ from ..runtime.cleanup_maintenance import (
     _reservation_matches_task,
     advance_cleanup_maintenance_step,
 )
+from ..runtime.dependency_projection import ProjectionUnavailable, mark_degraded, projected_dependents
 from ..runtime.group_namespace import read_group
-from ..runtime.locks import exclusive, group_lock, schema_writer_lock, task_lock
+from ..runtime.locks import (
+    dependency_lock,
+    exclusive,
+    group_lock,
+    schema_writer_lock,
+    sorted_group_locks,
+    task_lock,
+    task_locks,
+)
 from ..runtime.operation_store import (
     active_operation_path,
     iter_active_operation_paths,
@@ -86,6 +96,34 @@ def _cleanup_required_machines(cfg: RootConfig, task: TaskRecord) -> list[str]:
     for path in iter_json(attempts_dir):
         machines.add(AttemptRecord.from_dict(read_json(path)).machine_name)
     return sorted(machine for machine in machines if machine)
+
+
+@contextmanager
+def _cleanup_start_locks(cfg: RootConfig, task: TaskRecord):
+    """Acquire the dependency fence and the applicable complete lock set."""
+    with schema_writer_lock(cfg, require_narrow=True):
+        with dependency_lock(cfg.shared_root):
+            if is_task_dependencies_v2_root(cfg):
+                try:
+                    dependents = projected_dependents(cfg, task.task_id)
+                except ProjectionUnavailable as exc:
+                    try:
+                        mark_degraded(cfg, f"cleanup projection validation failed: {exc}")
+                    except (OSError, ProjectionUnavailable, TypeError, ValueError):
+                        pass
+                    raise
+            else:
+                dependents = []
+            groups = {task.group_name} if task.group_name else set()
+            task_ids = {task.task_id}
+            for dependent_id in dependents:
+                dependent = load_task(cfg, dependent_id)
+                task_ids.add(dependent.task_id)
+                if dependent.group_name:
+                    groups.add(dependent.group_name)
+            with sorted_group_locks(cfg.shared_root, groups):
+                with task_locks(cfg.shared_root, sorted(task_ids)):
+                    yield
 
 
 def _start_cleanup_operation(cfg: RootConfig, task: TaskRecord) -> dict[str, Any]:
@@ -241,6 +279,28 @@ def _finalize_cleanup_if_ready(cfg: RootConfig, operation_path: Path) -> list[st
         if pending:
             return []
         return _finalize_cleanup_operation(cfg, operation)
+
+    if is_task_dependencies_root(cfg):
+        try:
+            task = load_task(cfg, task_id)
+            with _cleanup_start_locks(cfg, task):
+                return finalize_under_task_lock()
+        except FileNotFoundError:
+            cleanup = operation["cleanup"]
+            group_name = cleanup.get("group_name")
+            with schema_writer_lock(cfg, require_narrow=True):
+                with dependency_lock(cfg.shared_root):
+                    if is_task_dependencies_v2_root(cfg):
+                        try:
+                            mark_degraded(cfg, "cleanup target Task missing during finalization")
+                        except (OSError, ProjectionUnavailable, TypeError, ValueError):
+                            pass
+                    groups = [group_name] if group_name else []
+                    with sorted_group_locks(cfg.shared_root, groups):
+                        with task_locks(cfg.shared_root, [task_id]):
+                            return finalize_under_task_lock()
+        except ProjectionUnavailable:
+            return []
 
     with schema_writer_lock(cfg, blocking=False, require_narrow=True) as has_schema_lock:
         if not has_schema_lock:
@@ -438,31 +498,43 @@ def clean(
         )
     from ..scheduler import authority_locks
 
+    def inspect_candidate(candidate: TaskRecord) -> None:
+        task = load_task(cfg, candidate.task_id)
+        blockers = _clean_blockers(cfg, task, reservation_runtime_root=reservation_runtime_root)
+        unsafe_blockers = [
+            item
+            for item in blockers
+            if not item.startswith(
+                (
+                    "local_active_reservation:",
+                    "local_provisional_reservation:",
+                    "local_cpu_active_reservation:",
+                    "local_cpu_provisional_reservation:",
+                )
+            )
+        ]
+        if unsafe_blockers:
+            result["skipped"][task.task_id] = unsafe_blockers
+            result["skipped_task_ids"].append(task.task_id)
+            result["blocked_task_ids"].append(task.task_id)
+            return
+        if not dry_run:
+            operation = _start_cleanup_operation(cfg, task)
+            result.setdefault("operations", {})[task.task_id] = operation["cleanup"]
+
     for candidate in candidates:
-        with schema_writer_lock(cfg, require_narrow=True):
-            with authority_locks(cfg, candidate):
-                task = load_task(cfg, candidate.task_id)
-                blockers = _clean_blockers(cfg, task, reservation_runtime_root=reservation_runtime_root)
-                unsafe_blockers = [
-                    item
-                    for item in blockers
-                    if not item.startswith(
-                        (
-                            "local_active_reservation:",
-                            "local_provisional_reservation:",
-                            "local_cpu_active_reservation:",
-                            "local_cpu_provisional_reservation:",
-                        )
-                    )
-                ]
-                if unsafe_blockers:
-                    result["skipped"][task.task_id] = unsafe_blockers
-                    result["skipped_task_ids"].append(task.task_id)
-                    result["blocked_task_ids"].append(task.task_id)
-                    continue
-                if not dry_run:
-                    operation = _start_cleanup_operation(cfg, task)
-                    result.setdefault("operations", {})[task.task_id] = operation["cleanup"]
+        try:
+            if is_task_dependencies_root(cfg):
+                with _cleanup_start_locks(cfg, candidate):
+                    inspect_candidate(candidate)
+            else:
+                with schema_writer_lock(cfg, require_narrow=True):
+                    with authority_locks(cfg, candidate):
+                        inspect_candidate(candidate)
+        except ProjectionUnavailable as exc:
+            result["skipped"][candidate.task_id] = [f"task_dependency_projection_unavailable:{exc}"]
+            result["skipped_task_ids"].append(candidate.task_id)
+            result["blocked_task_ids"].append(candidate.task_id)
     if not dry_run:
         for reconciliation in reconcile_cleanup_operations(cfg, reservation_runtime_root=reservation_runtime_root):
             if reconciliation["task_id"] in result["candidates"]:

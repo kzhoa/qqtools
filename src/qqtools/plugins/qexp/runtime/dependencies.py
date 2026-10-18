@@ -6,7 +6,8 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Iterable, Iterator
 
-from .locks import group_lock, task_lock
+from ..layout import is_task_dependencies_v2_root
+from .locks import group_lock, sorted_group_task_locks, task_lock, task_locks
 from .operation_store import operation_exists
 from .records import TaskRecord, validate_identifier
 from .submission_control import read_submission_state
@@ -61,43 +62,58 @@ def is_committed_submission_task(cfg: object, task: TaskRecord) -> bool:
         return False
 
 
+def _dependency_context(task: TaskRecord | None) -> str:
+    return task.group_name if task is not None and task.group_name is not None else "<ungrouped>"
+
+
+def _edge_error(
+    downstream: TaskRecord,
+    prerequisite_id: str,
+    message: str,
+    prerequisite: TaskRecord | None = None,
+) -> ValueError:
+    return ValueError(
+        f"dependency Task {prerequisite_id!r} {message}; downstream Task {downstream.task_id!r} "
+        f"(Group {_dependency_context(downstream)}), prerequisite Group {_dependency_context(prerequisite)}."
+    )
+
+
 def _check_no_cycle(
     cfg: object,
-    group_name: str,
     candidate_ids: Iterable[str],
     task_cache: dict[str, TaskRecord | None],
 ) -> None:
-    """Check cycles in the candidate-reachable same-Group dependency graph."""
+    """Check only the dependency closure reachable from candidate Tasks."""
     states: dict[str, str] = {}
 
     for candidate_id in candidate_ids:
         if states.get(candidate_id) == "visited":
             continue
-
-        candidate = task_cache[candidate_id]
+        candidate = task_cache.get(candidate_id)
+        if candidate is None:
+            continue
         states[candidate_id] = "visiting"
-        stack: list[tuple[str, Iterator[str]]] = [(candidate_id, iter(candidate.depends_on_task_ids))]
+        stack: list[tuple[TaskRecord, Iterator[str]]] = [(candidate, iter(candidate.depends_on_task_ids))]
         while stack:
-            task_id, dependencies = stack[-1]
+            current, dependencies = stack[-1]
             try:
                 dependency_id = next(dependencies)
             except StopIteration:
-                states[task_id] = "visited"
+                states[current.task_id] = "visited"
                 stack.pop()
                 continue
 
             dependency = _load_dependency_task(cfg, dependency_id, task_cache)
-            if dependency is None or dependency.group_name != group_name:
+            if dependency is None:
                 continue
-
             state = states.get(dependency_id)
             if state == "visiting":
-                raise ValueError("depends_on_task_ids creates a dependency cycle.")
+                raise _edge_error(current, dependency_id, "creates a dependency cycle", dependency)
             if state == "visited":
                 continue
 
             states[dependency_id] = "visiting"
-            stack.append((dependency_id, iter(dependency.depends_on_task_ids)))
+            stack.append((dependency, iter(dependency.depends_on_task_ids)))
 
 
 def validate_group_dependencies(
@@ -105,68 +121,83 @@ def validate_group_dependencies(
     group_name: str | None,
     candidates: Iterable[TaskRecord],
 ) -> None:
-    """Validate candidate dependency edges against current authoritative Group truth."""
-    candidates = list(candidates)
-    if group_name is None:
-        if any(task.depends_on_task_ids for task in candidates):
-            raise ValueError("ungrouped tasks cannot declare dependencies.")
-        return
+    """Validate candidate edges against the selected Project's Task truth.
 
+    V1 retains the historical same-Group and ungrouped restrictions. V2
+    validates exact Project-local IDs and permits every Group orientation.
+    """
+    candidates = list(candidates)
+    is_v2 = is_task_dependencies_v2_root(cfg)
+    if not is_v2 and group_name is None and any(task.depends_on_task_ids for task in candidates):
+        raise ValueError("ungrouped tasks cannot declare dependencies.")
     for task in candidates:
         if task.group_name != group_name:
-            raise ValueError("dependency candidate has a different Group.")
+            raise ValueError(
+                f"dependency candidate Task {task.task_id!r} belongs to Group "
+                f"{_dependency_context(task)}, not {_dependency_context(next(iter(candidates), None))}."
+            )
 
     candidate_ids = {task.task_id for task in candidates}
+    if len(candidate_ids) != len(candidates):
+        raise ValueError("dependency candidate Task IDs must be unique.")
     task_cache: dict[str, TaskRecord | None] = {task.task_id: task for task in candidates}
     for task in candidates:
         for dependency_id in task.depends_on_task_ids:
             dependency = _load_dependency_task(cfg, dependency_id, task_cache)
             if dependency is None:
-                raise ValueError(f"dependency Task {dependency_id!r} does not exist in Group {group_name!r}.")
-            if dependency.group_name != group_name:
-                raise ValueError(f"dependency Task {dependency_id!r} is not in Group {group_name!r}.")
+                raise _edge_error(task, dependency_id, "does not exist in this Project")
+            if not is_v2 and dependency.group_name != group_name:
+                raise _edge_error(task, dependency_id, f"is not in Group {group_name!r}", dependency)
             if dependency_id not in candidate_ids and not is_committed_submission_task(cfg, dependency):
-                raise ValueError(f"dependency Task {dependency_id!r} has not been committed by its submission.")
+                raise _edge_error(task, dependency_id, "has not been committed by its submission", dependency)
             if dependency_id == task.task_id:
-                raise ValueError("task cannot depend on itself.")
+                raise _edge_error(task, dependency_id, "cannot be the downstream Task itself", dependency)
             if (
                 dependency.control.get("cleanup_operation_id")
                 or dependency.control.get("cleanup_state")
                 or operation_exists(cfg, "cleanup", dependency_id)
             ):
-                raise ValueError(f"dependency Task {dependency_id!r} is being cleaned.")
-    _check_no_cycle(cfg, group_name, (task.task_id for task in candidates), task_cache)
+                raise _edge_error(task, dependency_id, "is being cleaned", dependency)
+    _check_no_cycle(cfg, (task.task_id for task in candidates), task_cache)
+
+
+def _load_gate_task(cfg: object, task_id: str) -> TaskRecord | None:
+    from .tasks import load_task
+
+    try:
+        return load_task(cfg, task_id)
+    except (FileNotFoundError, KeyError, TypeError, ValueError):
+        return None
 
 
 def dependency_gate(cfg: object, task: TaskRecord) -> DependencyGate:
     """Derive the scheduling state from direct prerequisite Task truth."""
     if not task.depends_on_task_ids:
         return DependencyGate("ready")
-    if task.group_name is None:
+    is_v2 = is_task_dependencies_v2_root(cfg)
+    if not is_v2 and task.group_name is None:
         return DependencyGate("invalid", ({"reason": "dependencies_without_group"},))
     invalid: list[dict[str, str]] = []
     blocked: list[dict[str, str]] = []
     waiting: list[dict[str, str]] = []
     for task_id in task.depends_on_task_ids:
-        try:
-            from .tasks import load_task
-
-            dependency = load_task(cfg, task_id)
-        except (FileNotFoundError, KeyError, TypeError, ValueError):
-            invalid.append({"task_id": task_id, "reason": "missing_or_invalid"})
+        dependency = _load_gate_task(cfg, task_id)
+        base = {"task_id": task_id}
+        if dependency is None:
+            invalid.append({**base, "reason": "missing_or_invalid"})
             continue
-        if dependency.group_name != task.group_name:
-            invalid.append({"task_id": task_id, "reason": "cross_group"})
+        if not is_v2 and dependency.group_name != task.group_name:
+            invalid.append({**base, "reason": "cross_group"})
         elif (
             dependency.control.get("cleanup_operation_id")
             or dependency.control.get("cleanup_state")
             or operation_exists(cfg, "cleanup", task_id)
         ):
-            invalid.append({"task_id": task_id, "reason": "cleanup_in_progress"})
+            invalid.append({**base, "reason": "cleanup_in_progress"})
         elif dependency.state["projection"] in {"failed", "cancelled"}:
-            blocked.append({"task_id": task_id, "reason": dependency.state["projection"]})
+            blocked.append({**base, "reason": dependency.state["projection"]})
         elif dependency.state["projection"] != "succeeded":
-            waiting.append({"task_id": task_id, "reason": dependency.state["projection"]})
+            waiting.append({**base, "reason": dependency.state["projection"]})
     if invalid:
         return DependencyGate("invalid", tuple(invalid))
     if blocked:
@@ -176,24 +207,66 @@ def dependency_gate(cfg: object, task: TaskRecord) -> DependencyGate:
     return DependencyGate("ready")
 
 
+def resolve_affected_dependency_locks(
+    cfg: object,
+    candidates: Iterable[TaskRecord],
+) -> tuple[list[str], list[str]]:
+    """Resolve all Groups and Task IDs touched by candidate dependency edges."""
+    candidate_list = list(candidates)
+    task_ids = {task.task_id for task in candidate_list}
+    groups = {task.group_name for task in candidate_list if task.group_name is not None}
+    cache: dict[str, TaskRecord | None] = {task.task_id: task for task in candidate_list}
+    for task in candidate_list:
+        for dependency_id in task.depends_on_task_ids:
+            dependency = _load_dependency_task(cfg, dependency_id, cache)
+            if dependency is not None:
+                task_ids.add(dependency.task_id)
+                if dependency.group_name is not None:
+                    groups.add(dependency.group_name)
+    return sorted(groups), sorted(task_ids)
+
+
+def resolve_dependency_lock_set(cfg: object, task: TaskRecord) -> tuple[list[str], list[str]]:
+    """Resolve the downstream/direct-prerequisite lock set used by claim."""
+    return resolve_affected_dependency_locks(cfg, [task])
+
+
 @contextmanager
 def dependency_locks(cfg: object, task: TaskRecord) -> Iterator[None]:
-    """Acquire Group then the downstream/direct-prerequisite Task locks in stable order."""
-    if not task.group_name:
-        with task_lock(cfg.shared_root, task.task_id):
-            yield
+    """Acquire all affected Groups then Tasks in stable order.
+
+    Claim deliberately does not acquire the Project dependency mutation fence;
+    writers use that fence before entering this same Group/Task order.
+    """
+    if not is_task_dependencies_v2_root(cfg):
+        if not task.group_name:
+            with task_lock(cfg.shared_root, task.task_id):
+                yield
+            return
+        with group_lock(cfg.shared_root, task.group_name):
+            with task_locks(cfg.shared_root, sorted({task.task_id, *task.depends_on_task_ids})):
+                yield
         return
-    with group_lock(cfg.shared_root, task.group_name):
-        task_ids = sorted({task.task_id, *task.depends_on_task_ids})
-        with _task_locks(cfg, task_ids):
-            yield
+    groups, task_ids = resolve_dependency_lock_set(cfg, task)
+    with sorted_group_task_locks(cfg.shared_root, groups, task_ids):
+        # The scheduler rereads Task truth immediately after this context is
+        # entered. This local identity check closes the same race for callers
+        # that only use dependency_locks directly.
+        from .tasks import load_task
 
-
-@contextmanager
-def _task_locks(cfg: object, task_ids: list[str]) -> Iterator[None]:
-    if not task_ids:
+        reread = load_task(cfg, task.task_id)
+        if reread.depends_on_task_ids != task.depends_on_task_ids:
+            raise RuntimeError("Task dependency identity changed while dependency locks were acquired.")
         yield
-        return
-    with task_lock(cfg.shared_root, task_ids[0]):
-        with _task_locks(cfg, task_ids[1:]):
-            yield
+
+
+__all__ = [
+    "DependencyGate",
+    "dependency_gate",
+    "dependency_locks",
+    "is_committed_submission_task",
+    "normalize_dependency_ids",
+    "resolve_affected_dependency_locks",
+    "resolve_dependency_lock_set",
+    "validate_group_dependencies",
+]

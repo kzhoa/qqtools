@@ -11,7 +11,12 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Mapping
 
-from ..layout import is_cpu_lane_root, is_group_ready_members_root, is_task_dependencies_root
+from ..layout import (
+    is_cpu_lane_root,
+    is_group_ready_members_root,
+    is_task_dependencies_root,
+    is_task_dependencies_v2_root,
+)
 from ..lease import clock_capability, new_timed_offer_proof, persist_clock_observation
 from ..task_live_progress import (
     build_live_progress_selection,
@@ -394,9 +399,11 @@ def _task_spec(item: Mapping[str, Any], *, is_canonical: bool) -> TaskSpec:
     )
 
 
-def _validate_planned_dependencies(specs: list[Mapping[str, Any]], group_name: str | None) -> None:
+def _validate_planned_dependencies(
+    specs: list[Mapping[str, Any]], group_name: str | None, *, is_v2: bool = False
+) -> None:
     """Reject deterministic dependency contradictions before any journal mutation."""
-    if group_name is None and any(item["depends_on_task_ids"] for item in specs):
+    if not is_v2 and group_name is None and any(item["depends_on_task_ids"] for item in specs):
         raise ValueError("ungrouped tasks cannot declare dependencies.")
     planned = {item["task_id"]: item for item in specs if item.get("task_id") is not None}
     visiting: set[str] = set()
@@ -516,6 +523,7 @@ def _resolve_submission_plan(
     working_directory = str(Path.cwd())
     is_canonical = is_cpu_lane_root(cfg)
     dependencies_are_canonical = is_task_dependencies_root(cfg)
+    dependencies_are_v2 = is_task_dependencies_v2_root(cfg)
     resolved = _resolved_specs(
         request.specs,
         submitting_machine,
@@ -527,7 +535,7 @@ def _resolve_submission_plan(
     for item in resolved:
         _task_spec(item, is_canonical=is_canonical)
     tmux_overrides = tuple(validate_tmux_override(item.pop("tmux_override", None)) for item in resolved)
-    _validate_planned_dependencies(resolved, request.group_name)
+    _validate_planned_dependencies(resolved, request.group_name, is_v2=dependencies_are_v2)
     for machine in sorted({item["home_machine"] for item in resolved if item["home_machine"] != submitting_machine}):
         _validate_target_machine_record(cfg, machine)
 
@@ -881,7 +889,9 @@ def _validate_worker_additions(value: Any) -> dict[str, dict[str, Any]]:
     return {machine: result[machine] for machine in sorted(result)}
 
 
-def decode_submission_plan(operation: Mapping[str, Any]) -> SubmissionPlan:
+def decode_submission_plan(
+    operation: Mapping[str, Any], *, allow_ungrouped_dependencies: bool = False
+) -> SubmissionPlan:
     """Decode and validate an existing operation without consulting runtime state."""
     if not isinstance(operation, Mapping):
         raise RuntimeError("submission operation is not a mapping.")
@@ -956,7 +966,11 @@ def decode_submission_plan(operation: Mapping[str, Any]) -> SubmissionPlan:
         if item["task_id"] != task_ids[index]:
             raise RuntimeError("submission task_specs and task_ids disagree.")
         canonical_specs.append(item)
-    _validate_planned_dependencies(canonical_specs, target_group)
+    _validate_planned_dependencies(
+        canonical_specs,
+        target_group,
+        is_v2=allow_ungrouped_dependencies,
+    )
     if "task_observation" not in operation:
         tmux_overrides = tuple(None for _ in task_ids)
     else:

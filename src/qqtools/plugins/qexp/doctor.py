@@ -9,9 +9,10 @@ from pathlib import Path
 from typing import Any
 
 from .config_types import RootConfig
-from .layout import validate_root_contract
+from .layout import is_task_dependencies_v2_root, validate_root_contract
 from .lease import clock_capability
 from .runtime.availability import rebuild_deadline_indexes
+from .runtime.dependency_projection import inspect_projection
 from .runtime.group_namespace import group_directory
 from .runtime.locks import schema_lock, schema_reader_lock
 from .runtime.observation.projection import inspect_observation, observation_path
@@ -135,6 +136,15 @@ def verify_integrity(
             "group_ready_members_degraded",
             shared_paths(cfg.shared_root)["ready_group_members"] / "state.json",
             "high",
+        )
+    dependency_projection = inspect_projection(cfg) if is_task_dependencies_v2_root(cfg) else {"state": "legacy"}
+    if dependency_projection.get("state") in {"missing", "degraded", "malformed", "building"}:
+        _issue(
+            issues,
+            "task_dependency_projection_unavailable",
+            shared_paths(cfg.shared_root)["task_dependencies_state"],
+            "high" if dependency_projection.get("state") in {"missing", "malformed", "degraded"} else "low",
+            dependency_projection.get("failure_reason") or dependency_projection.get("reason"),
         )
     paths = shared_paths(cfg.shared_root)
     cleaned = _cleaned_task_ids(cfg)
@@ -541,6 +551,7 @@ def verify_integrity(
             "archive_count": member_status.get("archive_count", 0),
             "archive_cleanup": member_status.get("archive_cleanup"),
         },
+        "task_dependencies": dependency_projection,
         "clock_capability": {
             "status": capability.status,
             "reason": capability.reason,

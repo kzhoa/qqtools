@@ -33,6 +33,9 @@ def shared_paths(root: Path) -> dict[str, Path]:
         "locks": root / "locks",
         "events": root / "events",
         "indexes": root / "indexes",
+        "task_dependencies": root / "indexes" / "task-dependencies",
+        "task_dependencies_state": root / "indexes" / "task-dependencies" / "state.json",
+        "task_dependencies_generations": root / "indexes" / "task-dependencies" / "generations",
         "offer_deadlines": root / "indexes" / "offer-deadlines",
         "offer_deadlines_active": root / "indexes" / "offer-deadlines" / "active",
         "offer_deadline_cursors": root / "indexes" / "offer-deadlines" / "cursors",
@@ -102,6 +105,21 @@ def ready_state_path(root: Path) -> Path:
     return shared_paths(root)["ready"] / "state.json"
 
 
+def task_dependency_state_path(root: Path) -> Path:
+    """Return the durable reverse-dependency projection state path."""
+    return shared_paths(root)["task_dependencies_state"]
+
+
+def task_dependency_generation_path(root: Path, generation: str) -> Path:
+    """Return one generation directory for the reverse-dependency projection."""
+    return shared_paths(root)["task_dependencies_generations"] / generation
+
+
+def task_dependency_record_path(root: Path, generation: str, task_id: str) -> Path:
+    """Return the generation-scoped record for one prerequisite Task ID."""
+    return task_dependency_generation_path(root, generation) / "records" / f"{task_id}.json"
+
+
 def idempotency_path(root: Path, digest: str) -> Path:
     return shared_paths(root)["idempotency"] / f"{digest}.json"
 
@@ -119,8 +137,12 @@ def lock_path(root: Path, kind: str, identifier: str | None = None) -> Path:
     base = shared_paths(root)["locks"]
     if kind == "schema":
         return base / "schema.lock"
+    if kind == "dependency":
+        if identifier is not None:
+            raise ValueError("dependency lock does not accept an identifier.")
+        return base / "dependency.lock"
     if kind not in {"groups", "tasks", "machines", "idempotency"} or identifier is None:
-        raise ValueError("kind must be schema, groups, tasks, machines, or idempotency with an identifier.")
+        raise ValueError("kind must be schema, dependency, groups, tasks, machines, or idempotency with an identifier.")
     return base / kind / f"{identifier}.lock"
 
 

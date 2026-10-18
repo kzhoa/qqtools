@@ -23,6 +23,7 @@ from .runtime.protocol_compatibility import (
     SUBMISSION_GROUP_PUBLICATION_CAPABILITY,
     SUPPORTED_REQUIRED_CAPABILITIES,
     TASK_DEPENDENCIES_CAPABILITY,
+    TASK_DEPENDENCIES_V2_CAPABILITY,
 )
 from .runtime.protocol_compatibility import LOCAL_RECOVERY_CAPABILITY as LOCAL_RECOVERY_CAPABILITY
 from .runtime.records import SCHEMA_VERSION, AttemptRecord, TaskRecord, utc_now
@@ -104,6 +105,22 @@ def is_task_dependencies_root(cfg: RootConfig) -> bool:
     if unknown:
         raise RuntimeError(f"qexp root requires unsupported capabilities: {', '.join(unknown)}.")
     return TASK_DEPENDENCIES_CAPABILITY in capabilities
+
+
+def is_task_dependencies_v2_root(cfg: RootConfig) -> bool:
+    """Return whether Project-wide Task dependency semantics are active."""
+    path = _schema_path(cfg)
+    if not path.exists():
+        return False
+    capabilities = read_json(path).get("schema", {}).get("required_capabilities")
+    if capabilities is None:
+        return False
+    if not isinstance(capabilities, list) or not all(isinstance(item, str) for item in capabilities):
+        raise RuntimeError("qexp schema/version.json has malformed required capabilities.")
+    unknown = sorted(set(capabilities) - SUPPORTED_REQUIRED_CAPABILITIES)
+    if unknown:
+        raise RuntimeError(f"qexp root requires unsupported capabilities: {', '.join(unknown)}.")
+    return TASK_DEPENDENCIES_V2_CAPABILITY in capabilities
 
 
 def is_group_ready_members_root(cfg: RootConfig) -> bool:
@@ -200,6 +217,7 @@ def ensure_shared_layout(cfg: RootConfig) -> None:
             "offer_deadlines_migration",
             "upgrade_journal",
             "upgrade_pause_intent",
+            "task_dependencies_state",
         }:
             continue
         path.mkdir(parents=True, exist_ok=True)
@@ -245,6 +263,7 @@ def initialize_shared_root(cfg: RootConfig) -> None:
                     "required_capabilities": [
                         CPU_LANE_CAPABILITY,
                         TASK_DEPENDENCIES_CAPABILITY,
+                        TASK_DEPENDENCIES_V2_CAPABILITY,
                         GROUP_READY_MEMBERS_CAPABILITY,
                         OBSERVATION_CAPABILITY,
                         SUBMISSION_GROUP_PUBLICATION_CAPABILITY,
@@ -277,6 +296,10 @@ def initialize_shared_root(cfg: RootConfig) -> None:
     policy_path = shared_paths(cfg.shared_root)["lease_policy"]
     if not policy_path.exists():
         atomic_replace(policy_path, default_lease_policy_document())
+    if is_task_dependencies_v2_root(cfg):
+        from .runtime.dependency_projection import initialize_empty_projection
+
+        initialize_empty_projection(cfg)
 
 
 def migrate_schema5_to_schema6(cfg: RootConfig) -> None:

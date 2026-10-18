@@ -146,8 +146,6 @@ class TaskRecord:
             normalized_dependencies
         ):
             raise ValueError("task depends_on_task_ids must contain unique sorted task IDs.")
-        if self.group_name is None and self.depends_on_task_ids:
-            raise ValueError("ungrouped tasks cannot declare dependencies.")
         if self.task_id in self.depends_on_task_ids:
             raise ValueError("task cannot depend on itself.")
         _check_meta(self.meta)

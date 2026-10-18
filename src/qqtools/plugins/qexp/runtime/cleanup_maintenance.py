@@ -4,18 +4,28 @@ from __future__ import annotations
 
 import shutil
 import stat
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from typing import Any
 
 from ..config_types import RootConfig
+from ..layout import is_task_dependencies_root, is_task_dependencies_v2_root
 from .authority_scan import is_path_present
 from .availability import remove_deadline_index
 from .claims import reconcile_claim_archives
+from .dependency_projection import (
+    ProjectionUnavailable,
+    begin_mutation,
+    complete_mutation,
+    invalidate_legacy_rebuild,
+    mark_degraded,
+    projected_dependents,
+    remove_task_from_projection,
+)
 from .directory_capture import read_directory_entry
 from .group_discovery.changes import record_task_change
 from .group_namespace import read_group
-from .locks import exclusive, group_lock, schema_writer_lock, task_lock
+from .locks import dependency_lock, exclusive, group_lock, schema_writer_lock, sorted_group_task_locks, task_lock
 from .operation_store import archive_operation, locate_operation_path, write_active_operation
 from .paths import attempt_path, local_paths, shared_paths, task_path
 from .progress import cleanup_shared_progress
@@ -53,8 +63,57 @@ def _reservation_matches_task(reservation: dict[str, Any], task_id: str, machine
     )
 
 
+@contextmanager
+def _cleanup_dependency_locks(
+    cfg: RootConfig,
+    task_id: str,
+    group_name: str | None,
+    *,
+    blocking: bool,
+) -> Any:
+    """Acquire the v2 cleanup fence and the complete projected lock set."""
+    if not is_task_dependencies_root(cfg):
+        yield True
+        return
+    with dependency_lock(cfg.shared_root, blocking=blocking) as has_dependency_lock:
+        if not has_dependency_lock:
+            yield False
+            return
+        if is_task_dependencies_v2_root(cfg) and task_path(cfg.shared_root, task_id).exists():
+            try:
+                dependents = projected_dependents(cfg, task_id)
+            except ProjectionUnavailable as exc:
+                try:
+                    mark_degraded(cfg, f"cleanup projection validation failed: {exc}")
+                except (OSError, ProjectionUnavailable, TypeError, ValueError):
+                    pass
+                yield None
+                return
+        else:
+            dependents = []
+        groups = {group_name} if group_name else set()
+        task_ids = {task_id}
+        for dependent_id in dependents:
+            dependent = load_task(cfg, dependent_id)
+            task_ids.add(dependent.task_id)
+            if dependent.group_name:
+                groups.add(dependent.group_name)
+        with sorted_group_task_locks(
+            cfg.shared_root,
+            groups,
+            task_ids,
+            blocking=blocking,
+        ) as locks_acquired:
+            if not locks_acquired:
+                yield False
+                return
+            yield True
+
+
 def _dependency_references(cfg: RootConfig, task: TaskRecord) -> list[str]:
     """Return all extant direct dependents that retain this Task's history."""
+    if is_task_dependencies_v2_root(cfg):
+        return projected_dependents(cfg, task.task_id)
     if task.group_name is None:
         return []
     references: list[str] = []
@@ -164,7 +223,7 @@ def _finalize_cleanup_operation(
     task: TaskRecord | None = None
     if path.exists():
         task = load_task(cfg, task_id)
-        if not dependencies_checked:
+        if is_task_dependencies_v2_root(cfg) or not dependencies_checked:
             references = _dependency_references(cfg, task)
             if references:
                 raise RuntimeError(
@@ -172,6 +231,12 @@ def _finalize_cleanup_operation(
                 )
     if not reconcile_claim_archives(cfg, task_id):
         return []
+    projection_started = False
+    if is_task_dependencies_v2_root(cfg) and task is not None:
+        begin_mutation(cfg, allow_degraded=False)
+        projection_started = True
+    elif is_task_dependencies_root(cfg) and task is not None:
+        invalidate_legacy_rebuild(cfg, "Task cleanup")
     removed: list[str] = []
     if path.exists():
         assert_ready_writer_compatible(cfg)
@@ -216,6 +281,8 @@ def _finalize_cleanup_operation(
         if path.exists():
             delete_task(cfg, task_id)
             removed.append(str(path))
+        if projection_started:
+            remove_task_from_projection(cfg, task_id, before=task)
         deadline_index = shared_paths(cfg.shared_root)["offer_deadlines"] / f"{task_id}.json"
         if deadline_index.exists():
             remove_deadline_index(cfg, task_id)
@@ -246,6 +313,8 @@ def _finalize_cleanup_operation(
         operation["meta"]["revision"] += 1
         operation["meta"]["updated_at"] = utc_now()
         archive_operation(cfg, "cleanup", task_id, operation)
+        if projection_started:
+            complete_mutation(cfg)
     return removed
 
 
@@ -325,13 +394,34 @@ def advance_cleanup_maintenance_step(
                 if not has_schema_lock:
                     return {"state": "waiting", "reason": "schema_lock_busy", "cursor": cursor}
                 group_name = cleanup.get("group_name")
-                group_context = (
-                    group_lock(cfg.shared_root, group_name, blocking=False) if group_name else nullcontext(True)
-                )
+                if is_task_dependencies_root(cfg):
+                    group_context = _cleanup_dependency_locks(
+                        cfg,
+                        task_id,
+                        group_name,
+                        blocking=False,
+                    )
+                    lock_busy_reason = "dependency_lock_busy"
+                else:
+                    group_context = (
+                        group_lock(cfg.shared_root, group_name, blocking=False) if group_name else nullcontext(True)
+                    )
+                    lock_busy_reason = "group_lock_busy"
                 with group_context as has_group_lock:
+                    if has_group_lock is None:
+                        return {
+                            "state": "intervention",
+                            "reason": "task_dependency_projection_unavailable",
+                            "cursor": cursor,
+                        }
                     if not has_group_lock:
-                        return {"state": "waiting", "reason": "group_lock_busy", "cursor": cursor}
-                    with task_lock(cfg.shared_root, task_id, blocking=False) as has_task_lock:
+                        return {"state": "waiting", "reason": lock_busy_reason, "cursor": cursor}
+                    task_context = (
+                        nullcontext(True)
+                        if is_task_dependencies_root(cfg)
+                        else task_lock(cfg.shared_root, task_id, blocking=False)
+                    )
+                    with task_context as has_task_lock:
                         if not has_task_lock:
                             return {"state": "waiting", "reason": "task_lock_busy", "cursor": cursor}
                         operation = read_json_limited(
@@ -389,7 +479,9 @@ def advance_cleanup_maintenance_step(
                                 "cursor": cursor,
                             }
 
-                        outcome = _advance_cleanup_finalization_step(cfg, operation_path, operation, cleanup, cursor)
+                        outcome = _advance_cleanup_finalization_with_fence(
+                            cfg, operation_path, operation, cleanup, cursor
+                        )
                         if outcome.get("state") in {"waiting", "intervention", "completed"}:
                             if outcome.get("state") != "completed":
                                 _persist_cleanup_child_cursor(operation_path, operation, cleanup)
@@ -402,6 +494,23 @@ def _persist_cleanup_child_cursor(operation_path: Path, operation: dict[str, Any
     operation["meta"]["revision"] += 1
     operation["meta"]["updated_at"] = utc_now()
     atomic_replace(operation_path, operation)
+
+
+def _advance_cleanup_finalization_with_fence(
+    cfg: RootConfig,
+    operation_path: Path,
+    operation: dict[str, Any],
+    cleanup: dict[str, Any],
+    cursor: dict[str, Any],
+) -> dict[str, Any]:
+    """Run finalization under the v2 Project dependency fence."""
+    # V2 callers hold the dependency fence before acquiring any Group or Task
+    # lock.  Keeping this helper as a compatibility boundary avoids a nested
+    # dependency-lock acquisition after those identity locks are held.
+    try:
+        return _advance_cleanup_finalization_step(cfg, operation_path, operation, cleanup, cursor)
+    except ProjectionUnavailable as exc:
+        return {"state": "intervention", "reason": "task_dependency_projection_unavailable", "detail": str(exc)}
 
 
 def _read_cleanup_child(directory: Path, offset: int) -> tuple[str | None, int]:
@@ -692,6 +801,22 @@ def _advance_cleanup_finalization_step(
         return {"state": "in_progress", "cursor": cursor}
 
     if stage == "dependency_scan":
+        if is_task_dependencies_v2_root(cfg):
+            if not task_path(cfg.shared_root, task_id).exists():
+                cursor.update({"stage": "claim_archives", "offset": 0})
+                return {"state": "in_progress", "cursor": cursor}
+            try:
+                references = projected_dependents(cfg, task_id)
+            except ProjectionUnavailable as exc:
+                try:
+                    mark_degraded(cfg, f"cleanup projection validation failed: {exc}")
+                except (OSError, ProjectionUnavailable, TypeError, ValueError):
+                    pass
+                return {"state": "intervention", "reason": "task_dependency_projection_unavailable", "detail": str(exc)}
+            if references:
+                return {"state": "intervention", "reason": "cleanup_task_still_referenced", "cursor": cursor}
+            cursor.update({"stage": "claim_archives", "offset": 0})
+            return {"state": "in_progress", "cursor": cursor}
         group_name = cleanup.get("group_name")
         if not group_name:
             cursor.update({"stage": "claim_archives", "offset": 0})

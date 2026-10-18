@@ -29,6 +29,7 @@ from .contracts import (
 )
 from .group_service import GroupServiceMigration
 from .production import UpgradeJournalMigration
+from .task_dependencies_v2 import TaskDependenciesV2Migration
 
 UPGRADE_JOURNAL_VERSION = 1
 UPGRADE_STATES = frozenset(
@@ -109,7 +110,9 @@ class MigrationRegistry:
         return tuple(ordered)
 
 
-DEFAULT_MIGRATIONS = MigrationRegistry([UpgradeJournalMigration(), GroupServiceMigration()])
+DEFAULT_MIGRATIONS = MigrationRegistry(
+    [UpgradeJournalMigration(), GroupServiceMigration(), TaskDependenciesV2Migration()]
+)
 
 
 def register_migration(plugin: MigrationPlugin) -> None:
@@ -1135,7 +1138,23 @@ class UpgradeCoordinator:
 
     def _prerequisites_satisfied(self, upgrade: dict[str, Any], spec: MigrationSpec) -> bool:
         migrations = upgrade["migrations"]
-        return all(migrations.get(name, {}).get("state") == "completed" for name in spec.dependencies)
+        for name in spec.dependencies:
+            item = migrations.get(name)
+            if isinstance(item, dict):
+                if item.get("state") != "completed":
+                    return False
+                continue
+            # A prerequisite may be a conditional migration that is not
+            # applicable to this root (for example a Group service on a
+            # project with no isolated Group namespace). Its absence is the
+            # durable proof that the prerequisite has no work here.
+            try:
+                prerequisite = self.registry.get(name)
+                if _is_applicable(prerequisite, self.cfg):
+                    return False
+            except (DeterministicUpgradeError, OSError, RuntimeError, ValueError, TypeError):
+                return False
+        return True
 
     def _conflicts_clear(self, upgrade: dict[str, Any], spec: MigrationSpec) -> bool:
         migrations = upgrade["migrations"]

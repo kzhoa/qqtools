@@ -7,7 +7,7 @@ import fcntl
 from contextlib import ExitStack, contextmanager
 from contextvars import ContextVar
 from pathlib import Path
-from typing import Iterator
+from typing import Iterable, Iterator
 
 from .paths import lock_path, shared_paths
 from .store import read_json
@@ -181,6 +181,69 @@ def schema_writer_lock(cfg: object, *, blocking: bool = True, require_narrow: bo
 def group_lock(root: Path, name: str, *, blocking: bool = True) -> Iterator[bool]:
     with exclusive(lock_path(root, "groups", name), blocking=blocking) as acquired:
         yield acquired
+
+
+@contextmanager
+def sorted_group_locks(
+    root: Path,
+    names: Iterable[str],
+    *,
+    blocking: bool = True,
+) -> Iterator[bool]:
+    """Acquire distinct Group locks in the global name order.
+
+    The helper deliberately owns only the Group portion of the order. Callers
+    acquire the schema and Project dependency fences before entering it and
+    Task locks after it.
+    """
+    ordered = sorted({name for name in names if name is not None})
+    with ExitStack() as stack:
+        for name in ordered:
+            acquired = stack.enter_context(group_lock(root, name, blocking=blocking))
+            if not acquired:
+                yield False
+                return
+        yield True
+
+
+@contextmanager
+def dependency_lock(root: Path, *, blocking: bool = True) -> Iterator[bool]:
+    """Fence Project-wide dependency and reverse-projection mutations."""
+    with exclusive(lock_path(root, "dependency"), blocking=blocking) as acquired:
+        yield acquired
+
+
+# Keep the longer spelling available to callers that describe the lock by its
+# purpose rather than the on-disk name.
+project_dependency_lock = dependency_lock
+
+
+@contextmanager
+def sorted_group_task_locks(
+    root: Path,
+    group_names: Iterable[str],
+    task_ids: Iterable[str],
+    *,
+    blocking: bool = True,
+) -> Iterator[bool]:
+    """Acquire sorted Group locks followed by sorted Task locks.
+
+    The Project dependency fence is intentionally not acquired here. This
+    keeps claim-time locking usable without the mutation fence and makes lock
+    order visible at the call site.
+    """
+    with sorted_group_locks(root, group_names, blocking=blocking) as groups_acquired:
+        if not groups_acquired:
+            yield False
+            return
+        ordered_tasks = sorted(set(task_ids))
+        with ExitStack() as stack:
+            for task_id in ordered_tasks:
+                acquired = stack.enter_context(task_lock(root, task_id, blocking=blocking))
+                if not acquired:
+                    yield False
+                    return
+            yield True
 
 
 @contextmanager

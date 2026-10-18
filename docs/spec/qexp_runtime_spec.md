@@ -416,7 +416,8 @@ All implementations use this global lock order:
 project schema lock (exclusive for migration/activation, shared for active narrow writers)
   -> ready-index state lock (ready build/repair only)
   -> idempotency-key lock (submission only)
-  -> Group control lock
+  -> Project dependency-mutation lock (dependency writers and Task cleanup only)
+  -> Group control lock, ordered lexicographically by Group name
        -> Task lock, ordered lexicographically by task_id
 ```
 
@@ -429,8 +430,12 @@ Rules:
   lock, then its identity fences
 - submission acquires its keyed idempotency lock before its Group lock; same-key retries serialize
   on that lock, while unrelated keys do not
+- dependency submission and editing, reverse-dependency projection repair, and Task-cleanup start
+  acquire the Project dependency-mutation lock before every affected Group and Task lock
+- operations that cover several Groups acquire each non-null Group lock in stable name order;
+  an ungrouped Task contributes no Group lock
 - a multi-Task operation acquires Task locks in sorted `task_id` order
-- no code path may acquire a Group lock while holding a Task lock
+- no code path may acquire the dependency-mutation lock or a Group lock while holding a Task lock
 - ready-index build and repair acquire the schema fence before the ready-index state lock; any
   nested Task repair then continues with Group and Task locks in this same order
 - machine-local reservation locks are outside the shared lock order and must not be held
@@ -748,6 +753,88 @@ Task rules:
 - absence of `active_claim` means no machine owns execution authority
 - user-facing Task projection is derived from Task and current Attempt truth
 - Task truth wins over every queue index or machine summary
+- `depends_on_task_ids` is a sorted, unique list of exact same-Project Task IDs; Group identity is
+  loaded from current Task truth and is not copied into an edge
+
+### 8.3.1 Project-wide Task dependency protocol
+
+The permanent `task-dependencies-v2` capability expands the dependency graph from one Group to
+the complete Project. A grouped or ungrouped downstream Task may reference a grouped or ungrouped
+prerequisite in the same Project. An ID absent from the selected Project is missing; dependency
+validation never searches another Project. Both committed Tasks and candidates in the same atomic
+Submission may be referenced. The complete candidate overlay is visible to validation, and the
+Submission publishes the whole graph or none of it.
+
+Every dependency mutation holds the schema writer fence and, for Submission, its idempotency-key
+lock before the Project dependency-mutation lock. It then resolves every affected Task's current
+Group, locks the distinct non-null Groups by name, locks downstream and prerequisite Task IDs by
+ID, and rereads all truth. Validation rejects missing or uncommitted prerequisites, self edges,
+cleanup in progress, and cycles. Cycle traversal follows only the complete Project-local closure
+reachable from candidate edges. Because all edge writers share the Project fence, two concurrent
+edits that would jointly form a cycle serialize and at most one commits.
+
+Claim does not acquire the Project dependency-mutation lock. It resolves the downstream and direct
+prerequisites, locks their non-null Groups and Task IDs in the same stable order, then rereads the
+downstream dependency identity and every prerequisite before reservation or Attempt creation. A
+changed identity restarts or rejects that claim. Locks are released before process launch and
+network or other unbounded I/O. The derived gate has this precedence:
+
+1. missing, malformed, cleaning, or inconsistent prerequisite truth is `invalid`;
+2. otherwise, a failed or cancelled prerequisite is `blocked`;
+3. otherwise, any prerequisite not yet succeeded is `waiting`;
+4. only all succeeded prerequisites, including the empty set, produce `ready`.
+
+Only `ready` authorizes claim. A queued downstream retains its ready marker while waiting. Bounded
+cyclic candidate traversal advances past it and later rechecks the gate even when the downstream
+revision did not change. Dependency-only primary-demand probes use the same recheck behavior.
+Notifications and the reverse projection may reduce latency or discovery cost but are never
+scheduling authority.
+
+Task truth is the sole edge authority. `indexes/task-dependencies/` contains a rebuildable reverse
+projection used only to find cleanup conflicts:
+
+```text
+indexes/task-dependencies/
+  state.json
+  generations/<generation>/records/<prerequisite-task-id>.json
+```
+
+The state binds Project identity, protocol version, active or building generation, phase, cursor,
+revision, and `active | building | degraded` status. An active generation contains one record for
+every live Task, including Tasks with no dependents. Each record names its prerequisite Task ID and
+the sorted direct downstream Task IDs, plus an identity-bound content digest so valid-looking
+truncation or omission is rejected as damaged coverage. Edge mutation first durably marks the
+projection degraded, changes canonical Task truth, updates all affected records, and only then
+republishes active coverage. A crash at any boundary therefore leaves Task truth authoritative and
+cleanup disabled; it cannot publish false complete coverage.
+
+Rebuild uses a new generation and bounded resumable passes under the dependency fence: capture
+canonical Task edges, audit every forward edge against the reverse records, audit every projected
+dependent against live downstream truth, then atomically select the generation as active. Cursors
+and generation identity are durable. Missing, malformed, stale, incomplete, or under-repair
+coverage fails closed for cleanup but does not affect claim or scheduling safety. Repair never
+creates or deletes a canonical edge.
+
+Cleanup start takes the dependency fence, requires active projection coverage, reads the target's
+record, then locks the target and projected downstream Groups and Tasks in global order. It rereads
+the projection state and validates every projected dependent against live downstream Task truth.
+Any confirmed direct dependent rejects cleanup regardless of downstream terminal state. Any
+projection mismatch degrades coverage and blocks deletion. The same check and fence precede final
+Task deletion, so a new edge and cleanup start cannot both commit. Deleting a downstream Task also
+removes its outgoing reverse memberships before coverage returns to active.
+
+`task-dependencies-v2` is additive to `task-dependencies-v1`. Fresh roots install both and an empty
+active reverse projection before admission. Existing roots retain v1 same-Group semantics until
+the machine-rolling coordinator proves every eligible writer meets the v2 writer floor, builds and
+audits the projection, and installs the v2 required capability. Running Attempts continue during
+this L1 rollout. The activation turn owns exclusive schema exclusion, which drains admitted
+schema-reader writers, and owns the dependency fence from its final projection check through the
+capability write. Every later mutation reacquires the schema reader fence and validates the full
+required-capability set; unfinished recovery and CLI operations therefore cannot cross the
+activation boundary on cached v1 admission. Once installed, an older process rejects the unknown
+capability before mutation or scheduling. Activation is forward-only; recovery resumes the same
+build or rebuild, while rollback requires restoring a pre-activation root snapshot and compatible
+process set.
 - `ready_generation` is non-negative and monotonic; additive schema-6 records without the field
   read as generation zero until a ready-producing transition or the ready builder assigns one
 

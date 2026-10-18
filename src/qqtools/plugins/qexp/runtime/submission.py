@@ -2,18 +2,41 @@
 
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator
 
-from ..layout import is_cpu_lane_root, is_group_ready_members_root, is_submission_group_publication_root
+from ..layout import (
+    is_cpu_lane_root,
+    is_group_ready_members_root,
+    is_submission_group_publication_root,
+    is_task_dependencies_root,
+    is_task_dependencies_v2_root,
+)
 from ..task_observation import validate_tmux_override
 from .availability import remove_deadline_index, sync_deadline_index
-from .dependencies import validate_group_dependencies
+from .dependencies import resolve_affected_dependency_locks, validate_group_dependencies
+from .dependency_projection import (
+    ProjectionUnavailable,
+    begin_mutation,
+    complete_mutation,
+    invalidate_legacy_rebuild,
+    read_projection_state,
+    synchronize_task_edges,
+)
 from .group_namespace import provisional_group_reader
 from .group_observation_policy import read_policy_snapshot
-from .locks import group_lock, group_writer_lock, idempotency_lock, schema_writer_lock, task_lock, task_locks
+from .locks import (
+    dependency_lock,
+    group_lock,
+    group_writer_lock,
+    idempotency_lock,
+    schema_writer_lock,
+    sorted_group_locks,
+    task_lock,
+    task_locks,
+)
 from .operation_store import operation_exists
 from .paths import group_path, idempotency_path, submission_path, task_path
 from .ready import (
@@ -102,11 +125,20 @@ def publish_submission(cfg: object, operation: dict[str, Any]) -> None:
 
 
 @contextmanager
-def _submission_protocol_lock(cfg: object, mapping_digest: str) -> Iterator[None]:
+def _submission_protocol_lock(
+    cfg: object,
+    mapping_digest: str,
+    *,
+    dependency_fence: bool = False,
+) -> Iterator[None]:
     """Fence submissions through the active member-projection protocol."""
     with schema_writer_lock(cfg, require_narrow=True):
         with idempotency_lock(cfg.shared_root, mapping_digest):
-            yield
+            if dependency_fence and is_task_dependencies_root(cfg):
+                with dependency_lock(cfg.shared_root):
+                    yield
+            else:
+                yield
 
 
 class IdempotencyConflict(ValueError):
@@ -268,7 +300,10 @@ def preview_specs(
                             operation_id=operation_id,
                             idempotency_key=idempotency_key,
                         )
-                frozen_plan = decode_submission_plan(operation)
+                frozen_plan = decode_submission_plan(
+                    operation,
+                    allow_ungrouped_dependencies=is_task_dependencies_v2_root(cfg),
+                )
                 operation_state = submission.get("state")
             except IdempotencyConflict:
                 raise
@@ -472,9 +507,12 @@ def _plan_specs(plan: SubmissionPlan) -> list[dict[str, Any]]:
     return [_thaw(item) for item in plan.task_specs]
 
 
-def _validate_operation_plan(operation: dict[str, Any], plan: SubmissionPlan) -> None:
+def _validate_operation_plan(cfg: Any, operation: dict[str, Any], plan: SubmissionPlan) -> None:
     try:
-        persisted_plan = decode_submission_plan(operation)
+        persisted_plan = decode_submission_plan(
+            operation,
+            allow_ungrouped_dependencies=is_task_dependencies_v2_root(cfg),
+        )
     except (RuntimeError, ValueError, TypeError) as exc:
         raise RuntimeError("submission operation has invalid immutable plan truth.") from exc
     if persisted_plan != plan:
@@ -492,6 +530,33 @@ def _load_plan_tasks(cfg: Any, plan: SubmissionPlan) -> list[TaskRecord]:
         ) from exc
 
 
+@contextmanager
+def _submission_cleanup_task_locks(cfg: Any, task_id: str) -> Iterator[None]:
+    """Lock one rollback Task and its dependency identities in global order."""
+    try:
+        current = TaskRecord.from_dict(read_json(task_path(cfg.shared_root, task_id)))
+    except FileNotFoundError:
+        groups: list[str] = []
+        task_ids = [task_id]
+    else:
+        groups, task_ids = resolve_affected_dependency_locks(cfg, [current])
+    with sorted_group_locks(cfg.shared_root, groups):
+        with task_locks(cfg.shared_root, task_ids):
+            yield
+
+
+def _begin_submission_projection_cleanup(cfg: Any, reason: str) -> bool:
+    """Fence rollback projection writes without concealing prior degradation."""
+    if is_task_dependencies_v2_root(cfg):
+        if read_projection_state(cfg)["state"] != "active":
+            return False
+        begin_mutation(cfg)
+        return True
+    if is_task_dependencies_root(cfg):
+        invalidate_legacy_rebuild(cfg, reason)
+    return False
+
+
 def _cleanup_aborted_submission(
     cfg: Any,
     operation_id: str,
@@ -499,6 +564,7 @@ def _cleanup_aborted_submission(
     resolved: list[dict[str, Any]],
 ) -> None:
     """Remove provisional Group and Task truth after a durable abort."""
+    projection_started = _begin_submission_projection_cleanup(cfg, "submission rollback")
     group_name = plan.target_group
     if group_name:
         with group_lock(cfg.shared_root, group_name):
@@ -531,7 +597,7 @@ def _cleanup_aborted_submission(
     for item in resolved:
         task_id = item["task_id"]
         path = task_path(cfg.shared_root, task_id)
-        with task_lock(cfg.shared_root, task_id):
+        with _submission_cleanup_task_locks(cfg, task_id):
             try:
                 current = TaskRecord.from_dict(read_json(path))
             except FileNotFoundError:
@@ -545,6 +611,10 @@ def _cleanup_aborted_submission(
                     pass
                 assert_ready_writer_compatible(cfg)
                 path.unlink(missing_ok=True)
+                if projection_started:
+                    synchronize_task_edges(cfg, current, None)
+    if projection_started:
+        complete_mutation(cfg)
 
 
 def advance_submission_cleanup_step(cfg: Any, operation_id: str) -> dict[str, Any]:
@@ -560,7 +630,7 @@ def advance_submission_cleanup_step(cfg: Any, operation_id: str) -> dict[str, An
         raise RuntimeError("Submission cleanup operation has no idempotency key.")
     mapping_digest = semantic_digest({"project": str(cfg.shared_root), "key": key})
 
-    with _submission_protocol_lock(cfg, mapping_digest):
+    with _submission_protocol_lock(cfg, mapping_digest, dependency_fence=True):
         operation = read_json(operation_file)
         submission = operation.get("submission")
         if not isinstance(submission, dict) or submission.get("operation_id") != operation_id:
@@ -611,7 +681,10 @@ def advance_submission_cleanup_step(cfg: Any, operation_id: str) -> dict[str, An
         if progress.get("state") == "completed" or progress.get("stage") == "complete":
             return {"state": "completed", "operation_id": operation_id}
 
-        plan = decode_submission_plan(operation)
+        plan = decode_submission_plan(
+            operation,
+            allow_ungrouped_dependencies=is_task_dependencies_v2_root(cfg),
+        )
         group_name = plan.target_group
         stage = progress["stage"]
         if stage in {"group", "group_workers", "group_finalize"}:
@@ -685,13 +758,16 @@ def advance_submission_cleanup_step(cfg: Any, operation_id: str) -> dict[str, An
         item = plan_items[index]
         task_id = validate_identifier(item.get("task_id"), "submission cleanup task_id")
         path = task_path(cfg.shared_root, task_id)
-        with task_lock(cfg.shared_root, task_id):
+        projection_started = _begin_submission_projection_cleanup(cfg, "submission cleanup")
+        with _submission_cleanup_task_locks(cfg, task_id):
             try:
                 current = TaskRecord.from_dict(read_json(path))
             except FileNotFoundError:
                 current = None
             if current is not None:
                 if current.submission_operation_id != operation_id:
+                    if projection_started:
+                        complete_mutation(cfg)
                     return {
                         "state": "intervention",
                         "operation_id": operation_id,
@@ -705,6 +781,10 @@ def advance_submission_cleanup_step(cfg: Any, operation_id: str) -> dict[str, An
                     pass
                 assert_ready_writer_compatible(cfg)
                 path.unlink(missing_ok=True)
+                if projection_started:
+                    synchronize_task_edges(cfg, current, None)
+        if projection_started:
+            complete_mutation(cfg)
         progress["task_offset"] = index + 1
         publish_submission(cfg, operation)
         return {
@@ -723,7 +803,7 @@ def _execute_submission_locked(
     on_prepared: Callable[[str, str], None] | None = None,
 ) -> SubmissionResult:
     """Execute a prepared operation while the schema and idempotency fences are held."""
-    _validate_operation_plan(operation, plan)
+    _validate_operation_plan(cfg, operation, plan)
     submission = operation["submission"]
     state = submission["state"]
     if state == "committed":
@@ -753,11 +833,7 @@ def _execute_submission_locked(
         for item in resolved
     ]
     try:
-        if group_name:
-            with group_lock(cfg.shared_root, group_name):
-                validate_group_dependencies(cfg, group_name, prepared_candidates)
-        else:
-            validate_group_dependencies(cfg, None, prepared_candidates)
+        _validate_prepared_dependencies(cfg, group_name, prepared_candidates)
     except Exception as exc:
         submission["state"] = "aborted"
         submission["failure_reason"] = str(exc)
@@ -882,10 +958,11 @@ def _execute_submission_locked(
 
     staged: list[TaskRecord] = []
     commit_durable = False
+    projection_started = False
 
     def stage_and_commit() -> None:
         """Validate and publish one submission while its Group cannot change."""
-        nonlocal commit_durable
+        nonlocal commit_durable, projection_started
         candidates = [
             _new_task_from_resolved(
                 item,
@@ -896,6 +973,11 @@ def _execute_submission_locked(
             for item in resolved
         ]
         validate_group_dependencies(cfg, group_name, candidates)
+        if is_task_dependencies_v2_root(cfg):
+            begin_mutation(cfg)
+            projection_started = True
+        elif is_task_dependencies_root(cfg):
+            invalidate_legacy_rebuild(cfg, "submission commit")
         for sequence, item in zip(sequences, resolved):
             path = task_path(cfg.shared_root, item["task_id"])
             _reject_cleanup_tombstones(cfg, [item])
@@ -910,6 +992,8 @@ def _execute_submission_locked(
                     save_task(cfg, current)
                     commit_ready_publication(cfg, current)
                     retire_previous_ready_generation(cfg, old_generation, current)
+                    if projection_started:
+                        synchronize_task_edges(cfg, current, current)
                 sync_deadline_index(cfg, current)
                 staged.append(current)
                 continue
@@ -932,6 +1016,8 @@ def _execute_submission_locked(
                 target_revision=task.meta["revision"],
             )
             save_task(cfg, task)
+            if projection_started:
+                synchronize_task_edges(cfg, None, task)
             commit_ready_publication(cfg, task)
             retire_previous_ready_generation(cfg, old_generation, task)
             sync_deadline_index(cfg, task)
@@ -947,12 +1033,29 @@ def _execute_submission_locked(
                 raise
             if persisted.get("submission", {}).get("state") != "committed":
                 raise
+        if projection_started:
+            complete_mutation(cfg)
         commit_durable = True
 
     try:
         # Validation and publication must be one Group-linearized operation. Otherwise a
         # prerequisite can begin cleanup between the final check and Task creation.
-        if group_name:
+        if is_task_dependencies_v2_root(cfg):
+            lock_candidates = [
+                _new_task_from_resolved(
+                    item,
+                    group_name=group_name,
+                    operation_id=operation_id,
+                    is_canonical=is_canonical,
+                )
+                for item in resolved
+            ]
+            affected_groups, affected_tasks = resolve_affected_dependency_locks(cfg, lock_candidates)
+            with sorted_group_locks(cfg.shared_root, affected_groups):
+                with task_locks(cfg.shared_root, affected_tasks):
+                    with provisional_group_reader():
+                        stage_and_commit()
+        elif group_name:
             with group_lock(cfg.shared_root, group_name):
                 with task_locks(cfg.shared_root, list(plan.task_ids)):
                     with provisional_group_reader():
@@ -998,6 +1101,47 @@ def _execute_submission_locked(
         operation["submission"]["failure_reason"] = str(exc)
         publish_submission(cfg, operation)
         _cleanup_aborted_submission(cfg, operation_id, plan, resolved)
+        raise
+
+
+def _validate_prepared_dependencies(
+    cfg: Any,
+    group_name: str | None,
+    candidates: list[TaskRecord],
+) -> None:
+    if group_name:
+        with group_lock(cfg.shared_root, group_name):
+            validate_group_dependencies(cfg, group_name, candidates)
+    else:
+        validate_group_dependencies(cfg, None, candidates)
+
+
+def _invoke_prepared_callback(
+    cfg: Any,
+    operation: dict[str, Any],
+    plan: SubmissionPlan,
+    callback: Callable[[str, str], None],
+) -> None:
+    """Validate and invoke the recovery-ID callback before the dependency fence."""
+    submission = operation["submission"]
+    if submission["state"] in {"committed", "aborted", "blocked"}:
+        return
+    candidates = [
+        _new_task_from_resolved(
+            item,
+            group_name=plan.target_group,
+            operation_id=plan.operation_id,
+            is_canonical=is_cpu_lane_root(cfg),
+        )
+        for item in _plan_specs(plan)
+    ]
+    try:
+        _validate_prepared_dependencies(cfg, plan.target_group, candidates)
+        callback(plan.operation_id, submission["idempotency_key"])
+    except Exception as exc:
+        submission["state"] = "aborted"
+        submission["failure_reason"] = str(exc)
+        publish_submission(cfg, operation)
         raise
 
 
@@ -1049,12 +1193,17 @@ def _abort_submission_owned(cfg: Any, operation: dict[str, Any], plan: Submissio
                         )
     for item in _plan_specs(plan):
         path = task_path(cfg.shared_root, item["task_id"])
-        with task_lock(cfg.shared_root, item["task_id"]):
+        projection_started = _begin_submission_projection_cleanup(cfg, "submission abort")
+        with _submission_cleanup_task_locks(cfg, item["task_id"]):
             try:
                 current = TaskRecord.from_dict(read_json(path))
             except FileNotFoundError:
+                if projection_started:
+                    complete_mutation(cfg)
                 continue
             if current.submission_operation_id != plan.operation_id:
+                if projection_started:
+                    complete_mutation(cfg)
                 continue
             remove_deadline_index(cfg, item["task_id"])
             try:
@@ -1062,6 +1211,10 @@ def _abort_submission_owned(cfg: Any, operation: dict[str, Any], plan: Submissio
             except (OSError, KeyError, TypeError, ValueError):
                 pass
             path.unlink(missing_ok=True)
+            if projection_started:
+                synchronize_task_edges(cfg, current, None)
+        if projection_started:
+            complete_mutation(cfg)
 
 
 def reconcile_submission(
@@ -1088,10 +1241,13 @@ def reconcile_submission(
     if not isinstance(key, str) or not key:
         raise RuntimeError(f"Submission operation {operation_id!r} has no idempotency key.")
     mapping_digest = semantic_digest({"project": str(cfg.shared_root), "key": key})
-    with _submission_protocol_lock(cfg, mapping_digest):
+    with _submission_protocol_lock(cfg, mapping_digest, dependency_fence=True):
         operation = read_json(operation_file)
         submission = operation["submission"]
-        plan = decode_submission_plan(operation)
+        plan = decode_submission_plan(
+            operation,
+            allow_ungrouped_dependencies=is_task_dependencies_v2_root(cfg),
+        )
         if submission["state"] == "committed":
             _finalize_committed_submission(cfg, submission)
             return "committed"
@@ -1186,7 +1342,10 @@ def submit_specs(
                     operation_id=mapped_operation_id,
                     idempotency_key=key,
                 )
-            plan = decode_submission_plan(operation)
+            plan = decode_submission_plan(
+                operation,
+                allow_ungrouped_dependencies=is_task_dependencies_v2_root(cfg),
+            )
             if requested_overrides != plan.tmux_overrides:
                 raise IdempotencyConflict(
                     "submission task observation metadata does not match the requested override.",
@@ -1213,4 +1372,8 @@ def submit_specs(
             from .maintenance_outbox import activate_work
 
             activate_work(cfg, work_descriptor)
-        return _execute_submission_locked(cfg, operation, plan, on_prepared=on_prepared)
+        if on_prepared is not None:
+            _invoke_prepared_callback(cfg, operation, plan, on_prepared)
+        dependency_context = dependency_lock(cfg.shared_root) if is_task_dependencies_root(cfg) else nullcontext(True)
+        with dependency_context:
+            return _execute_submission_locked(cfg, operation, plan)

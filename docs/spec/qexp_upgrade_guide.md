@@ -10,6 +10,39 @@ archived_at:
 This guide is for an existing qexp project rooted at `PROJECT_ROOT` (for example,
 `/mnt/share/myproject/.qexp`). Run commands with its explicit Project path.
 
+## Release 1.3.27
+
+Release 1.3.27 introduces Project-wide Task dependencies behind the permanent
+`task-dependencies-v2` capability. Upgrade the package and restart each
+machine's global agent in turn:
+
+```bash
+python -m pip install --upgrade qqtools
+qexp agent restart
+qexp admin upgrade status --format json
+```
+
+Existing Projects retain `task-dependencies-v1` same-Group behavior until every
+eligible registered writer reports the 1.3.27 floor. The coordinator then builds
+and audits the reverse-dependency projection before atomically installing the v2
+capability. Running Attempts continue; dependency mutation may wait while the
+projection is building. A v1 process that returns after activation is rejected
+on Project open before mutation or scheduling.
+
+`qexp admin upgrade status` reports participant-floor, projection-build, audit,
+and activation blockers. If normal background progress stops, run the bounded
+recovery command:
+
+```bash
+qexp admin upgrade advance --format json
+```
+
+Missing, damaged, stale, or under-repair projection coverage disables Task
+cleanup, not Task truth, claim safety, or running work. Recovery rebuilds the
+projection from canonical Tasks. Do not edit `schema/version.json`, projection
+state, or reverse records. Activation is forward-only; rollback requires a
+pre-activation Project snapshot and a compatible process set.
+
 ## Release 1.3.23
 
 The supported released-source path for the new maintenance protocols is 1.3.22

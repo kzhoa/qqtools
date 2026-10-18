@@ -32,6 +32,11 @@ from .machine import (
     inspect_registered_upgrades,
 )
 from .production import UPGRADE_JOURNAL_CAPABILITY, UpgradeJournalMigration
+from .task_dependencies_v2 import (
+    TASK_DEPENDENCIES_V2_TARGET_PROTOCOL,
+    TASK_DEPENDENCIES_V2_WRITER_FLOOR,
+    TaskDependenciesV2Migration,
+)
 
 __all__ = [
     "DEFAULT_MIGRATIONS",
@@ -62,4 +67,7 @@ __all__ = [
     "UpgradeJournalMigration",
     "GROUP_SERVICE_TARGET_PROTOCOL",
     "GroupServiceMigration",
+    "TASK_DEPENDENCIES_V2_TARGET_PROTOCOL",
+    "TASK_DEPENDENCIES_V2_WRITER_FLOOR",
+    "TaskDependenciesV2Migration",
 ]

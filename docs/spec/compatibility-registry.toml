@@ -1,4 +1,28 @@
-next_id = 23
+next_id = 24
+
+[[items]]
+id = "QQTOOLS-COMPAT-0023"
+component = "qexp.project-task-dependencies"
+kind = "runtime_protocol"
+status = "compatibility_active"
+summary = "Build and fence the Project-wide Task reverse-dependency projection before enabling cross-Group dependency writers and schedulers."
+# Entered the unreleased 1.3.26 development tree after tag v1.3.26; first ships in 1.3.27.
+introduced_in = "1.3.26"
+legacy_removed_in = "1.4.0"
+transition_purged_in = "1.5.0"
+marker = "QQTOOLS-COMPAT-0023"
+owner = "qexp.runtime.dependency_projection"
+verification = ["tests/integration/qexp/test_project_wide_task_dependencies.py", "tests/integration/qexp/test_upgrade_coordinator.py"]
+normal_level = "L1"
+recovery_level = "L1"
+source_versions = ["1.3.26"]
+target_version = "1.3.27"
+mixed_version_range = ["1.3.26-1.3.27.x"]
+normal_commands = ["python -m pip install --upgrade qqtools", "qexp agent restart"]
+machine_status_command = "qexp admin upgrade status"
+recovery_command = "qexp admin upgrade advance"
+workload_continuity = true
+interruption_budget_seconds = 1.0
 
 [[items]]
 id = "QQTOOLS-COMPAT-0022"

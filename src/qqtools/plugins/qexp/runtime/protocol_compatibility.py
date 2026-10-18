@@ -13,6 +13,7 @@ from typing import Any
 
 CPU_LANE_CAPABILITY = "cpu-lane-v1"
 TASK_DEPENDENCIES_CAPABILITY = "task-dependencies-v1"
+TASK_DEPENDENCIES_V2_CAPABILITY = "task-dependencies-v2"
 GROUP_READY_MEMBERS_CAPABILITY = "group-ready-members-v1"
 LOCAL_RECOVERY_CAPABILITY = "local-recovery-v1"
 GROUP_AUTHORITY_CAPABILITY = "group-authority-v2"
@@ -28,6 +29,7 @@ SUPPORTED_REQUIRED_CAPABILITIES = frozenset(
     {
         CPU_LANE_CAPABILITY,
         TASK_DEPENDENCIES_CAPABILITY,
+        TASK_DEPENDENCIES_V2_CAPABILITY,
         GROUP_READY_MEMBERS_CAPABILITY,
         LOCAL_RECOVERY_CAPABILITY,
         GROUP_AUTHORITY_CAPABILITY,
@@ -76,6 +78,7 @@ def manifest_schema_digest(schema: dict[str, Any]) -> str:
                 GROUP_SERVICE_CAPABILITY,
                 OBSERVATION_CAPABILITY,
                 SUBMISSION_GROUP_PUBLICATION_CAPABILITY,
+                TASK_DEPENDENCIES_V2_CAPABILITY,
             }
         ]
     writers = record.get("writer_capabilities")
