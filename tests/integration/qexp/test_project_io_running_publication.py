@@ -12,7 +12,7 @@ from qqtools.plugins.qexp.agent import project_io_worker as worker
 from qqtools.plugins.qexp.agent.context import MachineRuntime
 from qqtools.plugins.qexp.agent.project_io_controller import ProjectIOController
 from qqtools.plugins.qexp.agent.project_io_executor import ProjectIOExecutor
-from qqtools.plugins.qexp.agent.project_io_protocol import ProjectIOProcess
+from qqtools.plugins.qexp.agent.project_io_protocol import ProjectIOProcess, ProjectIOResult
 from qqtools.plugins.qexp.agent.setup import initialize_machine
 from qqtools.plugins.qexp.runtime import running_publication
 from qqtools.plugins.qexp.runtime.paths import attempt_path, local_paths, task_path
@@ -170,6 +170,139 @@ def test_exited_running_publication_retains_ambiguity_until_exact_retry(tmp_path
         assert _result(executor, request).status == "completed"
         assert AttemptRecord.from_dict(read_json(path)).phase == "running"
         assert load_task(cfg, parameters["task_id"]).claim_control["active_claim"]["launch_state"] == "running"
+    finally:
+        executor.shutdown()
+
+
+def test_ambiguous_running_publication_replays_before_revalidation(tmp_path: Path) -> None:
+    runtime, _cfg, bindings, revision, parameters, path, registration = _case(tmp_path)
+    binding = bindings[0]
+    executor = ProjectIOExecutor(runtime)
+    executor.begin_epoch()
+    controller = ProjectIOController(runtime, executor)
+    try:
+        _until(lambda: controller.advance_binding_validation(bindings, revision), bool)
+        request = executor.prepare_authority_running_publish(binding, revision, **parameters)
+        unknown = ProjectIOResult(
+            request=request,
+            status="outcome_unknown",
+            reason_code="project_io_worker_exited_without_result",
+            completed_at=utc_now(),
+            evidence={},
+        )
+        executor._write_record(
+            executor._record_path("results", request.request_id),
+            unknown.to_dict(),
+            "project_io_result",
+        )
+        before_registration = registration.read_bytes()
+        controller._validated.clear()
+
+        assert controller.advance_binding_validation(bindings, revision) == {}
+        replayed = _result(executor, request)
+        assert replayed.status == "completed"
+        assert request in executor.unresolved_requests()
+
+        _until(lambda: controller.advance_binding_validation(bindings, revision), bool)
+
+        assert request not in executor.unresolved_requests()
+        assert AttemptRecord.from_dict(read_json(path)).phase == "running"
+        assert registration.read_bytes() == before_registration
+    finally:
+        executor.shutdown()
+
+
+def test_running_publication_without_result_starts_exact_current_epoch_request(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime, _cfg, bindings, revision, parameters, _path, _registration = _case(tmp_path)
+    executor = ProjectIOExecutor(runtime)
+    executor.begin_epoch()
+    request = executor.prepare_authority_running_publish(bindings[0], revision, **parameters)
+    started = []
+    monkeypatch.setattr(executor, "start", lambda request_id: started.append(request_id))
+
+    try:
+        assert executor.resolve_stale_authority_running_publish(request.request_id, request) is False
+        assert started == [request.request_id]
+    finally:
+        executor.shutdown()
+
+
+def test_running_publication_identity_mismatch_does_not_start_stored_request(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime, _cfg, bindings, revision, parameters, _path, _registration = _case(tmp_path)
+    executor = ProjectIOExecutor(runtime)
+    executor.begin_epoch()
+    request = executor.prepare_authority_running_publish(bindings[0], revision, **parameters)
+    mismatched = replace(request, registry_revision=revision + 1)
+    started = []
+    monkeypatch.setattr(executor, "start", lambda request_id: started.append(request_id))
+
+    try:
+        assert executor.resolve_stale_authority_running_publish(request.request_id, mismatched) is False
+        assert started == []
+        assert executor.unresolved_requests() == (request,)
+    finally:
+        executor.shutdown()
+
+
+def test_running_publication_stale_resolution_is_idempotent(tmp_path: Path) -> None:
+    runtime, _cfg, bindings, revision, parameters, _path, _registration = _case(tmp_path)
+    executor = ProjectIOExecutor(runtime)
+    executor.begin_epoch()
+    try:
+        request = executor.prepare_authority_running_publish(bindings[0], revision, **parameters)
+        result = ProjectIOResult(
+            request=request,
+            status="completed",
+            reason_code=None,
+            completed_at=utc_now(),
+            evidence={
+                **request.parameters,
+                "outcome": "processed",
+                "reason": None,
+                "transitioned_to_running": False,
+                "authority_granted": False,
+                "local_effects": [],
+            },
+        )
+        executor._write_record(
+            executor._record_path("results", request.request_id),
+            result.to_dict(),
+            "project_io_result",
+        )
+
+        assert executor.resolve_stale_authority_running_publish(request.request_id, request) is True
+        assert executor.resolve_stale_authority_running_publish(request.request_id, request) is True
+    finally:
+        executor.shutdown()
+
+
+def test_retryable_running_publication_is_not_discarded_as_stale(tmp_path: Path) -> None:
+    runtime, _cfg, bindings, revision, parameters, _path, _registration = _case(tmp_path)
+    executor = ProjectIOExecutor(runtime)
+    executor.begin_epoch()
+    try:
+        request = executor.prepare_authority_running_publish(bindings[0], revision, **parameters)
+        retryable = ProjectIOResult(
+            request=request,
+            status="retryable_error",
+            reason_code="project_io_authority_running_publish_failed",
+            completed_at=utc_now(),
+            evidence={},
+        )
+        executor._write_record(
+            executor._record_path("results", request.request_id),
+            retryable.to_dict(),
+            "project_io_result",
+        )
+
+        assert executor.resolve_stale_authority_running_publish(request.request_id, request) is False
+        assert request in executor.unresolved_requests()
     finally:
         executor.shutdown()
 

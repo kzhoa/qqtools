@@ -943,6 +943,8 @@ def _authority_terminal_publish(
         raise ProjectIOProtocolError("terminal transition digest differs from canonical semantic fields.")
     cfg = load_root_config(Path(request.canonical_shared_root), parameters["machine_name"])
     cfg = replace(cfg, runtime_root=machine_project_paths(runtime_root, request.project_id)["root"])
+    if replay_only and not _authority_terminal_publish_partial_target_matches(request, cfg):
+        raise _AuthorityReplayBlocked
 
     def mutation_fence() -> None:
         epoch = _read_epoch(paths)

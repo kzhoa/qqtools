@@ -266,6 +266,7 @@ def begin_mutation(
     *,
     storage: Any | None = None,
     allow_degraded: bool = False,
+    reason: str = "canonical dependency mutation in progress",
 ) -> dict[str, Any]:
     """Mark active coverage degraded before canonical Task truth is changed."""
     state = _read_state(cfg, storage=storage)
@@ -274,7 +275,7 @@ def begin_mutation(
             raise ProjectionUnavailable("task dependency projection is not active for mutation")
         return state
     state["state"] = "degraded"
-    state["failure_reason"] = "canonical dependency mutation in progress"
+    state["failure_reason"] = str(reason)[:MAX_FAILURE_REASON] or "canonical dependency mutation in progress"
     state["updated_at"] = utc_now()
     return _write_state(cfg, state, storage=storage)
 

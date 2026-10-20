@@ -562,9 +562,11 @@ def _cleanup_aborted_submission(
     operation_id: str,
     plan: SubmissionPlan,
     resolved: list[dict[str, Any]],
+    *,
+    resume_projection_mutation: bool = False,
 ) -> None:
     """Remove provisional Group and Task truth after a durable abort."""
-    projection_started = _begin_submission_projection_cleanup(cfg, "submission rollback")
+    projection_started = resume_projection_mutation or _begin_submission_projection_cleanup(cfg, "submission rollback")
     group_name = plan.target_group
     if group_name:
         with group_lock(cfg.shared_root, group_name):
@@ -806,6 +808,7 @@ def _execute_submission_locked(
     _validate_operation_plan(cfg, operation, plan)
     submission = operation["submission"]
     state = submission["state"]
+    is_resuming_commit = state == "committing"
     if state == "committed":
         tasks = _load_plan_tasks(cfg, plan)
         _finalize_committed_submission(cfg, submission)
@@ -959,6 +962,7 @@ def _execute_submission_locked(
     staged: list[TaskRecord] = []
     commit_durable = False
     projection_started = False
+    projection_mutation_reason = f"submission commit {operation_id}"
 
     def stage_and_commit() -> None:
         """Validate and publish one submission while its Group cannot change."""
@@ -973,8 +977,21 @@ def _execute_submission_locked(
             for item in resolved
         ]
         validate_group_dependencies(cfg, group_name, candidates)
+        if submission["state"] != "committing":
+            submission["state"] = "committing"
+            publish_submission(cfg, operation)
         if is_task_dependencies_v2_root(cfg):
-            begin_mutation(cfg)
+            projection = read_projection_state(cfg)
+            is_own_interrupted_mutation = (
+                projection["state"] == "degraded"
+                and projection["failure_reason"] == projection_mutation_reason
+                and is_resuming_commit
+            )
+            begin_mutation(
+                cfg,
+                allow_degraded=is_own_interrupted_mutation,
+                reason=projection_mutation_reason,
+            )
             projection_started = True
         elif is_task_dependencies_root(cfg):
             invalidate_legacy_rebuild(cfg, "submission commit")
@@ -1089,7 +1106,13 @@ def _execute_submission_locked(
             cause = exc.__cause__ or exc
             raise diagnostic_error from cause
         try:
-            _cleanup_aborted_submission(cfg, operation_id, plan, resolved)
+            _cleanup_aborted_submission(
+                cfg,
+                operation_id,
+                plan,
+                resolved,
+                resume_projection_mutation=projection_started,
+            )
         except Exception:
             diagnostic_error.add_secondary("submission_cleanup_failed")
         cause = exc.__cause__ or exc
@@ -1100,7 +1123,13 @@ def _execute_submission_locked(
         operation["submission"]["state"] = "aborted"
         operation["submission"]["failure_reason"] = str(exc)
         publish_submission(cfg, operation)
-        _cleanup_aborted_submission(cfg, operation_id, plan, resolved)
+        _cleanup_aborted_submission(
+            cfg,
+            operation_id,
+            plan,
+            resolved,
+            resume_projection_mutation=projection_started,
+        )
         raise
 
 

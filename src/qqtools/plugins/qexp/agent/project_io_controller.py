@@ -11,7 +11,7 @@ import stat
 import time
 import uuid
 from bisect import bisect_right
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
@@ -46,7 +46,7 @@ from .process_reservation_recovery import registration_reservation
 from .progress_coordinator import ProgressObservationCoordinator
 from .project_io_admission import ProjectIOAdmission, ServiceIntent
 from .project_io_executor import ProjectIOExecutor, ProjectIOProtocolError
-from .project_io_protocol import ProjectIORequest
+from .project_io_protocol import PROJECT_IO_OPERATIONS, ProjectIORequest
 from .ready_cursor_validation import validate_ready_cursor_transition
 from .working_set import BindingTurn
 
@@ -90,6 +90,92 @@ _AUTHORITY_MUTATION_OPERATION_KINDS = frozenset(
         "authority_running_publish",
     }
 )
+_VALIDATION_OPERATION_KINDS = frozenset({"validate_binding"})
+_PREVALIDATION_RECONCILIATION_OPERATION_KINDS = frozenset(
+    {
+        "scheduler_launch_authorize",
+        "machine_snapshot_publish",
+        "authority_terminal_observe",
+        "authority_renewal",
+        "authority_orphan_recovery",
+        "authority_termination_commit",
+        "authority_terminal_publish",
+        "authority_running_publish",
+    }
+)
+_VALIDATION_INDEPENDENT_RECONCILIATION_OPERATION_KINDS = frozenset(
+    {
+        "upgrade_service",
+        "submission_control_service",
+        "observation_service",
+        "group_service_probe",
+        "group_service_advance",
+        "progress_projection",
+        "legacy_capture_read",
+        "legacy_capture_scan",
+        "recovery_source_hold",
+        "recovery_admission",
+        "recovery_source_release",
+        "recovery_group_authority",
+        "recovery_capture_transition",
+        "scheduler_observe",
+        "scheduler_primary_probe",
+        "scheduler_quiescence_probe",
+        "scheduler_claim",
+        "scheduler_cursor_commit",
+        "scheduler_reservation_reconcile",
+        "scheduler_due_offer",
+        "scheduler_ready_index_build",
+        "maintenance_descriptor_advance",
+        "maintenance_flush_event",
+        "registration_renew",
+        "activation_observe",
+        "activation_consumer_register",
+        "activation_consumer_ack",
+        "activation_consumer_retire",
+        "authority_service",
+    }
+)
+_PREVALIDATION_RESOLVER_NAMES = {
+    "scheduler_launch_authorize": "resolve_stale_scheduler_launch_authorize",
+    "machine_snapshot_publish": "resolve_stale_machine_snapshot",
+    "authority_terminal_observe": "resolve_stale_authority_terminal_observe",
+    "authority_renewal": "resolve_stale_authority_renewal",
+    "authority_orphan_recovery": "resolve_stale_authority_orphan_recovery",
+    "authority_termination_commit": "resolve_stale_authority_termination_commit",
+    "authority_terminal_publish": "resolve_stale_authority_terminal_publish",
+    "authority_running_publish": "resolve_stale_authority_running_publish",
+}
+
+
+def _validate_prevalidation_operation_partition(
+    validation: Iterable[str],
+    prevalidation: Iterable[str],
+    validation_independent: Iterable[str],
+) -> None:
+    """Require an exhaustive, disjoint classification of Project I/O operations."""
+    partitions = tuple(frozenset(partition) for partition in (validation, prevalidation, validation_independent))
+    overlaps = [partitions[index] & partitions[other] for index in range(3) for other in range(index + 1, 3)]
+    overlap = frozenset().union(*overlaps)
+    if overlap:
+        raise RuntimeError(f"Project I/O operation partition contains overlap: {sorted(overlap)!r}.")
+    union = frozenset().union(*partitions)
+    if union != PROJECT_IO_OPERATIONS:
+        missing = PROJECT_IO_OPERATIONS - union
+        extra = union - PROJECT_IO_OPERATIONS
+        raise RuntimeError(
+            f"Project I/O operation partition is incomplete: missing={sorted(missing)!r}, extra={sorted(extra)!r}."
+        )
+
+
+_validate_prevalidation_operation_partition(
+    _VALIDATION_OPERATION_KINDS,
+    _PREVALIDATION_RECONCILIATION_OPERATION_KINDS,
+    _VALIDATION_INDEPENDENT_RECONCILIATION_OPERATION_KINDS,
+)
+if frozenset(_PREVALIDATION_RESOLVER_NAMES) != _PREVALIDATION_RECONCILIATION_OPERATION_KINDS:
+    raise RuntimeError("Project I/O prevalidation resolver mapping does not cover its operation classification.")
+
 _SERVICE_CLASS_BY_OPERATION_KIND = {
     "upgrade_service": "background",
     "submission_control_service": "background",
@@ -596,12 +682,6 @@ class ProjectIOController:
             self._observed_executor_epoch = None
             return {}
         self._observed_executor_epoch = executor_epoch
-        unresolved = self.executor.unresolved_requests()
-        self._advance_prevalidation_authority_replays(unresolved, executor_epoch)
-        retry_start_permitted = (
-            executor_status["envelope"] != "unknown"
-            and executor_status["overdue_worker_count"] <= executor_status["supported_hang_limit"]
-        )
 
         current_bindings: dict[_ValidationIdentity, ProjectBinding] = {}
         ordered_bindings: list[tuple[_ValidationIdentity, ProjectBinding]] = []
@@ -612,21 +692,20 @@ class ProjectIOController:
             current_bindings[identity] = binding
             ordered_bindings.append((identity, binding))
 
+        unresolved = self.executor.unresolved_requests()
         unresolved_request_ids = {request.request_id for request in unresolved}
         self._started_requests.intersection_update(unresolved_request_ids)
+        self._advance_prevalidation_requests(
+            unresolved,
+            set(current_bindings),
+            executor_epoch,
+            unresolved_request_ids,
+        )
+        retry_start_permitted = (
+            executor_status["envelope"] != "unknown"
+            and executor_status["overdue_worker_count"] <= executor_status["supported_hang_limit"]
+        )
         for request in unresolved:
-            identity = self._request_identity(request)
-            if request.operation_kind == "scheduler_launch_authorize" and (
-                identity not in current_bindings or identity not in self._validated
-            ):
-                # A finished launch request occupies this owner's admission
-                # slot, but consuming its authority requires validation. Retire
-                # definitive evidence without launching; fresh validation and
-                # exact authorization replay break that circular dependency,
-                # including requests issued before a registry revision change.
-                if self.executor.resolve_stale_scheduler_launch_authorize(request.request_id, request):
-                    unresolved_request_ids.discard(request.request_id)
-                    self._started_requests.discard(request.request_id)
             if request.operation_kind != "validate_binding":
                 continue
             result = self.executor.consume(request.request_id, request)
@@ -703,32 +782,55 @@ class ProjectIOController:
             self._started_requests.add(request.request_id)
             self._backoff.pop(identity, None)
 
-    def _advance_prevalidation_authority_replays(
+    def _advance_prevalidation_requests(
         self,
         unresolved: Sequence[ProjectIORequest],
+        current_binding_identities: set[_ValidationIdentity],
         executor_epoch: str,
+        unresolved_request_ids: set[str],
     ) -> None:
-        """Drain retained cross-epoch mutations before their owner can validate.
+        """Reconcile retained validation-gated requests before their owner validates.
 
         Admission correctly prevents two requests for one Project owner. A
-        retained mutation from the prior executor epoch must therefore replay
-        before validation, rather than waiting for authority service that can
-        run only after validation.
+        retained request whose validation identity is no longer current must
+        therefore resolve before validation, rather than waiting for its normal
+        consumer that can run only after validation.
         """
-        resolvers = {
-            "authority_renewal": self.executor.resolve_stale_authority_renewal,
-            "authority_orphan_recovery": self.executor.resolve_stale_authority_orphan_recovery,
-            "authority_termination_commit": self.executor.resolve_stale_authority_termination_commit,
-            "authority_terminal_publish": self.executor.resolve_stale_authority_terminal_publish,
-        }
         for request in unresolved:
-            resolver = resolvers.get(request.operation_kind)
-            if resolver is None or request.executor_epoch == executor_epoch:
+            operation_kind = request.operation_kind
+            if operation_kind not in _PREVALIDATION_RECONCILIATION_OPERATION_KINDS:
+                continue
+            identity = self._request_identity(request)
+            if identity in current_binding_identities and identity in self._validated:
+                continue
+            if operation_kind == "authority_running_publish" and request.executor_epoch != executor_epoch:
                 continue
             try:
-                resolver(request.request_id, request)
+                if operation_kind == "scheduler_launch_authorize":
+                    resolved = self.executor.resolve_stale_scheduler_launch_authorize(request.request_id, request)
+                elif operation_kind == "machine_snapshot_publish":
+                    resolved = self.executor.resolve_stale_machine_snapshot(request.request_id, request)
+                elif operation_kind == "authority_terminal_observe":
+                    resolved = self.executor.resolve_stale_authority_terminal_observe(request.request_id, request)
+                elif operation_kind == "authority_renewal":
+                    resolved = self.executor.resolve_stale_authority_renewal(request.request_id, request)
+                elif operation_kind == "authority_orphan_recovery":
+                    resolved = self.executor.resolve_stale_authority_orphan_recovery(request.request_id, request)
+                elif operation_kind == "authority_termination_commit":
+                    resolved = self.executor.resolve_stale_authority_termination_commit(request.request_id, request)
+                elif operation_kind == "authority_terminal_publish":
+                    resolved = self.executor.resolve_stale_authority_terminal_publish(request.request_id, request)
+                elif operation_kind == "authority_running_publish":
+                    resolved = self.executor.resolve_stale_authority_running_publish(request.request_id, request)
+                else:  # pragma: no cover - guarded by the exhaustive operation partition above.
+                    raise RuntimeError(f"prevalidation resolver is missing for {operation_kind!r}.")
+            except ProjectIOProtocolError:
+                raise
             except (OSError, RuntimeError, ValueError):
                 continue
+            if resolved:
+                unresolved_request_ids.discard(request.request_id)
+                self._started_requests.discard(request.request_id)
 
     @_admission_operation
     def advance_scheduler_observations(

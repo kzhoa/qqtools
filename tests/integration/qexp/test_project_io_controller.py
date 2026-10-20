@@ -17,13 +17,18 @@ from qqtools.plugins.qexp import project_maintenance as project_maintenance_modu
 from qqtools.plugins.qexp.agent import dispatch_loop, project_io_supervision
 from qqtools.plugins.qexp.agent import project_io_admission as project_io_admission_module
 from qqtools.plugins.qexp.agent import project_io_controller as project_io_controller_module
+from qqtools.plugins.qexp.agent import project_io_executor as project_io_executor_module
 from qqtools.plugins.qexp.agent import project_io_worker as project_io_worker_module
 from qqtools.plugins.qexp.agent.context import MachineRuntime
 from qqtools.plugins.qexp.agent.dispatch_loop import dispatch_machine_cycle_locked
 from qqtools.plugins.qexp.agent.helpers import _machine_is_true_idle
 from qqtools.plugins.qexp.agent.project_io_controller import ProjectIOController
 from qqtools.plugins.qexp.agent.project_io_executor import ProjectIOExecutor
-from qqtools.plugins.qexp.agent.project_io_protocol import ProjectIOProcess, ProjectIOResult
+from qqtools.plugins.qexp.agent.project_io_protocol import (
+    ProjectIOProcess,
+    ProjectIOResult,
+    authority_terminal_transition_digest,
+)
 from qqtools.plugins.qexp.agent.project_io_supervision import AttemptSupervisionCoordinator
 from qqtools.plugins.qexp.agent.setup import initialize_machine
 from qqtools.plugins.qexp.agent.working_set import SERVICE_LANES
@@ -7603,3 +7608,397 @@ def test_terminal_attempt_cannot_reactivate_ambiguous_executor_offer(tmp_path: P
 
     assert executor.unresolved_requests() == ()
     assert classify_executor_offer(runtime.root, offer_identity) == "matching_released"
+
+
+@pytest.mark.parametrize("invalidation", ["registry_changed", "validation_lost"])
+@pytest.mark.parametrize("result_status", ["completed", "retryable_error"])
+def test_terminal_observation_does_not_block_revalidation(tmp_path, invalidation, result_status):
+    runtime = MachineRuntime(tmp_path / "machine")
+    initialize_machine(runtime, "gpu-1")
+    _cfg, binding, revision, bindings = _registered(tmp_path, "project-a", runtime)
+    executor = ProjectIOExecutor(runtime)
+    executor.begin_epoch()
+    controller = ProjectIOController(runtime, executor)
+    try:
+        _advance_until_validated(controller, bindings, revision, binding.project_id)
+        request = executor.prepare_authority_terminal_observe(
+            binding,
+            revision,
+            task_id="finished-task",
+            attempt_id="finished-task-attempt-1",
+            attempt_number=1,
+            fencing_token=1,
+            reservation_id=None,
+            process_identity={
+                "wrapper_pid": None,
+                "wrapper_start_time_ticks": None,
+                "process_group_id": None,
+                "process_group_start_time_ticks": None,
+            },
+            mode="active",
+        )
+        evidence = {}
+        if result_status == "completed":
+            evidence = {
+                **request.to_dict()["project_io_request"]["parameters"],
+                "outcome": "stale",
+                "reason": "binding_fence",
+                "task_phase": "succeeded",
+                "attempt_phase": "succeeded",
+                "attempt_result_reason": "completed",
+                "attempt_exit_code": 0,
+                "execution_machine_name": binding.machine_name,
+                "reservation_machine_name": binding.machine_name,
+                "termination_result": None,
+                "cancel_requested": False,
+                "source_revisions": {"task": None, "attempt_digest": None},
+                "authority_granted": False,
+                "local_effects": [],
+            }
+        result = ProjectIOResult(
+            request=request,
+            status=result_status,
+            reason_code="project_io_worker_exited_without_result" if result_status == "retryable_error" else None,
+            completed_at=datetime.now(timezone.utc).isoformat(),
+            evidence=evidence,
+        )
+        atomic_replace(executor.paths["project_io_results"] / f"{request.request_id}.json", result.to_dict())
+        assert binding.project_id in controller.advance_binding_validation(bindings, revision)
+        assert request in executor.unresolved_requests()
+
+        if invalidation == "registry_changed":
+            _other_cfg, _other, revision, bindings = _registered(tmp_path, "project-b", runtime)
+            assert revision != request.registry_revision
+        else:
+            controller._validated.clear()
+
+        _advance_until_validated(controller, bindings, revision, binding.project_id)
+        assert request not in executor.unresolved_requests()
+        assert executor.load_result(request.request_id) is None
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            renewed = controller.advance_registration_renewals([binding], revision, renewal_horizon_seconds=120)
+            if binding.project_id in renewed:
+                break
+            time.sleep(0.02)
+        assert renewed[binding.project_id]["outcome"] == "eligible"
+    finally:
+        executor.shutdown()
+
+
+@pytest.mark.parametrize("process_state", ["live", "unverifiable"])
+def test_terminal_observation_process_blocks_concurrent_revalidation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    process_state: str,
+) -> None:
+    runtime = MachineRuntime(tmp_path / "machine")
+    initialize_machine(runtime, "gpu-1")
+    _cfg, binding, revision, bindings = _registered(tmp_path, "project-a", runtime)
+    executor = ProjectIOExecutor(runtime)
+    executor.begin_epoch()
+    controller = ProjectIOController(runtime, executor)
+    try:
+        _advance_until_validated(controller, bindings, revision, binding.project_id)
+        request = executor.prepare_authority_terminal_observe(
+            binding,
+            revision,
+            task_id="running-task",
+            attempt_id="running-task-attempt-1",
+            attempt_number=1,
+            fencing_token=1,
+            reservation_id=None,
+            process_identity={
+                "wrapper_pid": None,
+                "wrapper_start_time_ticks": None,
+                "process_group_id": None,
+                "process_group_start_time_ticks": None,
+            },
+            mode="active",
+        )
+        process = ProjectIOProcess(request, 2_000_000_000, 1, datetime.now(timezone.utc).isoformat(), "running")
+        executor._write_record(
+            executor._record_path("processes", request.request_id),
+            process.to_dict(),
+            "project_io_process",
+        )
+        observed = {
+            "live": project_io_executor_module._PROCESS_LIVE,
+            "unverifiable": project_io_executor_module._PROCESS_UNVERIFIED,
+        }[process_state]
+        monkeypatch.setattr(project_io_executor_module, "inspect_process_identity", lambda _pid, _ticks: observed)
+        controller._validated.clear()
+
+        assert controller.advance_binding_validation(bindings, revision) == {}
+
+        assert executor.unresolved_requests() == (request,)
+        assert all(item.operation_kind != "validate_binding" for item in executor.unresolved_requests())
+    finally:
+        executor.paths["project_io_processes"].joinpath(f"{request.request_id}.json").unlink(missing_ok=True)
+        executor.shutdown()
+
+
+def test_prevalidation_resolver_failure_is_isolated_by_owner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = MachineRuntime(tmp_path / "machine")
+    initialize_machine(runtime, "gpu-1")
+    _cfg_a, binding_a, _revision, _bindings = _registered(tmp_path, "project-a", runtime)
+    _cfg_b, binding_b, revision, bindings = _registered(tmp_path, "project-b", runtime)
+    executor = ProjectIOExecutor(runtime)
+    executor.begin_epoch()
+    controller = ProjectIOController(runtime, executor)
+    try:
+        for binding in bindings:
+            _advance_until_validated(controller, bindings, revision, binding.project_id)
+        requests = {
+            binding.project_id: executor.prepare_authority_terminal_observe(
+                binding,
+                revision,
+                task_id=f"{binding.project_id}-task",
+                attempt_id=f"{binding.project_id}-task-attempt-1",
+                attempt_number=1,
+                fencing_token=1,
+                reservation_id=None,
+                process_identity={
+                    "wrapper_pid": None,
+                    "wrapper_start_time_ticks": None,
+                    "process_group_id": None,
+                    "process_group_start_time_ticks": None,
+                },
+                mode="active",
+            )
+            for binding in (binding_a, binding_b)
+        }
+        real_resolve = executor.resolve_stale_authority_terminal_observe
+
+        def fail_one(request_id, request):
+            if request.project_id == binding_a.project_id:
+                raise OSError("synthetic resolver failure")
+            return real_resolve(request_id, request)
+
+        monkeypatch.setattr(executor, "resolve_stale_authority_terminal_observe", fail_one)
+        controller._validated.clear()
+
+        controller.advance_binding_validation(bindings, revision)
+
+        unresolved = executor.unresolved_requests()
+        assert requests[binding_a.project_id] in unresolved
+        assert requests[binding_b.project_id] not in unresolved
+        _advance_until_validated(controller, bindings, revision, binding_b.project_id)
+        assert controller.validated_config(binding_b, revision) is not None
+        assert requests[binding_a.project_id] in executor.unresolved_requests()
+    finally:
+        executor.shutdown()
+
+
+@pytest.mark.parametrize(
+    ("operation_kind", "resolver_name"),
+    [
+        ("authority_renewal", "resolve_stale_authority_renewal"),
+        ("authority_orphan_recovery", "resolve_stale_authority_orphan_recovery"),
+        ("authority_termination_commit", "resolve_stale_authority_termination_commit"),
+        ("authority_terminal_publish", "resolve_stale_authority_terminal_publish"),
+    ],
+)
+def test_same_epoch_authority_mutation_reconciles_when_validation_is_lost(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    operation_kind: str,
+    resolver_name: str,
+) -> None:
+    runtime = MachineRuntime(tmp_path / "machine")
+    initialize_machine(runtime, "gpu-1")
+    _cfg, binding, revision, _bindings = _registered(tmp_path, "project-a", runtime)
+    executor = ProjectIOExecutor(runtime)
+    executor.begin_epoch()
+    controller = ProjectIOController(runtime, executor)
+    try:
+        process_identity = {
+            "wrapper_pid": None,
+            "wrapper_start_time_ticks": None,
+            "process_group_id": None,
+            "process_group_start_time_ticks": None,
+        }
+        common = {
+            "task_id": "running-task",
+            "attempt_id": "running-task-attempt-1",
+            "attempt_number": 1,
+            "fencing_token": 1,
+            "reservation_id": None,
+            "process_identity": process_identity,
+        }
+        source_revisions = {"task": 0, "attempt_digest": "a" * 64}
+        if operation_kind == "authority_renewal":
+            request = executor.prepare_authority_renewal(binding, revision, **common, source_revisions=source_revisions)
+        elif operation_kind == "authority_orphan_recovery":
+            request = executor.prepare_authority_orphan_recovery(
+                binding,
+                revision,
+                **common,
+                binding_signature=["synthetic-binding"],
+                source_revisions=source_revisions,
+            )
+        elif operation_kind == "authority_termination_commit":
+            request = executor.prepare_authority_termination_commit(
+                binding,
+                revision,
+                **common,
+                decision_id="synthetic-decision",
+                decision_token=1,
+                authority_outcome="terminal",
+                reason="completed",
+                source_revisions=source_revisions,
+            )
+        else:
+            transition_digest = authority_terminal_transition_digest(
+                mode="active",
+                machine_name=binding.machine_name,
+                phase="succeeded",
+                reason="completed",
+                exit_code=0,
+                termination_result=None,
+                **common,
+            )
+            request = executor.prepare_authority_terminal_publish(
+                binding,
+                revision,
+                **common,
+                mode="active",
+                phase="succeeded",
+                reason="completed",
+                exit_code=0,
+                termination_result=None,
+                source_revisions=source_revisions,
+                transition_digest=transition_digest,
+            )
+        identity = controller._request_identity(request)
+        calls = []
+        monkeypatch.setattr(executor, resolver_name, lambda request_id, current: calls.append((request_id, current)))
+
+        controller._advance_prevalidation_requests(
+            [request],
+            {identity},
+            request.executor_epoch,
+            {request.request_id},
+        )
+
+        assert calls == [(request.request_id, request)]
+    finally:
+        executor.shutdown()
+
+
+def test_completed_machine_snapshot_does_not_block_revalidation(tmp_path: Path) -> None:
+    runtime = MachineRuntime(tmp_path / "machine")
+    initialize_machine(runtime, "gpu-1")
+    _cfg, binding, revision, bindings = _registered(tmp_path, "project-a", runtime)
+    executor = ProjectIOExecutor(runtime)
+    executor.begin_epoch()
+    controller = ProjectIOController(runtime, executor)
+    try:
+        _advance_until_validated(controller, bindings, revision, binding.project_id)
+        request = executor.prepare_machine_snapshot_publish(
+            binding,
+            revision,
+            instance_id="agent-a",
+            pid=123,
+            visible_gpu_ids=[0],
+            reserved_gpu_ids=[],
+            reservation_summaries=[],
+            heartbeat_interval_seconds=5.0,
+            started_at="2026-10-20T00:00:00+00:00",
+            gpu_policy={"mode": "all", "warnings": []},
+        )
+        assert executor.start(request.request_id) is not None
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            executor.poll()
+            result = executor.load_result(request.request_id)
+            if result is not None:
+                break
+            time.sleep(0.02)
+        assert result is not None and result.status == "completed"
+
+        _other_cfg, _other, revision, bindings = _registered(tmp_path, "project-b", runtime)
+        _advance_until_validated(controller, bindings, revision, binding.project_id)
+
+        assert request not in executor.unresolved_requests()
+        assert executor.load_result(request.request_id) is None
+    finally:
+        executor.shutdown()
+
+
+def test_dispatch_cycle_revalidates_and_renews_after_stale_terminal_observation(tmp_path: Path) -> None:
+    runtime = MachineRuntime(tmp_path / "machine")
+    initialize_machine(runtime, "gpu-1")
+    cfg, binding, revision, bindings = _registered(tmp_path, "project-a", runtime)
+    executor = ProjectIOExecutor(runtime)
+    executor.begin_epoch()
+    runtime.project_io_executor = executor
+    controller = ProjectIOController(runtime, executor)
+    runtime.project_io_controller = controller
+    try:
+        _advance_until_validated(controller, bindings, revision, binding.project_id)
+        request = executor.prepare_authority_terminal_observe(
+            binding,
+            revision,
+            task_id="finished-task",
+            attempt_id="finished-task-attempt-1",
+            attempt_number=1,
+            fencing_token=1,
+            reservation_id=None,
+            process_identity={
+                "wrapper_pid": None,
+                "wrapper_start_time_ticks": None,
+                "process_group_id": None,
+                "process_group_start_time_ticks": None,
+            },
+            mode="active",
+        )
+        assert executor.start(request.request_id) is not None
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            executor.poll()
+            result = executor.load_result(request.request_id)
+            if result is not None:
+                break
+            time.sleep(0.02)
+        assert result is not None and result.status == "completed"
+        assert result.evidence["outcome"] == "stale"
+        _other_cfg, _other, revision, bindings = _registered(tmp_path, "project-b", runtime)
+        registration_path = shared_paths(cfg.shared_root)["machines"] / cfg.machine_name / "registration.json"
+        registration = read_json(registration_path)
+        registration["registration"]["eligibility_expires_at"] = (
+            (datetime.now(timezone.utc) + timedelta(seconds=10)).replace(microsecond=0).isoformat()
+        )
+        atomic_replace(registration_path, registration)
+        before = load_machine_registration(cfg)["registration"]["eligibility_expires_at"]
+        runtime.publish_registration_renewal_intent(
+            bindings=bindings,
+            registry_revision=revision,
+            renewal_horizon_seconds=120,
+            heartbeat_interval_seconds=5,
+        )
+
+        deadline = time.monotonic() + 8.0
+        renewed = before
+        while time.monotonic() < deadline:
+            dispatch_machine_cycle_locked(
+                runtime,
+                available_gpus=[],
+                supervise=False,
+                publish_snapshots=False,
+            )
+            renewed = load_machine_registration(cfg)["registration"]["eligibility_expires_at"]
+            if renewed != before and request not in executor.unresolved_requests():
+                break
+            time.sleep(0.02)
+
+        assert request not in executor.unresolved_requests()
+        assert renewed != before
+    finally:
+        coordinator = getattr(runtime, "attempt_supervision_coordinator", None)
+        if coordinator is not None:
+            coordinator.close()
+        executor.shutdown()

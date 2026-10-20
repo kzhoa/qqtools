@@ -10,6 +10,7 @@ from qqtools.plugins.qexp.commands import task as task_commands
 from qqtools.plugins.qexp.runtime.authority_lock import authority_locks
 from qqtools.plugins.qexp.runtime.group_discovery.changes import record_task_change, settle_task_change
 from qqtools.plugins.qexp.runtime.group_discovery.rechecks import GroupRechecks
+from qqtools.plugins.qexp.runtime.locks import task_lock
 from qqtools.plugins.qexp.runtime.ready.routes import reference_for_generation
 from qqtools.plugins.qexp.runtime.tasks import load_task
 from qqtools.plugins.qexp.scheduler import authorize_launch, claim_task, fail_attempt
@@ -358,7 +359,7 @@ def test_retired_retry_settles_when_its_marker_was_already_consumed(tmp_path, mo
     assert fail_attempt(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token, "failure")
     clean(cfg, task_id=task.task_id)
     assert reference_for_generation(cfg, task.task_id, event["evidence"]["details"]["reserved_generation"]) is None
-    with authority_locks(cfg, task):
+    with task_lock(cfg.shared_root, task.task_id):
         assert settle_task_change(cfg, event) == (True, [])
     assert journal.read(journal.snapshot(), 1)["state"] == "committed"
 

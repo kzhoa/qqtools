@@ -290,9 +290,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser = _QexpArgumentParser(
         prog="qexp",
         description=(
-            "qexp schema-6 experiment queue. Ordinary commands use --expect-machine NAME as an identity assertion "
-            "(--machine is a compatibility alias), while --home-machine selects Task placement. Selecting "
-            "placement does not remotely start an agent."
+            "qexp schema-6 experiment queue. Task placement uses --home-machine NAME and does not remotely start "
+            "an agent. Ordinary commands use --expect-machine NAME as an identity assertion; --machine is a "
+            "compatibility alias."
         ),
         epilog=(
             "Machine setup: qexp init --machine NAME creates or replaces the local identity. Create shared truth "

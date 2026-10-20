@@ -289,7 +289,7 @@ def test_ungrouped_same_submission_candidate_dependency_commits_atomically(tmp_p
     assert load_task(cfg, "child").depends_on_task_ids == ["parent"]
 
 
-def test_interrupted_submission_rollback_preserves_degraded_projection(
+def test_interrupted_submission_rollback_restores_active_projection(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     cfg = _config(tmp_path)
@@ -319,8 +319,9 @@ def test_interrupted_submission_rollback_preserves_degraded_projection(
     assert not (cfg.shared_root / "tasks" / "parent.json").exists()
     assert not (cfg.shared_root / "tasks" / "child.json").exists()
     state = read_projection_state(cfg)
-    assert state["state"] == "degraded"
-    assert "canonical dependency mutation" in state["failure_reason"]
+    assert state["state"] == "active"
+    assert state["phase"] == "complete"
+    assert state["failure_reason"] is None
 
 
 def test_degraded_projection_blocks_cleanup_but_not_dependency_gate(tmp_path: Path) -> None:

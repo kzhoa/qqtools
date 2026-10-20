@@ -1472,9 +1472,35 @@ class ProjectIOExecutor:
         request_id: str,
         current_request: ProjectIORequest,
     ) -> bool:
-        """Archive an obsolete running publication after proving worker absence."""
-        if current_request.operation_kind != "authority_running_publish" or current_request.request_id != request_id:
+        """Replay an ambiguous current-epoch publication before archiving it."""
+        if (
+            not isinstance(current_request, ProjectIORequest)
+            or current_request.operation_kind != "authority_running_publish"
+            or current_request.request_id != request_id
+        ):
             raise ValueError("stale resolution requires authority_running_publish.")
+        with exclusive(self.paths["project_io_lock"]):
+            try:
+                stored = self._load_request(request_id)
+            except FileNotFoundError:
+                return self._find_resolution(request_id, current_request) is not None
+            if stored != current_request:
+                return False
+            try:
+                result = self._load_result(request_id)
+            except FileNotFoundError:
+                result = None
+            if result is not None and result.request != stored:
+                raise ProjectIOProtocolError("result record does not repeat its exact request identity.")
+        if result is None:
+            self.start(request_id)
+            return False
+        if result.status == "outcome_unknown":
+            if self.reset_ambiguous_authority_running_publish_for_retry(request_id, current_request):
+                self.start(request_id)
+            return False
+        if result.status == "retryable_error":
+            return False
         return self._resolve_stale_request(request_id, current_request)
 
     def reset_ambiguous_authority_termination_commit_for_retry(
