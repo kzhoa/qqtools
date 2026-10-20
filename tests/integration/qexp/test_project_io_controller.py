@@ -5406,10 +5406,11 @@ def test_scheduler_observation_progresses_past_sixty_four_empty_projects(tmp_pat
     executor.begin_epoch()
     controller = ProjectIOController(runtime, executor)
     _prime_current_activation(runtime, bindings, revision)
+    for binding in bindings:
+        _advance_until_validated(controller, bindings, revision, binding.project_id)
 
     deadline = time.monotonic() + 15.0
     while time.monotonic() < deadline:
-        controller.advance_binding_validation(bindings, revision)
         observations = controller.advance_scheduler_observations(
             bindings,
             revision,
