@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v1.3.27
+
 - feat: give launched qexp Attempts durable holder-bound ownership, preserving exact running
   processes across agent restarts and expired historical leases; suppress historical deadline-only
   termination decisions without replaying signals or discarding evidence.
@@ -10,6 +12,24 @@
   extending legacy removal to 1.3.28 and temporary-transition purge to 1.3.29. Preserve direct
   rolling upgrades from 1.3.23, 1.3.25, and 1.3.26 without interrupting training; see the
   [upgrade guide](docs/spec/qexp_upgrade_guide.md#durable-attempt-ownership-rollout).
+- feat: let qexp Group helpers offer eligible elapsed Tasks across machine homes through bounded,
+  resumable deadline scans without making historical sweeps part of steady-state scheduling.
+- fix: reconcile qexp agent termination with durable runner exits, preserving exact terminal
+  evidence and recovering supervision without relaunching completed work.
+- fix: expose durable diagnostics when a cancelled qexp retry cannot be reconstructed safely,
+  including actionable CLI status instead of silently discarding historical evidence.
+- feat: add explicit qexp machine-identity assertions to applicable CLI commands and align the
+  consolidated help tree and examples with their actual identity requirements.
+- feat: add qexp heartbeat, control-plane, Project I/O, and scheduler health diagnostics with
+  bounded watchdog evidence and human-readable agent status output.
+- fix: report qexp Project I/O health from actual worker activity and completion state, avoiding
+  stale healthy or busy status after executor transitions.
+- feat: support Project-wide qexp Task dependencies across grouped and ungrouped Tasks, backed by
+  a rebuildable reverse projection and machine-rolling activation protocol.
+- fix: reconcile interrupted qexp Project I/O prevalidation requests so recovered work preserves
+  authoritative request identity and publication ordering.
+- fix: recover a committed qexp Submission's owned dependency projection during same-key replay,
+  restoring active coverage after a process exits between durable commit and projection activation.
 
 ## v1.3.26
 
