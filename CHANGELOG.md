@@ -30,6 +30,8 @@
   authoritative request identity and publication ordering.
 - fix: recover a committed qexp Submission's owned dependency projection during same-key replay,
   restoring active coverage after a process exits between durable commit and projection activation.
+- ci: isolate scheduler-observation fairness timing from asynchronous binding prevalidation so the
+  65-Project release regression retains its 15-second observation budget under parallel CI load.
 
 ## v1.3.26
 
