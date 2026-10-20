@@ -19,6 +19,7 @@ from qqtools.plugins.qexp.runtime.dependency_projection import (
     start_rebuild,
 )
 from qqtools.plugins.qexp.runtime.locks import dependency_lock
+from qqtools.plugins.qexp.runtime.paths import submission_path
 from qqtools.plugins.qexp.runtime.store import atomic_replace, read_json
 from qqtools.plugins.qexp.runtime.tasks import load_task
 from qqtools.plugins.qexp.runtime.upgrade import UpgradeCoordinator
@@ -322,6 +323,88 @@ def test_interrupted_submission_rollback_restores_active_projection(
     assert state["state"] == "active"
     assert state["phase"] == "complete"
     assert state["failure_reason"] is None
+
+
+def test_committed_submission_replay_restores_its_interrupted_projection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = _config(tmp_path)
+    original_complete_mutation = submission_runtime.complete_mutation
+
+    def exit_before_projection_activation(_cfg) -> None:
+        raise SystemExit(17)
+
+    monkeypatch.setattr(submission_runtime, "complete_mutation", exit_before_projection_activation)
+    with pytest.raises(SystemExit, match="17"):
+        submission_runtime.submit_specs(
+            cfg,
+            [
+                {"task_id": "parent", "command": ["echo", "parent"]},
+                {
+                    "task_id": "child",
+                    "command": ["echo", "child"],
+                    "depends_on_task_ids": ["parent"],
+                },
+            ],
+            group_name=None,
+            idempotency_key="committed-project-graph",
+        )
+
+    interrupted = read_projection_state(cfg)
+    assert interrupted["state"] == "degraded"
+    operation_id = load_task(cfg, "parent").submission_operation_id
+    assert interrupted["failure_reason"] == f"submission commit {operation_id}"
+    operation = read_json(submission_path(cfg.shared_root, operation_id))
+    assert operation["submission"]["state"] == "committed"
+
+    monkeypatch.setattr(submission_runtime, "complete_mutation", original_complete_mutation)
+    replayed = submission_runtime.submit_specs(
+        cfg,
+        [
+            {"task_id": "parent", "command": ["echo", "parent"]},
+            {
+                "task_id": "child",
+                "command": ["echo", "child"],
+                "depends_on_task_ids": ["parent"],
+            },
+        ],
+        group_name=None,
+        idempotency_key="committed-project-graph",
+    )
+
+    assert [task.task_id for task in replayed] == ["parent", "child"]
+    recovered = read_projection_state(cfg)
+    assert recovered["state"] == "active"
+    assert recovered["phase"] == "complete"
+    assert recovered["failure_reason"] is None
+    assert projected_dependents(cfg, "parent") == ["child"]
+    later = submit(cfg, ["echo", "later"], task_id="later", working_dir=tmp_path)
+    assert later.task_id == "later"
+
+
+def test_committed_submission_replay_does_not_clear_foreign_projection_failure(tmp_path: Path) -> None:
+    cfg = _config(tmp_path)
+    first = submit(
+        cfg,
+        ["echo", "first"],
+        task_id="first",
+        working_dir=tmp_path,
+        idempotency_key="foreign-projection-failure",
+    )
+    mark_degraded(cfg, "unrelated projection failure")
+
+    replayed = submit(
+        cfg,
+        ["echo", "first"],
+        task_id="first",
+        working_dir=tmp_path,
+        idempotency_key="foreign-projection-failure",
+    )
+
+    assert replayed.task_id == first.task_id
+    projection = read_projection_state(cfg)
+    assert projection["state"] == "degraded"
+    assert projection["failure_reason"] == "unrelated projection failure"
 
 
 def test_degraded_projection_blocks_cleanup_but_not_dependency_gate(tmp_path: Path) -> None:

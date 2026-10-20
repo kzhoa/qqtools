@@ -530,6 +530,22 @@ def _load_plan_tasks(cfg: Any, plan: SubmissionPlan) -> list[TaskRecord]:
         ) from exc
 
 
+def _recover_committed_submission_projection(
+    cfg: Any,
+    plan: SubmissionPlan,
+    tasks: list[TaskRecord],
+) -> None:
+    """Recover an interrupted projection mutation owned by this Submission."""
+    if not is_task_dependencies_v2_root(cfg):
+        return
+    projection = read_projection_state(cfg)
+    if projection["state"] != "degraded" or projection["failure_reason"] != f"submission commit {plan.operation_id}":
+        return
+    for task in tasks:
+        synchronize_task_edges(cfg, task, task)
+    complete_mutation(cfg)
+
+
 @contextmanager
 def _submission_cleanup_task_locks(cfg: Any, task_id: str) -> Iterator[None]:
     """Lock one rollback Task and its dependency identities in global order."""
@@ -811,6 +827,7 @@ def _execute_submission_locked(
     is_resuming_commit = state == "committing"
     if state == "committed":
         tasks = _load_plan_tasks(cfg, plan)
+        _recover_committed_submission_projection(cfg, plan, tasks)
         _finalize_committed_submission(cfg, submission)
         return _submission_result(tasks, submission)
     if state == "aborted":
