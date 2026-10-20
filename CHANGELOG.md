@@ -32,6 +32,8 @@
   restoring active coverage after a process exits between durable commit and projection activation.
 - ci: isolate scheduler-observation fairness timing from asynchronous binding prevalidation so the
   65-Project release regression retains its 15-second observation budget under parallel CI load.
+- ci: establish live machine-agent binding validation before timing continuous viewer behavior,
+  preserving the existing 15-second training-start assertion under parallel CI load.
 
 ## v1.3.26
 
