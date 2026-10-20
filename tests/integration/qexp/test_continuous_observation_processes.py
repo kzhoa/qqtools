@@ -119,6 +119,12 @@ def test_independent_viewers_do_not_control_training_and_default_viewers_exit_te
     env = os.environ.copy()
     env.update(checkout_subprocess_env)
     try:
+
+        def binding_is_validated() -> bool:
+            status = get_machine_agent_status(runtime)
+            return status["is_running"] and not status["waiting_for_first_registration"]
+
+        _wait_for(binding_is_validated, "binding validation")
         _wait_for(ready.exists, "training output")
         _wait_for(lambda: load_task(cfg, task.task_id).state["projection"] == "running", "running truth")
         stored = load_task(cfg, task.task_id)
