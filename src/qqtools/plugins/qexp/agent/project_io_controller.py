@@ -3908,7 +3908,7 @@ class ProjectIOController:
                 continue
             entry = self._snapshot_publication_progress.get((identity, instance_id))
             new_attempt = entry is None or entry.get("stage") == "published" or entry.get("stage") == "backoff"
-            self._snapshot_begin_intent(
+            entry = self._snapshot_begin_intent(
                 identity,
                 instance_id,
                 heartbeat_interval_seconds,
@@ -3931,6 +3931,10 @@ class ProjectIOController:
                     policy,
                     service_key,
                 ),
+                # Prefer snapshots only as freshness becomes at risk, leaving
+                # one heartbeat for publication before the three-interval
+                # stale diagnostic without consuming early startup grants.
+                deadline=entry["_attempt_started_monotonic"] + 2 * heartbeat_interval_seconds,
             )
         return completions
 

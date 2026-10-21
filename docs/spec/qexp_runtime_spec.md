@@ -1,7 +1,7 @@
 ---
 doc_type: spec
 status: active
-updated_at: 2026-10-17
+updated_at: 2026-10-21
 archived_at:
 ---
 
@@ -1629,6 +1629,17 @@ finite set of due authority work by its existing safe deadlines without allowing
 continually displace already due work. Registration, readiness, or recovery prerequisites inherit
 the requesting service class. Skipped opportunities are immediately available to another eligible
 class; this is not permanent process-slot partitioning or a separate pool per service.
+
+Machine snapshot intents remain background work and carry a local admission deadline two
+heartbeat intervals after their first deferred intent. Repeated offers retain that deadline.
+A due snapshot may receive one extra grant when no finite authority-deadline burst or critical
+claim/launch continuation is preferred. The override rotates background owners but preserves the
+ordinary weighted class cursor; another ordinary grant must occur before the next override.
+Within a binding, the existing urgent-family guard preserves the ordinary background cursor and
+requires another family opportunity between repeated snapshot preferences. These bounds prevent
+continuously due snapshots from excluding renewal, scheduling, or maintenance work. Capacity,
+per-binding serialization, retry backoff, and the three-heartbeat stale diagnostic remain unchanged;
+a scheduling deadline grants no authority and cannot guarantee freshness under blocked I/O or overload.
 
 The `primary` service-class name covers scheduling requests, including eligible borrow work.
 It is an arbiter weight, not an admission role or permission to borrow. Existing machine-wide

@@ -8003,3 +8003,58 @@ def test_dispatch_cycle_revalidates_and_renews_after_stale_terminal_observation(
         if coordinator is not None:
             coordinator.close()
         executor.shutdown()
+
+
+def test_deferred_snapshot_keeps_original_admission_deadline_and_then_publishes(tmp_path, monkeypatch):
+    runtime = MachineRuntime(tmp_path / "machine")
+    initialize_machine(runtime, "gpu-1")
+    cfg, binding, revision, bindings = _registered(tmp_path, "project-a", runtime)
+    executor = ProjectIOExecutor(runtime)
+    executor.begin_epoch()
+    now = [100.0]
+    controller = ProjectIOController(runtime, executor, monotonic=lambda: now[0])
+    _advance_until_validated(controller, bindings, revision, binding.project_id)
+    offered = []
+    original_offer = project_io_admission_module.ProjectIOAdmission.offer
+    original_finish = project_io_admission_module.ProjectIOAdmission.finish
+    defer = [True]
+
+    def capture_offer(admission, intent, action):
+        if intent.operation_kind == "machine_snapshot_publish":
+            offered.append(intent)
+        return original_offer(admission, intent, action)
+
+    def finish_with_capacity(admission, **kwargs):
+        if defer[0]:
+            admission.refresh_capacity(blocked=(), free_slots=0)
+        return original_finish(admission, **kwargs)
+
+    monkeypatch.setattr(project_io_admission_module.ProjectIOAdmission, "offer", capture_offer)
+    monkeypatch.setattr(project_io_admission_module.ProjectIOAdmission, "finish", finish_with_capacity)
+    kwargs = dict(
+        instance_id="agent-1",
+        pid=123,
+        visible_gpu_ids=[],
+        reservations=[],
+        heartbeat_interval_seconds=5.0,
+        started_at="2026-10-21T00:00:00+00:00",
+        gpu_policy={"mode": "none", "warnings": []},
+    )
+    for value in (100.0, 102.0, 111.0):
+        now[0] = value
+        with controller.admission_turn():
+            controller.advance_machine_snapshot_publications(bindings, revision, **kwargs)
+        assert executor.unresolved_requests() == ()
+    assert [intent.deadline for intent in offered] == [110.0] * 3
+    assert {intent.service_class for intent in offered} == {"background"}
+
+    defer[0] = False
+    deadline = time.monotonic() + 5.0
+    completions = {}
+    while time.monotonic() < deadline:
+        completions = controller.advance_machine_snapshot_publications(bindings, revision, **kwargs)
+        if binding.project_id in completions:
+            break
+        time.sleep(0.02)
+    assert completions[binding.project_id]["outcome"] == "published"
+    assert read_json(machine_state_path(cfg, "agent.json"))["agent"]["instance_id"] == "agent-1"

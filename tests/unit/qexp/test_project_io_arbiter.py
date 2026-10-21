@@ -176,3 +176,16 @@ def test_invalid_intents_are_rejected(changes):
     fields.update(changes)
     with pytest.raises(ValueError):
         ServiceIntent(**fields)
+
+
+def test_deadline_override_preserves_class_cycle_and_advances_owner_roster():
+    arbiter = ProjectIOArbiter()
+    snapshots = [_intent(project, "background") for project in ("a", "b")]
+    authority = _intent("c", "authority")
+    primary = _intent("d", "primary")
+    arbiter.reconcile([item.owner for item in [*snapshots, authority, primary]])
+    assert arbiter.select([authority, primary], limit=1) == (authority,)
+    assert arbiter.select(snapshots, limit=1, advance_class_cycle=False) == (snapshots[0],)
+    assert arbiter.select([authority, primary], limit=1) == (primary,)
+    assert arbiter.select(snapshots, limit=1, advance_class_cycle=False) == (snapshots[1],)
+    assert arbiter.select([authority, primary], limit=1) == (authority,)

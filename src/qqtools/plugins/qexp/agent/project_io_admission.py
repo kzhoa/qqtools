@@ -145,6 +145,7 @@ class ProjectIOAdmission:
         "_due_authority_burst_grants",
         "_due_authority_yielded_classes",
         "_progress_chain_grants",
+        "_snapshot_yield_pending",
     )
 
     def __init__(self, *, monotonic: Callable[[], float] = time.monotonic) -> None:
@@ -171,6 +172,7 @@ class ProjectIOAdmission:
         self._due_authority_burst_grants = 0
         self._due_authority_yielded_classes: set[ServiceClass] = set()
         self._progress_chain_grants: dict[BindingOwner, _ProgressChainCredit] = {}
+        self._snapshot_yield_pending = False
 
     @property
     def active(self) -> bool:
@@ -529,13 +531,28 @@ class ProjectIOAdmission:
                 prefer_due_authority = (
                     len(due_authority) > 1 and self._due_authority_burst_grants < _MAX_DUE_AUTHORITY_GRANTS
                 )
-                candidates = (
-                    due_authority
-                    # A finite deadline burst reduces expiry risk, then the
-                    # ordinary class cycle must regain an opportunity even if
-                    # multiple owners remain continuously due.
-                    if prefer_due_authority
-                    else tuple(
+                due_snapshots = tuple(
+                    intent
+                    for intent in eligible
+                    if intent.service_class == "background"
+                    and intent.operation_kind == "machine_snapshot_publish"
+                    and intent.deadline is not None
+                    and intent.deadline <= self._pass_time
+                )
+                prefer_snapshot = (
+                    bool(due_snapshots)
+                    and not prefer_due_authority
+                    and not prefer_critical
+                    and not self._snapshot_yield_pending
+                )
+                if prefer_due_authority:
+                    # Bound expiry-risk overrides before ordinary classes
+                    # regain an opportunity under continuous authority load.
+                    candidates = due_authority
+                elif prefer_snapshot:
+                    candidates = due_snapshots
+                else:
+                    candidates = tuple(
                         intent
                         for intent in eligible
                         if not (
@@ -545,11 +562,11 @@ class ProjectIOAdmission:
                         )
                         and not (prefer_critical and intent.service_class == "background")
                     )
-                )
                 selected = self._arbiter.select(
                     candidates,
                     blocked=self._blocked,
                     limit=1,
+                    advance_class_cycle=not prefer_snapshot,
                 )
                 if not selected:
                     break
@@ -557,6 +574,13 @@ class ProjectIOAdmission:
                 key = (intent.owner, intent.service_class)
                 action = self._collected.pop(key)[1]
                 self._blocked.add(intent.owner)
+                if prefer_snapshot:
+                    self._snapshot_yield_pending = True
+                elif not prefer_due_authority and not prefer_critical:
+                    # One ordinary grant must separate snapshot overrides.
+                    # The override leaves the weighted class cursor intact,
+                    # so renewals and primary work retain their rotation.
+                    self._snapshot_yield_pending = False
                 if prefer_due_authority:
                     self._due_authority_burst_grants += 1
                     if self._due_authority_burst_grants == _MAX_DUE_AUTHORITY_GRANTS:

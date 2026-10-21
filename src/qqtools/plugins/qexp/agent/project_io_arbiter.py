@@ -82,12 +82,15 @@ class ServiceIntent:
         if type(self.work_family) is not str or self.work_family not in WORK_FAMILIES:
             raise ValueError("work_family must name a supported scheduling lane or default.")
         if self.deadline is not None and (
-            self.service_class != "authority"
+            not (
+                self.service_class == "authority"
+                or (self.service_class == "background" and self.operation_kind == "machine_snapshot_publish")
+            )
             or type(self.deadline) not in {float, int}
             or not math.isfinite(self.deadline)
             or self.deadline < 0
         ):
-            raise ValueError("deadline must be a finite nonnegative authority-service timestamp.")
+            raise ValueError("deadline must be a finite nonnegative authority or machine-snapshot timestamp.")
 
 
 class ProjectIOArbiter:
@@ -146,14 +149,20 @@ class ProjectIOArbiter:
         *,
         blocked: Collection[BindingOwner] = (),
         limit: int = PROJECT_IO_CAPACITY,
+        advance_class_cycle: bool = True,
     ) -> tuple[ServiceIntent, ...]:
         """Return fair, per-owner transient grants from currently discovered work.
 
         The caller must continue discovering omitted work on later passes. A
         selected owner is blocked across every service class for this call.
+        A bounded deadline override may preserve the ordinary class cycle while
+        still advancing the selected class's binding roster.
         """
         if type(limit) is not int or not 0 <= limit <= PROJECT_IO_CAPACITY:
             raise ValueError(f"limit must be an integer from 0 to {PROJECT_IO_CAPACITY}.")
+
+        if type(advance_class_cycle) is not bool:
+            raise ValueError("advance_class_cycle must be a bool.")
 
         intent_sequence = _require_sequence(intents, "intents")
         if len(intent_sequence) > _MAX_RAW_CANDIDATES:
@@ -207,6 +216,7 @@ class ProjectIOArbiter:
             blocked_owners.add(owner)
             selected.append(intent)
             class_cursor = (cycle_slot + 1) % len(_SERVICE_CLASS_CYCLE)
-            self._class_cursor = class_cursor
+            if advance_class_cycle:
+                self._class_cursor = class_cursor
 
         return tuple(selected)

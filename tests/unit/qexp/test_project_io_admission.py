@@ -920,3 +920,99 @@ def test_continuous_progress_cannot_rewind_ordinary_background_rotation(reverse)
     # Every continuously waiting family gets two full turns despite an endless
     # producer stream. In particular upgrade cannot remain unknown after restart.
     assert [item for item in executed if item.operation_kind != "progress_projection"] == ordinary * 2
+
+
+@pytest.mark.parametrize("free_slots", [1, 2, 4])
+@pytest.mark.parametrize("project_count", [2, 3, 5])
+def test_due_snapshots_receive_bounded_service_under_continuous_mixed_load(free_slots, project_count):
+    admission = ProjectIOAdmission(monotonic=lambda: 10.0)
+    owners = [_intent(f"mixed-{index}").owner for index in range(project_count)]
+    snapshots = [ServiceIntent(owner, "background", "machine_snapshot_publish", (), deadline=9.0) for owner in owners]
+    ordinary = [
+        ServiceIntent(owner, service, kind, ())
+        for owner in owners
+        for service, kind in (
+            ("authority", "authority_renewal"),
+            ("primary", "scheduler_observe"),
+            ("background", "maintenance_descriptor_advance"),
+        )
+    ]
+    intents = [*ordinary, *snapshots]
+    executed = []
+    # Each finite window must cover every snapshot owner, even when an owner
+    # already won another class's grant earlier in the same machine pass.
+    window = 16 * project_count
+    for _ in range(3):
+        start = len(executed)
+        for _turn in range(window):
+            admission.begin(owners, blocked=(), free_slots=free_slots)
+            _offer_all(admission, intents, executed)
+            admission.finish()
+        granted = executed[start:]
+        assert set(snapshots) <= set(granted)
+        assert set(ordinary) <= set(granted)
+
+
+def test_snapshot_deadline_override_yields_without_rewinding_ordinary_family_cursor():
+    admission = ProjectIOAdmission(monotonic=lambda: 10.0)
+    owner = _intent("a").owner
+    snapshot = ServiceIntent(owner, "background", "machine_snapshot_publish", (), deadline=9.0)
+    ordinary = [ServiceIntent(owner, "background", kind, ()) for kind in ("recovery_admission", "upgrade_service")]
+    executed = []
+    for _ in range(8):
+        admission.begin([owner], blocked=(), free_slots=1)
+        _offer_all(admission, [*ordinary, snapshot], executed)
+        admission.finish()
+    assert executed == [snapshot, ordinary[0], snapshot, ordinary[1]] * 2
+
+
+def test_future_snapshot_deadline_and_blocked_owner_do_not_spend_override():
+    now = [10.0]
+    admission = ProjectIOAdmission(monotonic=lambda: now[0])
+    owner = _intent("a").owner
+    snapshot = ServiceIntent(owner, "background", "machine_snapshot_publish", (), deadline=11.0)
+    ordinary = ServiceIntent(owner, "background", "recovery_admission", ())
+    executed = []
+    admission.begin([owner], blocked=(), free_slots=1)
+    _offer_all(admission, [snapshot, ordinary], executed)
+    admission.finish()
+    assert executed == [ordinary]
+    now[0] = 12.0
+    admission.begin([owner], blocked=[owner], free_slots=1)
+    _offer_all(admission, [snapshot, ordinary], executed)
+    admission.finish()
+    assert executed == [ordinary]
+    admission.begin([owner], blocked=(), free_slots=1)
+    _offer_all(admission, [snapshot, ordinary], executed)
+    admission.finish()
+    assert executed == [ordinary, snapshot]
+
+
+def test_deadlines_remain_restricted_to_authority_and_background_snapshots():
+    for service, kind in (("primary", "machine_snapshot_publish"), ("background", "observation_service")):
+        with pytest.raises(ValueError, match="deadline"):
+            ServiceIntent(_intent("a").owner, service, kind, (), deadline=1.0)
+
+
+@pytest.mark.parametrize("free_slots", [1, 2, 4])
+def test_due_snapshots_preserve_finite_renewal_and_claim_bursts(free_slots):
+    admission = ProjectIOAdmission(monotonic=lambda: 10.0)
+    owners = [_intent(f"mixed-{index}").owner for index in range(3)]
+    snapshots = [ServiceIntent(owner, "background", "machine_snapshot_publish", (), deadline=9.0) for owner in owners]
+    renewals = [ServiceIntent(owner, "authority", "registration_renew", (), deadline=9.0) for owner in owners]
+    primary = [ServiceIntent(owner, "primary", "scheduler_observe", (), "cpu_primary") for owner in owners]
+    background = [ServiceIntent(owner, "background", "observation_service", ()) for owner in owners]
+    executed = []
+    for turn in range(120):
+        claims = [
+            ServiceIntent(owner, "primary", "scheduler_claim", ("epoch", f"attempt-{turn}"), "gpu_primary")
+            for owner in owners
+        ]
+        admission.begin(owners, blocked=(), free_slots=free_slots)
+        _offer_all(admission, [*claims, *renewals, *primary, *background, *snapshots], executed)
+        admission.finish()
+    assert set(snapshots) <= set(executed)
+    assert set(renewals) <= set(executed)
+    assert any(intent.operation_kind == "scheduler_claim" for intent in executed)
+    assert any(intent.operation_kind == "scheduler_observe" for intent in executed)
+    assert any(intent.operation_kind == "observation_service" for intent in executed)
