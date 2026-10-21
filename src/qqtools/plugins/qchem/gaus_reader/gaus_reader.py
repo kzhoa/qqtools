@@ -8,7 +8,9 @@ g16Reader = create_g16_reader(opt=False)  # for single-point log files
 results = g16Reader.read_file('output.log')
 """
 
+import math
 import re
+from decimal import Decimal
 from typing import Dict, List
 
 import numpy as np
@@ -16,6 +18,67 @@ import numpy as np
 from qqtools.qlogreader import GeneralLogReader, extract_float
 
 __all__ = ["create_g16_reader"]
+
+
+def extract_frequencies(lines: List[str]) -> list[float]:
+    """Read one completed harmonic block in cm^-1, preserving signed mode order.
+
+    The enclosing rule consumes through Thermochemistry, not the subsequent
+    zero-point correction. Low-frequency translation/rotation diagnostics are
+    deliberately excluded. Missing/truncated blocks do not invoke this callback.
+    """
+    groups = {"--": [], "---": []}
+    printed = {"--": [], "---": []}
+    for index, line in enumerate(lines):
+        match = re.match(r"^\s*Frequencies\s+(---|--)\s+(.*)$", line)
+        if match is None:
+            continue
+        separator, payload = match.groups()
+        frequencies = groups[separator]
+        try:
+            tokens = [value.replace("D", "E").replace("d", "e") for value in payload.split()]
+            values = [float(value) for value in tokens]
+        except ValueError as exc:
+            raise ValueError("Malformed Gaussian harmonic frequency group") from exc
+        modes = []
+        # Gaussian variants place mode numbers immediately before frequencies
+        # or before the intervening symmetry-label line.
+        for offset in (1, 2):
+            if index >= offset and re.fullmatch(r"\s*\d+(?:\s+\d+)*\s*", lines[index - offset]):
+                modes = [int(value) for value in lines[index - offset].split()]
+                break
+        expected = list(range(len(frequencies) + 1, len(frequencies) + len(values) + 1))
+        maximum_group_size = 5 if separator == "---" else 3
+        if not 1 <= len(values) <= maximum_group_size or modes != expected:
+            raise ValueError("Gaussian harmonic mode numbers are missing, repeated, or out of order")
+        if not all(math.isfinite(value) for value in values):
+            raise ValueError("Gaussian harmonic frequency is not finite")
+        frequencies.extend(values)
+        printed[separator].extend(Decimal(token) for token in tokens)
+    ordinary, high_precision = groups["--"], groups["---"]
+    if ordinary and high_precision:
+        if len(ordinary) != len(high_precision):
+            raise ValueError("Ordinary and HPModes frequency counts disagree")
+        for low, high in zip(printed["--"], printed["---"]):
+            # Compare rounding intervals implied by the printed decimal places,
+            # including exponents. Do not concatenate two views of the modes.
+            tolerance = (Decimal(1).scaleb(low.as_tuple().exponent) + Decimal(1).scaleb(high.as_tuple().exponent)) / 2
+            if abs(low - high) > tolerance:
+                raise ValueError("Ordinary and HPModes frequency values disagree")
+    if not ordinary and not high_precision:
+        raise ValueError("Harmonic frequency block contains no Frequencies -- values")
+    return high_precision or ordinary
+
+
+def frequency_rule() -> dict:
+    """Build an optional rule for both single-point and optimization readers."""
+    return {
+        "name": "freq",
+        "pattern": "Harmonic frequencies",
+        "end_pattern": "Thermochemistry",
+        "callback": extract_frequencies,
+        "required": False,
+    }
 
 
 def extract_molecule_charge_multiplicity(lines: List[str]) -> tuple:
@@ -287,7 +350,7 @@ g16_singlepoint_rules = [
         "callback": lambda lines: extract_float(lines[1])[:3],
     },
     # --- leave l601 ---
-    # frequencies, maybe later
+    frequency_rule(),
     {
         "name": "zpe_correction",
         "pattern": "Zero-point correction=",
@@ -411,7 +474,7 @@ g16_opt_rules = [
     },
     # --- leave l601 ---
     # --- enter l716
-    # frequencies, maybe later
+    frequency_rule(),
     {
         "name": "zpe_correction",
         "pattern": "Zero-point correction=",
