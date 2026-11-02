@@ -2488,7 +2488,8 @@ def _recovery_group_authority(
     from ..runtime.group_namespace import activate_group_authority_locked
     from ..runtime.locks import schema_lock
     from ..runtime.recovery_admission import _upgrade_blocker
-    from ..runtime.registration_authority import RECOVERY_REGISTRATION_VERSION, registration_write_guard
+    from ..runtime.registration_authority import registration_write_guard
+    from ..runtime.registration_protocol import has_recovery_protocol
     from ..runtime.responsibility_capture import GENERATION_FILE, capture_admission
     from ..runtime.responsibility_completion import _digest, read_capture_completion
     from ..runtime.responsibility_source_read import SourceCaptureStale
@@ -2544,7 +2545,7 @@ def _recovery_group_authority(
         with registration_write_guard(
             cfg, identity, is_current=is_current, before_shared_write=before_shared_write
         ) as registration:
-            if registration is None or registration["version"] != RECOVERY_REGISTRATION_VERSION:
+            if registration is None or not has_recovery_protocol(registration):
                 return {"state": "waiting"}
             with schema_lock(cfg.shared_root, blocking=False) as acquired:
                 if not acquired or _upgrade_blocker(cfg) is not None:

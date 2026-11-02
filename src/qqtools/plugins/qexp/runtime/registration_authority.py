@@ -17,12 +17,20 @@ from ..lease import LeasePolicy, lease_expiry, load_lease_policy, parse_utc
 from .locks import exclusive, machine_lock
 from .paths import machine_registration_path, shared_paths
 from .records import utc_now
+from .registration_protocol import (
+    RECOVERY_PROTOCOL,
+    TARGET_REGISTRATION_VERSION,
+    convert_registration,
+    validate_registration,
+)
 from .responsibility_store import DurableIO
 from .work_budget import diagnostic_increment, diagnostic_observe_ns
 
 REGISTRATION_VERSION = 1
 RECOVERY_REGISTRATION_VERSION = 2
-RECOVERY_REGISTRATION_PROTOCOL = "qexp-local-responsibility-v1"
+# Keep the legacy names exported for compatibility imports while the target
+# envelope is owned by registration_protocol.
+RECOVERY_REGISTRATION_PROTOCOL = RECOVERY_PROTOCOL
 
 
 @dataclass(frozen=True, slots=True)
@@ -47,8 +55,18 @@ def publish_recovery_registration_locked(
     durably retire any local rollback snapshot before a version-1 conversion.
     This function owns no MachineRuntime lock, retention, or capture state.
     """
-    validate_registration_record(registration, registration["project_id"], cfg)
-    if registration["version"] == RECOVERY_REGISTRATION_VERSION:
+    project_id = registration.get("project_id")
+    validate_registration_record(registration, project_id, cfg, allow_source=True)
+    updated = convert_registration(registration, project_id, cfg)
+    needs_save = (
+        updated != registration
+        or updated.get("recovery_protocol") != RECOVERY_PROTOCOL
+        or registration.get("version") != TARGET_REGISTRATION_VERSION
+    )
+    if needs_save:
+        updated["recovery_protocol"] = RECOVERY_PROTOCOL
+        updated["updated_at"] = utc_now()
+    if not needs_save:
         if before_shared_write is not None:
             before_shared_write()
         # Replay must complete the directory barrier after a possibly committed
@@ -58,37 +76,17 @@ def publish_recovery_registration_locked(
             "recovery_registration_fence",
         )
         return
-    updated = dict(registration)
-    updated.update(
-        version=RECOVERY_REGISTRATION_VERSION,
-        protocol_version=RECOVERY_REGISTRATION_VERSION,
-        recovery_protocol=RECOVERY_REGISTRATION_PROTOCOL,
-        client_version=__version__,
-        updated_at=utc_now(),
-    )
+    updated["client_version"] = __version__
     if before_shared_write is not None:
         before_shared_write()
     save_machine_registration(cfg, {"registration": updated})
 
 
-def validate_registration_record(record: dict[str, Any], project_id: str, cfg: RootConfig) -> None:
+def validate_registration_record(
+    record: dict[str, Any], project_id: str, cfg: RootConfig, *, allow_source: bool = True
+) -> None:
     """Validate the existing shared ownership record without local state."""
-    version = record.get("version")
-    if type(version) is not int or version not in {REGISTRATION_VERSION, RECOVERY_REGISTRATION_VERSION}:
-        raise RuntimeError("project machine registration uses an unsupported protocol version.")
-    if version == RECOVERY_REGISTRATION_VERSION and (
-        type(record.get("protocol_version")) is not int
-        or record["protocol_version"] != version
-        or record.get("recovery_protocol") != RECOVERY_REGISTRATION_PROTOCOL
-    ):
-        raise RuntimeError("project machine registration has an unsupported recovery protocol.")
-    if record.get("project_id") != project_id or record.get("shared_root") != str(cfg.shared_root):
-        raise RuntimeError("project machine registration does not match Project identity.")
-    if record.get("machine_name") != cfg.machine_name:
-        raise RuntimeError("project machine registration does not match the requested logical name.")
-    for key in ("generation", "runtime_instance_id", "runtime_root", "eligibility_expires_at"):
-        if not isinstance(record.get(key), str) or not record[key]:
-            raise RuntimeError("project machine registration is malformed.")
+    validate_registration(record, project_id, cfg, allow_source=allow_source)
 
 
 def registration_state(record: dict[str, Any]) -> str:
@@ -114,7 +112,7 @@ def observe_registration_owner(
             record = raw.get("registration") if isinstance(raw, dict) else None
             if not isinstance(record, dict):
                 return "unregistered"
-            validate_registration_record(record, identity.project_id, cfg)
+            validate_registration_record(record, identity.project_id, cfg, allow_source=True)
             state = registration_state(record)
             if state == "invalid":
                 raise RuntimeError("registration observation has invalid lease evidence")
@@ -176,7 +174,17 @@ def registration_write_guard(
             if not isinstance(record, dict):
                 yield None
                 return
-            validate_registration_record(record, identity.project_id, cfg)
+            validation_record = record
+            if (
+                force_renewal
+                and record.get("state") == "eligible"
+                and isinstance(record.get("eligibility_expires_at"), str)
+                and record["eligibility_expires_at"]
+                and record.get("generation") == identity.generation
+                and record.get("runtime_instance_id") == identity.runtime_id
+                and record.get("runtime_root") == identity.runtime_root
+            ):
+                validation_record = {**record, "eligibility_expires_at": lease_expiry(policy)}
             state = registration_state(record)
             # The explicit library reactivation also repairs an unreadable
             # expiry for its exact owner. Ordinary isolated renewals cannot
@@ -192,6 +200,7 @@ def registration_write_guard(
             ):
                 yield None
                 return
+            validate_registration_record(validation_record, identity.project_id, cfg, allow_source=True)
             client_version_mismatch = record.get("client_version") != __version__
             previous_expiry = record["eligibility_expires_at"]
             expires_at = None if can_repair_expiry else parse_utc(previous_expiry)
@@ -205,7 +214,8 @@ def registration_write_guard(
             )
             horizon = now + timedelta(seconds=renewal_horizon_seconds)
             if (
-                force_renewal
+                record["version"] != TARGET_REGISTRATION_VERSION
+                or force_renewal
                 or is_reactivation
                 or client_version_mismatch
                 or (
@@ -213,7 +223,9 @@ def registration_write_guard(
                     and (now >= renew_at or expires_at <= horizon or parsed_next_expiry < expires_at)
                 )
             ):
-                record = dict(record)
+                record = convert_registration(
+                    {**record, "eligibility_expires_at": next_expiry}, identity.project_id, cfg
+                )
                 record["client_version"] = __version__
                 record["eligibility_expires_at"] = next_expiry
                 record["updated_at"] = utc_now()

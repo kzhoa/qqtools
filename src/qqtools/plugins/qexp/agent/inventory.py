@@ -204,6 +204,10 @@ def reconcile_live_bindings_locked(runtime: Any, *, repair: bool = True) -> Inve
         raise RuntimeError("Project inventory reconciliation requires inventory and registry guards.")
     inventory_revision, entries = load_inventory(machine_runtime)
     registry_revision, bindings = machine_runtime.load_registry_uncached()
+    from .registration_replacement import read_replacement_intent
+
+    pending = read_replacement_intent(machine_runtime)
+    pending_project = pending["project_id"] if pending is not None else None
     next_entries = list(entries)
     blockers: list[str] = []
     runtime_id = machine_runtime.instance_id
@@ -231,6 +235,8 @@ def reconcile_live_bindings_locked(runtime: Any, *, repair: bool = True) -> Inve
             blockers.append("binding_identity_changed")
             continue
         entry = exact_matches[0]
+        if binding.project_id == pending_project:
+            continue
         if entry.enabled == binding.enabled:
             continue
         updated = ProjectInventoryEntry(
@@ -270,6 +276,7 @@ def reconcile_live_bindings_locked(runtime: Any, *, repair: bool = True) -> Inve
         )
         == binding.enabled
         for binding in bindings
+        if binding.project_id != pending_project
     )
     return InventoryReconciliation(
         registry_revision=registry_revision,
@@ -314,6 +321,12 @@ def find_inventory_entries(
 def inventory_status(runtime: Any) -> dict[str, Any]:
     """Classify each inventory item against current effective bindings."""
     machine_runtime = _as_runtime(runtime)
+    from .registration_replacement import CANCELLABLE_PHASES, read_replacement_intent
+
+    try:
+        pending_replacement = read_replacement_intent(machine_runtime)
+    except (OSError, RuntimeError, ValueError, KeyError, TypeError) as exc:
+        pending_replacement = {"phase": "unavailable", "error": str(exc)}
     with machine_runtime.inventory_guard():
         with machine_runtime.registry_guard():
             revision, entries = load_inventory(machine_runtime)
@@ -343,6 +356,15 @@ def inventory_status(runtime: Any) -> dict[str, Any]:
             "registry_revision": registry_revision,
             "inventory_revision": revision,
         }
+        if isinstance(pending_replacement, dict) and pending_replacement.get("project_id") == entry.project_id:
+            item["replacement"] = {
+                "action": "project_registration_replacement",
+                "phase": pending_replacement.get("phase"),
+                "old_machine_name": pending_replacement.get("old_machine_name"),
+                "requested_machine_name": pending_replacement.get("requested_machine_name"),
+                "cancellable": pending_replacement.get("phase") in CANCELLABLE_PHASES,
+                "blockers": [],
+            }
         if binding is not None:
             try:
                 item["eligibility"] = machine_runtime.registration_status(binding)
@@ -358,6 +380,7 @@ def inventory_status(runtime: Any) -> dict[str, Any]:
         "revision": revision,
         "inventory_revision": revision,
         "registry_revision": registry_revision,
+        "pending_replacement": pending_replacement,
         "projects": result,
     }
 

@@ -33,12 +33,13 @@ def prepare(runtime, binding):
 def test_preparation_preserves_authority_and_retry_does_not_republish(registered, monkeypatch):
     runtime, binding, cfg, path = registered
     original = read_json(path)["registration"]
-    assert original["version"] == 1
+    assert original["version"] == 3
+    assert original["recovery_protocol"] is None
     assert prepare(runtime, binding)
     stored = read_json(path)["registration"]
     for key in ("generation", "runtime_instance_id", "runtime_root", "state", "eligibility_expires_at", "created_at"):
         assert stored[key] == original[key]
-    assert stored["version"] == stored["protocol_version"] == 2
+    assert stored["version"] == stored["protocol_version"] == 3
     assert stored["recovery_protocol"] == RECOVERY_REGISTRATION_PROTOCOL
     assert runtime.registration_status(binding)["write_eligible"]
     assert "local-recovery-v1" not in read_json(cfg.shared_root / "schema" / "version.json")["schema"].get(
@@ -178,19 +179,19 @@ def test_rebinding_reactivation_and_adoption_preserve_protocol_floor(registered,
     record["registration"]["eligibility_expires_at"] = "2000-01-01T00:00:00Z"
     atomic_replace(path, record)
     assert runtime.reactivate_binding(binding)
-    assert read_json(path)["registration"]["version"] == 2
+    assert read_json(path)["registration"]["recovery_protocol"] == RECOVERY_REGISTRATION_PROTOCOL
     runtime.registration._supersede_registration(binding, "replacement")
     replacement = MachineRuntime(tmp_path / "replacement")
     adopted, _added = replacement.ensure_binding(cfg.shared_root, cfg.machine_name, adopt_existing=True)
     stored = read_json(path)["registration"]
-    assert stored["version"] == stored["protocol_version"] == 2
+    assert stored["version"] == stored["protocol_version"] == 3
     assert stored["recovery_protocol"] == RECOVERY_REGISTRATION_PROTOCOL
     assert stored["generation"] == adopted.registration_generation != binding.registration_generation
     assert replacement.registration_status(adopted)["write_eligible"]
 
 
 @pytest.mark.parametrize(
-    "damage", [{"version": True}, {"version": 3}, {"protocol_version": 1}, {"recovery_protocol": "unknown"}]
+    "damage", [{"version": True}, {"version": 99}, {"protocol_version": 1}, {"recovery_protocol": "unknown"}]
 )
 def test_unsupported_protocol_cannot_prepare_or_rebind(registered, damage):
     runtime, binding, cfg, path = registered
@@ -226,7 +227,7 @@ def test_old_transaction_is_replayed_and_durably_retired_before_preparation(regi
     def check_barrier(self, directory, label):
         if label == "recovery_registration":
             assert not runtime.paths["registration_transaction"].exists()
-            assert read_json(path)["registration"]["version"] == 1
+            assert read_json(path)["registration"]["recovery_protocol"] is None
             assert read_json(path)["registration"]["generation"] == binding.registration_generation
             barriers.append(directory)
         return sync(self, directory, label)
@@ -236,7 +237,7 @@ def test_old_transaction_is_replayed_and_durably_retired_before_preparation(regi
     assert barriers == [runtime.root]
     with runtime.registry_guard():
         runtime.registration.rollback_pending_locked()
-    assert read_json(path)["registration"]["version"] == 2
+    assert read_json(path)["registration"]["recovery_protocol"] == RECOVERY_REGISTRATION_PROTOCOL
 
 
 def test_failed_retirement_barrier_does_not_publish_protocol_and_retry_syncs(registered, monkeypatch):
@@ -251,10 +252,10 @@ def test_failed_retirement_barrier_does_not_publish_protocol_and_retry_syncs(reg
     monkeypatch.setattr(DurableIO, "sync_directory", failed_sync)
     with pytest.raises(OSError, match="retirement fsync"):
         prepare(runtime, binding)
-    assert read_json(path)["registration"]["version"] == 1
+    assert read_json(path)["registration"]["recovery_protocol"] is None
     monkeypatch.setattr(DurableIO, "sync_directory", sync)
     assert prepare(runtime, binding)
-    assert read_json(path)["registration"]["version"] == 2
+    assert read_json(path)["registration"]["recovery_protocol"] == RECOVERY_REGISTRATION_PROTOCOL
 
 
 @pytest.mark.parametrize("boundary", ["retired_old_transaction", "published_protocol"])
@@ -281,7 +282,10 @@ def test_process_crash_retries_preparation_without_restoring_old_protocol(regist
 
         def interrupted_save(config, value):
             save(config, value)
-            if boundary == "published_protocol" and value["registration"]["version"] == 2:
+            if (
+                boundary == "published_protocol"
+                and value["registration"].get("recovery_protocol") == RECOVERY_REGISTRATION_PROTOCOL
+            ):
                 os._exit(41)
 
         DurableIO.sync_directory = interrupted_sync
@@ -291,14 +295,18 @@ def test_process_crash_retries_preparation_without_restoring_old_protocol(regist
         finally:
             os._exit(42)
     assert os.waitstatus_to_exitcode(os.waitpid(pid, 0)[1]) == 41
-    assert read_json(path)["registration"]["version"] == (1 if boundary == "retired_old_transaction" else 2)
+    assert read_json(path)["registration"]["version"] == 3
+    assert read_json(path)["registration"]["recovery_protocol"] == (
+        None if boundary == "retired_old_transaction" else RECOVERY_REGISTRATION_PROTOCOL
+    )
     restarted = MachineRuntime(runtime.root)
     assert prepare(restarted, binding)
     assert not restarted.paths["registration_transaction"].exists()
     with restarted.registry_guard():
         restarted.registration.rollback_pending_locked()
     stored = read_json(path)["registration"]
-    assert stored["version"] == 2
+    assert stored["version"] == 3
+    assert stored["recovery_protocol"] == RECOVERY_REGISTRATION_PROTOCOL
     assert stored["generation"] == binding.registration_generation
     assert restarted.registration_status(binding)["write_eligible"]
 
@@ -320,7 +328,7 @@ def test_scheduler_does_not_release_authority_during_preparation(registered, mon
     save = registration_owner.save_machine_registration
 
     def slow_save(cfg, value):
-        if value["registration"]["version"] == 2:
+        if value["registration"].get("recovery_protocol") == RECOVERY_REGISTRATION_PROTOCOL:
             publishing.set()
             if not finish_publication.wait(5):
                 raise RuntimeError("test publication release timed out")
@@ -366,7 +374,7 @@ def test_scheduler_does_not_release_authority_during_preparation(registered, mon
     assert not errors
     assert not worker_thread.is_alive() and not owner_thread.is_alive()
     assert prepared == [True] and exited.is_set()
-    assert read_json(path)["registration"]["version"] == 2
+    assert read_json(path)["registration"]["recovery_protocol"] == RECOVERY_REGISTRATION_PROTOCOL
     with contender.scheduler_authority() as owns:
         assert owns
     with pytest.raises(RuntimeError, match="scheduler authority"):
@@ -382,13 +390,13 @@ def test_visible_protocol_after_failed_publication_requires_retry_barrier(regist
 
     def uncertain_save(cfg, value):
         save(cfg, value)
-        if value["registration"]["version"] == 2:
+        if value["registration"].get("recovery_protocol") == RECOVERY_REGISTRATION_PROTOCOL:
             raise OSError("publication durability is uncertain")
 
     monkeypatch.setattr(registration_owner, "save_machine_registration", uncertain_save)
     with pytest.raises(OSError, match="durability is uncertain"):
         prepare(runtime, binding)
-    assert read_json(path)["registration"]["version"] == 2
+    assert read_json(path)["registration"]["recovery_protocol"] == RECOVERY_REGISTRATION_PROTOCOL
     barriers = []
 
     def failed_retry(self, directory, label):
@@ -404,7 +412,7 @@ def test_visible_protocol_after_failed_publication_requires_retry_barrier(regist
     monkeypatch.setattr(DurableIO, "sync_directory", sync)
     assert prepare(runtime, binding)
     status = runtime.registration_status(binding)
-    assert status["registration_version"] == 2
+    assert status["registration_version"] == 3
     assert status["recovery_protocol"] == RECOVERY_REGISTRATION_PROTOCOL
 
 

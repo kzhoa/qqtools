@@ -25,6 +25,7 @@ from ..runtime.authority_scan import is_path_present, iter_evidence_files, valid
 from ..runtime.locks import exclusive
 from ..runtime.paths import local_paths
 from ..runtime.records import utc_now, validate_identifier
+from ..runtime.registration_protocol import assert_name_unreserved, convert_registration
 from ..runtime.responsibility_store import DurableIO
 from ..runtime.store import atomic_replace, read_json
 from .context import MachineRuntime, ProjectBinding, default_machine_runtime_root
@@ -399,7 +400,8 @@ def migrate_project(runtime: MachineRuntime | str | Path | None, cfg: RootConfig
                 current = raw_current.get("registration") if isinstance(raw_current, dict) else None
                 if not isinstance(current, dict) or current.get("generation") != generation:
                     raise
-                current = dict(current)
+                assert_name_unreserved(cfg)
+                current = convert_registration(current, current["project_id"], cfg)
                 current.update(
                     {
                         "state": "superseded",

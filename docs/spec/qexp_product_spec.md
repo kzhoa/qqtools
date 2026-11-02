@@ -1,11 +1,66 @@
 ---
 doc_type: spec
 status: active
-updated_at: 2026-10-17
+updated_at: 2026-11-02
 archived_at:
 ---
 
 # qexp Product Spec
+
+## Project registration replacement delivery contract
+
+`qexp project register PATH --machine NAME --replace-current` replaces exactly
+one current local Project binding. It preserves the MachineRuntime identity,
+host binding, global default name, other Projects, and historical Task attribution.
+It cannot combine with pool enrollment, adoption, multiple paths, or default name
+source. No current binding is an error; an already matching name is unchanged.
+The requested name must be free: an existing registration requires ordinary
+registration or separately confirmed adoption, never implicit takeover.
+
+The operation reserves the requested name, durably disables old admission, and
+uses the existing removal blockers. Running work finishes under its old name and
+generation. An accepted drain returns exit 0 with `replacement_pending`; exact
+repetition resumes it. `--cancel-replacement` accepts only one explicit path and
+no naming/adoption/pool options. Before retirement commits, cancellation releases
+the exact reservation and restores the original enablement. After that boundary,
+only completion is allowed. Originally disabled bindings remain disabled after
+either cancellation or completion. No waiting locks or background replacement
+daemon are introduced.
+
+Finite JSON results use action `project_registration_replacement`, status
+`replacement_pending`, `replacement_completed`, `replacement_cancelled`, or
+`unchanged`, and include `project_id`, `shared_root`, `runtime_id`,
+`old_machine_name`, `requested_machine_name`, `phase`, `cancellable`, bounded
+`blockers`, and shell-safe follow-up actions. Completion also includes
+`registration_generation` and confirms unchanged runtime identity. Human output
+renders that same result. Usage errors return 2 before mutation; operational
+errors return 1 and identify whether a prior intent remains active. Upgrade
+pending is an operational error, not an accepted replacement.
+
+### One-time registration protocol downtime exception
+
+For the registration protocol upgrade from qqtools 1.3.27 only, the owner approved
+a coordinated downtime deployment on 2026-11-02. Before upgrading, the operator
+stops training and **all** old qexp processes across participating machines,
+including agents, independent CLI/recovery commands, and residual Project I/O
+workers. No old process may restart during the upgrade or write converted state
+afterward. Upgrade all packages before starting any new agent. Agents can then
+start at different times and automatically convert discoverable registered roots.
+No per-Project conversion or activation command is required; `qexp admin upgrade
+status` is optional inspection.
+
+This is an explicit deployment precondition, not a remote-process detection
+guarantee. Source registration rollback does not honor a new protocol marker;
+stopping only agents or replacing package files cannot exclude old writers.
+The exception does not change other rolling-upgrade promises or the runtime
+replacement drain behavior above. Durable unfinished effects remain recovery
+obligations even when their processes have exited. Unavailable roots retry when
+accessible; unknown or damaged state blocks conversion without resetting it.
+Each newly started machine prepares its own local registration journal before
+shared mutations; a shared activation cannot certify another machine's journal.
+New Projects use the target protocol directly. Delivery requires released-source
+fixtures, crash/retry tests, and actual stop/upgrade/start verification; this
+contract alone is not evidence that those checks have passed.
 
 ## Schema 6 clock capability and local-safe execution
 

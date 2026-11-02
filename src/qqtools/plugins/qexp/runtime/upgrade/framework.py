@@ -29,6 +29,7 @@ from .contracts import (
 )
 from .group_service import GroupServiceMigration
 from .production import UpgradeJournalMigration
+from .registration_v3 import RegistrationV3Migration
 from .task_dependencies_v2 import TaskDependenciesV2Migration
 
 UPGRADE_JOURNAL_VERSION = 1
@@ -111,7 +112,7 @@ class MigrationRegistry:
 
 
 DEFAULT_MIGRATIONS = MigrationRegistry(
-    [UpgradeJournalMigration(), GroupServiceMigration(), TaskDependenciesV2Migration()]
+    [UpgradeJournalMigration(), GroupServiceMigration(), RegistrationV3Migration(), TaskDependenciesV2Migration()]
 )
 
 

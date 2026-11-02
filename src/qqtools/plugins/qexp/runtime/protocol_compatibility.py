@@ -24,6 +24,7 @@ OBSERVATION_CAPABILITY = "task-observation-v1"
 # QQTOOLS-COMPAT-0015: old readers must be fenced before Submission-owned
 # provisional Groups can carry creation provenance.
 SUBMISSION_GROUP_PUBLICATION_CAPABILITY = "submission-group-publication-v1"
+REGISTRATION_REPLACEMENT_CAPABILITY = "registration-replacement-v1"
 SUPPORTED_READY_WRITERS = frozenset({READY_WRITER_CAPABILITY, CURRENT_READY_WRITER_CAPABILITY})
 SUPPORTED_REQUIRED_CAPABILITIES = frozenset(
     {
@@ -36,6 +37,7 @@ SUPPORTED_REQUIRED_CAPABILITIES = frozenset(
         GROUP_SERVICE_CAPABILITY,
         OBSERVATION_CAPABILITY,
         SUBMISSION_GROUP_PUBLICATION_CAPABILITY,
+        REGISTRATION_REPLACEMENT_CAPABILITY,
     }
 )
 
@@ -78,6 +80,7 @@ def manifest_schema_digest(schema: dict[str, Any]) -> str:
                 GROUP_SERVICE_CAPABILITY,
                 OBSERVATION_CAPABILITY,
                 SUBMISSION_GROUP_PUBLICATION_CAPABILITY,
+                REGISTRATION_REPLACEMENT_CAPABILITY,
                 TASK_DEPENDENCIES_V2_CAPABILITY,
             }
         ]

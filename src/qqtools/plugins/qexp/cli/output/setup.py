@@ -78,7 +78,33 @@ def _render_project_operation(result: Mapping[str, Any], _presentation: Mapping[
     return "\n".join(lines)
 
 
+def _render_project_registration_replacement(result: Mapping[str, Any]) -> str:
+    lines = [
+        _operation(
+            "project registration replacement",
+            result.get("status"),
+            (
+                ("Project ID", result.get("project_id")),
+                ("Shared root", result.get("shared_root")),
+                ("Runtime ID", result.get("runtime_id")),
+                ("Old machine", result.get("old_machine_name")),
+                ("Requested machine", result.get("requested_machine_name")),
+                ("Phase", result.get("phase")),
+                ("Generation", result.get("registration_generation")),
+                ("Cancellable", result.get("cancellable")),
+                ("Blockers", result.get("blockers")),
+            ),
+        )
+    ]
+    actions = result.get("next_actions") or result.get("follow_up_actions") or []
+    if actions:
+        lines.append("Next: " + " or ".join(str(action) for action in actions))
+    return "\n".join(lines)
+
+
 def _render_project_register(result: Mapping[str, Any], _presentation: Mapping[str, object]) -> str:
+    if result.get("action") == "project_registration_replacement":
+        return _render_project_registration_replacement(result)
     projects = result.get("projects", ())
     successful = [project for project in projects if project.get("status") in {"registered", "disabled"}]
     failed = [project for project in projects if project not in successful]
@@ -206,8 +232,45 @@ def _validate_project_operation(result: Any) -> None:
             raise ValueError("project-operation payload.reason must be a string or null")
 
 
+def _validate_project_registration_replacement(value: Mapping[str, Any]) -> None:
+    label = "project-registration-replacement payload"
+    if _required(value, "action", label) != "project_registration_replacement":
+        raise ValueError(f"{label}.action is invalid")
+    for key in (
+        "status",
+        "project_id",
+        "shared_root",
+        "runtime_id",
+        "runtime_root",
+        "old_machine_name",
+        "old_generation",
+        "requested_machine_name",
+        "target_generation",
+        "phase",
+        "blockers",
+        "next_actions",
+        "follow_up_actions",
+    ):
+        _required(value, key, label)
+    if value["status"] not in {
+        "replacement_pending",
+        "replacement_completed",
+        "replacement_cancelled",
+        "unchanged",
+    }:
+        raise ValueError(f"{label}.status is invalid")
+    _required_bool(value, "cancellable", label)
+    for key in ("blockers", "next_actions", "follow_up_actions"):
+        _required_sequence(value, key, label)
+    if value["status"] == "replacement_completed":
+        _required(value, "registration_generation", label)
+
+
 def _validate_project_register(result: Any) -> None:
     value = _mapping(result, "project-register payload")
+    if value.get("action") == "project_registration_replacement":
+        _validate_project_registration_replacement(value)
+        return
     _required_int(value, "revision", "project-register payload")
     projects = _required_sequence(value, "projects", "project-register payload")
     for index, item in enumerate(projects):

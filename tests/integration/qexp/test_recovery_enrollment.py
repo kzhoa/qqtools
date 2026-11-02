@@ -106,7 +106,10 @@ def test_all_registered_projects_are_prepared_in_fair_bounded_passes(tmp_path, m
         wait_until("nine-projects-settled", completed, stage="recovery-enrollment:fair-passes", timeout=30)
         assert visited == {binding for binding, _path in entries}
         assert enrollment._settled == visited
-        assert all(read_json(path)["registration"]["version"] == 2 for _binding, path in entries)
+        assert all(
+            read_json(path)["registration"]["recovery_protocol"] == "qexp-local-responsibility-v1"
+            for _binding, path in entries
+        )
         advance_coordinated(enrollment, controller)
         assert not runtime.recovery_enrollment_pending_projects
 
@@ -129,8 +132,11 @@ def test_pending_project_retries_without_starving_new_or_disabled_bindings(tmp_p
 
             wait_until("peers-settled", others_completed, stage="recovery-enrollment:blocked-peer", timeout=20)
             assert runtime.recovery_enrollment_pending_projects == {first.project_id}
-            assert read_json(first_path)["registration"]["version"] == 1
-            assert all(read_json(path)["registration"]["version"] == 2 for _binding, path in others)
+            assert read_json(first_path)["registration"]["recovery_protocol"] is None
+            assert all(
+                read_json(path)["registration"]["recovery_protocol"] == "qexp-local-responsibility-v1"
+                for _binding, path in others
+            )
             assert disabled in runtime.load_registry()[1]
             added, added_path = register(runtime, tmp_path, "added")
 
@@ -141,8 +147,8 @@ def test_pending_project_retries_without_starving_new_or_disabled_bindings(tmp_p
             wait_until("new-peer-settled", added_completed, stage="recovery-enrollment:new-peer", timeout=20)
             assert first not in enrollment._settled
         settle_coordinated(enrollment, controller)
-        assert read_json(first_path)["registration"]["version"] == 2
-        assert read_json(added_path)["registration"]["version"] == 2
+        assert read_json(first_path)["registration"]["recovery_protocol"] == "qexp-local-responsibility-v1"
+        assert read_json(added_path)["registration"]["recovery_protocol"] == "qexp-local-responsibility-v1"
         assert added in enrollment._settled
 
 
@@ -238,7 +244,10 @@ def test_real_global_agent_prepares_registered_roots_before_on_demand_exit(tmp_p
     try:
         wait_until(
             "all-registrations-prepared",
-            lambda: all(read_json(path)["registration"]["version"] == 2 for _binding, path in entries),
+            lambda: all(
+                read_json(path)["registration"]["recovery_protocol"] == "qexp-local-responsibility-v1"
+                for _binding, path in entries
+            ),
             stage="recovery-enrollment:automatic-preparation",
             deadline=startup_deadline,
             on_timeout=lambda: {
@@ -311,10 +320,10 @@ def test_failed_worker_start_is_retryable(tmp_path, monkeypatch):
         monkeypatch.setattr(controller.executor, "start", unavailable)
         advance_coordinated(enrollment, controller)
         assert runtime.recovery_enrollment_pending_projects == {binding.project_id}
-        assert read_json(path)["registration"]["version"] == 1
+        assert read_json(path)["registration"]["recovery_protocol"] is None
         monkeypatch.setattr(controller.executor, "start", start)
         settle_coordinated(enrollment, controller)
-        assert read_json(path)["registration"]["version"] == 2
+        assert read_json(path)["registration"]["recovery_protocol"] == "qexp-local-responsibility-v1"
 
 
 def test_background_preparation_waits_for_migration_then_resumes(tmp_path, monkeypatch):
@@ -351,12 +360,12 @@ def test_background_preparation_waits_for_migration_then_resumes(tmp_path, monke
             return any(value.get("state") == "waiting" for value in observed)
 
         wait_until("migration-deferred", migration_deferred, stage="recovery-enrollment:migration")
-        assert read_json(path)["registration"]["version"] == 1
+        assert read_json(path)["registration"]["recovery_protocol"] is None
         assert runtime.recovery_enrollment_pending_projects == {binding.project_id}
         assert read_json(journal_path) == pending
         atomic_replace(journal_path, original)
         settle_coordinated(enrollment, controller)
-        assert read_json(path)["registration"]["version"] == 2
+        assert read_json(path)["registration"]["recovery_protocol"] == "qexp-local-responsibility-v1"
 
 
 def test_malformed_binding_does_not_abort_other_projects_in_pass(tmp_path):
@@ -375,8 +384,8 @@ def test_malformed_binding_does_not_abort_other_projects_in_pass(tmp_path):
 
         wait_until("healthy-settled", healthy_completed, stage="recovery-enrollment:damaged-peer", timeout=20)
         assert runtime.recovery_enrollment_pending_projects == {damaged.project_id}
-        assert read_json(damaged_path)["registration"]["version"] == 1
-        assert read_json(healthy_path)["registration"]["version"] == 2
+        assert read_json(damaged_path)["registration"]["recovery_protocol"] is None
+        assert read_json(healthy_path)["registration"]["recovery_protocol"] == "qexp-local-responsibility-v1"
 
 
 def test_paused_machine_rollout_waits_without_stalling_other_projects(tmp_path, monkeypatch):

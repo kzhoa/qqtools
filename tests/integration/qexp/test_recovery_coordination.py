@@ -50,7 +50,9 @@ def test_dispatch_allows_registration_but_excludes_migration_and_rollback(tmp_pa
             with runtime.migration_guard(blocking=False) as acquired:
                 assert not acquired
             assert runtime.prepare_recovery_registration(binding) is not has_rollback
-            assert read_json(path)["registration"]["version"] == (1 if has_rollback else 2)
+            assert read_json(path)["registration"]["recovery_protocol"] == (
+                None if has_rollback else "qexp-local-responsibility-v1"
+            )
             assert runtime.paths["registration_transaction"].exists() is has_rollback
         finally:
             release.set()
@@ -58,7 +60,7 @@ def test_dispatch_allows_registration_but_excludes_migration_and_rollback(tmp_pa
     with runtime.scheduler_authority() as acquired:
         assert acquired
         assert runtime.prepare_recovery_registration(binding)
-    assert read_json(path)["registration"]["version"] == 2
+    assert read_json(path)["registration"]["recovery_protocol"] == "qexp-local-responsibility-v1"
     assert not runtime.paths["registration_transaction"].exists()
 
 

@@ -1,4 +1,28 @@
-next_id = 24
+next_id = 25
+
+[[items]]
+id = "QQTOOLS-COMPAT-0024"
+component = "qexp.registration-replacement"
+kind = "runtime_protocol"
+status = "compatibility_active"
+summary = "Convert 1.3.27 registration versions 1/2 and local registry/journals to the replacement protocol under the owner-approved one-time fleet downtime exception."
+introduced_in = "1.3.27"
+legacy_removed_in = "1.3.29"
+transition_purged_in = "1.3.30"
+marker = "QQTOOLS-COMPAT-0024"
+owner = "qexp.runtime.registration_protocol"
+verification = ["tests/integration/qexp/test_registration_protocol_upgrade.py", "tests/integration/qexp/test_project_registration_replacement.py", "tests/fixtures/qexp_registration_source_1_3_27.json"]
+normal_level = "L3"
+recovery_level = "L3"
+source_versions = ["1.3.27"]
+target_version = "1.3.28"
+mixed_version_range = ["none: all old qexp processes stopped before fleet package upgrade"]
+normal_commands = ["Stop training and all old qexp processes on every machine; prohibit old process restart", "python -m pip install --upgrade qqtools", "qexp agent start"]
+machine_status_command = "qexp admin upgrade status"
+recovery_command = "qexp admin upgrade advance"
+workload_continuity = false
+# Verification must establish the post-start per-slice budget; fleet downtime is operator-controlled.
+interruption_budget_seconds = 1.0
 
 [[items]]
 id = "QQTOOLS-COMPAT-0023"

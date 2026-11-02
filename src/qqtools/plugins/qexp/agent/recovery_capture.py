@@ -15,6 +15,7 @@ from ..runtime.authority_scan import is_path_present
 from ..runtime.group_namespace import activate_group_authority_locked
 from ..runtime.locks import exclusive, schema_lock
 from ..runtime.paths import shared_paths
+from ..runtime.registration_protocol import RECOVERY_PROTOCOL
 from ..runtime.responsibility import responsibility_root
 from ..runtime.responsibility_backfill import ResponsibilityBackfill
 from ..runtime.responsibility_capture import CAPTURE_BYTES, CAPTURE_FILE, GENERATION_FILE, is_same_capture_owner
@@ -27,7 +28,7 @@ from ..runtime.responsibility_generation import restart_capture_generation
 from ..runtime.responsibility_process_capture import RunnerProcessCapture
 from ..runtime.responsibility_store import Conflict, Ledger, Unavailable
 from ..runtime.store import read_json, read_json_limited
-from .context import RECOVERY_REGISTRATION_VERSION, MachineRuntime, ProjectBinding
+from .context import MachineRuntime, ProjectBinding
 
 
 class RecoveryProgress(Enum):
@@ -152,10 +153,7 @@ class RecoveryCapture:
                 if not registered or binding not in runtime.load_registry()[1]:
                     raise Conflict("capture binding changed")
                 with runtime.binding_write_guard(binding) as eligible:
-                    if (
-                        not eligible
-                        or runtime.registration_status(binding)["registration_version"] != RECOVERY_REGISTRATION_VERSION
-                    ):
+                    if not eligible or runtime.registration_status(binding)["recovery_protocol"] != RECOVERY_PROTOCOL:
                         raise Conflict("capture registration is not prepared")
                     cfg = replace(binding.root_config(), runtime_root=self.root)
                     with schema_lock(cfg.shared_root, blocking=False) as acquired:

@@ -314,9 +314,18 @@ def _validate_operational_contract(raw_item: dict[str, Any], item_id: str) -> No
         return
     normal_level = raw_item.get("normal_level")
     recovery_level = raw_item.get("recovery_level")
-    if normal_level not in {"L0", "L1", "L2"}:
+    registration_downtime_exception = (
+        item_id == "QQTOOLS-COMPAT-0024"
+        and raw_item.get("component") == "qexp.registration-replacement"
+        and raw_item.get("source_versions") == ["1.3.27"]
+        and raw_item.get("target_version") == "1.3.28"
+        and normal_level == "L3"
+        and recovery_level == "L3"
+        and raw_item.get("workload_continuity") is False
+    )
+    if normal_level not in {"L0", "L1", "L2"} and not registration_downtime_exception:
         raise RegistryError(f"{item_id}.normal_level must be L0, L1, or L2.")
-    if recovery_level not in {"L0", "L1", "L2"}:
+    if recovery_level not in {"L0", "L1", "L2"} and not registration_downtime_exception:
         raise RegistryError(f"{item_id}.recovery_level must be L0, L1, or L2.")
     if normal_level == "L2" and recovery_level not in {"L2"}:
         raise RegistryError(f"{item_id}.recovery_level cannot be less disruptive than normal_level.")
@@ -330,7 +339,7 @@ def _validate_operational_contract(raw_item: dict[str, Any], item_id: str) -> No
     for field in ("machine_status_command", "recovery_command"):
         if not isinstance(raw_item.get(field), str) or not raw_item[field].strip():
             raise RegistryError(f"{item_id}.{field} must be a non-empty string.")
-    if raw_item.get("workload_continuity") is not True:
+    if raw_item.get("workload_continuity") is not True and not registration_downtime_exception:
         raise RegistryError(f"{item_id}.workload_continuity must be true for qexp compatibility.")
     budget = raw_item.get("interruption_budget_seconds")
     if isinstance(budget, bool) or not isinstance(budget, (int, float)) or budget <= 0:

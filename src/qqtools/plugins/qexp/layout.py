@@ -20,6 +20,7 @@ from .runtime.protocol_compatibility import (
     GROUP_READY_MEMBERS_CAPABILITY,
     OBSERVATION_CAPABILITY,
     READY_WRITER_CAPABILITY,
+    REGISTRATION_REPLACEMENT_CAPABILITY,
     SUBMISSION_GROUP_PUBLICATION_CAPABILITY,
     SUPPORTED_REQUIRED_CAPABILITIES,
     TASK_DEPENDENCIES_CAPABILITY,
@@ -267,6 +268,7 @@ def initialize_shared_root(cfg: RootConfig) -> None:
                         GROUP_READY_MEMBERS_CAPABILITY,
                         OBSERVATION_CAPABILITY,
                         SUBMISSION_GROUP_PUBLICATION_CAPABILITY,
+                        REGISTRATION_REPLACEMENT_CAPABILITY,
                     ],
                     "writer_capabilities": [READY_WRITER_CAPABILITY],
                 }
@@ -587,8 +589,9 @@ def save_machine_record(cfg: RootConfig, record: dict[str, Any]) -> None:
 
 def load_machine_registration(cfg: RootConfig) -> dict[str, Any] | None:
     """Read the project-owned logical-machine registration, when present."""
-    path = machine_registration_path(cfg.shared_root, cfg.machine_name)
-    return read_json(path) if path.exists() else None
+    from .runtime.registration_protocol import read_registration_document
+
+    return read_registration_document(cfg)
 
 
 def save_machine_registration(cfg: RootConfig, record: dict[str, Any]) -> None:

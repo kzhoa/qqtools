@@ -74,8 +74,8 @@ class MigrationSpec:
     dependencies: tuple[str, ...] = ()
     conflicts: tuple[str, ...] = ()
     cleanup_version: str | None = None
-    normal_level: Literal["L0", "L1", "L2"] = "L1"
-    recovery_level: Literal["L0", "L1", "L2"] = "L2"
+    normal_level: Literal["L0", "L1", "L2", "L3"] = "L1"
+    recovery_level: Literal["L0", "L1", "L2", "L3"] = "L2"
     safe_legacy_path: bool = True
 
     def __post_init__(self) -> None:
@@ -101,9 +101,16 @@ class MigrationSpec:
             raise ValueError("migration max_io_bytes_per_slice must be a positive integer")
         if self.interruption_budget_seconds <= 0:
             raise ValueError("migration interruption budget must be positive")
-        if self.normal_level not in {"L0", "L1", "L2"}:
+        l3_exception = (
+            self.name == "registration-replacement-v1"
+            and self.source_protocol == "registration-v1-v2"
+            and self.target_protocol == "registration-v3"
+            and self.normal_level == "L3"
+            and self.recovery_level == "L3"
+        )
+        if self.normal_level not in {"L0", "L1", "L2", "L3"} or (self.normal_level == "L3" and not l3_exception):
             raise ValueError("migration normal_level must be L0, L1, or L2")
-        if self.recovery_level not in {"L0", "L1", "L2"}:
+        if self.recovery_level not in {"L0", "L1", "L2", "L3"} or (self.recovery_level == "L3" and not l3_exception):
             raise ValueError("L3 workload drain is not a supported qexp recovery level")
         if self.normal_level == "L2" and self.recovery_level != "L2":
             raise ValueError("migration recovery level cannot be less disruptive than normal level")
@@ -279,7 +286,7 @@ class UpgradeStorage:
             raise ValueError("max_bytes must be a positive integer")
         self._budget.consume_metadata_ops()
         with authorized_migration_json_io():
-            descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+            descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK)
             try:
                 metadata = os.fstat(descriptor)
                 if not stat.S_ISREG(metadata.st_mode):

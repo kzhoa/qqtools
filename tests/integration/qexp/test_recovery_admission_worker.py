@@ -121,7 +121,7 @@ def test_actual_worker_prepares_registration_and_root_while_parent_holds_machine
     assert result.status == "completed"
     assert dict(result.evidence) == {"state": "ready", "registration_prepared": True, "admission_fenced": True}
     current = registration(cfg)
-    assert current["version"] == current["protocol_version"] == 2
+    assert current["version"] == current["protocol_version"] == 3
     for key in ("generation", "runtime_root", "runtime_instance_id", "eligibility_expires_at"):
         assert current[key] == original[key]
     assert capability(cfg)
@@ -169,7 +169,8 @@ def test_malformed_registration_journal_fails_closed_without_retiring_evidence(c
     assert read_json(runtime.paths["registration_transaction"]) == {"pending": True}
 
 
-def test_registration_rollback_epoch_loss_retains_journal_for_exact_replay(case, monkeypatch):
+@pytest.mark.parametrize("fence_at", [2, 3])
+def test_registration_rollback_epoch_loss_retains_journal_for_exact_replay(case, monkeypatch, fence_at):
     runtime, binding, cfg, executor = case
     revision, bindings = runtime.load_registry()
     original_registration = load_machine_registration(cfg)
@@ -190,7 +191,7 @@ def test_registration_rollback_epoch_loss_retains_journal_for_exact_replay(case,
         def fenced_effect():
             nonlocal calls
             calls += 1
-            if calls == 2:
+            if calls == fence_at:
                 executor.fence_epoch()
             assert before_effect is not None
             before_effect()
@@ -204,7 +205,11 @@ def test_registration_rollback_epoch_loss_retains_journal_for_exact_replay(case,
     assert result.status == "outcome_unknown"
     assert result.reason_code == "project_io_outcome_unknown"
     assert runtime.paths["registration_transaction"].exists()
+    assert load_machine_registration(cfg) == (changed if fence_at == 2 else original_registration)
+    with runtime.registry_guard():
+        original_rollback(runtime.registration)
     assert load_machine_registration(cfg) == original_registration
+    assert not runtime.paths["registration_transaction"].exists()
 
 
 def test_local_pending_migration_defers_without_shared_writes(case):
@@ -229,7 +234,7 @@ def test_schema_busy_does_not_confuse_prepared_registration_with_root_admission(
         assert executor.start(request.request_id) is not None
         result = consume(executor, request)
     assert dict(result.evidence) == {"state": "waiting", "registration_prepared": True, "admission_fenced": False}
-    assert registration(cfg)["version"] == 2
+    assert registration(cfg)["recovery_protocol"] == "qexp-local-responsibility-v1"
     assert not capability(cfg)
     retry = executor.prepare_recovery_admission(binding, revision)
     assert executor.start(retry.request_id) is not None
@@ -295,7 +300,7 @@ def test_lost_readiness_after_shared_publication_retains_ambiguous_outcome(case,
     assert result.status == "outcome_unknown"
     assert result.reason_code == "project_io_outcome_unknown"
     assert not result.evidence
-    assert registration(cfg)["version"] == 2
+    assert registration(cfg)["recovery_protocol"] == "qexp-local-responsibility-v1"
     assert capability(cfg)
     assert not (runtime.project_paths(binding.project_id)["root"] / "responsibility-writer-capture.json").exists()
 

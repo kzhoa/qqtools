@@ -1,11 +1,153 @@
 ---
 doc_type: spec
 status: active
-updated_at: 2026-10-21
+updated_at: 2026-11-02
 archived_at:
 ---
 
 # qexp Runtime Spec
+
+## Registration replacement protocol design
+
+The target shared registration envelope retains `registration` and uses integer
+`version = protocol_version = 3`, with `registration_protocol =
+"qexp-registration-replacement-v1"`. Existing Project ID, canonical shared root,
+logical name, runtime ID/root, generation, eligibility expiry, state, creation
+and update times retain their meanings. `recovery_protocol` is either null or
+`qexp-local-responsibility-v1`: protocol conversion must not itself grant recovery
+capture readiness. Source version 1 maps to null; source version 2 retains its
+validated recovery protocol. Recovery preparation changes this field under its
+existing guards without downgrading the registration envelope. Unknown versions,
+invalid identities, nonregular/symlink records, oversized records, invalid dates,
+or unsupported recovery values fail closed. Individual records are bounded to
+64 KiB. Target-only authority paths validate version 3; the registered temporary
+source adapter owns versions 1 and 2 during preparation/conversion.
+
+The local registry target is version 2, retaining its revision and binding shape.
+Source registry version 1 is prepared under its existing registry guard before
+mutation. Pending source registration snapshots are interpreted under local
+registry and shared registration ownership. Before replay, snapshot data is
+converted durably and current shared identities are checked. A rollback may not
+overwrite a successor runtime/generation, a replacement reservation, or an
+unrecognized target record. An absent prior snapshot cannot authorize deleting
+another owner's current record. Conversion preserves the journal until all
+effects and their directory barriers complete. The prepared journal records
+`replay_state: "rollback_prepared"` before replay; an equal restored roster with
+an advanced revision may finish that rollback, including an empty roster after
+interrupted first-time registration. Uncertain ownership is diagnosed,
+never resolved by deleting the journal.
+
+For a source journal, an uncached registry equal to its saved revision and
+bindings proves the precommit state. Under the source transaction's sole local
+registry ownership, a current shared publication for an affected name owned by
+this exact runtime/root can then be rolled back to the converted snapshot.
+If the registry differs, preparation instead recognizes a committed publication
+only when its affected bindings and machine records match the current shared
+names, runtime identities and generations; a replaced old name must be
+superseded by that exact successor. In that case preparation retains the committed
+bindings, converts current shared records, and clears the stale journal durably.
+It never rolls back committed admission or its recovery obligations. Any other
+revision/identity combination retains the journal and blocks. This attribution
+depends on the downtime precondition and mandatory local preparation before
+every target registration mutation, not merely a matching runtime string.
+
+### Record ownership and replacement phases
+
+One machine-local `project-registration-replacement.json` records one in-flight
+replacement across the runtime. It is separate from machine-identity replacement
+and ordinary registration rollback; conflicting mutations are fenced. Its
+version-1 envelope binds a transaction ID, Project ID/root, runtime ID/root, old
+name/generation, requested name, a single preallocated target generation, original
+effective enablement, inventory/registry revisions, and phase. It is bounded to
+64 KiB. Project-owned `project/registration-reservations/NAME.json` is a version-1
+exclusive claim with the same transaction and identity tuple. It grants no
+admission, renewal, claim, or machine-publication authority. All acquisition,
+validation, release, and promotion use `registrations.lock` followed by affected
+machine locks in name order. Ordinary registration/adoption checks this claim
+inside that same fence.
+
+The durable phases are `preparing`, `reserved`, `draining`,
+`old_retirement_committed`, `target_published`, `binding_published`, and
+`completed`; cancellation uses `cancelling` and `reservation_release_committed`.
+Before any admission change, persist `preparing`, publish its exact reservation,
+and persist `reserved` under shared exclusion. A retry repairs either prefix
+using the same transaction/generation; a different target is rejected. A failed
+prefix never disables the old binding. The local prefix makes an interruption
+before shared publication visible to identity reset and ordinary registration.
+
+Disable registry admission durably before persisting `draining`; repair the
+inventory mirror from the registry. Each explicit drain retry services at most
+one stored recovery responsibility per bucket (16 buckets), reusing the existing
+terminal/accounting proof, writer-quiescence checks, and durable cleanup receipts.
+This advances completed evidence without scanning Task history or signalling
+running work; interrupted deletion resumes from its retained receipt. Immediately
+before removal, reuse the
+existing removal implementation's final blocker check and invoke its internal
+retirement callback under local removal guards. The callback reacquires shared
+registration ownership, validates the Project/runtime/old generation and exact
+reservation, and durably writes `old_retirement_committed`. This is the
+cancellation boundary. Only then may removal retire the local partition and
+binding. Replays after this boundary finish exact retirement; they cannot restore
+old admission. Old shared attribution remains historical and is superseded by
+the preallocated target generation.
+
+Publish the target record using that generation only after old local retirement
+is complete. Publish the new local binding disabled, commit inventory with an
+explicit name and recorded enablement, then restore registry enablement. Release
+the exact reservation and clear the completed intent with parent-directory
+durability barriers. Every prefix can resume without allocating a second
+generation. Resume renews an expired exact target generation under shared
+exclusion; a missing or changed published target fails closed. Enablement and
+completed-intent replay revalidate local and shared ownership under local-before-
+shared guards. At no point can both local names be enabled.
+
+Cancellation first validates the unchanged old binding and reservation and
+records `cancelling`. Commit the irreversible release decision before releasing
+the exact reservation; restore old registry enablement only after release is
+durable. Revalidate old shared ownership while holding the restoration guards.
+Repair its inventory mirror and clear the local intent last. Retrying
+cancellation converges from each prefix; an ordinary resume of a cancelling
+intent finishes cancellation rather than reinstating its reservation.
+Before `reservation_release_committed`, a missing or mismatched reservation is
+an operational error, except for `preparing` with the exact unchanged old local
+binding: that prefix may not yet have published its claim, so cancellation can
+clear its own intent without touching a competing target. After the durable
+release decision, the cancellation suffix owns
+only release of its own claim: absence is success and a successor claim must be
+left untouched. The recorded decision authorizes restoring the unchanged old
+binding without reacquiring or requiring the released name. A different old
+binding identity still blocks restoration in every phase.
+
+Machine lifecycle -> inventory -> migration/removal -> registry is the local
+ownership order; shared registration ownership is acquired only for bounded
+publication/validation, never while waiting for workload completion. The
+replacement uses existing removal blockers, not a copied census. Pending intents
+fence registration, enablement changes, removal, and machine identity reset;
+startup and inventory reconciliation preserve and explain them. Unrelated
+Project execution and old-name terminal convergence remain available. Project
+listing exposes the durable phase and exact retry/cancel actions.
+
+### Automatic conversion and deployment boundary
+
+`runtime/upgrade` owns scheduling and the canonical shared migration journal.
+A registration plugin provides readiness, bounded backfill, audit, activation,
+and contraction. Conversion examines registration records, not Task history.
+It preserves generation, names, identities, effective enablement, and recovery
+obligations. New registrations are target-format; source records encountered by
+new writers are prepared under the same registration lock before mutation, so
+backfill cannot overwrite a concurrent change. Activation adds the supported
+`registration-replacement-v1` capability only after successful audit. A replacement
+before activation fails with upgrade-pending and changes no registration intent.
+New root initialization installs the capability directly.
+
+The one-time downtime precondition is defined in the product spec. It supersedes
+workload continuity for this deployment only; no new marker is claimed to fence
+already imported 1.3.27 rollback code. Every later-starting target process still
+prepares its own local registry/journal before shared mutation. Discovery uses
+registry/inventory locators independently of successful target authority
+validation. Inaccessible roots remain pending and retry. Source interpretation
+is confined to compatibility-marked conversion and journal preparation; malformed
+or unsupported records retain their evidence and block the affected Project.
 
 ## Schema 6 clock-capability authority contract
 

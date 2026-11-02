@@ -929,6 +929,10 @@ class MachineRuntime:
     def set_enabled(self, identifier: str | Path, enabled: bool) -> ProjectBinding:
         return self.registration.set_enabled(identifier, enabled)
 
+    def assert_no_pending_project_registration(self) -> None:
+        """Reject machine mutations while a Project registration replacement is active."""
+        self.registration._assert_no_pending_project_registration()
+
     def remove_binding(self, identifier: str | Path) -> ProjectBinding:
         """Remove a disabled partition, allowing an active capture to finish first."""
         from ..runtime.responsibility_capture import CaptureBusy
@@ -947,12 +951,20 @@ class MachineRuntime:
                         raise
                 time.sleep(0.05)
 
-    def _remove_binding_once(self, identifier: str | Path) -> ProjectBinding:
+    def _remove_binding_once(
+        self,
+        identifier: str | Path,
+        *,
+        before_retire: Callable[[], None] | None = None,
+        replacement_fence: bool = False,
+    ) -> ProjectBinding:
         from ..runtime.responsibility_capture import CaptureBusy, capture_cleanup_guard
         from ..runtime.responsibility_completion import COMPLETION_FILE, release_completed_source
 
         with self.migration_guard():
             with self.registry_guard():
+                if not replacement_fence:
+                    self.registration._assert_no_pending_project_registration()
                 revision, bindings = self.load_registry()
                 binding = self._find_binding(bindings, identifier)
                 if binding.enabled:
@@ -996,6 +1008,8 @@ class MachineRuntime:
                             raise RuntimeError(
                                 "cannot remove project with active local evidence: " + ", ".join(blockers)
                             )
+                        if before_retire is not None:
+                            before_retire()
                         self.activation_consumer_retirements.prepare(binding)
                         if is_path_present(project_root):
                             try:

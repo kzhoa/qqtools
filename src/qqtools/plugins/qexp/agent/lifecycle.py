@@ -134,6 +134,12 @@ def get_machine_agent_status(
     identity = _active_machine_identity(machine_runtime)
     pid = identity[0] if identity is not None else _read_pid(machine_runtime)
     running = bool(identity or (pid and not probe_local_pid))
+    from .registration_replacement import CANCELLABLE_PHASES, read_replacement_intent
+
+    try:
+        pending_replacement = read_replacement_intent(machine_runtime)
+    except (OSError, RuntimeError, ValueError, KeyError, TypeError) as exc:
+        pending_replacement = {"phase": "unavailable", "error": str(exc)}
     with machine_runtime.inventory_guard():
         with machine_runtime.registry_guard():
             reconciliation = reconcile_live_bindings_locked(machine_runtime, repair=False)
@@ -200,6 +206,15 @@ def get_machine_agent_status(
                 {},
             ),
         }
+        if isinstance(pending_replacement, dict) and pending_replacement.get("project_id") == binding.project_id:
+            project["replacement"] = {
+                "action": "project_registration_replacement",
+                "phase": pending_replacement.get("phase"),
+                "old_machine_name": pending_replacement.get("old_machine_name"),
+                "requested_machine_name": pending_replacement.get("requested_machine_name"),
+                "cancellable": pending_replacement.get("phase") in CANCELLABLE_PHASES,
+                "blockers": [],
+            }
         if eligibility.get("state") == "superseded":
             replacement_name = f"{binding.machine_name}-replacement"
             project["blocker"] = (
@@ -279,6 +294,7 @@ def get_machine_agent_status(
         "waiting_for_first_registration": waiting_for_first_registration if running else False,
         "registry_revision": revision,
         "projects": projects,
+        "pending_replacement": pending_replacement,
         "upgrade": upgrade,
         "gpu_policy": gpu_policy,
         "project_io_isolation": project_io_isolation,
@@ -323,6 +339,14 @@ def run_machine_agent_loop(
     if machine_runtime.paths["replacement_transaction"].exists():
         raise MachineAgentStartBlockedError("machine agent activation is blocked by a pending machine replacement.")
     machine_runtime.ensure_layout(create_identity=False)
+    from .registration_replacement import read_replacement_intent
+
+    pending_replacement = read_replacement_intent(machine_runtime)
+    with machine_runtime.inventory_guard():
+        with machine_runtime.registry_guard():
+            machine_runtime.registration.prepare_registry_locked()
+            if pending_replacement is None:
+                machine_runtime.registration.rollback_pending_locked()
     agent_config = load_agent_config(machine_runtime)
     instance_id = instance_id or uuid.uuid4().hex
     if effective_log_max_bytes is None:

@@ -499,13 +499,28 @@ def dispatch_local(
                     machine_name=project_machine,
                     name_source=args.name_source,
                     adopt_existing=args.adopt_existing,
+                    replace_current=args.replace_current,
+                    cancel_replacement=args.cancel_replacement,
                 )
             except SetupUsageError as exc:
                 raise CliUsageError(str(exc)) from exc
             except (SetupOperationalError, MachineRuntimeUninitializedError) as exc:
                 raise CliOperationalError(str(exc)) from exc
-            statuses = [item.get("status") for item in result.get("projects", ())]
-            exit_code = 0 if not statuses or all(item in {"registered", "disabled"} for item in statuses) else 2
+            if result.get("action") == "project_registration_replacement":
+                exit_code = (
+                    0
+                    if result.get("status")
+                    in {
+                        "replacement_pending",
+                        "replacement_completed",
+                        "replacement_cancelled",
+                        "unchanged",
+                    }
+                    else 1
+                )
+            else:
+                statuses = [item.get("status") for item in result.get("projects", ())]
+                exit_code = 0 if not statuses or all(item in {"registered", "disabled"} for item in statuses) else 2
             return CommandOutcome(exit_code, CliOutput(OutputKind.PROJECT_REGISTER, result))
         try:
             if handler == "project_list":

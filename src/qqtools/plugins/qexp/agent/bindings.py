@@ -9,7 +9,9 @@ from typing import Any
 from ..config_types import RootConfig
 from ..layout import load_machine_record, load_root_config
 
-REGISTRY_VERSION = 1
+REGISTRY_VERSION = 2
+# QQTOOLS-COMPAT-0024: source registry envelopes remain readable for local preparation.
+SOURCE_REGISTRY_VERSION = 1
 
 
 @dataclass(frozen=True, slots=True)
@@ -126,7 +128,11 @@ class ProjectBinding:
 def decode_registry(value: dict[str, Any]) -> tuple[int, tuple[ProjectBinding, ...]]:
     """Decode an immutable local roster without resolving any Project path."""
     registry = value.get("registry")
-    if not isinstance(registry, dict) or registry.get("version") != REGISTRY_VERSION:
+    if (
+        not isinstance(registry, dict)
+        or type(registry.get("version")) is not int
+        or registry["version"] not in {SOURCE_REGISTRY_VERSION, REGISTRY_VERSION}
+    ):
         raise RuntimeError("machine registry is malformed or unsupported.")
     revision = registry.get("revision")
     bindings = registry.get("bindings")

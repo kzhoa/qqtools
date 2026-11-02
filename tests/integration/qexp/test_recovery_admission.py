@@ -122,7 +122,7 @@ def test_explicit_supersession_can_retire_a_version_one_participant(project, tmp
     peer_runtime, peer_binding, peer_cfg = add_peer(cfg, tmp_path)
     prepare(runtime, binding)
     peer_runtime._supersede_registration(peer_binding, binding.registration_generation)
-    assert read_json(registration_path(peer_cfg))["registration"]["version"] == 1
+    assert read_json(registration_path(peer_cfg))["registration"]["recovery_protocol"] is None
     assert fence(runtime, binding).is_fenced
 
 
@@ -143,7 +143,7 @@ def test_missing_or_invalid_peer_prevents_activation(project, tmp_path, damage):
         atomic_replace(metadata_path, metadata)
     else:
         if damage == "version":
-            record["registration"]["version"] = 3
+            record["registration"]["version"] = 99
         elif damage == "identity":
             record["registration"]["shared_root"] = "/wrong/project"
         else:

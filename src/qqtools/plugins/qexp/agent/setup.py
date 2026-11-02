@@ -44,6 +44,11 @@ from .inventory import (
     save_inventory_locked,
 )
 from .project_admin import register_project, unregister_project
+from .registration_replacement import (
+    ReplacementOperationalError,
+    ReplacementUsageError,
+    replace_current_project_registration,
+)
 
 
 class SetupUsageError(ValueError):
@@ -406,6 +411,7 @@ def initialize_machine(
     if _identity_record(machine_runtime) is None and _read_replacement(machine_runtime) is None:
         require_fresh_runtime(machine_runtime.root)
     with machine_runtime.agent_lifecycle_guard():
+        machine_runtime.assert_no_pending_project_registration()
         transaction = _read_replacement(machine_runtime)
         if transaction is not None:
             new_id = _validate_pending_target(transaction, target_name, selected_mode, detach_old_runtime)
@@ -783,11 +789,35 @@ def register_projects(
     machine_name: str | None = None,
     name_source: str | None = None,
     adopt_existing: bool = False,
+    replace_current: bool = False,
+    cancel_replacement: bool = False,
 ) -> dict[str, Any]:
     """Enroll explicit Projects or the saved local inventory incrementally."""
     machine_runtime = _runtime(runtime)
     machine_runtime.require_initialized()
     selected_paths = list(paths)
+    if replace_current or cancel_replacement:
+        if replace_current and cancel_replacement:
+            raise SetupUsageError("--replace-current and --cancel-replacement are mutually exclusive.")
+        if from_pool or len(selected_paths) != 1:
+            raise SetupUsageError("replacement requires exactly one explicit Project path.")
+        if name_source is not None or adopt_existing:
+            raise SetupUsageError("replacement does not accept --name-source or --adopt-existing.")
+        if cancel_replacement and machine_name is not None:
+            raise SetupUsageError("--cancel-replacement does not accept --machine.")
+        if replace_current and machine_name is None:
+            raise SetupUsageError("--replace-current requires --machine NAME.")
+        try:
+            return replace_current_project_registration(
+                machine_runtime,
+                selected_paths[0],
+                machine_name,
+                cancel_replacement=cancel_replacement,
+            )
+        except ReplacementUsageError as exc:
+            raise SetupUsageError(str(exc)) from exc
+        except ReplacementOperationalError as exc:
+            raise SetupOperationalError(str(exc)) from exc
     if from_pool and selected_paths:
         raise SetupUsageError("Project register paths and --from-pool are mutually exclusive.")
     if not from_pool and not selected_paths:
@@ -958,6 +988,7 @@ def remove_project(runtime: MachineRuntime | str | Path | None, selector: str | 
     machine_runtime = _runtime(runtime)
     machine_runtime.require_initialized()
     with machine_runtime.agent_lifecycle_guard():
+        machine_runtime.assert_no_pending_project_registration()
         with machine_runtime.inventory_guard():
             with machine_runtime.registry_guard():
                 _selected_entry(machine_runtime, selector)
@@ -1056,6 +1087,7 @@ def set_project_enablement(
 
     if enabled:
         with machine_runtime.agent_lifecycle_guard():
+            machine_runtime.assert_no_pending_project_registration()
             with machine_runtime.inventory_guard():
                 with machine_runtime.registry_guard():
                     reconciliation, entry, binding, early_result = _prepare_project_enablement(
@@ -1071,6 +1103,7 @@ def set_project_enablement(
         authority = None if is_eligible else machine_runtime.registration_status(observed_binding)
 
     with machine_runtime.agent_lifecycle_guard():
+        machine_runtime.assert_no_pending_project_registration()
         with machine_runtime.inventory_guard():
             with machine_runtime.registry_guard():
                 if enabled:

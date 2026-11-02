@@ -381,6 +381,16 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Explicitly replace a prior ineligible Project registration for one named machine.",
     )
+    project_register.add_argument(
+        "--replace-current",
+        action="store_true",
+        help="Replace the current local Project registration name after its workload drains.",
+    )
+    project_register.add_argument(
+        "--cancel-replacement",
+        action="store_true",
+        help="Cancel a pending Project registration-name replacement.",
+    )
     _add_output_format(project_register)
     bind_command(
         project_register,

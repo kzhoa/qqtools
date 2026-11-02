@@ -994,6 +994,17 @@ class AuthoritySupervisor:
             self._record_diagnostic({"attempt_id": attempt_id}, "terminal_cleanup_unavailable", exc)
             return request is not None
 
+    def reconcile_terminal_cleanup(self) -> None:
+        """Service one stored responsibility per bucket for an explicit drain retry.
+
+        Reuse terminal/accounting proof and writer-quiescence checks. No running
+        process is signalled, and persisted cleanup receipts survive interruption.
+        """
+        from .runtime.responsibility_store import BUCKETS
+
+        for _ in range(BUCKETS):
+            self._replay_terminal_cleanup()
+
     def _replay_terminal_cleanup(self) -> None:
         """Service stored receipts even after all evidence and shared truth are gone."""
         try:

@@ -176,6 +176,18 @@ operability to a later patch.
 
 ### Continuity and rollout completion
 
+The owner approved one narrowly scoped exception on 2026-11-02:
+`QQTOOLS-COMPAT-0024`, `qexp.registration-replacement`, may use L3 for the
+1.3.27-to-1.3.28 cutover. All training and all old qexp processes must stop across
+the fleet before package upgrades, with old-process restart prohibited. All
+packages must be upgraded before new agents start. This deployment precondition
+addresses source rollback writers that cannot honor a newly introduced fence.
+Its registry entry declares `workload_continuity = false`; the validator must
+accept only this exact source/target exception, not general L3 migrations.
+Persisted recovery evidence is retained. Post-start migration slice latency is
+measured separately from operator-controlled downtime. Other migration items
+retain the existing L0/L1/L2 and workload-continuity requirements.
+
 Operator coordination level and service continuity are separate contracts. Verification must cover
 admission/scheduling interruption scope, terminal reconciliation behavior, and the recorded
 interruption budget. Two commands alone do not prove L1: waiting for the fleet to upgrade or a full

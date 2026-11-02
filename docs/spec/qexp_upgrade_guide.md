@@ -1,7 +1,7 @@
 ---
 doc_type: spec
 status: active
-updated_at: 2026-10-05
+updated_at: 2026-11-02
 archived_at:
 ---
 
@@ -9,6 +9,71 @@ archived_at:
 
 This guide is for an existing qexp project rooted at `PROJECT_ROOT` (for example,
 `/mnt/share/myproject/.qexp`). Run commands with its explicit Project path.
+
+## Registration replacement upgrade (target 1.3.28)
+
+This one-time upgrade from 1.3.27 requires coordinated downtime, explicitly
+approved by the owner. Complete each stage across the fleet before the next:
+
+1. Stop training and all old qexp processes, including agents, standalone CLI and
+   recovery commands, and residual Project I/O workers. Prevent old processes
+   from restarting. `qexp agent stop` alone is not proof that all writers exited.
+2. Upgrade qqtools on every participating machine. Do not start any agent until
+   all package upgrades are complete. Old executables must never write converted
+   Project state afterward.
+3. Run `qexp agent start` on each machine. Starts need not be simultaneous.
+   Registered Project conversion runs automatically; no per-Project activation
+   or manual metadata edit is required.
+
+Use `qexp admin upgrade status --format json` for optional progress inspection.
+Inaccessible registered roots remain pending. Preserve unfinished registration
+journals and recovery evidence; stopped processes do not make those records
+disposable. Unknown or malformed records require diagnosis. The conversion
+preserves runtime IDs, names, generations, enablement and historical attribution.
+The source artifact is `qqtools-1.3.27-py3-none-any.whl`, SHA256
+`1c996115980d188858f87766455166059210f0ee51be5fb5e8d07481dcc1e4e7`.
+
+Conversion processes at most one registration per slice with budgets of 32 metadata
+operations and 512 KiB of JSON I/O. Directory enumeration is capped at 4,096
+machine entries; only the selected entry receives a metadata check. The configured
+post-start slice budget is 1 second, excluding operator-controlled downtime.
+A Linux `/tmp` qualification with real file and directory synchronization on
+2026-11-02 measured a maximum of 0.013 seconds across seven slices for one source
+registration. This is local evidence, not a latency guarantee for remote storage.
+
+A separate source-wheel lifecycle qualification started and stopped 1.3.27,
+retained version-1/version-2 registrations and an unfinished registration journal,
+then started the target checkout against that stopped runtime. Both shared
+Projects activated in 21.245 seconds with runtime and registration generations
+preserved; the local registry converted to version 2. Integration coverage also
+waits for the migration journal to finish and exercises staggered coordinators.
+These measurements describe the qualified local filesystem and do not bound
+fleet downtime or remote-storage recovery.
+
+After activation, change one Project's local registration with:
+
+```bash
+qexp project register /path/to/project --machine g2 --replace-current
+```
+
+The requested name is reserved before admission under the old name is disabled.
+Running work continues under the old name. A pending result returns exit 0;
+rerun the same command after the listed obligations finish. Before old retirement
+commits, cancel with:
+
+```bash
+qexp project register /path/to/project --cancel-replacement
+```
+
+Cancellation restores the original enabled/disabled state. After retirement
+commits, follow the exact resume command instead. `qexp project list` exposes the
+pending transaction. Do not delete its journal or reservation.
+
+Replacement changes only this Project's registration. `qexp init` replaces the
+machine runtime identity; `qexp agent name --set-to` changes the global default
+for future default-source registrations; `--adopt-existing` takes over an
+ineligible logical name through its separate confirmation and eligibility rules.
+None is an interchangeable shortcut for replacement.
 
 ## Release 1.3.27
 

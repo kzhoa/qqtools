@@ -1,0 +1,98 @@
+{
+  "compatibility_id": "QQTOOLS-COMPAT-0024",
+  "source_package": "qqtools==1.3.27",
+  "wheel_sha256": "1c996115980d188858f87766455166059210f0ee51be5fb5e8d07481dcc1e4e7",
+  "registration_v1": {
+    "registration": {
+      "client_version": "1.3.27",
+      "created_at": "2026-11-02T02:25:43Z",
+      "eligibility_expires_at": "2026-11-02T02:27:43Z",
+      "generation": "89c508469741447fa8c4d8bfcb7e61f9",
+      "machine_name": "g3",
+      "project_id": "1cabbef9e937716b",
+      "protocol_version": 1,
+      "runtime_instance_id": "9b6f3a6b20116b95c65c3fd3200fd27ac605d364ea6b93c3d55edb510f5abd03",
+      "runtime_root": "${FIXTURE_ROOT}/machine",
+      "shared_root": "${FIXTURE_ROOT}/project/.qexp",
+      "state": "eligible",
+      "updated_at": "2026-11-02T02:25:43Z",
+      "version": 1
+    }
+  },
+  "registration_v2": {
+    "registration": {
+      "client_version": "1.3.27",
+      "created_at": "2026-11-02T02:25:43Z",
+      "eligibility_expires_at": "2026-11-02T02:27:43Z",
+      "generation": "89c508469741447fa8c4d8bfcb7e61f9",
+      "machine_name": "g3",
+      "project_id": "1cabbef9e937716b",
+      "protocol_version": 2,
+      "recovery_protocol": "qexp-local-responsibility-v1",
+      "runtime_instance_id": "9b6f3a6b20116b95c65c3fd3200fd27ac605d364ea6b93c3d55edb510f5abd03",
+      "runtime_root": "${FIXTURE_ROOT}/machine",
+      "shared_root": "${FIXTURE_ROOT}/project/.qexp",
+      "state": "eligible",
+      "updated_at": "2026-11-02T02:25:43Z",
+      "version": 2
+    }
+  },
+  "registry": {
+    "registry": {
+      "bindings": [
+        {
+          "enabled": true,
+          "machine_name": "g3",
+          "project_id": "1cabbef9e937716b",
+          "registration_generation": "89c508469741447fa8c4d8bfcb7e61f9",
+          "runtime_instance_id": "9b6f3a6b20116b95c65c3fd3200fd27ac605d364ea6b93c3d55edb510f5abd03",
+          "runtime_root": "${FIXTURE_ROOT}/machine",
+          "shared_root": "${FIXTURE_ROOT}/project/.qexp"
+        }
+      ],
+      "revision": 1,
+      "updated_at": "2026-11-02T02:25:43Z",
+      "version": 1
+    }
+  },
+  "pending_transaction": {
+    "registration_transaction": {
+      "bindings": [
+        {
+          "enabled": true,
+          "machine_name": "g3",
+          "project_id": "1cabbef9e937716b",
+          "registration_generation": "89c508469741447fa8c4d8bfcb7e61f9",
+          "runtime_instance_id": "9b6f3a6b20116b95c65c3fd3200fd27ac605d364ea6b93c3d55edb510f5abd03",
+          "runtime_root": "${FIXTURE_ROOT}/machine",
+          "shared_root": "${FIXTURE_ROOT}/project/.qexp"
+        }
+      ],
+      "machine_records": [],
+      "registrations": [
+        {
+          "machine_name": "g3",
+          "record": {
+            "registration": {
+              "client_version": "1.3.27",
+              "created_at": "2026-11-02T02:25:43Z",
+              "eligibility_expires_at": "2026-11-02T02:27:43Z",
+              "generation": "89c508469741447fa8c4d8bfcb7e61f9",
+              "machine_name": "g3",
+              "project_id": "1cabbef9e937716b",
+              "protocol_version": 1,
+              "runtime_instance_id": "9b6f3a6b20116b95c65c3fd3200fd27ac605d364ea6b93c3d55edb510f5abd03",
+              "runtime_root": "${FIXTURE_ROOT}/machine",
+              "shared_root": "${FIXTURE_ROOT}/project/.qexp",
+              "state": "eligible",
+              "updated_at": "2026-11-02T02:25:43Z",
+              "version": 1
+            }
+          },
+          "shared_root": "${FIXTURE_ROOT}/project/.qexp"
+        }
+      ],
+      "revision": 1
+    }
+  }
+}

@@ -7,6 +7,7 @@ import stat
 import uuid
 from collections.abc import Callable, Iterator
 from contextlib import ExitStack, contextmanager
+from copy import deepcopy
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -45,6 +46,14 @@ from ..runtime.registration_authority import (
     registration_write_guard,
     validate_registration_record,
 )
+from ..runtime.registration_protocol import (
+    RECOVERY_PROTOCOL,
+    REGISTRATION_PROTOCOL,
+    TARGET_REGISTRATION_VERSION,
+    assert_name_unreserved,
+    convert_registration,
+    has_recovery_protocol,
+)
 from ..runtime.responsibility_store import DurableIO
 from ..runtime.store import atomic_replace, read_json
 from .bindings import REGISTRY_VERSION, ProjectBinding, decode_registry
@@ -79,6 +88,22 @@ class MachineRegistration:
         self._registry_cache_witness: tuple[int, int, int, int, int] | None = None
         self._registry_cache_revision: int | None = None
         self._registry_cache_bindings: tuple[ProjectBinding, ...] | None = None
+
+    def _pending_project_registration_path(self) -> Path:
+        return self.root / "project-registration-replacement.json"
+
+    def _assert_no_pending_project_registration(self) -> None:
+        if _is_path_present(self._pending_project_registration_path()):
+            raise RuntimeError("pending Project registration replacement")
+
+    def prepare_registry_locked(self) -> None:
+        """QQTOOLS-COMPAT-0024: retain the exact roster while upgrading its envelope."""
+        if not _is_path_present(self.paths["registry"]):
+            return
+        value = read_json(self.paths["registry"])
+        revision, bindings = self._decode_registry(value)
+        if value["registry"]["version"] != REGISTRY_VERSION:
+            self.save_registry_locked(revision, list(bindings))
 
     @contextmanager
     def registry_guard(self, *, blocking: bool = True) -> Iterator[bool]:
@@ -247,6 +272,7 @@ class MachineRegistration:
             self.paths["registration_transaction"],
             {
                 "registration_transaction": {
+                    "version": 2,
                     "revision": revision,
                     "bindings": [binding.to_dict() for binding in bindings],
                     "registrations": [
@@ -274,16 +300,20 @@ class MachineRegistration:
         path = self.paths["registration_transaction"]
         if not path.exists():
             return
+        self._assert_no_pending_project_registration()
         value = read_json(path).get("registration_transaction")
         if not isinstance(value, dict):
             raise RuntimeError("machine registration transaction is malformed.")
+        if "version" in value and (type(value["version"]) is not int or value["version"] != 2):
+            raise RuntimeError("machine registration transaction version is unsupported.")
         try:
             revision = value["revision"]
             bindings = [ProjectBinding.from_dict(item) for item in value["bindings"]]
             registrations = value["registrations"]
             machine_records = value["machine_records"]
             if (
-                not isinstance(revision, int)
+                type(revision) is not int
+                or revision < 0
                 or not isinstance(registrations, list)
                 or not isinstance(machine_records, list)
             ):
@@ -305,7 +335,110 @@ class MachineRegistration:
             ):
                 configs.append(cfg)
         with self._registration_guards(*configs):
-            current_revision, _current_bindings = self.load_registry()
+            current_revision, current_bindings = self.load_registry_uncached()
+            shared_records = {}
+            project_ids = set()
+            for cfg in configs:
+                assert_name_unreserved(cfg)
+                project = read_json(shared_paths(cfg.shared_root)["project"] / "identity.json").get("project", {})
+                stable_id = project.get("project_id")
+                if not isinstance(stable_id, str) or not stable_id:
+                    raise RuntimeError("registration recovery Project identity is malformed.")
+                project_ids.add(stable_id)
+                raw = load_machine_registration(cfg)
+                record = raw.get("registration") if isinstance(raw, dict) else None
+                if raw is not None and not isinstance(record, dict):
+                    raise RuntimeError("registration recovery shared record is malformed.")
+                shared_records[cfg.machine_name] = (
+                    convert_registration(record, stable_id, cfg) if record is not None else None
+                )
+
+            is_restored_rollback = (
+                value.get("replay_state") == "rollback_prepared"
+                and current_revision >= revision
+                and current_bindings == bindings
+            )
+            if (current_revision != revision or current_bindings != bindings) and not is_restored_rollback:
+                # A successful registry commit can precede journal removal. It
+                # already permits admission; never restore its old snapshot.
+                old_unrelated = [item for item in bindings if item.project_id not in project_ids]
+                new_unrelated = [item for item in current_bindings if item.project_id not in project_ids]
+                published = [item for item in current_bindings if item.project_id in project_ids]
+                if current_revision <= revision or old_unrelated != new_unrelated or len(published) != 1:
+                    raise RuntimeError("registration recovery registry identity changed; journal retained.")
+                binding = published[0]
+                expected = shared_records.get(binding.machine_name)
+                if (
+                    expected is None
+                    or binding.runtime_instance_id != self._current_instance_id()
+                    or binding.runtime_root != str(self.root)
+                    or expected["runtime_instance_id"] != binding.runtime_instance_id
+                    or expected["runtime_root"] != binding.runtime_root
+                    or expected["generation"] != binding.registration_generation
+                    or expected["shared_root"] != str(binding.shared_root)
+                    or expected["state"] != "eligible"
+                ):
+                    raise RuntimeError("registration recovery cannot prove committed publication; journal retained.")
+                for cfg in configs:
+                    record = shared_records[cfg.machine_name]
+                    if cfg.machine_name != binding.machine_name and (
+                        record is None
+                        or record["state"] != "superseded"
+                        or record.get("superseded_by_generation") != binding.registration_generation
+                    ):
+                        raise RuntimeError("registration recovery has an ambiguous previous owner; journal retained.")
+                    metadata = load_machine_record(cfg)
+                    if cfg.machine_name == binding.machine_name and (
+                        not isinstance(metadata, dict)
+                        or metadata.get("machine", {}).get("machine_name") != binding.machine_name
+                    ):
+                        raise RuntimeError("registration recovery machine publication is incomplete; journal retained.")
+                for cfg in configs:
+                    if before_effect is not None:
+                        before_effect()
+                    save_machine_registration(cfg, {"registration": shared_records[cfg.machine_name]})
+                if before_effect is not None:
+                    before_effect()
+                self.prepare_registry_locked()
+                path.unlink()
+                DurableIO().sync_directory(path.parent, "registration_recovery_committed")
+                return
+
+            # QQTOOLS-COMPAT-0024: convert source rollback data durably before
+            # replay. Whole-journal validation precedes the first shared effect.
+            prepared = deepcopy(value)
+            prepared["version"] = 2
+            prepared["replay_state"] = "rollback_prepared"
+            for item in prepared["registrations"]:
+                cfg = load_root_config(item["shared_root"], item["machine_name"])
+                current = shared_records[cfg.machine_name]
+                snapshot = item.get("record")
+                old_record = snapshot.get("registration") if isinstance(snapshot, dict) else None
+                if snapshot is not None and not isinstance(old_record, dict):
+                    raise RuntimeError("registration rollback snapshot is malformed.")
+                stable_id = next(iter(project_ids))
+                converted = convert_registration(old_record, stable_id, cfg) if old_record is not None else None
+                has_same_snapshot = bool(
+                    current is not None
+                    and converted is not None
+                    and all(
+                        current[key] == converted[key] for key in ("generation", "runtime_instance_id", "runtime_root")
+                    )
+                )
+                is_partial_owner = bool(
+                    current is not None
+                    and current["runtime_instance_id"] == self._current_instance_id()
+                    and current["runtime_root"] == str(self.root)
+                )
+                if current is not None and not has_same_snapshot and not is_partial_owner:
+                    raise RuntimeError("registration rollback would overwrite a successor; journal retained.")
+                if has_same_snapshot and has_recovery_protocol(current):
+                    converted["recovery_protocol"] = RECOVERY_PROTOCOL
+                item["record"] = {"registration": converted} if converted is not None else None
+            if before_effect is not None:
+                before_effect()
+            atomic_replace(path, {"registration_transaction": prepared})
+            registrations = prepared["registrations"]
             for item in registrations:
                 cfg = load_root_config(item["shared_root"], item["machine_name"])
                 registration_path = machine_registration_path(cfg.shared_root, cfg.machine_name)
@@ -356,6 +489,8 @@ class MachineRegistration:
             raise RuntimeError(f"machine {machine_name!r} is not initialized in {cfg.shared_root}.")
         runtime_instance_id = self._current_instance_id()
         with self.registry_guard():
+            self._assert_no_pending_project_registration()
+            self.prepare_registry_locked()
             self.rollback_pending_locked()
             revision, bindings = self.load_registry()
             force_new_generation = bool(
@@ -396,6 +531,8 @@ class MachineRegistration:
             # the old record before taking shared ownership permits a late
             # rollback to resurrect version 1 after recovery preparation.
             with self._registration_guards(*affected_configs):
+                for item in affected_configs:
+                    assert_name_unreserved(item)
                 registration_records = [(item, load_machine_registration(item)) for item in affected_configs]
                 machine_records = [(item, load_machine_record(item)) for item in affected_configs]
                 self._save_registration_transaction(
@@ -485,11 +622,12 @@ class MachineRegistration:
         force_new_generation: bool = False,
     ) -> dict[str, str]:
         """Acquire registration while the caller holds the project registration fence."""
+        assert_name_unreserved(cfg)
         policy = load_lease_policy(cfg)
         raw = load_machine_registration(cfg)
         registration = raw.get("registration") if isinstance(raw, dict) else None
         if registration is not None:
-            self.validate_registration_record(registration, project_id, cfg)
+            registration = convert_registration(registration, project_id, cfg)
         current_generation = current.registration_generation if current is not None else None
         same_owner = bool(
             isinstance(registration, dict)
@@ -544,7 +682,7 @@ class MachineRegistration:
         now = utc_now()
         # The protocol floor belongs to the logical name, including an explicit
         # ownership replacement. Returning old agents must remain fenced.
-        version = registration["version"] if registration else REGISTRATION_VERSION
+        version = TARGET_REGISTRATION_VERSION
         value = {
             "version": version,
             "project_id": project_id,
@@ -552,6 +690,8 @@ class MachineRegistration:
             "machine_name": cfg.machine_name,
             "generation": generation,
             "protocol_version": version,
+            "registration_protocol": REGISTRATION_PROTOCOL,
+            "recovery_protocol": registration.get("recovery_protocol") if registration else None,
             "client_version": __version__,
             "runtime_instance_id": runtime_instance_id,
             "runtime_root": str(self.root),
@@ -562,8 +702,6 @@ class MachineRegistration:
             ),
             "updated_at": now,
         }
-        if version == RECOVERY_REGISTRATION_VERSION:
-            value["recovery_protocol"] = RECOVERY_REGISTRATION_PROTOCOL
         save_machine_registration(cfg, {"registration": value})
         return value
 
@@ -622,7 +760,7 @@ class MachineRegistration:
         record = raw.get("registration") if isinstance(raw, dict) else None
         if not isinstance(record, dict) or record.get("generation") != binding.registration_generation:
             return
-        record = dict(record)
+        record = convert_registration(record, binding.project_id, cfg)
         record.update(
             {
                 "state": "superseded",
@@ -662,7 +800,7 @@ class MachineRegistration:
             if not eligible:
                 return False
             registration = load_machine_registration(cfg)["registration"]
-            if registration["version"] != RECOVERY_REGISTRATION_VERSION:
+            if not has_recovery_protocol(registration):
                 # Retire local rollback durability before the shared-only fence.
                 DurableIO().sync_directory(self.paths["registration_transaction"].parent, "recovery_registration")
             publish_recovery_registration_locked(cfg, registration)
@@ -788,6 +926,7 @@ class MachineRegistration:
         # Project-scoped commit fence owned by an isolated worker.
         with self.binding_commit_guard(observed):
             with self.registry_guard():
+                self._assert_no_pending_project_registration()
                 revision, bindings = self.load_registry()
                 current = self._find_binding(bindings, observed.project_id)
                 if current != observed:

@@ -66,7 +66,7 @@ def test_shared_preparation_and_admission_need_no_machine_owner_or_local_writes(
             path.relative_to(runtime.root): path.read_bytes() for path in runtime.root.rglob("*") if path.is_file()
         }
     prepared = load_machine_registration(cfg)["registration"]
-    assert prepared["version"] == 2
+    assert prepared["recovery_protocol"] == "qexp-local-responsibility-v1"
     assert prepared["generation"] == original["generation"]
     assert prepared["runtime_instance_id"] == original["runtime_instance_id"]
     assert LOCAL_RECOVERY_CAPABILITY in read_json(_schema(cfg))["schema"]["required_capabilities"]
@@ -101,7 +101,7 @@ def test_visible_capability_does_not_authorize_unprepared_registration(registere
     assert not outcome.is_fenced
     assert outcome.blockers == ("local_registration_not_prepared",)
     assert _schema(cfg).read_bytes() == before
-    assert load_machine_registration(cfg)["registration"]["version"] == 1
+    assert load_machine_registration(cfg)["registration"]["recovery_protocol"] is None
 
 
 @pytest.mark.parametrize("boundary", [1, 2])

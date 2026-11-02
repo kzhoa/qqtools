@@ -13,13 +13,13 @@ from ..layout import LOCAL_RECOVERY_CAPABILITY, load_machine_record, load_machin
 from .locks import schema_lock
 from .paths import machine_registration_path, shared_paths
 from .registration_authority import (
-    RECOVERY_REGISTRATION_VERSION,
     RegistrationIdentity,
     publish_recovery_registration_locked,
     registration_state,
     registration_write_guard,
     validate_registration_record,
 )
+from .registration_protocol import RECOVERY_PROTOCOL, has_recovery_protocol
 from .responsibility_store import DurableIO
 from .store import atomic_replace, read_json
 from .upgrade.framework import UpgradeCoordinator, pending_upgrade_requires_completion
@@ -102,7 +102,7 @@ def _participants(project_id: str, cfg: RootConfig) -> tuple[list[Path], list[st
                 ):
                     blockers.append(f"invalid_supersession:{entry.name}")
                     continue
-            elif record.get("state") != "eligible" or record["version"] != RECOVERY_REGISTRATION_VERSION:
+            elif record.get("state") != "eligible" or not has_recovery_protocol(record):
                 # An expired or offline registration still owns its logical name.
                 # Heartbeat absence is never evidence of durable retirement.
                 blockers.append(f"registration_not_prepared:{entry.name}")
@@ -170,7 +170,7 @@ def prepare_shared_recovery_admission(
     ) as registration:
         if registration is None:
             return RecoveryPreparation(False, RecoveryAdmission(False, ("registration_ineligible",)))
-        if registration["version"] != RECOVERY_REGISTRATION_VERSION:
+        if not has_recovery_protocol(registration):
             before_registration_conversion()
         publish_recovery_registration_locked(cfg, registration, before_shared_write=before_shared_write)
         admission = _fence_recovery_capability_locked(
@@ -200,7 +200,7 @@ def fence_shared_recovery_admission(
     ) as registration:
         if registration is None:
             return RecoveryAdmission(False, ("registration_ineligible",))
-        if registration["version"] != RECOVERY_REGISTRATION_VERSION:
+        if not has_recovery_protocol(registration):
             return RecoveryAdmission(False, ("local_registration_not_prepared",))
         return _fence_recovery_capability_locked(
             cfg,
@@ -249,7 +249,7 @@ def inspect_recovery_admission(runtime: MachineRuntime, binding: ProjectBinding)
         status = runtime.registration_status(binding)
         if status["state"] == "superseded":
             return {"state": "superseded", "blockers": [], "diagnostic_only": True}
-        if not status["write_eligible"] or status["registration_version"] != RECOVERY_REGISTRATION_VERSION:
+        if not status["write_eligible"] or status["recovery_protocol"] != RECOVERY_PROTOCOL:
             blockers = ["local_registration_not_prepared"]
         elif (
             LOCAL_RECOVERY_CAPABILITY

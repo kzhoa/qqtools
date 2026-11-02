@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -22,8 +23,17 @@ from qqtools.plugins.qexp.agent.scheduler_diagnostics import SchedulerDiagnostic
 
 @pytest.fixture(autouse=True)
 def _deterministic_publication_clock(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Keep store-contract tests independent of host filesystem latency."""
+    """Keep publication budgets and retention independent of host time."""
+    now = datetime(2026, 9, 28, 12, tzinfo=timezone.utc)
+
+    class FixedDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return now.replace(tzinfo=None) if tz is None else now.astimezone(tz)
+
     monkeypatch.setattr(diagnostic_module, "time", SimpleNamespace(monotonic_ns=lambda: 0))
+    monkeypatch.setattr(diagnostic_module, "datetime", FixedDatetime)
+    monkeypatch.setattr(diagnostic_module, "utc_now", lambda: "2026-09-28T12:00:00Z")
 
 
 def _identity(index: int = 1, *, project_id: str = "project-a") -> dict[str, object]:

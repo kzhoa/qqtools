@@ -270,3 +270,49 @@ def test_planned_future_item_passes_an_earlier_release(tmp_path: Path) -> None:
     item = load_registry(registry, tmp_path)[0]
 
     check_release((item,), Version.parse("2.9.0", "target"))
+
+
+def _registration_downtime_contract():
+    return {
+        "component": "qexp.registration-replacement",
+        "normal_level": "L3",
+        "recovery_level": "L3",
+        "source_versions": ["1.3.27"],
+        "target_version": "1.3.28",
+        "mixed_version_range": ["none"],
+        "normal_commands": ["Stop all old processes", "Upgrade every package", "qexp agent start"],
+        "machine_status_command": "qexp admin upgrade status",
+        "recovery_command": "qexp admin upgrade advance",
+        "workload_continuity": False,
+        "interruption_budget_seconds": 1.0,
+    }
+
+
+def test_exact_registration_downtime_exception_is_accepted():
+    from scripts.checks.check_compatibility_registry import _validate_operational_contract
+
+    _validate_operational_contract(_registration_downtime_contract(), "QQTOOLS-COMPAT-0024")
+
+
+@pytest.mark.parametrize(
+    "changed",
+    [
+        {"component": "qexp.unrelated"},
+        {"source_versions": ["1.3.26"]},
+        {"target_version": "1.3.29"},
+        {"recovery_level": "L2"},
+    ],
+)
+def test_downtime_exception_cannot_expand_to_other_protocols_or_releases(changed):
+    from scripts.checks.check_compatibility_registry import _validate_operational_contract
+
+    value = {**_registration_downtime_contract(), **changed}
+    with pytest.raises(RegistryError):
+        _validate_operational_contract(value, "QQTOOLS-COMPAT-0024")
+
+
+def test_other_items_still_cannot_require_workload_downtime():
+    from scripts.checks.check_compatibility_registry import _validate_operational_contract
+
+    with pytest.raises(RegistryError):
+        _validate_operational_contract(_registration_downtime_contract(), "QQTOOLS-COMPAT-9001")
