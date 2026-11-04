@@ -8,6 +8,7 @@ from collections.abc import Mapping, Sequence
 from datetime import datetime
 from typing import Any
 
+from ...config_types import MAX_IDLE_JOB_STOP_TIMEOUT_SECONDS
 from .admin import _validate_upgrade_registry
 from .core import OutputContract, OutputKind
 from .primitives import (
@@ -163,6 +164,11 @@ def _render_agent_status(result: Mapping[str, Any], _presentation: Mapping[str, 
     rendered = _render_agent_operation(result, _presentation)
     if result.get("stop_reason") is not None:
         rendered = f"{rendered}\n\nStop reason: {result.get('stop_reason')}"
+    idle_job = result.get("idle_job")
+    if isinstance(idle_job, Mapping):
+        idle_job_details = _status_section("Idle Job", _status_mapping_fields(idle_job))
+        if idle_job_details:
+            rendered = f"{rendered}\n\n{idle_job_details}" if rendered else idle_job_details
     project_io = result.get("project_io_isolation")
     if isinstance(project_io, Mapping) and project_io.get("envelope") in {"degraded", "exceeded", "unknown"}:
         project_io_details = _status_section(
@@ -373,6 +379,23 @@ def _render_cpu_lane(result: CpuLanePayload, _presentation: Mapping[str, object]
             ("MachineRuntime root", result.get("machine_runtime_root")),
             ("Capacity", lane["capacity"]),
             ("Revision", lane["revision"]),
+        )
+    )
+
+
+def _render_idle_job(result: Mapping[str, Any], _presentation: Mapping[str, object]) -> str:
+    config = result["idle_job"]
+    return _details(
+        (
+            ("Outcome", str(result.get("action", "shown")).replace("_", " ")),
+            ("MachineRuntime root", result.get("machine_runtime_root")),
+            ("Enabled", config["enabled"]),
+            ("Command", config["command"] or "-"),
+            ("GPU IDs", config["gpu_ids"]),
+            ("Idle delay seconds", config["idle_delay_seconds"]),
+            ("Stop timeout seconds", config["stop_timeout_seconds"]),
+            ("Working directory", config["working_directory"] or "-"),
+            ("Revision", config["revision"]),
         )
     )
 
@@ -802,6 +825,56 @@ def _validate_cpu_lane(result: Any) -> None:
     _required_int(lane, "revision", "cpu-lane payload.cpu_lane")
 
 
+def _validate_idle_job(result: Any) -> None:
+    value = _mapping(result, "idle-job payload")
+    action = _required(value, "action", "idle-job payload")
+    if action not in {"shown", "updated"}:
+        raise ValueError("idle-job payload.action is invalid")
+    _required(value, "machine_runtime_root", "idle-job payload")
+    config = _required_mapping(value, "idle_job", "idle-job payload")
+    expected_keys = {
+        "version",
+        "enabled",
+        "command",
+        "gpu_ids",
+        "idle_delay_seconds",
+        "stop_timeout_seconds",
+        "working_directory",
+        "revision",
+    }
+    if set(config) != expected_keys:
+        raise ValueError("idle-job payload.idle_job has missing or unknown fields")
+    if type(config["version"]) is not int or config["version"] != 1:
+        raise ValueError("idle-job payload.idle_job.version is unsupported")
+    if type(config["enabled"]) is not bool:
+        raise TypeError("idle-job payload.idle_job.enabled must be a boolean")
+    if not isinstance(config["command"], str):
+        raise TypeError("idle-job payload.idle_job.command must be a string")
+    gpu_ids = config["gpu_ids"]
+    if not isinstance(gpu_ids, list) or not gpu_ids:
+        raise TypeError("idle-job payload.idle_job.gpu_ids must be a non-empty list")
+    if any(type(gpu_id) is not int or gpu_id < -1 for gpu_id in gpu_ids):
+        raise TypeError("idle-job payload.idle_job.gpu_ids must contain -1 or nonnegative integers")
+    for key, is_positive in (("idle_delay_seconds", False), ("stop_timeout_seconds", True)):
+        number = config[key]
+        try:
+            is_finite = math.isfinite(number)
+        except (OverflowError, TypeError):
+            is_finite = False
+        if type(number) not in {int, float} or isinstance(number, bool) or not is_finite:
+            raise TypeError(f"idle-job payload.idle_job.{key} must be finite")
+        if (is_positive and number <= 0) or (not is_positive and number < 0):
+            raise ValueError(f"idle-job payload.idle_job.{key} has an invalid value")
+        if key == "stop_timeout_seconds" and number > MAX_IDLE_JOB_STOP_TIMEOUT_SECONDS:
+            raise ValueError(f"idle-job payload.idle_job.{key} has an invalid value")
+    working_directory = config["working_directory"]
+    if working_directory is not None and not isinstance(working_directory, str):
+        raise TypeError("idle-job payload.idle_job.working_directory must be a string or null")
+    revision = config["revision"]
+    if type(revision) is not int or revision < 0:
+        raise TypeError("idle-job payload.idle_job.revision must be a nonnegative integer")
+
+
 def _validate_gpu_policy_view(result: Any, label: str) -> None:
     value = _mapping(result, label)
     for key in (
@@ -861,6 +934,7 @@ CONTRACTS = {
     OutputKind.AGENT_READINESS: OutputContract(_validate_agent_readiness, _render_agent_readiness),
     OutputKind.SCHEDULER_DIAGNOSTICS: OutputContract(_validate_scheduler_diagnostics, _render_scheduler_diagnostics),
     OutputKind.CPU_LANE: OutputContract(_validate_cpu_lane, _render_cpu_lane),
+    OutputKind.IDLE_JOB: OutputContract(_validate_idle_job, _render_idle_job),
     OutputKind.GPU_POLICY: OutputContract(_validate_gpu_policy_payload, _render_gpu_policy),
 }
 

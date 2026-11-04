@@ -177,6 +177,20 @@ def _local_obligations(runtime: MachineRuntime) -> tuple[list[str], bool]:
     except (OSError, RuntimeError, ValueError, KeyError, TypeError) as exc:
         return [f"registry_unavailable:{exc}"], False
     execution_blockers: list[str] = []
+    # Idle Job owns machine-local processes independently of Project records.
+    # Retain this obligation through replacement, including a dead agent whose
+    # guardian has not yet confirmed cleanup.
+    from ..runtime.resources.idle_job import idle_job_instance_path, read_idle_job_ownership
+    from .idle_job_process import idle_job_processes_exited
+
+    try:
+        idle_owner = read_idle_job_ownership(runtime.root)
+        if idle_owner is not None:
+            obligations.append("idle_job:ownership")
+            if not idle_job_processes_exited(idle_job_instance_path(runtime.root, idle_owner["instance_id"])):
+                execution_blockers.append("idle_job:cleanup_unconfirmed")
+    except (OSError, RuntimeError, ValueError, KeyError, TypeError):
+        execution_blockers.append("idle_job:ownership_unavailable")
     for binding in bindings:
         try:
             blockers = runtime.binding_blockers(binding)

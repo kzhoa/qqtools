@@ -161,6 +161,12 @@ Its result can therefore say `Ready: pending`; use the following `agent status` 
 readiness. Status keeps configured `daemon|on_demand` policy distinct from a differing observed
 mode.
 
+Daemon mode also supports `agent start` before any Project is registered. Optional
+[Idle Job commands](docs/qexp-idle-job.md) can use selected GPUs during proven
+qexp training idleness; eligible training stops the Idle Job before admission.
+Configure them with `qexp agent config idle-job` and inspect their independent
+state in `qexp agent status`.
+
 Detached agents keep owner-private diagnostic output in a per-instance directory below
 `/tmp/qqtools-qexp-<uid>/`. Configure the rotation trigger for the next agent instance, then restart
 to apply it:

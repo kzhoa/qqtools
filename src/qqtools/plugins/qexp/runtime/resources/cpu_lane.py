@@ -11,6 +11,7 @@ from ..locks import exclusive
 from ..paths import local_paths
 from ..records import new_id, utc_now, validate_identifier
 from ..store import atomic_replace, iter_json, read_json
+from .idle_job import idle_job_guard, require_idle_job_released
 
 PROVISIONAL_TTL_SECONDS = 30
 
@@ -247,12 +248,13 @@ def reserve_cpu(
         fencing_token=fencing_token,
     )
     paths = local_paths(runtime_root)
-    with exclusive(paths["locks"] / "cpu-lane.lock"):
+    with idle_job_guard(runtime_root), exclusive(paths["locks"] / "cpu-lane.lock"):
         _release_expired(paths)
         policy = _policy(paths)
         reserved = sum(item.get("cpu_slots", 0) for item in _reservations(paths))
         if reserved + cpu_slots > policy.capacity:
             raise ValueError("CPU lane has insufficient free slots.")
+        require_idle_job_released(paths["locks"].parent)
         reservation_id = new_id()
         reservation = {
             "reservation_id": reservation_id,

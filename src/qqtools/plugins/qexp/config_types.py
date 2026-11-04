@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import InitVar, dataclass, field
 from pathlib import Path
 
+MAX_IDLE_JOB_STOP_TIMEOUT_SECONDS = 300.0
+
 
 @dataclass(slots=True)
 class RootConfig:

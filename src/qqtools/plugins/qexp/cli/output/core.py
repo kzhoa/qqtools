@@ -33,6 +33,7 @@ class OutputKind(str, Enum):
     AGENT_STATUS = "agent-status"
     AGENT_CONFIG = "agent-config"
     AGENT_READINESS = "agent-readiness"
+    IDLE_JOB = "idle-job"
     SCHEDULER_DIAGNOSTICS = "scheduler-diagnostics"
     MACHINE_INIT = "machine-init"
     PROJECT_OPERATION = "project-operation"

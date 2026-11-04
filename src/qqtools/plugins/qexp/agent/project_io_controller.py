@@ -41,6 +41,7 @@ from .bindings import ProjectBinding
 from .context import MachineRuntime
 from .dispatch_probe import PrimaryProbeSession
 from .group_service_coordinator import GroupServiceCoordinator, GroupServiceOffer
+from .idle_job_demand import IdleJobDemandCoordinator
 from .primary_probe_transport import encode_probe_session
 from .process_reservation_recovery import registration_reservation
 from .progress_coordinator import ProgressObservationCoordinator
@@ -121,6 +122,7 @@ _VALIDATION_INDEPENDENT_RECONCILIATION_OPERATION_KINDS = frozenset(
         "scheduler_observe",
         "scheduler_primary_probe",
         "scheduler_quiescence_probe",
+        "idle_job_probe",
         "scheduler_claim",
         "scheduler_cursor_commit",
         "scheduler_reservation_reconcile",
@@ -207,6 +209,7 @@ _SERVICE_CLASS_BY_OPERATION_KIND = {
     "scheduler_reservation_reconcile": "primary",
     "scheduler_due_offer": "background",
     "scheduler_quiescence_probe": "primary",
+    "idle_job_probe": "primary",
     "scheduler_ready_index_build": "background",
     "maintenance_descriptor_advance": "background",
     "maintenance_flush_event": "background",
@@ -355,6 +358,7 @@ class ProjectIOController:
         self._primary_rounds: dict[str, _PrimaryProbeRound] = {}
         self._scheduler_quiescence_rounds: dict[_ValidationIdentity, _SchedulerQuiescenceRound] = {}
         self._scheduler_quiescence_requests: dict[str, _SchedulerQuiescenceRound] = {}
+        self._idle_job_demand = IdleJobDemandCoordinator(monotonic=monotonic)
         self._group_service = GroupServiceCoordinator(monotonic=monotonic)
         self._borrow_grants: dict[str, BorrowAdmissionGrant] = {}
         self._pending_claim_offers: dict[str, _PendingClaimOffer] = {}
@@ -1470,6 +1474,26 @@ class ProjectIOController:
         if request is None:
             return
         self._start_observation_request(request, key)
+
+    @_admission_operation
+    def advance_idle_job_demand(
+        self,
+        bindings: Sequence[ProjectBinding],
+        registry_revision: int,
+        *,
+        gpu_capacity: int,
+        cpu_capacity: int,
+        capacity_key: str,
+    ) -> str:
+        """Return the fail-closed machine demand state for an Idle Job census."""
+        return self._idle_job_demand.advance(
+            self,
+            bindings,
+            registry_revision,
+            gpu_capacity=gpu_capacity,
+            cpu_capacity=cpu_capacity,
+            capacity_key=capacity_key,
+        )
 
     @_admission_operation
     def advance_scheduler_quiescence(self, bindings: Sequence[ProjectBinding], registry_revision: int) -> None:

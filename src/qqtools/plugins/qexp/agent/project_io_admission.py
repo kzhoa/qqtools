@@ -52,6 +52,7 @@ _PRIMARY_FAMILY_ORDER = {
     # An active result backs off for one second, allowing ordinary discovery to
     # authorize work on the following pass.
     ("scheduler_quiescence_probe", "default"): 1,
+    ("idle_job_probe", "default"): 1,
     ("scheduler_observe", "cpu_primary"): 2,
     ("scheduler_observe", "gpu_primary"): 2,
     ("scheduler_observe", "cpu_borrow"): 3,

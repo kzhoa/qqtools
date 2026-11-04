@@ -1,7 +1,7 @@
 ---
 doc_type: spec
 status: active
-updated_at: 2026-11-02
+updated_at: 2026-11-04
 archived_at:
 ---
 
@@ -178,8 +178,16 @@ pitch or delivery change description, with explicit approval.
 `init --machine NAME` initializes or deliberately replaces only the local MachineRuntime identity
 and global agent configuration. `project init [PATH]` creates shared Project truth, and `project
 register PATH...` enrolls existing Projects in the current runtime. None of these commands starts
-the agent. `agent start` requires at least one enabled, registered Project and waits for current
-generation readiness; it never initializes or enrolls a Project.
+the agent. `agent start` waits for current-generation readiness; it never initializes or
+enrolls a Project. After MachineRuntime initialization, daemon mode permits startup without
+enabled, registered Projects. On-demand mode still requires at least one enabled, registered
+Project. Machine-only daemon startup is independent of optional idle work.
+
+The owner-approved compatibility decision of 2026-11-03 relaxes the protected activation
+workflow's registration prerequisite for daemon startup only. Machine-only readiness requires
+current singleton ownership and completed machine-local ownership/recovery reconciliation.
+Unknown registry or ownership evidence cannot establish an empty, ready machine. Existing
+Project readiness checks remain required whenever enabled Projects are present.
 
 Unless `--no-activate` is supplied, `submit` activates the local agent for an existing binding
 and submitted work eventually converges through its normal scheduling lifecycle. `--no-activate`
@@ -2117,6 +2125,8 @@ qexp agent start
 ```
 
 `agent start` ensures one detached process and waits for captured enabled Projects to be ready.
+A daemon can also start before Project registration, using machine-only readiness; later
+registered Projects enter normal scheduling without restarting the daemon.
 Use `qexp agent run` for foreground debugging. It has no `--format` option or finite startup
 record, and interrupting it does not signal already launched runners. Neither machine initialization nor Project
 registration starts a long-lived process.
@@ -2716,3 +2726,47 @@ qPipeline reports committed training steps as overall labeled Training, retainin
 them during evaluation using its valid start fact or last committed training
 step in the same run. Invalid/missing limits mean unknown total; standalone
 evaluation without a training fact remains activity-only.
+
+## Machine Idle Job
+
+A MachineRuntime can opt into one Idle Job command in daemon mode, including
+before any Project is registered. The command is machine work: it creates no Task
+or Attempt, and does not contribute to experiment counts or completion rates.
+On-demand agents reject enablement, and an enabled Idle Job prevents changing
+the agent to on-demand mode until it is disabled. Daemon residency remains
+independent of this feature.
+
+The configuration key is `idle_job`; the CLI is
+`qexp agent config idle-job show|set|disable`. The command accepts quoted argument
+strings without shell expansion. GPU selection belongs exclusively to `gpu_ids`;
+detectable command assignments of `CUDA_VISIBLE_DEVICES` are rejected. The default
+selector `[-1]` resolves to the last sorted GPU admitted by current machine policy
+and successful discovery. Multiple selectors are deduplicated; invalid IDs,
+empty inventory, and unavailable discovery fail closed.
+
+A continuous idle interval (default 60 seconds) requires no qexp training
+reservations and no training eligible for local admission across every enabled
+Project. Known locally ineligible queued work does not suppress the Idle Job.
+Unresolved ownership, recovery, or scheduling evidence interrupts idleness.
+Eligible GPU or CPU work stops the entire instance, including when it requests
+other GPUs. Training admission waits for confirmed process cleanup. Idle Job
+occupancy must not hide eligible training from this preemption decision.
+
+Changing command or GPU configuration, removing a selected GPU from policy,
+disabling Idle Job, and stopping the agent reclaim the current instance before
+replacement. Cleanup first requests graceful termination (default 10 seconds),
+then forces termination. Unconfirmed cleanup remains blocking. Process start
+identity prevents signalling a reused numeric PID. Commands must remain within
+their inherited process group; detached workloads and external training are
+outside the first version's coordination contract.
+
+Machine status exposes `idle_job` independently, with states `disabled`,
+`waiting`, `running`, `stopping`, `backoff`, and `blocked`. It reports configured
+and resolved GPUs, process identity, start time, last exit reason, next retry,
+and a separate log path. Readiness means supervision is initialized when enabled;
+it does not wait for the idle delay or guarantee a successful command launch.
+Unexpected exits back off exponentially up to 60 seconds, normal exits also
+wait before relaunch, and every retry rechecks training demand.
+
+See [Idle Job operation](../qexp-idle-job.md) for configuration examples,
+interpreter/environment rules, shutdown, and troubleshooting.

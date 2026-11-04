@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import stat
 from contextlib import closing
 from dataclasses import replace
 from pathlib import Path
@@ -15,6 +16,7 @@ from ..layout import machine_state_path
 from ..machine_config import load_machine_policy
 from ..machine_state import publish_machine_snapshots
 from ..project_maintenance import reconcile_reservation
+from ..runtime.authority_scan import iter_evidence_entries
 from ..runtime.paths import local_paths, shared_paths
 from ..runtime.records import TaskSpec, utc_now
 from ..runtime.resources.reservations import (
@@ -130,6 +132,107 @@ def _machine_is_true_idle(runtime: MachineRuntime, *, has_consumed_binding: bool
     except (OSError, RuntimeError, ValueError, KeyError, TypeError):
         return False
     return not snapshot.active and not snapshot.provisional
+
+
+def _unregistered_partition_evidence(runtime: MachineRuntime, registered: frozenset[str]):
+    """Yield bounded discovery steps; an orphan JSON record needs reconciliation."""
+    directory = runtime.paths["projects"]
+    try:
+        entries = os.scandir(directory)
+    except FileNotFoundError:
+        return
+    with entries:
+        for entry in entries:
+            if entry.is_symlink() or not entry.is_dir(follow_symlinks=False):
+                raise OSError("machine project partition is not a real directory")
+            yield False
+            if entry.name not in registered:
+                with closing(iter_evidence_entries(Path(entry.path), recursive=True)) as evidence:
+                    for path in evidence:
+                        yield path is not None
+
+
+def _observe_unregistered_partitions(runtime: MachineRuntime, bindings) -> str:
+    registered = frozenset(binding.project_id for binding in bindings)
+    previous = getattr(runtime, "_machine_only_partition_scan", None)
+    try:
+        metadata = runtime.paths["projects"].stat(follow_symlinks=False)
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise OSError("machine projects root is not a real directory")
+        identity = (metadata.st_dev, metadata.st_ino, metadata.st_mtime_ns)
+    except FileNotFoundError:
+        identity = None
+    except OSError:
+        if previous is not None:
+            previous[1].close()
+        runtime._machine_only_partition_scan = None
+        return "blocked"
+    key = (registered, identity)
+    previous_key = getattr(runtime, "_machine_partition_identity", key)
+    runtime._machine_partition_identity = key
+    if previous is None or previous[0] != key:
+        if previous is not None:
+            previous[1].close()
+        previous = (key, _unregistered_partition_evidence(runtime, registered))
+        runtime._machine_only_partition_scan = previous
+    if previous_key != key:
+        return "blocked"
+    scan = previous[1]
+    try:
+        for _ in range(64):
+            if next(scan):
+                scan.close()
+                runtime._machine_only_partition_scan = None
+                return "blocked"
+    except StopIteration:
+        runtime._machine_only_partition_scan = None
+        return "clear"
+    except OSError:
+        scan.close()
+        runtime._machine_only_partition_scan = None
+        return "blocked"
+    return "pending"
+
+
+def _unregistered_partitions_settled(runtime: MachineRuntime, bindings) -> bool:
+    return _observe_unregistered_partitions(runtime, bindings) == "clear"
+
+
+def _machine_only_recovery_complete(
+    runtime: MachineRuntime,
+    bindings: list[ProjectBinding] | tuple[ProjectBinding, ...],
+    *,
+    partition_observation: str | None = None,
+) -> bool:
+    """Prove local ownership settlement without requiring daemon service lanes to retire."""
+    if any(binding.enabled for binding in bindings):
+        return False
+    if (
+        runtime.pending_launch_handoffs
+        or runtime.upgrade_discovery_unknown
+        or runtime.upgrade_idle_blocked_projects
+        or runtime.recovery_enrollment_pending_projects
+        or runtime.maintenance_retry_idle_blocked_projects
+    ):
+        return False
+    try:
+        executor = getattr(runtime, "project_io_executor", None)
+        if executor is not None and executor.status_view().get("envelope") != "healthy":
+            return False
+        snapshot = reservation_snapshot(runtime.root)
+        if snapshot.active or snapshot.provisional:
+            return False
+        if partition_observation is None:
+            partition_observation = _observe_unregistered_partitions(runtime, bindings)
+        if partition_observation != "clear":
+            return False
+        for binding in bindings:
+            with closing(runtime.iter_recovery_blockers(binding, should_use_capture=True)) as blockers:
+                if next(blockers, None) is not None:
+                    return False
+    except (OSError, RuntimeError, ValueError, KeyError, TypeError):
+        return False
+    return True
 
 
 def _active_machine_identity(runtime: MachineRuntime) -> tuple[int, str, int] | None:

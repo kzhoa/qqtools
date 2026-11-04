@@ -106,6 +106,7 @@ _RETRYABLE_ON_WORKER_EXIT = frozenset(
         "scheduler_observe",
         "scheduler_primary_probe",
         "scheduler_quiescence_probe",
+        "idle_job_probe",
         "scheduler_reservation_reconcile",
         "activation_observe",
         "authority_service",
@@ -462,6 +463,29 @@ class ProjectIOExecutor:
             registry_revision,
             "scheduler_quiescence_probe",
             {"machine_name": getattr(binding, "machine_name", None), "probe_state": probe_state},
+            source_revisions=None,
+        )
+
+    def prepare_idle_job_probe(
+        self,
+        binding: object,
+        registry_revision: int,
+        *,
+        probe_state: Mapping[str, Any],
+        gpu_capacity: int,
+        cpu_capacity: int,
+    ) -> ProjectIORequest:
+        """Persist one read-only demand census continuation for Idle Job admission."""
+        return self._prepare_request(
+            binding,
+            registry_revision,
+            "idle_job_probe",
+            {
+                "machine_name": getattr(binding, "machine_name", None),
+                "probe_state": probe_state,
+                "gpu_capacity": gpu_capacity,
+                "cpu_capacity": cpu_capacity,
+            },
             source_revisions=None,
         )
 
@@ -1577,6 +1601,12 @@ class ProjectIOExecutor:
         """Discard non-authorizing scan progress only after exact worker absence."""
         if current_request.operation_kind != "scheduler_quiescence_probe":
             raise ValueError("stale resolution requires scheduler_quiescence_probe.")
+        return self._resolve_stale_request(request_id, current_request)
+
+    def resolve_stale_idle_job_probe(self, request_id: str, current_request: ProjectIORequest) -> bool:
+        """Discard obsolete Idle Job demand progress only after exact worker absence."""
+        if current_request.operation_kind != "idle_job_probe":
+            raise ValueError("stale resolution requires idle_job_probe.")
         return self._resolve_stale_request(request_id, current_request)
 
     def _validate_project_event_source(self, project_id: str, bucket: str, filename: str, sha256: str) -> None:

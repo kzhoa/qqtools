@@ -160,16 +160,17 @@ def initialize_agent_config(runtime: Any, name: str, *, agent_mode: str | None =
         else:
             provenance = "init_explicit"
         revision = previous.revision + 1 if previous is not None else 0
-        return _write_locked(
-            machine_runtime,
-            AgentConfig(
-                validated_name,
-                selected_mode,
-                log_max_bytes=previous.log_max_bytes if previous is not None else DEFAULT_LOG_MAX_BYTES,
-                revision=revision,
-                provenance=provenance,
-            ),
+        updated = AgentConfig(
+            validated_name,
+            selected_mode,
+            log_max_bytes=previous.log_max_bytes if previous is not None else DEFAULT_LOG_MAX_BYTES,
+            revision=revision,
+            provenance=provenance,
         )
+        from .idle_job_config import load_idle_job_config, validate_idle_job_mode
+
+        validate_idle_job_mode(load_idle_job_config(machine_runtime), updated.agent_mode)
+        return _write_locked(machine_runtime, updated)
 
 
 def set_agent_config(
@@ -195,6 +196,9 @@ def set_agent_config(
             revision=current.revision + 1,
             provenance="configured",
         )
+        from .idle_job_config import load_idle_job_config, validate_idle_job_mode
+
+        validate_idle_job_mode(load_idle_job_config(machine_runtime), updated.agent_mode)
         return _write_locked(machine_runtime, updated)
 
 

@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from ..machine_config import is_legacy_agent_project
+from ..models import AGENT_MODE_DAEMON
 from ..runtime.store import read_json
 from .config import load_agent_config
 from .context import MachineRuntime
@@ -75,6 +76,31 @@ def _captured_entries(snapshot: dict[str, Any]) -> list[ProjectInventoryEntry]:
     return parsed
 
 
+def allows_machine_only_start(runtime: MachineRuntime | str | Path | None, snapshot: dict[str, Any]) -> bool:
+    """Return whether a verified empty roster may start a resident daemon."""
+    if not isinstance(snapshot, dict):
+        return False
+    try:
+        machine_runtime = runtime if isinstance(runtime, MachineRuntime) else MachineRuntime(runtime)
+        config = load_agent_config(machine_runtime)
+        inventory_revision = snapshot.get("inventory_revision")
+        registry_revision = snapshot.get("registry_revision")
+        return bool(
+            config.agent_mode == AGENT_MODE_DAEMON
+            and isinstance(snapshot.get("project_ids"), list)
+            and not snapshot["project_ids"]
+            and snapshot.get("inventory_converged") is True
+            and isinstance(snapshot.get("reconciliation_blockers"), list)
+            and not snapshot["reconciliation_blockers"]
+            and type(inventory_revision) is int
+            and inventory_revision >= 0
+            and type(registry_revision) is int
+            and registry_revision >= 0
+        )
+    except (OSError, RuntimeError, ValueError, KeyError, TypeError):
+        return False
+
+
 def evaluate_readiness(runtime: MachineRuntime | str | Path | None, snapshot: dict[str, Any]) -> dict[str, Any]:
     """Evaluate current process, policy acknowledgement, authority and reconciliation."""
     machine_runtime = runtime if isinstance(runtime, MachineRuntime) else MachineRuntime(runtime)
@@ -119,7 +145,7 @@ def evaluate_readiness(runtime: MachineRuntime | str | Path | None, snapshot: di
     identity = _active_machine_identity(machine_runtime)
     projects: list[dict[str, Any]] = []
     reasons: list[str] = []
-    if not snapshot.get("project_ids"):
+    if not snapshot.get("project_ids") and not allows_machine_only_start(machine_runtime, snapshot):
         reasons.append("no_enabled_projects")
     if revision != captured_revision:
         reasons.append("concurrent_inventory_change")
@@ -131,6 +157,12 @@ def evaluate_readiness(runtime: MachineRuntime | str | Path | None, snapshot: di
         reasons.append("captured_enablement_reconciliation_incomplete")
     if identity is None:
         reasons.append("agent_not_ready")
+    elif (
+        status.get("instance_id") != identity[1]
+        or status.get("pid") != identity[0]
+        or status.get("pid_start_time_ticks") != identity[2]
+    ):
+        reasons.append("stale_agent_identity")
     if status.get("runtime_id") != machine_runtime.instance_id:
         reasons.append("stale_runtime_generation")
     if status.get("policy_revision_requested") != config.revision:
@@ -250,6 +282,7 @@ def wait_for_readiness(
 
 __all__ = [
     "DEFAULT_START_TIMEOUT_SECONDS",
+    "allows_machine_only_start",
     "capture_readiness_snapshot",
     "evaluate_readiness",
     "wait_for_readiness",

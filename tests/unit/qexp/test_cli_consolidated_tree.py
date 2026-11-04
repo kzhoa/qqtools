@@ -191,6 +191,9 @@ def test_every_command_leaf_retains_its_frozen_dispatch_contract() -> None:
         ),
         ("agent", "stop"): ("agent_stop", "machine", "agent-operation"),
         ("agent", "name"): ("agent_name", "machine", "agent-config"),
+        ("agent", "config", "idle-job", "show"): ("agent_config_idle_job_show", "machine", "idle-job"),
+        ("agent", "config", "idle-job", "set"): ("agent_config_idle_job_set", "machine", "idle-job"),
+        ("agent", "config", "idle-job", "disable"): ("agent_config_idle_job_disable", "machine", "idle-job"),
         ("agent", "config", "gpus", "show"): ("agent_config_gpus_show", "machine", "gpu-policy"),
         ("agent", "config", "gpus", "set"): ("agent_config_gpus_set", "machine", "gpu-policy"),
         ("agent", "config", "gpus", "reset"): ("agent_config_gpus_reset", "machine", "gpu-policy"),
@@ -256,8 +259,8 @@ def test_normalized_leaf_help_matches_the_characterization_baseline() -> None:
     # argparse produces distinct stable normalized forms on Python 3.12 and the
     # standard Python 3.13 toolchain even though the parser definitions match.
     assert hashlib.sha256(text.encode()).hexdigest() in {
-        "a54cae2e40c5074ee4da3de499efe3da3820910f3e23895b972759e663877dd7",
-        "60461985d3cf43678360a8fac8c8dd7f51c3a59a30ef9b5f1b9be1c5c1a2dd8b",
+        "99f444acfb631ce900aeebe804c12abcd3fb4c071adb172d1d71a7f200a11716",
+        "476941f0478b1bd4ca868eed124623856699bd2038ca315f582508fe4265821a",
     }
 
 

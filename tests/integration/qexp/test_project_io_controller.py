@@ -8058,3 +8058,78 @@ def test_deferred_snapshot_keeps_original_admission_deadline_and_then_publishes(
         time.sleep(0.02)
     assert completions[binding.project_id]["outcome"] == "published"
     assert read_json(machine_state_path(cfg, "agent.json"))["agent"]["instance_id"] == "agent-1"
+
+
+def test_idle_job_census_is_activation_scoped_and_does_not_retire_scheduler(tmp_path):
+    runtime = MachineRuntime(tmp_path / "machine")
+    initialize_machine(runtime, "gpu-1")
+    cfg, binding, revision, bindings = _registered(tmp_path, "project", runtime)
+    repair_ready_index(cfg)
+    executor = ProjectIOExecutor(runtime)
+    executor.begin_epoch()
+    controller = ProjectIOController(runtime, executor)
+
+    def advance_until(expected, capacity=1):
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            dispatch_loop._advance_activation_working_set(runtime, controller, revision, bindings)
+            demand = controller.advance_idle_job_demand(
+                bindings, revision, gpu_capacity=capacity, cpu_capacity=1, capacity_key=str(capacity)
+            )
+            if demand == expected:
+                return
+            time.sleep(0.02)
+        raise AssertionError(f"Idle Job census stayed {demand}, expected {expected}")
+
+    try:
+        _advance_until_validated(controller, bindings, revision, binding.project_id)
+        _observe_working_set_activation(runtime, controller, bindings, revision)
+        advance_until("idle")
+        state = runtime.working_set._states[runtime.working_set._identity(binding)]
+        assert "scheduler" not in state.acknowledged_lanes
+        assert not controller.scheduler_is_quiescent(binding, revision)
+        submit(cfg, ["echo", "requires-two"], requested_gpus=2, working_dir=tmp_path)
+        runtime.working_set.activate(binding, "new_local_work")
+        assert (
+            controller.advance_idle_job_demand(bindings, revision, gpu_capacity=1, cpu_capacity=1, capacity_key="1")
+            != "idle"
+        )
+        advance_until("idle")
+        advance_until("busy", capacity=2)
+        assert "scheduler" not in state.acknowledged_lanes
+    finally:
+        executor.shutdown()
+
+
+def test_idle_job_census_waits_for_every_enabled_project(tmp_path):
+    runtime = MachineRuntime(tmp_path / "machine")
+    initialize_machine(runtime, "gpu-1")
+    first_cfg, first, _, _ = _registered(tmp_path, "first", runtime)
+    second_cfg, second, revision, bindings = _registered(tmp_path, "second", runtime)
+    for cfg in (first_cfg, second_cfg):
+        repair_ready_index(cfg)
+    executor = ProjectIOExecutor(runtime)
+    executor.begin_epoch()
+    controller = ProjectIOController(runtime, executor)
+    try:
+        _advance_until_validated(controller, bindings, revision, first.project_id)
+        _advance_until_validated(controller, bindings, revision, second.project_id)
+        _observe_working_set_activation(runtime, controller, bindings, revision)
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            demand = controller.advance_idle_job_demand(
+                bindings, revision, gpu_capacity=1, cpu_capacity=1, capacity_key="one-gpu"
+            )
+            if demand == "idle":
+                break
+            time.sleep(0.02)
+        assert demand == "idle"
+        runtime.working_set.activate(second, "new_local_work")
+        assert (
+            controller.advance_idle_job_demand(
+                bindings, revision, gpu_capacity=1, cpu_capacity=1, capacity_key="one-gpu"
+            )
+            == "unknown"
+        )
+    finally:
+        executor.shutdown()

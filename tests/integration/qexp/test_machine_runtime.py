@@ -1516,7 +1516,7 @@ def test_background_machine_agent_publishes_pid_only_after_acquiring_authority(
         process.wait(timeout=1.0)
 
 
-def test_first_registration_wait_is_consumed_without_dispatching_work(tmp_path: Path) -> None:
+def test_daemon_becomes_ready_before_registration_and_accepts_later_project(tmp_path: Path) -> None:
     runtime = MachineRuntime(tmp_path / "machine-runtime")
     initialize_machine(runtime, "gpu-1")
     script = """
@@ -1539,22 +1539,22 @@ run_machine_agent_loop(sys.argv[1], loop_interval=0.05, available_gpus=[])
             on_timeout=lambda: {"process_returncode": process.poll()},
         )
         assert process.poll() is None
-        assert get_machine_agent_status(runtime)["waiting_for_first_registration"] is True
+        from qqtools.plugins.qexp.agent.readiness import capture_readiness_snapshot, wait_for_readiness
 
-        cfg = init_shared_root(
-            tmp_path / "project" / ".qexp",
-            "gpu-1",
-            agent_mode="daemon",
-            runtime_root=tmp_path / "legacy",
-        )
-        runtime.ensure_binding(cfg.shared_root, cfg.machine_name)
+        initial_ready = wait_for_readiness(runtime, capture_readiness_snapshot(runtime), timeout_seconds=30)
+        assert initial_ready["ready"], initial_ready
+        assert not get_machine_agent_status(runtime)["waiting_for_first_registration"]
 
-        wait_until(
-            "registration-consumed",
-            lambda: not get_machine_agent_status(runtime)["waiting_for_first_registration"],
-            stage="first-registration:consume",
-            on_timeout=lambda: get_machine_agent_status(runtime),
-        )
+        from qqtools.plugins.qexp.agent.setup import initialize_project, register_projects
+
+        root = tmp_path / "project"
+        initialize_project(root)
+        registered = register_projects(runtime, [root])
+        assert registered["projects"][0]["status"] == "registered"
+
+        project_ready = wait_for_readiness(runtime, capture_readiness_snapshot(runtime), timeout_seconds=30)
+        assert project_ready["ready"], project_ready
+        assert len(project_ready["projects"]) == 1
         status = get_machine_agent_status(runtime)
         assert status["waiting_for_first_registration"] is False
         assert process.poll() is None

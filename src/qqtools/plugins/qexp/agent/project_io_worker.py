@@ -223,6 +223,7 @@ def _validate_binding(
         "scheduler_observe",
         "scheduler_primary_probe",
         "scheduler_quiescence_probe",
+        "idle_job_probe",
         "scheduler_claim",
         "scheduler_cursor_commit",
         "scheduler_launch_authorize",
@@ -1745,6 +1746,15 @@ def _scheduler_candidate(
     if classification.classification == "permanently_stale":
         return None, {}, None
     if classification.classification == "temporarily_unavailable":
+        if request.operation_kind == "idle_job_probe":
+            if classification.reason in {"dependency_waiting", "dependency_blocked"}:
+                return None, {}, "locally_ineligible"
+            if classification.reason == "group_paused" and classification.task is not None:
+                from ..runtime.group_namespace import read_group
+
+                group = read_group(cfg.shared_root, classification.task.group_name)["group"]
+                if group.get("dispatch_state") == "paused":
+                    return None, {}, "locally_ineligible"
         if classification.reason.startswith("dependency_"):
             return None, {}, "dependency_not_ready"
         return None, {}, "candidate_unresolved"
@@ -1779,6 +1789,8 @@ def _scheduler_candidate(
         group_revision = group_meta["revision"]
         group_dispatch_epoch = group_record.get("dispatch_epoch")
         group_worker_set_epoch = group_record.get("worker_set_epoch")
+        if request.operation_kind == "idle_job_probe" and group_record.get("dispatch_state") == "paused":
+            return None, {}, "locally_ineligible"
         if (
             group_record.get("dispatch_state") != "active"
             or type(group_dispatch_epoch) is not int
@@ -1866,6 +1878,9 @@ def _scheduler_quiescence_probe(request: ProjectIORequest) -> dict[str, Any]:
     session = decode_probe_session(request.parameters["probe_state"], request.project_id, cfg.machine_name, "gpu")
     keys = [(request.project_id, scope, "gpu") for scope in ("home", "shared")]
     session.begin_round("gpu", keys)
+    is_idle_job_probe = request.operation_kind == "idle_job_probe"
+    gpu_capacity = request.parameters.get("gpu_capacity") if is_idle_job_probe else None
+    cpu_capacity = request.parameters.get("cpu_capacity") if is_idle_job_probe else None
     budget = SliceBudget(
         WorkBudgetPolicy(
             record_hard_limit=64,
@@ -1916,6 +1931,14 @@ def _scheduler_quiescence_probe(request: ProjectIORequest) -> dict[str, Any]:
                     request, cfg, peek.reference, cursor, is_quiescence_probe=True
                 )
                 if candidate is not None:
+                    if is_idle_job_probe and (
+                        candidate["requested_gpus"] > gpu_capacity or candidate["requested_cpus"] > cpu_capacity
+                    ):
+                        # The task is valid demand but cannot run under this
+                        # capacity snapshot. Continue the census so a larger
+                        # eligible task does not get hidden behind it.
+                        session.record_progress(key, cursor)
+                        continue
                     session.record_progress(key, before)
                     return result("active")
                 if reason in {"candidate_unresolved", "dependency_not_ready"}:
@@ -3248,7 +3271,7 @@ def _run(
                 evidence = _scheduler_observe(request)
             elif request.operation_kind == "scheduler_primary_probe":
                 evidence = _scheduler_primary_probe(request)
-            elif request.operation_kind == "scheduler_quiescence_probe":
+            elif request.operation_kind in {"scheduler_quiescence_probe", "idle_job_probe"}:
                 evidence = _scheduler_quiescence_probe(request)
             elif request.operation_kind == "scheduler_claim":
                 # This last check deliberately takes no MachineRuntime lock:
@@ -3897,6 +3920,7 @@ def _run(
             "scheduler_observe": "project_io_scheduler_observation_failed",
             "scheduler_primary_probe": "project_io_scheduler_observation_failed",
             "scheduler_quiescence_probe": "project_io_scheduler_observation_failed",
+            "idle_job_probe": "project_io_idle_job_probe_failed",
             "scheduler_claim": "project_io_scheduler_claim_failed_before_commit",
             "scheduler_reservation_reconcile": "project_io_scheduler_reservation_reconcile_failed",
             "scheduler_due_offer": "project_io_scheduler_due_offer_failed",

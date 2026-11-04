@@ -97,11 +97,15 @@ from .helpers import (
     _active_machine_identity,
     _consume_first_registered_binding,
     _machine_is_true_idle,
+    _machine_only_recovery_complete,
+    _observe_unregistered_partitions,
     _pid_start_time_ticks,
     _publish_process_status,
     _publish_project_snapshots,
     _read_pid,
 )
+from .idle_job import IdleJobSupervisor, idle_job_status
+from .idle_job_integration import advance_machine_idle_job
 from .inventory import exact_binding_for_entry, load_inventory, reconcile_live_bindings_locked
 from .project_admin import _stop_verified_legacy_agent, migrate_project
 from .project_io_controller import ProjectIOController
@@ -272,6 +276,19 @@ def get_machine_agent_status(
             "warnings": [{"reason": "gpu_policy_unavailable", "message": "GPU policy status is unavailable."}],
             "agent_running": running,
         }
+    try:
+        idle_job = idle_job_status(machine_runtime)
+    except (OSError, RuntimeError, TypeError, ValueError, KeyError):
+        idle_job = {
+            "state": "blocked",
+            "reason": "status_unavailable",
+            "supervision_active": False,
+        }
+    if identity is None and idle_job.get("supervision_active") is True:
+        idle_job = dict(idle_job)
+        idle_job["state"] = "stopping" if idle_job.get("state") == "stopping" else "blocked"
+        idle_job["reason"] = "agent_unavailable"
+        idle_job["supervision_active"] = False
     result = {
         "machine_runtime_root": str(machine_runtime.root),
         "runtime_id": machine_runtime.instance_id,
@@ -297,6 +314,7 @@ def get_machine_agent_status(
         "pending_replacement": pending_replacement,
         "upgrade": upgrade,
         "gpu_policy": gpu_policy,
+        "idle_job": idle_job,
         "project_io_isolation": project_io_isolation,
         "warnings": list(gpu_policy.get("warnings", [])),
     }
@@ -384,6 +402,7 @@ def run_machine_agent_loop(
     started_at = utc_now()
     control_plane: _MachineControlPlane | None = None
     project_io_executor: ProjectIOExecutor | None = None
+    idle_job_supervisor: IdleJobSupervisor | None = None
     scheduler_wakeup = threading.Event()
     stop = False
     stop_reason: str | None = None
@@ -538,6 +557,7 @@ def run_machine_agent_loop(
             # thread starts.  The lifecycle must never expose a production
             # window where the legacy authority supervisor can claim a turn.
             _dispatch._project_io_controller(machine_runtime)
+            idle_job_supervisor = IdleJobSupervisor(machine_runtime, runtime_id=machine_runtime.instance_id)
             previous_term = signal.signal(signal.SIGTERM, request_stop)
             previous_int = signal.signal(signal.SIGINT, request_stop)
             previous_hup = signal.signal(signal.SIGHUP, request_stop)
@@ -751,7 +771,35 @@ def run_machine_agent_loop(
                             # A completed cycle acknowledges only the durable view
                             # whose enabled projects have been reconciled.
                             policy_revision_acknowledged = policy_revision_requested
-                    ready = bool(
+                    partition_observation = (
+                        _observe_unregistered_partitions(machine_runtime, observed_bindings)
+                        if cycle_completed and enablement_view_converged
+                        else "blocked"
+                    )
+                    if idle_job_supervisor is not None:
+                        advance_machine_idle_job(
+                            machine_runtime,
+                            idle_job_supervisor,
+                            available_gpus=available_gpus,
+                            instance_id=instance_id,
+                            cycle_completed=cycle_completed,
+                            bindings=observed_bindings,
+                            registry_revision=registry_revision,
+                            enablement_converged=enablement_view_converged,
+                            partition_observation=partition_observation,
+                        )
+                    machine_only_ready = bool(
+                        not enabled_project_ids
+                        and agent_config.agent_mode == "daemon"
+                        and cycle_completed
+                        and enablement_view_converged
+                        and policy_revision_acknowledged == policy_revision_requested
+                        and idle_job_supervisor is not None
+                        and _machine_only_recovery_complete(
+                            machine_runtime, observed_bindings, partition_observation=partition_observation
+                        )
+                    )
+                    ready = machine_only_ready or bool(
                         cycle_completed
                         and enablement_view_converged
                         and enabled_project_ids
@@ -769,7 +817,7 @@ def run_machine_agent_loop(
                         instance_id=instance_id,
                         pid=os.getpid(),
                         start_ticks=start_ticks,
-                        waiting_for_first_registration=not has_consumed_binding,
+                        waiting_for_first_registration=(not has_consumed_binding and not machine_only_ready),
                         runtime_id=machine_runtime.instance_id,
                         configured_agent_mode=agent_config.agent_mode,
                         observed_agent_mode=observed_agent_mode,
@@ -787,6 +835,11 @@ def run_machine_agent_loop(
                     machine_runtime.last_enablement_reconciliation_probe = _dispatch._enablement_reconciliation_probe(
                         machine_runtime, None
                     )
+                    if idle_job_supervisor is not None:
+                        try:
+                            idle_job_supervisor.tick(demand="unknown")
+                        except (AttributeError, OSError, RuntimeError, ValueError, KeyError, TypeError):
+                            pass
                     try:
                         _publish_process_status(
                             machine_runtime,
@@ -851,6 +904,11 @@ def run_machine_agent_loop(
             primary_traceback = exc.__traceback__
             stop = True
             stop_reason = "unhandled_exception"
+            if idle_job_supervisor is not None:
+                try:
+                    idle_job_supervisor.tick(demand="unknown")
+                except (AttributeError, OSError, RuntimeError, TypeError, ValueError, KeyError):
+                    pass
             try:
                 exception_text = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
             except BaseException:
@@ -910,6 +968,21 @@ def run_machine_agent_loop(
                     controller.progress.close()
 
             run_cleanup_step("progress_observation_close", close_progress_observation)
+
+            def close_machine_only_partition_scan() -> None:
+                previous_scan = getattr(machine_runtime, "_machine_only_partition_scan", None)
+                if previous_scan is None:
+                    return
+                previous_scan[1].close()
+                machine_runtime._machine_only_partition_scan = None
+
+            run_cleanup_step("machine_only_partition_scan_close", close_machine_only_partition_scan)
+
+            def shutdown_idle_job() -> None:
+                if idle_job_supervisor is not None and not idle_job_supervisor.shutdown():
+                    raise RuntimeError("Idle Job supervisor shutdown failed.")
+
+            run_cleanup_step("idle_job_supervisor_shutdown", shutdown_idle_job)
 
             if project_io_executor is None:
                 record_cleanup_step("project_io_executor_shutdown")
@@ -1216,14 +1289,36 @@ def ensure_machine_agent_started(
 
 
 def _stop_machine_agent_locked(machine_runtime: MachineRuntime, *, timeout: float) -> bool:
+    from ..runtime.resources.idle_job import read_idle_job_ownership
+    from .idle_job import DEFAULT_SHUTDOWN_EXTRA_SECONDS
+    from .idle_job_config import load_idle_job_config
+
+    try:
+        has_idle_job = read_idle_job_ownership(machine_runtime.root) is not None
+        idle_config = load_idle_job_config(machine_runtime)
+        if has_idle_job or idle_config.enabled:
+            timeout += idle_config.stop_timeout_seconds + DEFAULT_SHUTDOWN_EXTRA_SECONDS
+    except (OSError, RuntimeError, ValueError, TypeError, KeyError) as exc:
+        raise MachineAgentStopError("recovery_blocked: Idle Job ownership cannot be verified.") from exc
+
+    def reclaim_idle_job() -> None:
+        try:
+            if read_idle_job_ownership(machine_runtime.root) is not None:
+                if not IdleJobSupervisor(machine_runtime).shutdown(timeout_seconds=timeout):
+                    raise MachineAgentStopError("recovery_blocked: Idle Job cleanup could not be confirmed.")
+        except (OSError, ValueError, TypeError, KeyError) as exc:
+            raise MachineAgentStopError("recovery_blocked: Idle Job ownership cannot be verified.") from exc
+
     identity = _active_machine_identity(machine_runtime)
     if identity is None:
+        reclaim_idle_job()
         machine_runtime.paths["pid"].unlink(missing_ok=True)
         return False
     pid, _instance_id, start_ticks = identity
     try:
         os.kill(pid, signal.SIGTERM)
     except ProcessLookupError:
+        reclaim_idle_job()
         return True
     except OSError as exc:
         raise MachineAgentStopError(f"machine agent {pid} could not be signalled: {exc}") from exc
@@ -1244,6 +1339,7 @@ def _stop_machine_agent_locked(machine_runtime: MachineRuntime, *, timeout: floa
             f"heartbeat_state={heartbeat.get('state', 'unknown')!r} "
             f"heartbeat_thread_alive={heartbeat.get('thread_alive')!r}."
         )
+    reclaim_idle_job()
     return True
 
 

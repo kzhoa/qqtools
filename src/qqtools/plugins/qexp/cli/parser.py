@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import re
 import sys
 from pathlib import Path
 
@@ -283,6 +284,20 @@ def _add_common_options(parser: argparse.ArgumentParser, *, include_format: bool
         if isinstance(action, argparse._SubParsersAction):
             for child in action.choices.values():
                 _add_common_options(child, include_format=include_format)
+
+
+def _idle_job_gpu_ids(value: str) -> tuple[int, ...]:
+    """Parse the signed GPU selectors accepted by the Idle Job configuration."""
+    if (
+        not isinstance(value, str)
+        or not value
+        or any(re.fullmatch(r"[+-]?\d+", item) is None for item in value.split(","))
+    ):
+        raise argparse.ArgumentTypeError("--gpu-ids must be a comma-separated list of signed integers.")
+    try:
+        return tuple(int(item, 10) for item in value.split(","))
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("--gpu-ids must be a comma-separated list of signed integers.") from exc
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -958,6 +973,43 @@ def build_parser() -> argparse.ArgumentParser:
         context=ContextKind.MACHINE,
         modes=OutputMode.FINITE,
         output_kinds=OutputKind.CPU_LANE,
+    )
+    idle_job = agent_config_sub.add_parser("idle-job", help="Inspect or configure the optional Idle Job.")
+    idle_job_sub = idle_job.add_subparsers(dest="idle_job_action", required=True)
+    idle_job_show = idle_job_sub.add_parser("show", help="Show the Idle Job configuration.")
+    _add_output_format(idle_job_show)
+    bind_command(
+        idle_job_show,
+        handler="agent_config_idle_job_show",
+        context=ContextKind.MACHINE,
+        modes=OutputMode.FINITE,
+        output_kinds=OutputKind.IDLE_JOB,
+    )
+    idle_job_set = idle_job_sub.add_parser("set", help="Update Idle Job configuration fields.")
+    idle_job_enabled = idle_job_set.add_mutually_exclusive_group()
+    idle_job_enabled.add_argument("--enable", action="store_true", default=None)
+    idle_job_enabled.add_argument("--disable", action="store_true", default=None)
+    idle_job_set.add_argument("--command", dest="idle_job_command")
+    idle_job_set.add_argument("--gpu-ids", type=_idle_job_gpu_ids)
+    idle_job_set.add_argument("--working-directory")
+    idle_job_set.add_argument("--idle-delay-seconds", type=float)
+    idle_job_set.add_argument("--stop-timeout-seconds", type=float)
+    _add_output_format(idle_job_set)
+    bind_command(
+        idle_job_set,
+        handler="agent_config_idle_job_set",
+        context=ContextKind.MACHINE,
+        modes=OutputMode.FINITE,
+        output_kinds=OutputKind.IDLE_JOB,
+    )
+    idle_job_disable = idle_job_sub.add_parser("disable", help="Disable the Idle Job.")
+    _add_output_format(idle_job_disable)
+    bind_command(
+        idle_job_disable,
+        handler="agent_config_idle_job_disable",
+        context=ContextKind.MACHINE,
+        modes=OutputMode.FINITE,
+        output_kinds=OutputKind.IDLE_JOB,
     )
 
     notifications = commands.add_parser(

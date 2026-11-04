@@ -67,6 +67,7 @@ PROJECT_IO_OPERATIONS = frozenset(
         "scheduler_observe",
         "scheduler_primary_probe",
         "scheduler_quiescence_probe",
+        "idle_job_probe",
         "scheduler_claim",
         "scheduler_cursor_commit",
         "scheduler_launch_authorize",
@@ -1219,6 +1220,18 @@ def _request_parameters(operation_kind: str, value: object) -> dict[str, Any]:
         parameters["probe_state"] = validate_probe_state(parameters["probe_state"])
         if any(route["recheck"] is not None for route in parameters["probe_state"]["routes"].values()):
             raise ValueError("scheduler quiescence probe cannot carry primary dependency rechecks.")
+    elif operation_kind == "idle_job_probe":
+        _require_exact_keys(
+            parameters,
+            frozenset({"machine_name", "probe_state", "gpu_capacity", "cpu_capacity"}),
+            "idle_job_probe parameters",
+        )
+        parameters["machine_name"] = _require_identifier(parameters["machine_name"], "machine_name")
+        parameters["probe_state"] = validate_probe_state(parameters["probe_state"])
+        if any(route["recheck"] is not None for route in parameters["probe_state"]["routes"].values()):
+            raise ValueError("idle job probe cannot carry primary dependency rechecks.")
+        parameters["gpu_capacity"] = _require_nonnegative_int(parameters["gpu_capacity"], "gpu_capacity")
+        parameters["cpu_capacity"] = _require_nonnegative_int(parameters["cpu_capacity"], "cpu_capacity")
     elif operation_kind == "scheduler_primary_probe":
         _require_exact_keys(
             parameters,
@@ -1547,6 +1560,10 @@ def _request_fields(value: object) -> dict[str, Any]:
         _require_exact_keys(revisions, frozenset(), "scheduler_quiescence_probe source_revisions")
         if offer_id is not None:
             raise ValueError("scheduler quiescence probe cannot name a provisional offer.")
+    if operation_kind == "idle_job_probe":
+        _require_exact_keys(revisions, frozenset(), "idle_job_probe source_revisions")
+        if offer_id is not None:
+            raise ValueError("idle job probe cannot name a provisional offer.")
     if operation_kind in {"group_service_probe", "group_service_advance"}:
         _require_exact_keys(revisions, frozenset(), f"{operation_kind} source_revisions")
         if offer_id is not None:
@@ -1759,6 +1776,7 @@ class ProjectIOResult:
             "project_io_recovery_group_authority_failed",
             "project_io_recovery_capture_transition_failed",
             "project_io_scheduler_observation_failed",
+            "project_io_idle_job_probe_failed",
             "project_io_scheduler_claim_failed_before_commit",
             "project_io_scheduler_cursor_commit_failed",
             "project_io_scheduler_launch_authorize_failed",
@@ -2016,7 +2034,7 @@ def _validate_evidence(request: ProjectIORequest, status: str, value: Mapping[st
                     )
             elif next_due_at is not None:
                 raise ValueError("maintenance_descriptor_advance next_due_at must be null outside waiting state.")
-        elif request.operation_kind == "scheduler_quiescence_probe":
+        elif request.operation_kind in {"scheduler_quiescence_probe", "idle_job_probe"}:
             _require_exact_keys(evidence, frozenset({"state", "probe_state"}), "scheduler quiescence evidence")
             if evidence["state"] not in {"quiescent", "active", "pending"}:
                 raise ValueError("scheduler quiescence state is invalid.")

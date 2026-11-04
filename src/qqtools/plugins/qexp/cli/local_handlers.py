@@ -11,6 +11,7 @@ from pathlib import Path
 
 from ..agent.config import agent_config_payload, set_agent_config
 from ..agent.context import MachineRuntime, MachineRuntimeUninitializedError
+from ..agent.idle_job_config import load_idle_job_config, set_idle_job_config
 from ..agent.lifecycle import (
     MachineAgentStartBlockedError,
     MachineAgentStartError,
@@ -21,7 +22,12 @@ from ..agent.lifecycle import (
     stop_machine_agent,
 )
 from ..agent.project_admin import migrate_project, project_migration_state
-from ..agent.readiness import capture_readiness_snapshot, evaluate_readiness, wait_for_readiness
+from ..agent.readiness import (
+    allows_machine_only_start,
+    capture_readiness_snapshot,
+    evaluate_readiness,
+    wait_for_readiness,
+)
 from ..agent.scheduler_diagnostics import SchedulerDiagnosticStore
 from ..agent.setup import (
     SetupOperationalError,
@@ -76,6 +82,9 @@ LOCAL_HANDLERS = frozenset(
         "agent_config_gpus_reset",
         "agent_config_cpu_show",
         "agent_config_cpu_set",
+        "agent_config_idle_job_show",
+        "agent_config_idle_job_set",
+        "agent_config_idle_job_disable",
         "config_show",
         "config_set",
         "config_reset",
@@ -595,7 +604,9 @@ def dispatch_local(
         ) as exc:
             raise CliOperationalError(str(exc)) from exc
         registered_ids = {binding.project_id for binding in current_bindings if binding.enabled}
-        if not snapshot["project_ids"] or not registered_ids.intersection(snapshot["project_ids"]):
+        if (not snapshot["project_ids"] and not allows_machine_only_start(runtime, snapshot)) or (
+            snapshot["project_ids"] and not registered_ids.intersection(snapshot["project_ids"])
+        ):
             result = evaluate_readiness(runtime, snapshot)
             return CommandOutcome(2, CliOutput(OutputKind.AGENT_READINESS, result))
         ready = evaluate_readiness(runtime, snapshot)
@@ -730,6 +741,63 @@ def dispatch_local(
         return CommandOutcome(0, output)
     if handler.startswith("agent_config_"):
         runtime = MachineRuntime(args.machine_runtime_root)
+        if handler in {
+            "agent_config_idle_job_show",
+            "agent_config_idle_job_set",
+            "agent_config_idle_job_disable",
+        }:
+            changes: dict[str, object] = {}
+            if handler == "agent_config_idle_job_set":
+                enabled = getattr(args, "enable", None)
+                disabled = getattr(args, "disable", None)
+                if enabled is not None:
+                    changes["enabled"] = bool(enabled)
+                elif disabled is not None:
+                    changes["enabled"] = not bool(disabled)
+                for argument, field in (
+                    ("idle_job_command", "command"),
+                    ("gpu_ids", "gpu_ids"),
+                    ("idle_delay_seconds", "idle_delay_seconds"),
+                    ("stop_timeout_seconds", "stop_timeout_seconds"),
+                ):
+                    value = getattr(args, argument, None)
+                    if value is not None:
+                        changes[field] = value
+                working_directory = getattr(args, "working_directory", None)
+                if working_directory is not None:
+                    changes["working_directory"] = working_directory or None
+                if not changes:
+                    raise CliUsageError("idle-job set requires at least one option.")
+            try:
+                runtime.require_initialized()
+            except (MachineRuntimeUninitializedError, OSError, RuntimeError, TypeError, ValueError) as exc:
+                raise CliOperationalError(str(exc)) from exc
+            if handler == "agent_config_idle_job_show":
+                try:
+                    config = load_idle_job_config(runtime)
+                except (OSError, RuntimeError, TypeError, ValueError) as exc:
+                    raise CliOperationalError(str(exc)) from exc
+                action = "shown"
+            else:
+                try:
+                    setter_changes = {"enabled": False} if handler == "agent_config_idle_job_disable" else changes
+                    config = set_idle_job_config(runtime, **setter_changes)
+                except (MachineRuntimeUninitializedError, OSError, RuntimeError) as exc:
+                    raise CliOperationalError(str(exc)) from exc
+                except (TypeError, ValueError) as exc:
+                    raise CliUsageError(str(exc)) from exc
+                action = "updated"
+            return CommandOutcome(
+                0,
+                CliOutput(
+                    OutputKind.IDLE_JOB,
+                    {
+                        "machine_runtime_root": str(runtime.root),
+                        "idle_job": config.to_dict(),
+                        "action": action,
+                    },
+                ),
+            )
         if handler.startswith("agent_config_gpus_"):
             runtime.ensure_layout()
             if handler == "agent_config_gpus_show":

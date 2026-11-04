@@ -1,7 +1,7 @@
 ---
 doc_type: spec
 status: active
-updated_at: 2026-11-02
+updated_at: 2026-11-04
 archived_at:
 ---
 
@@ -4228,7 +4228,14 @@ qexp agent run
 ```
 
 `agent start` ensures a detached agent, waits for current-generation readiness, and does not
-restart a healthy process. `agent run` keeps
+restart a healthy process. Daemon startup accepts a verified empty enabled Project roster after
+MachineRuntime initialization, independently of optional idle work. A successful dispatch cycle,
+converged inventory/registry view, policy acknowledgement, and completed local ownership/recovery
+reconciliation establish machine-only readiness. The readiness status must match the live agent's
+instance ID, PID, process start identity, and runtime ID. Unknown registry or recovery evidence
+blocks readiness; enabled Projects retain their existing readiness requirements. This implements
+the owner-approved startup compatibility decision of 2026-11-03. On-demand startup retains its
+registered-Project prerequisite. `agent run` keeps
 the agent in the current terminal for debugging. It has no structured output format or finite
 startup record. Restart readiness is observed separately: process replacement may return while
 Project readiness remains pending, and `agent status` reports later convergence. Both modes auto-start after local submission;
@@ -4912,3 +4919,59 @@ Project migration or a fleet barrier. Existing producers retain original
 channels; only newly launched enabled Attempts receive v3. Released-source
 coexistence must cover old cleanup/writers, supervision, scheduling and final
 outcome recovery separately from new-Attempt activation.
+
+## Machine Idle Job ownership and admission
+
+Idle Job uses machine-local `idle-job/config.json`, with a versioned `idle_job`
+configuration envelope and revisioned updates under the existing config guard.
+Global agent-mode changes use the same guard and reject on-demand mode while
+Idle Job is enabled. There is no temporary compatibility adapter.
+
+`idle-job/ownership.json` is an independent versioned ownership envelope. It
+binds runtime ID, boot ID, unique instance ID, phase, config revision, resolved
+GPU IDs, parent PID/start ticks, and creation time. Per-instance `intent.json`
+precedes spawning; `supervisor.json` and `process.json` record exact process
+identities before the user command can run. `stop.json` requests termination;
+`exit.json` records verified terminal cleanup. Unknown or malformed ownership
+blocks admission and replacement rather than being discarded. Machine identity
+replacement includes Idle Job in its local execution obligations.
+
+Both CPU and GPU reservation admission acquire the outer machine-local
+Idle Job admission guard. Once existing resource/policy checks prove training
+eligible, admission publishes a demand revision and requests an owned Idle Job's
+stop. It must not grant a training reservation until ownership is released.
+Idle launch holds the same guard, rechecks configuration and demand revision,
+observes all GPU and CPU reservations sequentially, and validates current GPU
+policy under the GPU reservation lock before publishing intent and ownership.
+GPU and CPU reservation locks are never nested. Idle Job consumes no Task
+reservation IDs, and its occupancy is not subtracted from training eligibility.
+
+A dedicated read-only Project I/O `idle_job_probe` performs bounded, resumable
+ready-route censuses using current GPU/CPU capacity. It scans past known
+ineligible candidates so they cannot hide feasible peers. Its coordinator binds
+proofs to runtime/Project generation, executor epoch, registry revision, capacity,
+and activation turn. Unknown or incomplete proofs cannot establish idleness.
+These probes neither acknowledge nor retire the scheduler activation lane, and
+do not change protected on-demand exit semantics. Existing current full
+quiescence proofs may be reused.
+
+On Linux a supervisor and a separate process-group guardian use parent-death
+signals and pidfds. The guardian persists its identity before a GO handshake,
+launches the command with `shell=False`, and owns cleanup of ordinary descendants.
+Abrupt agent or supervisor death therefore cannot leave a running unmanaged
+command group indefinitely. Direct PID signalling is not cleanup authority.
+Commands that detach into another session are unsupported, and this mechanism is
+not security isolation. Log write failures also require bounded process cleanup.
+
+Machine-only daemon readiness additionally checks orphan Project partitions with
+bounded local discovery, including directory replacement and symlink rejection.
+This prevents an empty registry from erasing unresolved local ownership evidence.
+Idle Job supervision starts before readiness publication; command delay and
+command failure remain independently observable. An unknown demand observation
+resets the continuous idle interval, and restart requires a fresh interval.
+Readiness and Idle Job share one partition scan observation per cycle. A pending
+rescan preserves an already established idle interval but cannot permit launch;
+the next complete clear sweep is required. Initial incomplete discovery cannot
+start the interval. Discovered evidence, scan errors, or changed registry/root
+identity invalidate it. Agent stop includes the configured Idle Job grace and
+bounded cleanup allowance, and reconciles retained ownership after agent exit.

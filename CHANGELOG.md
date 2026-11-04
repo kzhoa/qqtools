@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- feat: allow machine-level qexp daemon startup before Project registration, and add opt-in
+  Idle Job commands with GPU selection, training preemption, independent status, and bounded logs.
+
 ## v1.3.27
 
 - feat: give launched qexp Attempts durable holder-bound ownership, preserving exact running
