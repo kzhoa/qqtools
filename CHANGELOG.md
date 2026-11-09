@@ -20,6 +20,7 @@
 - compat: remove post-launch lease renewal/expiry writers and deadline-only termination decision
   creation for the 1.3.28 lifecycle boundary; retain exact historical ownership adoption,
   already-committed renewal recovery, and timeout-decision retirement through the transition window.
+  Claim lease renewal and expiry before launch remain enforced.
 
 ## v1.3.27
 
