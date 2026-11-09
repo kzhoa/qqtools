@@ -21,6 +21,8 @@
   retaining canonical-directory identity checks and rejecting missing Group storage.
 - fix: keep bounded foreign-home deadline scans eligible after local ready routes become
   quiescent, allowing a live Group helper to offer and execute a stopped home's elapsed Tasks.
+- fix: exclude current holder-bound processes from historical orphan recovery, preventing
+  repeated recovery probes from blocking restart readiness and pending launch handoffs.
 - compat: remove post-launch lease renewal/expiry writers and deadline-only termination decision
   creation for the 1.3.28 lifecycle boundary; retain exact historical ownership adoption,
   already-committed renewal recovery, and timeout-decision retirement through the transition window.
