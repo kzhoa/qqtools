@@ -1679,12 +1679,7 @@ def _dispatch_isolated_machine_cycle(
 
     try:
         due_offer_completions = controller.advance_scheduler_due_offers(
-            [
-                binding
-                for binding in ordered_bindings
-                if binding.project_id not in blocked_projects
-                and not controller.scheduler_is_quiescent(binding, registry_revision)
-            ],
+            [binding for binding in ordered_bindings if binding.project_id not in blocked_projects],
             registry_revision,
         )
         if any(

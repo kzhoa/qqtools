@@ -179,7 +179,6 @@ def _validate_root_contract(cfg: RootConfig, *, should_require_cpu_lane: bool) -
         "schema",
         "project",
         "clock-observations",
-        group_directory(cfg.shared_root).name,
         "tasks",
         "attempts",
         "operations",
@@ -190,7 +189,15 @@ def _validate_root_contract(cfg: RootConfig, *, should_require_cpu_lane: bool) -
         "events",
         "indexes",
     }
-    missing = sorted(name for name in required if not (cfg.shared_root / name).exists())
+    missing = [name for name in required if not (cfg.shared_root / name).exists()]
+    groups = group_directory(cfg.shared_root)
+    if not groups.exists():
+        # Activation can atomically move the canonical directory after it was
+        # resolved. Re-resolve with journal identity checks before failing.
+        groups = group_directory(cfg.shared_root)
+        if not groups.exists():
+            missing.append(groups.name)
+    missing.sort()
     if missing:
         raise RuntimeError(f"qexp schema-6 root is incomplete; missing {missing}.")
     required_subdirs = [

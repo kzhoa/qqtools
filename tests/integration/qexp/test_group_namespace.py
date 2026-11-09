@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from qqtools.plugins.qexp import init_shared_root, submit
+from qqtools.plugins.qexp import layout as layout_module
 from qqtools.plugins.qexp.agent.context import MachineRuntime
 from qqtools.plugins.qexp.agent.setup import initialize_machine
 from qqtools.plugins.qexp.commands.group import (
@@ -140,6 +141,29 @@ def test_group_reader_retries_path_resolved_before_cutover(project, monkeypatch)
     assert has_activated
 
 
+def test_root_validation_retries_concurrent_namespace_move(project, monkeypatch):
+    has_activated = False
+
+    def resolve_before_move(root):
+        nonlocal has_activated
+        directory = group_directory(root)
+        if not has_activated:
+            has_activated = True
+            assert activate(project)
+        return directory
+
+    monkeypatch.setattr(layout_module, "group_directory", resolve_before_move)
+    validate_root_contract(project)
+    assert has_activated
+    assert not (project.shared_root / "groups").exists()
+
+
+def test_root_validation_still_rejects_missing_groups(project):
+    (project.shared_root / "groups").rename(project.shared_root / "displaced")
+    with pytest.raises(RuntimeError, match="incomplete; missing .*groups"):
+        validate_root_contract(project)
+
+
 @pytest.mark.parametrize("damage", ["missing_journal", "missing_directory", "different_directory", "symlink"])
 def test_activated_namespace_damage_never_falls_back_to_old_truth(project, damage):
     cfg = project
@@ -159,6 +183,8 @@ def test_activated_namespace_damage_never_falls_back_to_old_truth(project, damag
         read_group(cfg.shared_root, "experiment")
     with pytest.raises(RuntimeError, match="Group authority"):
         activate(cfg)
+    with pytest.raises(RuntimeError, match="Group authority"):
+        validate_root_contract(cfg)
 
 
 def test_legacy_removal_blocks_without_changing_worker_task_or_capacity(project):

@@ -2115,6 +2115,10 @@ claim or local capacity authority, and requires no machine-local effect. Missing
 or outcome-unknown results are retried from durable deadline and Task truth; disabled or replaced
 bindings start no new due-offer request. The isolated production dispatch does not call the
 synchronous whole-Project maintenance entry to preserve this behavior.
+Ready-route quiescence does not suppress due-offer scans on a resident binding:
+another machine's home-queued Task may become runnable here only after its deadline
+is offered. The due-offer family receives an ordinary background turn before
+service-lane closure; final binding retirement stops new scans for dormant Projects.
 
 Initial ready-index activation uses the closed `scheduler_ready_index_build` operation. A request
 names only the exact enabled, validated binding; it carries no source revision or provisional

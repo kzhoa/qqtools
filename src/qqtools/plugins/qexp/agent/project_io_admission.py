@@ -30,13 +30,17 @@ _BACKGROUND_FAMILY_ORDER = {
     # Give its finite build slices the next ordinary turn after activation,
     # before periodic services that can already resume from durable state.
     "scheduler_ready_index_build": 5,
-    "group_service_probe": 6,
-    "group_service_advance": 7,
-    "recovery_group_authority": 8,
-    "submission_control_service": 9,
-    "observation_service": 10,
-    "maintenance_descriptor_advance": 11,
-    "activation_consumer_ack": 12,
+    # A helper can have no ready-route demand until this bounded scan offers
+    # another machine's elapsed Task. Run it before service-lane closure can
+    # make that apparently empty binding dormant.
+    "scheduler_due_offer": 6,
+    "group_service_probe": 7,
+    "group_service_advance": 8,
+    "recovery_group_authority": 9,
+    "submission_control_service": 10,
+    "observation_service": 11,
+    "maintenance_descriptor_advance": 12,
+    "activation_consumer_ack": 13,
 }
 _PRIMARY_FAMILY_ORDER = {
     # Finish an already-produced empty scan before starting another proof.

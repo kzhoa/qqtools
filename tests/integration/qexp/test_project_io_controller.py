@@ -1035,16 +1035,21 @@ def test_isolated_dispatch_launches_healthy_peer_without_legacy_project_io(
     project_io_executor.shutdown()
 
 
+@pytest.mark.parametrize("home_machine", ["gpu-1", "gpu-2"])
 def test_isolated_dispatch_advances_due_offer_without_legacy_maintenance(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    home_machine: str,
 ) -> None:
     runtime = MachineRuntime(tmp_path / "machine")
     initialize_machine(runtime, "gpu-1")
     cfg, binding, _revision, _bindings = _registered(tmp_path, "project", runtime)
     create_group(cfg, "exp")
+    if home_machine != cfg.machine_name:
+        init_shared_root(cfg.shared_root, home_machine, runtime_root=tmp_path / "other-runtime")
+        change_worker(cfg, "exp", home_machine, "add")
     task = submit(
-        cfg,
+        replace(cfg, machine_name=home_machine),
         ["echo", "due"],
         group="exp",
         sharing_mode="spillover",

@@ -3112,8 +3112,8 @@ class ProjectIOController:
         registry_revision: int,
         service_key: tuple[_ValidationIdentity, str, str, str],
     ) -> None:
-        if self.scheduler_is_quiescent(binding, registry_revision):
-            return
+        # Ready-route absence does not settle foreign-home deadline work.
+        # Preserve an admitted scan even if that independent census finished.
         try:
             request = self.executor.prepare_scheduler_due_offer(binding, registry_revision)
         except (OSError, RuntimeError, ValueError):
