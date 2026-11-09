@@ -54,6 +54,7 @@ from .working_set import BindingTurn
 _INITIAL_BACKOFF_SECONDS = 5.0
 _MAX_BACKOFF_SECONDS = 300.0
 _RECOVERY_WAIT_RETRY_SECONDS = 1.0
+_SCHEDULER_DUE_OFFER_IDLE_RETRY_SECONDS = 1.0
 _MAX_RETAINED_SCHEDULER_INTENTS = 64
 _MAX_RETAINED_RESERVATION_RECONCILIATIONS = 256
 _MAX_MACHINE_SNAPSHOT_HEALTH_ITEMS = 8
@@ -3064,7 +3065,12 @@ class ProjectIOController:
             self._started_requests.discard(request.request_id)
             if consumed.status == "completed":
                 completions[binding.project_id] = dict(consumed.evidence)
-                self._service_backoff.pop(key, None)
+                if consumed.evidence.get("outcome") == "noop" and consumed.evidence.get("reason") == "no_due_deadline":
+                    self._service_backoff[key] = _FailureBackoff(
+                        0, self._monotonic() + _SCHEDULER_DUE_OFFER_IDLE_RETRY_SECONDS
+                    )
+                else:
+                    self._service_backoff.pop(key, None)
             else:
                 self._record_service_failure(key)
 

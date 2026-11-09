@@ -1396,7 +1396,8 @@ def test_due_offer_worker_reports_noop_and_disabled_binding_starts_nothing(tmp_p
     _cfg, binding, revision, bindings = _registered(tmp_path, "project", runtime)
     executor = ProjectIOExecutor(runtime)
     executor.begin_epoch()
-    controller = ProjectIOController(runtime, executor)
+    clock = [100.0]
+    controller = ProjectIOController(runtime, executor, monotonic=lambda: clock[0])
     _advance_until_validated(controller, bindings, revision, binding.project_id)
 
     completions = {}
@@ -1411,6 +1412,22 @@ def test_due_offer_worker_reports_noop_and_disabled_binding_starts_nothing(tmp_p
         "reason": "no_due_deadline",
         "task_id": None,
     }
+
+    # An empty scan must yield its worker slot to other service lanes until
+    # the next poll; ready-route quiescence must not permanently disable it.
+    for _ in range(8):
+        controller.advance_scheduler_due_offers(bindings, revision)
+        assert not executor.unresolved_requests()
+    clock[0] += 1.0
+    controller.advance_scheduler_due_offers(bindings, revision)
+    assert any(request.operation_kind == "scheduler_due_offer" for request in executor.unresolved_requests())
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        if binding.project_id in controller.advance_scheduler_due_offers(bindings, revision):
+            break
+        time.sleep(0.02)
+    else:
+        raise AssertionError("empty due-offer scan did not resume after its poll interval")
 
     disabled = replace(binding, enabled=False)
     controller.advance_scheduler_due_offers([disabled], revision)

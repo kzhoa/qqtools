@@ -2115,6 +2115,8 @@ claim or local capacity authority, and requires no machine-local effect. Missing
 or outcome-unknown results are retried from durable deadline and Task truth; disabled or replaced
 bindings start no new due-offer request. The isolated production dispatch does not call the
 synchronous whole-Project maintenance entry to preserve this behavior.
+An empty due-offer scan yields for one monotonic second before polling again, so it
+does not repeatedly consume worker slots needed by startup and finite service closure.
 Ready-route quiescence does not suppress due-offer scans on a resident binding:
 another machine's home-queued Task may become runnable here only after its deadline
 is offered. The due-offer family receives an ordinary background turn before
