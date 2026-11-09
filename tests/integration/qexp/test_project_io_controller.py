@@ -3762,6 +3762,8 @@ def test_controller_replays_ambiguous_version_refresh_without_replacing_generati
 
 
 def test_blocked_registration_renewal_does_not_delay_healthy_peer(tmp_path: Path) -> None:
+    from qqtools.plugins.qexp.runtime.locks import exclusive
+
     runtime = MachineRuntime(tmp_path / "machine")
     initialize_machine(runtime, "gpu-1")
     blocked_cfg, blocked, _revision, _bindings = _registered(tmp_path, "blocked", runtime)
@@ -3771,30 +3773,28 @@ def test_blocked_registration_renewal_does_not_delay_healthy_peer(tmp_path: Path
     controller = ProjectIOController(runtime, executor)
     _advance_until_validated(controller, bindings, revision, blocked.project_id)
     _advance_until_validated(controller, bindings, revision, healthy.project_id)
-    blocked_registration = blocked_cfg.shared_root / "machines" / "gpu-1" / "registration.json"
-    original = blocked_registration.read_bytes()
-    blocked_registration.unlink()
-    os.mkfifo(blocked_registration)
-
+    # Registration records reject FIFOs before reading. Hold the real shared
+    # registration lock to keep this worker blocked inside a valid renewal.
     try:
-        completions = {}
-        deadline = time.monotonic() + 5.0
-        while time.monotonic() < deadline:
-            completions = controller.advance_registration_renewals(
-                bindings,
-                revision,
-                renewal_horizon_seconds=120.0,
-            )
-            if healthy.project_id in completions:
-                break
-            time.sleep(0.02)
+        with exclusive(shared_paths(blocked_cfg.shared_root)["locks"] / "registrations.lock"):
+            completions = {}
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline:
+                completions = controller.advance_registration_renewals(
+                    bindings,
+                    revision,
+                    renewal_horizon_seconds=120.0,
+                )
+                if healthy.project_id in completions:
+                    break
+                time.sleep(0.02)
 
-        assert completions[healthy.project_id]["outcome"] == "eligible"
-        assert load_machine_registration(healthy_cfg)["registration"]["generation"] == (healthy.registration_generation)
-        assert executor.status_view()["active_worker_count"] == 1
+            assert completions[healthy.project_id]["outcome"] == "eligible"
+            assert load_machine_registration(healthy_cfg)["registration"]["generation"] == (
+                healthy.registration_generation
+            )
+            assert executor.status_view()["active_worker_count"] == 1
     finally:
-        blocked_registration.unlink()
-        blocked_registration.write_bytes(original)
         executor.shutdown()
 
 
@@ -6472,7 +6472,7 @@ def test_authority_renewal_replay_only_reconciles_stale_request_after_restart(
 
 
 @pytest.mark.parametrize("entry_point", ["supervision", "dispatch"])
-def test_isolated_dispatch_authority_router_renews_from_local_manifest(
+def test_isolated_dispatch_authority_router_adopts_legacy_from_local_manifest(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     entry_point: str,
@@ -6491,6 +6491,8 @@ def test_isolated_dispatch_authority_router_renews_from_local_manifest(
     }
     attempt_file = attempt_path(cfg.shared_root, task.task_id, attempt.attempt_number)
     stored_attempt = AttemptRecord.from_dict(read_json(attempt_file))
+    authorized_at = datetime.now(timezone.utc).isoformat()
+    stored_attempt.authorization["launch_id"] = "legacy-launch"
     stored_attempt.phase = "running"
     stored_attempt.authority_mode = "bounded_lease"
     stored_attempt.process.update(process_identity)
@@ -6503,6 +6505,8 @@ def test_isolated_dispatch_authority_router_renews_from_local_manifest(
     claim.update(
         {
             "launch_state": "running",
+            "launch_id": "legacy-launch",
+            "launch_authorized_at": authorized_at,
             "authority_mode": "bounded_lease",
             "lease_expires_at": stored_attempt.lease["expires_at"],
         }
@@ -6565,7 +6569,7 @@ def test_isolated_dispatch_authority_router_renews_from_local_manifest(
 
     def advance_with_local_io_only() -> None:
         # Guard only the controller process. Fresh worker interpreters must still
-        # read and mutate the Project to complete the actual lease transaction.
+        # read and mutate the Project to complete the legacy ownership adoption.
         def reject_project_access(operation):
             def checked(path, *args, **kwargs):
                 if isinstance(path, (str, bytes, os.PathLike)):
@@ -6598,7 +6602,7 @@ def test_isolated_dispatch_authority_router_renews_from_local_manifest(
     while time.monotonic() < deadline:
         advance_with_local_io_only()
         local_process = read_json(manifest)["process"]
-        if local_process.get("authority_state") == "healthy":
+        if local_process.get("authority_state") == "local_safe":
             break
         time.sleep(0.02)
     else:
@@ -6613,19 +6617,20 @@ def test_isolated_dispatch_authority_router_renews_from_local_manifest(
         }
         resolved = [read_json(path) for path in executor.paths["project_io_resolved"].glob("*.json")]
         raise AssertionError(
-            "isolated authority router did not renew the local process: "
+            "isolated authority router did not adopt the legacy local process: "
             f"manifest={read_json(manifest)!r}, unresolved={unresolved!r}, "
             f"results={results!r}, resolved={resolved!r}"
         )
 
-    renewed_task = load_task(cfg, task.task_id)
-    renewed_attempt = AttemptRecord.from_dict(read_json(attempt_file))
-    assert renewed_task.claim_control["active_claim"]["clock_observation_id"]
-    assert (
-        renewed_task.claim_control["active_claim"]["clock_observation_id"]
-        == renewed_attempt.lease["clock_evidence"]["observation_id"]
-    )
-    assert local_process["lease_expires_at"] == renewed_attempt.lease["expires_at"]
+    adopted_task = load_task(cfg, task.task_id)
+    adopted_attempt = AttemptRecord.from_dict(read_json(attempt_file))
+    assert adopted_task.claim_control["active_claim"]["authority_mode"] == "holder_bound"
+    assert adopted_attempt.authority_mode == "holder_bound"
+    assert adopted_task.claim_control["active_claim"]["lease_expires_at"] is None
+    assert adopted_attempt.lease["expires_at"] is None
+    assert local_process["fencing_token"] == attempt.current_fencing_token
+    for key, value in process_identity.items():
+        assert local_process[key] == value
     assert local_process["custom_marker"] == {"preserve": True}
     executor.shutdown()
 
