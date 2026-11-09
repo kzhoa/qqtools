@@ -35,7 +35,8 @@ from qqtools.plugins.qexp.runtime.termination import (
     timeout_retirement_path,
     update_decision,
 )
-from qqtools.plugins.qexp.scheduler import claim_task
+from qqtools.plugins.qexp.scheduler import authorize_launch, claim_task
+from tests.fixtures.qexp_legacy_ownership import persist_legacy_termination_decision
 
 pytestmark = [pytest.mark.integration, pytest.mark.qexp_fast_io]
 
@@ -75,6 +76,13 @@ def _running_case(tmp_path: Path, *, trigger: str):
         project_id=binding.project_id,
     )
     assert attempt is not None
+    assert authorize_launch(
+        cfg,
+        task.task_id,
+        attempt.attempt_id,
+        attempt.current_fencing_token,
+        reservation_runtime_root=runtime.root,
+    )
     child = subprocess.Popen(["sleep", "60"], start_new_session=True)
     ticks = process_start_time_ticks(child.pid)
     assert ticks is not None
@@ -211,7 +219,7 @@ def test_historical_timeout_decision_retires_through_worker_without_signaling(
     )
     local_cfg = project_io_supervision._termination_local_config(runtime, binding)
     process = read_json(manifest)["process"]
-    decision = create_decision(
+    decision = persist_legacy_termination_decision(
         local_cfg,
         task_id=task.task_id,
         attempt_id=attempt.attempt_id,
@@ -680,7 +688,7 @@ def test_converged_historical_termination_does_not_repeat_shared_work_or_block_s
         candidate.trigger = trigger
         decision_id = project_io_supervision._termination_decision_id(candidate, trigger)
         local_cfg = project_io_supervision._termination_local_config(runtime, binding)
-        decision = create_decision(
+        decision = persist_legacy_termination_decision(
             local_cfg,
             task_id=task.task_id,
             attempt_id=attempt.attempt_id,

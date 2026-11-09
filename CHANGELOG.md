@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- compat: remove post-launch lease renewal/expiry writers and deadline-only termination decision
+  creation for the 1.3.28 lifecycle boundary; retain exact historical ownership adoption,
+  already-committed renewal recovery, and timeout-decision retirement through the transition window.
+
 - feat: allow machine-level qexp daemon startup before Project registration, and add opt-in
   Idle Job commands with GPU selection, training preemption, independent status, and bounded logs.
 

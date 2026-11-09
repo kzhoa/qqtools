@@ -805,11 +805,14 @@ active durable owner may run `qexp task retry TASK --supersede-attempt ATTEMPT`;
 old process may still run and write outputs, does not stop it, and keeps its reservation until exact
 absence is verified.
 
-Temporary legacy-writer and timeout-retirement adapters remain active for 1.3.27. The registry
-records legacy removal in 1.3.28 and temporary-transition purge in 1.3.29; cleanup requires evidence
-that supported upgrades and running legacy Attempts remain safe. The permanent source-evidence
-importer, ownership receipts, exact identity checks, and historical retirement interpretation
-remain supported after temporary cleanup.
+In 1.3.28, new post-launch lease renewals and deadline-only termination decisions are
+removed. Pre-launch claims still use bounded leases. Exact historical ownership adoption,
+completion of already-committed renewals, and timeout-decision retirement remain available;
+incomplete ownership evidence cannot authorize another execution lease or signal. The registry
+records these items as `legacy_removed`, with temporary-transition purge due in 1.3.29.
+Supported upgrades and running legacy Attempts retain their existing recovery paths. The permanent
+source-evidence importer, ownership receipts, exact identity checks, and historical retirement
+interpretation remain supported after temporary cleanup.
 
 ## Task history pagination
 

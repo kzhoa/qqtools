@@ -27,13 +27,14 @@ from qqtools.plugins.qexp.lease import (
 from qqtools.plugins.qexp.runtime.attempt_recovery import recover_running_attempt
 from qqtools.plugins.qexp.runtime.paths import attempt_path, shared_paths, task_path
 from qqtools.plugins.qexp.runtime.process_evidence import ProcessEvidence
-from qqtools.plugins.qexp.runtime.records import AttemptRecord
+from qqtools.plugins.qexp.runtime.records import AttemptRecord, utc_now
 from qqtools.plugins.qexp.runtime.store import atomic_replace, read_json
 from qqtools.plugins.qexp.runtime.tasks import load_task, save_task
 from qqtools.plugins.qexp.runtime.termination import (
     commit_local_unavailable,
     commit_signal,
     create_decision,
+    decision_path,
     is_recovery_blocked,
     send_signals,
     update_decision,
@@ -48,6 +49,7 @@ from qqtools.plugins.qexp.scheduler import (
     renew_project_io_attempt_lease,
     resume_starting_attempt,
 )
+from tests.fixtures.qexp_legacy_ownership import persist_legacy_renewal, persist_legacy_termination_decision
 
 pytestmark = [pytest.mark.integration, pytest.mark.qexp_fast_io]
 
@@ -106,14 +108,6 @@ def test_project_io_renewal_replays_after_task_commit_without_old_revision_rejec
     expected_task_revision = task_value["meta"]["revision"]
     expected_attempt_digest = hashlib.sha256(attempt_file.read_bytes()).hexdigest()
     request_id = "b" * 32
-    fence_calls = 0
-
-    def crash_before_attempt_commit() -> None:
-        nonlocal fence_calls
-        fence_calls += 1
-        if fence_calls == 3:
-            raise OSError("injected crash after Task renewal")
-
     parameters = {
         "request_id": request_id,
         "task_id": task.task_id,
@@ -133,16 +127,19 @@ def test_project_io_renewal_replays_after_task_commit_without_old_revision_rejec
         "expected_task_revision": expected_task_revision,
         "expected_attempt_digest": expected_attempt_digest,
     }
-    with pytest.raises(OSError, match="injected crash"):
-        renew_project_io_attempt_lease(cfg, mutation_fence=crash_before_attempt_commit, **parameters)
+    # Fresh requests cannot extend a post-launch lease, even with a healthy clock.
+    before_task = task_file.read_bytes()
+    before_attempt = attempt_file.read_bytes()
+    fresh = renew_project_io_attempt_lease(cfg, mutation_fence=lambda: None, **parameters)
+    assert fresh["outcome"] == "observed_stale"
+    assert fresh["reason"] == "legacy_ownership_evidence_incomplete"
+    assert task_file.read_bytes() == before_task
+    assert attempt_file.read_bytes() == before_attempt
+    observation_file = shared_paths(cfg.shared_root)["clock_observations"] / cfg.machine_name / f"{request_id}.json"
+    assert not observation_file.exists()
 
-    partial_attempt = AttemptRecord.from_dict(read_json(attempt_file))
-    assert partial_attempt.lease["clock_evidence"]["observation_id"] != request_id
-    assert read_json(task_file)["task"]["claim_control"]["active_claim"]["clock_observation_id"] == request_id
-    clock_record = read_json(
-        shared_paths(cfg.shared_root)["clock_observations"] / cfg.machine_name / f"{request_id}.json"
-    )
-    planned_renewed_at = clock_record["renewal_plan"]["renewed_at"]
+    plan = persist_legacy_renewal(cfg, task.task_id, request_id, observation)
+    planned_renewed_at = plan["renewed_at"]
     task_after_other_update = read_json(task_file)
     task_after_other_update["meta"]["revision"] += 1
     task_after_other_update["meta"]["updated_at"] = "2099-01-01T00:00:00Z"
@@ -161,99 +158,13 @@ def test_project_io_renewal_replays_after_task_commit_without_old_revision_rejec
     assert renewed_task["claim_control"]["active_claim"]["lease_expires_at"] == renewed_attempt.lease["expires_at"]
     lease_policy_path(cfg).unlink()
 
-    expired_request_id = "d" * 32
-    now = datetime.now(timezone.utc).replace(microsecond=0)
-    expired_observation = ClockObservation(
-        observation_id=expired_request_id,
-        provider="linux_adjtimex",
-        observed_at=now.isoformat().replace("+00:00", "Z"),
-        monotonic_observed_at=time.monotonic(),
-        boot_id="test-boot",
-        lower_error_seconds=-0.001,
-        upper_error_seconds=0.001,
-        max_drift_rate=0.0,
-        provider_margin_seconds=0.001,
-    )
-    atomic_replace(
-        shared_paths(cfg.shared_root)["clock_observations"] / cfg.machine_name / f"{expired_request_id}.json",
-        {
-            "clock_observation": expired_observation.to_dict(),
-            "renewal_plan": {
-                "renewed_at": (now - timedelta(minutes=2)).isoformat().replace("+00:00", "Z"),
-                "lease_expires_at": (now - timedelta(minutes=1)).isoformat().replace("+00:00", "Z"),
-                "renew_after_seconds": 10.0,
-            },
-        },
-    )
-    current_task_bytes = task_file.read_bytes()
-    current_attempt_bytes = attempt_file.read_bytes()
-    expired = renew_project_io_attempt_lease(
-        cfg,
-        mutation_fence=lambda: None,
-        **{
-            **parameters,
-            "request_id": expired_request_id,
-            "expected_task_revision": read_json(task_file)["meta"]["revision"],
-            "expected_attempt_digest": hashlib.sha256(current_attempt_bytes).hexdigest(),
-        },
-    )
-    assert expired["outcome"] == "observed_stale"
-    assert expired["reason"] == "renewal_plan_expired"
-    assert task_file.read_bytes() == current_task_bytes
-    assert attempt_file.read_bytes() == current_attempt_bytes
-
-    stale_request_id = "c" * 32
-    stale_observation = ClockObservation(
-        observation_id=stale_request_id,
-        provider="linux_adjtimex",
-        observed_at="2026-09-28T00:00:00Z",
-        monotonic_observed_at=time.monotonic(),
-        boot_id="old-boot",
-        lower_error_seconds=-0.001,
-        upper_error_seconds=0.001,
-        max_drift_rate=-1.0,
-        provider_margin_seconds=0.001,
-    )
-    atomic_replace(
-        shared_paths(cfg.shared_root)["clock_observations"] / cfg.machine_name / f"{stale_request_id}.json",
-        {
-            "clock_observation": stale_observation.to_dict(),
-            "renewal_plan": {
-                "renewed_at": "2026-09-28T00:00:00Z",
-                "lease_expires_at": "2026-09-28T00:02:00Z",
-                "renew_after_seconds": 10.0,
-            },
-        },
-    )
-    task_before = task_file.read_bytes()
-    attempt_before = attempt_file.read_bytes()
-    stale_parameters = {
-        **parameters,
-        "request_id": stale_request_id,
-        "expected_task_revision": read_json(task_file)["meta"]["revision"],
-        "expected_attempt_digest": hashlib.sha256(attempt_before).hexdigest(),
-    }
-
-    with pytest.raises(ValueError, match="bounds are invalid"):
-        renew_project_io_attempt_lease(cfg, mutation_fence=lambda: None, **stale_parameters)
-
-    assert task_file.read_bytes() == task_before
-    assert attempt_file.read_bytes() == attempt_before
-    valid_but_old = stale_observation.to_dict()
-    valid_but_old["max_drift_rate"] = 0.0
-    atomic_replace(
-        shared_paths(cfg.shared_root)["clock_observations"] / cfg.machine_name / f"{stale_request_id}.json",
-        {
-            "clock_observation": valid_but_old,
-            "renewal_plan": {
-                "renewed_at": "2026-09-28T00:00:00Z",
-                "lease_expires_at": "2026-09-28T00:02:00Z",
-                "renew_after_seconds": 10.0,
-            },
-        },
-    )
-    with pytest.raises(RuntimeError, match="no longer current"):
-        renew_project_io_attempt_lease(cfg, mutation_fence=lambda: None, **stale_parameters)
+    # Replaying the same durable operation is idempotent.
+    before_task = task_file.read_bytes()
+    before_attempt = attempt_file.read_bytes()
+    again = renew_project_io_attempt_lease(cfg, mutation_fence=lambda: None, replay_only=True, **parameters)
+    assert again == replayed
+    assert task_file.read_bytes() == before_task
+    assert attempt_file.read_bytes() == before_attempt
 
 
 def test_local_irreversible_commitment_blocks_recovery(tmp_path: Path):
@@ -273,9 +184,35 @@ def test_local_irreversible_commitment_blocks_recovery(tmp_path: Path):
     assert is_recovery_blocked(cfg, "attempt")
 
 
+@pytest.mark.parametrize("has_existing", [False, True])
+@pytest.mark.parametrize("field", ["authority_outcome", "reason", "both"])
+def test_deadline_only_decision_writer_rejects_without_mutation(tmp_path: Path, field: str, has_existing: bool):
+    cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
+    parameters = {
+        "task_id": "task",
+        "attempt_id": "attempt",
+        "fencing_token": 7,
+        "process": {"process_group_id": 1234, "process_group_start_time_ticks": 5678},
+        "authority_outcome": "cancellation_requested",
+        "reason": "cancellation_requested",
+        "decision_id": "historical-decision",
+    }
+    if field in {"authority_outcome", "both"}:
+        parameters["authority_outcome"] = "holder_safe_deadline_elapsed"
+    if field in {"reason", "both"}:
+        parameters["reason"] = "holder_safe_deadline_elapsed"
+    path = decision_path(cfg, "attempt", "historical-decision")
+    if has_existing:
+        persist_legacy_termination_decision(cfg, **parameters)
+    before = path.read_bytes() if has_existing else None
+    with pytest.raises(ValueError, match="only be read as historical evidence"):
+        create_decision(cfg, **parameters)
+    assert (path.read_bytes() if path.exists() else None) == before
+
+
 def test_deadline_only_decision_cannot_commit_or_send_a_signal(tmp_path: Path, monkeypatch):
     cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
-    decision = create_decision(
+    decision = persist_legacy_termination_decision(
         cfg,
         task_id="task",
         attempt_id="attempt",
@@ -349,6 +286,14 @@ def test_exact_legacy_running_execution_is_adopted_without_lease_renewal(tmp_pat
     running_attempt.timestamps["launch_authorized_at"] = launch_time
     running_attempt.process.update(process_identity)
     atomic_replace(path, running_attempt.to_dict())
+
+    task_before = task_path.read_bytes()
+    attempt_before = path.read_bytes()
+    incomplete = renew_attempt_lease(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token)
+    assert incomplete.outcome is LeaseRenewalOutcome.RETRYABLE_ERROR
+    assert incomplete.error.error_type == "LegacyOwnershipEvidenceIncomplete"
+    assert task_path.read_bytes() == task_before
+    assert path.read_bytes() == attempt_before
 
     renewal = renew_attempt_lease(
         cfg,
@@ -587,6 +532,34 @@ def test_termination_confirmation_uses_real_process_group_identity(tmp_path: Pat
         if child.poll() is None:
             child.kill()
             child.wait(timeout=5)
+
+
+@pytest.mark.parametrize("grouped", [False, True])
+def test_expired_prelaunch_claim_requeues_without_creating_an_orphan(tmp_path: Path, grouped: bool):
+    cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
+    if grouped:
+        create_group(cfg, "exp")
+    task = submit(cfg, ["echo", "ok"], **({"group": "exp"} if grouped else {}))
+    attempt = claim_task(cfg, task.task_id, [0])
+    assert attempt is not None
+    current = load_task(cfg, task.task_id)
+    current.claim_control["active_claim"]["lease_expires_at"] = "2000-01-01T00:00:00Z"
+    save_task(cfg, current)
+
+    assert expire_claim(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token)
+
+    current = load_task(cfg, task.task_id)
+    expired = AttemptRecord.from_dict(read_json(attempt_path(cfg.shared_root, task.task_id, attempt.attempt_number)))
+    assert expired.phase == "cancelled"
+    assert expired.result["reason"] == "lease_expired_before_launch"
+    assert expired.timestamps["finished_at"] is not None
+    assert expired.timestamps["orphaned_at"] is None
+    assert current.state["projection"] == "queued"
+    assert current.claim_control["active_claim"] is None
+    assert not expire_claim(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token)
+    replacement = claim_task(cfg, task.task_id, [0])
+    assert replacement is not None
+    assert replacement.attempt_id != attempt.attempt_id
 
 
 def test_launch_ownership_does_not_use_policy_ttl_after_authorization(tmp_path: Path):

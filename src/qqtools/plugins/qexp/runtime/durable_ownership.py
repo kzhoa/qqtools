@@ -5,8 +5,9 @@ before its companion Attempt.  The receipt stored in the Task makes that
 ordering replayable: a later writer can either finish the matching Attempt or
 fail closed when any part of the transition identity changed.
 
-QQTOOLS-COMPAT-0021: durable ownership receipts bridge the Task-first
-authorization write to the existing Attempt projection during this rollout.
+Task-first receipts are the permanent launch contract. QQTOOLS-COMPAT-0021
+retains only historical bounded-lease adoption and partial-write recovery;
+new launch authorizations never publish a bounded execution lease.
 """
 
 from __future__ import annotations

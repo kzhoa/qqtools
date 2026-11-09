@@ -4004,6 +4004,11 @@ timestamps, stale heartbeat, invalid clock evidence, storage unavailability, or 
 may make supervision stale or isolate shared writes, but they cannot archive the claim, create an
 `orphaned` state, signal the process, release its reservation, or permit a replacement Attempt.
 `orphaned` remains readable only as historical uncertainty produced by supported older sources.
+Current writers renew bounded leases only while both claim and Attempt remain `claimed`.
+Historical running Attempts require exact ownership adoption; incomplete adoption evidence
+isolates shared writes without extending the old lease. A retained Project-I/O renewal may
+finish only the companion Attempt projection of an exact Task commit and immutable clock plan
+that already exist. It cannot create a new clock plan or renew the Task again.
 
 ### 15.4 Recovery CAS
 
@@ -4085,7 +4090,9 @@ is written only after the recorded PGID and start-time identity is absent. For e
 termination, the Task lock first commits `termination_decision_id` and token; Recovery CAS then
 rejects that Attempt.
 
-Fixed agents reject deadline-only decisions independently at every signal entry. Historical
+Current decision writers reject `holder_safe_deadline_elapsed` in either the authority outcome
+or reason before reading or writing a decision file. Fixed agents also reject historical
+deadline-only decisions independently at every signal entry. Historical
 `holder_safe_deadline_elapsed` decisions are preserved and gain an audited
 `timeout_decision_retirement` operation. Its local phases are `suppressed -> shared_reconciled ->
 retired`; suppression is durable before signal/recovery lanes proceed, shared reconciliation

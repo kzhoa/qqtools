@@ -400,7 +400,9 @@ def create_decision(
     reason: str,
     decision_id: str | None = None,
 ) -> dict[str, Any]:
-    """Create the only durable record that may authorize an external signal."""
+    """Create a durable signal decision, rejecting retired deadline-only causes."""
+    if "holder_safe_deadline_elapsed" in {authority_outcome, reason}:
+        raise ValueError("deadline-only termination decisions can only be read as historical evidence")
     decision_id = decision_id or new_id()
     path = decision_path(cfg, attempt_id, decision_id)
     if path.exists():

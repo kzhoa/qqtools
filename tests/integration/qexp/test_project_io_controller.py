@@ -36,6 +36,7 @@ from qqtools.plugins.qexp.commands.group import change_worker, create_group
 from qqtools.plugins.qexp.commands.task import share
 from qqtools.plugins.qexp.executor import LaunchHandle, LaunchHandoff
 from qqtools.plugins.qexp.layout import load_machine_registration, machine_state_path, save_machine_registration
+from qqtools.plugins.qexp.lease import ClockObservation
 from qqtools.plugins.qexp.runtime import maintenance as maintenance_module
 from qqtools.plugins.qexp.runtime import maintenance_outbox as maintenance_outbox_module
 from qqtools.plugins.qexp.runtime import project_activation as project_activation_module
@@ -69,6 +70,7 @@ from qqtools.plugins.qexp.runtime.store import atomic_replace, check_mutation_fe
 from qqtools.plugins.qexp.runtime.tasks import load_task, save_task
 from qqtools.plugins.qexp.scheduler import claim_task, renew_project_io_attempt_lease
 from qqtools.version import __version__
+from tests.fixtures.qexp_legacy_ownership import persist_legacy_renewal
 from tests.helpers.qexp.worker_diagnostics import describe_project_io_workers
 
 pytestmark = [pytest.mark.integration, pytest.mark.qexp_fast_io]
@@ -6256,29 +6258,10 @@ def test_authority_renewal_replay_only_reconciles_stale_request_after_restart(
     )
     task_before = (cfg.shared_root / "tasks" / f"{task.task_id}.json").read_bytes()
     attempt_before = attempt_file.read_bytes()
-    fence_calls = 0
-    fail_at = 3 if crash_after_task else 2
-
-    def crash_during_commit() -> None:
-        nonlocal fence_calls
-        fence_calls += 1
-        if fence_calls == fail_at:
-            raise RuntimeError("simulated worker interruption")
-
-    with pytest.raises(RuntimeError, match="simulated worker interruption"):
-        renew_project_io_attempt_lease(
-            cfg,
-            request_id=request.request_id,
-            task_id=task.task_id,
-            attempt_id=attempt.attempt_id,
-            attempt_number=attempt.attempt_number,
-            fencing_token=attempt.current_fencing_token,
-            reservation_id=attempt.reservation_id,
-            process_identity=process_identity,
-            expected_task_revision=source_revisions["task"],
-            expected_attempt_digest=source_revisions["attempt_digest"],
-            mutation_fence=crash_during_commit,
-        )
+    observation = ClockObservation.from_dict(
+        read_json(local_paths(project_runtime_root)["clock_health"])["clock_capability"]["observation"]
+    )
+    persist_legacy_renewal(cfg, task.task_id, request.request_id, observation, commit_task=crash_after_task)
     assert attempt_file.read_bytes() == attempt_before
     if crash_after_task:
         assert load_task(cfg, task.task_id).claim_control["active_claim"]["clock_observation_id"] == request.request_id

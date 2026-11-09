@@ -2021,6 +2021,15 @@ def renew_attempt_lease(
                 return LeaseRenewalResult(LeaseRenewalOutcome.NOT_REQUIRED, attempt_id, observed_token=fencing_token)
             if process_identity is not None and not process_identity_matches(attempt, process_identity):
                 return LeaseRenewalResult(LeaseRenewalOutcome.AUTHORITY_CHANGED, attempt_id)
+            if claim.get("launch_state") != "claimed" or attempt.phase != "claimed":
+                return LeaseRenewalResult(
+                    LeaseRenewalOutcome.RETRYABLE_ERROR,
+                    attempt_id,
+                    error=LeaseFailureDetails(
+                        "LegacyOwnershipEvidenceIncomplete",
+                        "post-launch ownership requires exact legacy adoption evidence",
+                    ),
+                )
             capability = clock_capability(cfg, policy)
             if not capability.is_healthy or capability.observation is None:
                 return LeaseRenewalResult(
@@ -2077,15 +2086,11 @@ def renew_project_io_attempt_lease(
     mutation_fence: Callable[[], None],
     replay_only: bool = False,
 ) -> dict[str, Any]:
-    """Renew one exact observed Attempt with replayable per-write fencing.
+    """Adopt exact legacy ownership or finish an already committed renewal.
 
-    ``request_id`` becomes the immutable clock-observation identity.  That
-    marker lets an exact request resume after the clock-plan or Task write and
-    recognize a fully committed Task/Attempt pair without adding shared-schema
-    fields.  The Task write is deliberately metadata-only: renewal cannot
-    change observation routes, so it bypasses ``save_task`` and its unrelated
-    projection/outbox transaction.  ``replay_only`` is for stale executor
-    requests and may only finish a Task commit already marked by this request.
+    New post-launch ownership is holder-bound. A retained request may complete
+    its Attempt projection only when the Task already records that exact
+    request and its immutable clock plan; it cannot create another lease.
     """
 
     def stale(reason: str, *, task_revision: int | None, attempt_digest: str | None) -> dict[str, Any]:
@@ -2306,156 +2311,49 @@ def renew_project_io_attempt_lease(
                 "committed_revisions": {"task": task_revision, "attempt_digest": attempt_digest},
             }
 
+        # QQTOOLS-COMPAT-0021: finish historical Task-first renewal commits,
+        # but never initiate another bounded execution lease.
+        if not task_applied:
+            return stale(
+                "legacy_ownership_evidence_incomplete", task_revision=task_revision, attempt_digest=attempt_digest
+            )
         observation_path = shared_paths(cfg.shared_root)["clock_observations"] / cfg.machine_name / f"{request_id}.json"
         try:
             clock_record = read_json(observation_path)
-            if set(clock_record) != {"clock_observation", "renewal_plan"}:
-                raise ValueError("renewal clock record fields are invalid.")
-            stored_observation = ClockObservation.from_dict(clock_record["clock_observation"])
-            validate_clock_observation(stored_observation)
-            renewed_at, expires, renew_after_seconds = validate_plan(clock_record["renewal_plan"])
-        except FileNotFoundError:
-            if task_applied:
-                raise RuntimeError("Authoritative Task renewal is missing its clock observation.")
-            policy = load_lease_policy(cfg)
-            capability = clock_capability(cfg, policy)
-            if not capability.is_healthy or capability.observation is None:
-                raise RuntimeError(f"clock capability is unavailable: {capability.reason}")
-            source = capability.observation
-            stored_observation = ClockObservation(
-                observation_id=request_id,
-                provider=source.provider,
-                observed_at=source.observed_at,
-                monotonic_observed_at=source.monotonic_observed_at,
-                boot_id=source.boot_id,
-                lower_error_seconds=source.lower_error_seconds,
-                upper_error_seconds=source.upper_error_seconds,
-                max_drift_rate=source.max_drift_rate,
-                provider_margin_seconds=source.provider_margin_seconds,
-            )
-            validate_clock_observation(stored_observation)
-            renewed_at = utc_now()
-            expires = lease_expiry(policy)
-            renew_after_seconds = policy.renew_interval_seconds
-            validate_plan(
-                {
-                    "renewed_at": renewed_at,
-                    "lease_expires_at": expires,
-                    "renew_after_seconds": renew_after_seconds,
-                }
-            )
-            mutation_fence()
-            atomic_replace(
-                observation_path,
-                {
-                    "clock_observation": stored_observation.to_dict(),
-                    "renewal_plan": {
-                        "renewed_at": renewed_at,
-                        "lease_expires_at": expires,
-                        "renew_after_seconds": renew_after_seconds,
-                    },
-                },
-            )
-        else:
-            if not task_applied:
-                policy = load_lease_policy(cfg)
-                capability = clock_capability(cfg, policy)
-                now_mono = time.monotonic()
-                age = now_mono - stored_observation.monotonic_observed_at
-                if (
-                    not capability.is_healthy
-                    or capability.observation is None
-                    or capability.observation.boot_id != stored_observation.boot_id
-                    or age < 0
-                    or age > policy.clock_observation_max_age_seconds
-                    or stored_observation.bound_at(now_mono) > policy.max_clock_skew_seconds
-                ):
-                    raise RuntimeError("renewal clock observation is no longer current.")
-
-        if not task_applied:
-            remaining_deadline = datetime.fromisoformat(expires.replace("Z", "+00:00"))
-            conservative_commit_time = datetime.now(timezone.utc) + timedelta(
-                seconds=stored_observation.bound_at(time.monotonic()) + policy.renewal_commit_margin_seconds
-            )
-            if remaining_deadline <= conservative_commit_time:
-                return stale(
-                    "renewal_plan_expired",
-                    task_revision=task_revision,
-                    attempt_digest=attempt_digest,
-                )
-
-        if task_applied:
-            evidence = {
-                "clock_error_bound_seconds": claim.get("clock_error_bound_seconds"),
-                "provider": claim.get("clock_provider"),
-                "observation_id": claim.get("clock_observation_id"),
-            }
+        except FileNotFoundError as exc:
+            raise RuntimeError("Authoritative Task renewal is missing its clock observation.") from exc
+        if set(clock_record) != {"clock_observation", "renewal_plan"}:
+            raise ValueError("renewal clock record fields are invalid.")
+        stored_observation = ClockObservation.from_dict(clock_record["clock_observation"])
+        validate_clock_observation(stored_observation)
+        renewed_at, expires, renew_after_seconds = validate_plan(clock_record["renewal_plan"])
+        evidence = {
+            "clock_error_bound_seconds": claim.get("clock_error_bound_seconds"),
+            "provider": claim.get("clock_provider"),
+            "observation_id": claim.get("clock_observation_id"),
+        }
+        if (
+            claim.get("lease_expires_at") != expires
+            or evidence["observation_id"] != request_id
+            or evidence["provider"] != stored_observation.provider
+            or type(evidence["clock_error_bound_seconds"]) not in {int, float}
+            or not math.isfinite(evidence["clock_error_bound_seconds"])
+            or evidence["clock_error_bound_seconds"] < 0
+        ):
+            raise RuntimeError("Authoritative Task renewal evidence is inconsistent.")
+        if attempt_applied:
             if (
-                claim.get("lease_expires_at") != expires
-                or evidence["observation_id"] != request_id
-                or evidence["provider"] != stored_observation.provider
-                or type(evidence["clock_error_bound_seconds"]) not in {int, float}
-                or not math.isfinite(evidence["clock_error_bound_seconds"])
-                or evidence["clock_error_bound_seconds"] < 0
+                attempt.lease.get("expires_at") != expires
+                or attempt.lease.get("renewed_at") != renewed_at
+                or attempt_clock != evidence
             ):
-                raise RuntimeError("Authoritative Task renewal evidence is inconsistent.")
-            if attempt_applied:
-                if (
-                    attempt.lease.get("expires_at") != expires
-                    or attempt.lease.get("renewed_at") != renewed_at
-                    or attempt_clock != evidence
-                ):
-                    raise RuntimeError("Committed renewal evidence is inconsistent.")
-                return {
-                    "outcome": "renewed",
-                    "reason": None,
-                    "lease_expires_at": expires,
-                    "renew_after_seconds": renew_after_seconds,
-                    "committed_revisions": {"task": task_revision, "attempt_digest": attempt_digest},
-                }
+                raise RuntimeError("Committed renewal evidence is inconsistent.")
         else:
-            evidence = _clock_evidence(stored_observation)
-            if (
-                type(evidence.get("clock_error_bound_seconds")) not in {int, float}
-                or not math.isfinite(evidence["clock_error_bound_seconds"])
-                or evidence["clock_error_bound_seconds"] < 0
-            ):
-                raise ValueError("renewal clock evidence bound is invalid.")
-
-            before = copy.deepcopy(task.to_dict())
-            claim["lease_expires_at"] = expires
-            claim.update(
-                {
-                    "clock_error_bound_seconds": evidence["clock_error_bound_seconds"],
-                    "clock_provider": evidence["provider"],
-                    "clock_observation_id": evidence["observation_id"],
-                }
-            )
-            task.meta["revision"] = task_revision + 1
-            task.meta["updated_at"] = renewed_at
-            after = copy.deepcopy(task.to_dict())
-            for value in (before, after):
-                value["meta"].pop("revision", None)
-                value["meta"].pop("updated_at", None)
-                active_claim = value["task"]["claim_control"].get("active_claim") or {}
-                for field in (
-                    "lease_expires_at",
-                    "clock_error_bound_seconds",
-                    "clock_provider",
-                    "clock_observation_id",
-                ):
-                    active_claim.pop(field, None)
-            if before != after:
-                raise RuntimeError("renewal attempted an observation-visible Task mutation.")
+            attempt.lease.update({"renewed_at": renewed_at, "expires_at": expires, "clock_evidence": evidence})
             mutation_fence()
-            atomic_replace(task_path(cfg.shared_root, task_id), task.to_dict())
-            task_revision += 1
-
-        attempt.lease.update({"renewed_at": renewed_at, "expires_at": expires, "clock_evidence": evidence})
-        mutation_fence()
-        attempt_file = attempt_path(cfg.shared_root, task_id, attempt_number)
-        atomic_replace(attempt_file, attempt.to_dict())
-        attempt_digest = hashlib.sha256(attempt_file.read_bytes()).hexdigest()
+            attempt_file = attempt_path(cfg.shared_root, task_id, attempt_number)
+            atomic_replace(attempt_file, attempt.to_dict())
+            attempt_digest = hashlib.sha256(attempt_file.read_bytes()).hexdigest()
         return {
             "outcome": "renewed",
             "reason": None,
@@ -3065,28 +2963,6 @@ def expire_claim(
             return False
         path = attempt_path(cfg.shared_root, task_id, task.attempt_control["current_attempt_number"])
         attempt = AttemptRecord.from_dict(read_json(path))
-        orphan_work = None
-        if claim.get("launch_state") != "claimed":
-            from .runtime.maintenance_outbox import prepare_work
-
-            orphan_work = prepare_work(
-                cfg,
-                kind="orphan_recovery",
-                target_id=attempt_id,
-                work_generation=f"fencing-{fencing_token}",
-                phase="attempt_recovery",
-                cursor={
-                    "stage": "process",
-                    "task_id": task_id,
-                    "attempt_number": attempt.attempt_number,
-                    "attempt_id": attempt_id,
-                    "fencing_token": fencing_token,
-                    "attempt_process_identity": {
-                        key: attempt.process.get(key) for key in ("process_group_id", "process_group_start_time_ticks")
-                    },
-                    "was_terminated": bool(task.control.get("terminate_running")),
-                },
-            )
         with record_task_change(
             cfg,
             task,
@@ -3094,30 +2970,17 @@ def expire_claim(
             details={
                 "expected_attempt_id": attempt_id,
                 "expected_fencing_token": fencing_token,
-                "reserved_generation": task.ready_generation + 1 if claim.get("launch_state") == "claimed" else None,
+                "reserved_generation": task.ready_generation + 1,
             },
         ):
-            old_ready_generation = None
-            if claim.get("launch_state") == "claimed":
-                task.state.update({"projection": "queued", "reason": "lease_expired_before_launch"})
-                old_ready_generation, _ = prepare_ready_transition(cfg, task, "prelaunch_expiry")
-                attempt.phase = "cancelled"
-                attempt.result["reason"] = "lease_expired_before_launch"
-                _release_task_reservation(
-                    task, reservation_runtime_root, claim["reservation_id"], "lease_expired_before_launch"
-                )
-            else:
-                attempt.phase = "orphaned"
-                attempt.result.update({"exit_code": None, "signal": None, "category": None, "reason": None})
-                decision_id = claim.get("termination_decision_id")
-                if isinstance(decision_id, str):
-                    attempt.termination.update(
-                        {"decision_id": decision_id, "decision_token": claim.get("termination_decision_token")}
-                    )
-                attempt.timestamps["orphaned_at"] = utc_now()
-                task.state.update({"projection": "blocked", "reason": "orphaned_attempt_requires_recovery"})
-            if attempt.phase != "orphaned":
-                attempt.timestamps["finished_at"] = utc_now()
+            task.state.update({"projection": "queued", "reason": "lease_expired_before_launch"})
+            old_ready_generation, _ = prepare_ready_transition(cfg, task, "prelaunch_expiry")
+            attempt.phase = "cancelled"
+            attempt.result["reason"] = "lease_expired_before_launch"
+            _release_task_reservation(
+                task, reservation_runtime_root, claim["reservation_id"], "lease_expired_before_launch"
+            )
+            attempt.timestamps["finished_at"] = utc_now()
             atomic_replace(path, attempt.to_dict())
             archive_claim(cfg, task_id, claim, "lease_expired")
             task.claim_control["active_claim"] = None
@@ -3125,37 +2988,8 @@ def expire_claim(
             task.meta["revision"] += 1
             task.meta["updated_at"] = utc_now()
             save_task(cfg, task)
-            if old_ready_generation is not None:
-                commit_ready_publication(cfg, task)
-            if old_ready_generation is not None:
-                retire_previous_ready_generation(cfg, old_ready_generation, task)
-            if attempt.phase == "orphaned":
-                try:
-                    write_event(
-                        cfg,
-                        "attempt_orphaned",
-                        task_id=task_id,
-                        details={
-                            "attempt_id": attempt_id,
-                            "fencing_token": fencing_token,
-                            "reason": "lease_expired_process_unknown",
-                        },
-                    )
-                except OSError:
-                    pass
-                if orphan_work is not None and orphan_work["state"] not in {
-                    "completed",
-                    "intervention",
-                    "superseded",
-                }:
-                    try:
-                        from .runtime.maintenance_outbox import activate_work
-
-                        activate_work(cfg, orphan_work)
-                    except (OSError, RuntimeError, ValueError):
-                        # The descriptor is already durable and active; a
-                        # later resident turn can recover this handoff.
-                        pass
+            commit_ready_publication(cfg, task)
+            retire_previous_ready_generation(cfg, old_ready_generation, task)
             return True
 
 
