@@ -4215,7 +4215,7 @@ class AttemptSupervisionCoordinator:
                         page.paths[0],
                         signature,
                     )
-                    if entry is None or entry["process"].get("authority_state") == "healthy":
+                    if entry is None or entry["process"].get("authority_state") in {"healthy", "local_safe"}:
                         continue
                     if len(self._orphan_recovery_entries) >= _MAX_TERMINATION_CANDIDATES:
                         continue

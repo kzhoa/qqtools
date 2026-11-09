@@ -1009,6 +1009,33 @@ def test_termination_coordinator_never_signals_from_stale_shared_identity(tmp_pa
         child.wait(timeout=5)
 
 
+def test_local_safe_running_process_does_not_enter_historical_orphan_recovery(tmp_path: Path) -> None:
+    runtime, cfg, binding, revision, task, _attempt, child, _paths, manifest, _ = _running_case(
+        tmp_path, trigger="none"
+    )
+    process = read_json(manifest)["process"]
+    process["authority_state"] = "local_safe"
+    atomic_replace(manifest, {"process": process})
+    executor = ProjectIOExecutor(runtime)
+    executor.begin_epoch()
+    coordinator = AttemptSupervisionCoordinator(runtime, ProjectIOController(runtime, executor))
+    try:
+        _until(lambda: coordinator.controller.advance_binding_validation([binding], revision), bool)
+        for _ in range(8):
+            coordinator.advance_orphan_recoveries([binding], revision)
+            assert not executor.unresolved_requests()
+        assert read_json(manifest)["process"] == process
+        assert load_task(cfg, task.task_id).state["projection"] == "running"
+        assert child.poll() is None
+        assert len(reservation_snapshot(runtime.root).active) == 1
+    finally:
+        coordinator.close()
+        executor.shutdown()
+        if child.poll() is None:
+            child.kill()
+        child.wait(timeout=5)
+
+
 def test_healthy_termination_observation_does_not_pin_restart_readiness(tmp_path: Path) -> None:
     runtime, cfg, binding, revision, task, attempt, child, paths, manifest, _ = _running_case(tmp_path, trigger="none")
     executor = ProjectIOExecutor(runtime)

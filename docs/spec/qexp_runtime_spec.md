@@ -4017,6 +4017,8 @@ that already exist. It cannot create a new clock plan or renew the Task again.
 ### 15.4 Recovery CAS
 
 This section applies only to historical `orphaned` records created by supported older sources.
+Local `healthy` and holder-bound `local_safe` process manifests are current supervision
+evidence, not orphan-recovery candidates; repeated recovery probes must not block startup readiness.
 A returning machine with a verified live orphaned process cannot perform ordinary renewal. A
 grouped Task acquires Group then Task lock; an ungrouped Task acquires only Task lock.
 
