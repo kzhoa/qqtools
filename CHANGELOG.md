@@ -2,12 +2,24 @@
 
 ## Unreleased
 
+## v1.3.28
+
+- breaking: upgrading the qexp registration protocol from 1.3.27 requires one coordinated
+  fleet downtime: stop training and all old qexp processes on every participating machine,
+  prohibit old-process restart, and upgrade all packages before starting any new agent.
+  Agents then convert registered Projects automatically; see the
+  [upgrade guide](docs/spec/qexp_upgrade_guide.md#registration-replacement-upgrade-target-1328).
+- feat: support resumable replacement of a Project registration's machine name while preserving
+  Project identity, historical attribution, and explicit drain/cancellation recovery.
+- feat: allow machine-level qexp daemon startup before Project registration, and add opt-in
+  Idle Job commands with GPU selection, training preemption, independent status, and bounded logs.
+- feat: add optional Gaussian harmonic-frequency parsing through the `freq` rule, including
+  ordinary and high-precision mode blocks, negative frequencies, and consistency validation.
+- fix: reserve early qexp startup admission before snapshot preference so competing Project
+  snapshot work cannot consume the grant intended for startup progress.
 - compat: remove post-launch lease renewal/expiry writers and deadline-only termination decision
   creation for the 1.3.28 lifecycle boundary; retain exact historical ownership adoption,
   already-committed renewal recovery, and timeout-decision retirement through the transition window.
-
-- feat: allow machine-level qexp daemon startup before Project registration, and add opt-in
-  Idle Job commands with GPU selection, training preemption, independent status, and bounded logs.
 
 ## v1.3.27
 
