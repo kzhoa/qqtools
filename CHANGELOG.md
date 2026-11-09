@@ -17,6 +17,10 @@
   ordinary and high-precision mode blocks, negative frequencies, and consistency validation.
 - fix: reserve early qexp startup admission before snapshot preference so competing Project
   snapshot work cannot consume the grant intended for startup progress.
+- fix: preserve qexp root validation across an atomic Group namespace activation, while
+  retaining canonical-directory identity checks and rejecting missing Group storage.
+- fix: keep bounded foreign-home deadline scans eligible after local ready routes become
+  quiescent, allowing a live Group helper to offer and execute a stopped home's elapsed Tasks.
 - compat: remove post-launch lease renewal/expiry writers and deadline-only termination decision
   creation for the 1.3.28 lifecycle boundary; retain exact historical ownership adoption,
   already-committed renewal recovery, and timeout-decision retirement through the transition window.
