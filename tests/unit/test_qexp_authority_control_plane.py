@@ -639,6 +639,7 @@ def test_heartbeat_queues_snapshot_without_resident_project_io(plane_factory, mo
     assert intent["pid"] == 123
     assert intent["visible_gpu_ids"] == (0, 1)
     assert intent["reservations"] == []
+    assert intent["heartbeat_interval_seconds"] == 1.0
     assert intent["gpu_policy"] == {"mode": "auto"}
     assert case.plane._authority_snapshot == authority_sample
 

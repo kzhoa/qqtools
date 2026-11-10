@@ -41,6 +41,7 @@ from .recovery_capture import recovery_owner
 from .scheduler_diagnostics import SchedulerDiagnosticStore
 
 STARTUP_AUTHORITY_POLL_SECONDS = 1.0
+_MIN_MACHINE_SNAPSHOT_INTERVAL_SECONDS = 1.0
 _INITIAL_CONTROL_PLANE_BINDINGS = 64
 _SCHEDULER_DIAGNOSTIC_READ_LIMIT = 32
 _HEARTBEAT_FINDING_REASONS = frozenset(
@@ -948,7 +949,10 @@ class _MachineControlPlane:
             pid=_read_pid(self._runtime),
             visible_gpu_ids=gpu_policy.visible_gpu_ids or (),
             reservations=reservations,
-            heartbeat_interval_seconds=self._loop_interval,
+            # Snapshot publication is isolated Project I/O. Very short agent
+            # polling intervals can otherwise keep a replacement heartbeat
+            # permanently in flight and prevent on-demand idle convergence.
+            heartbeat_interval_seconds=max(_MIN_MACHINE_SNAPSHOT_INTERVAL_SECONDS, self._loop_interval),
             started_at=self._started_at,
             gpu_policy=gpu_policy_payload,
         )
