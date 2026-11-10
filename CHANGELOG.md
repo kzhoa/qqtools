@@ -29,6 +29,8 @@
 - fix: keep foreign-home deadline scans from occupying a binding's admission slot while
   finite non-critical scheduler work is still pending, preserving startup and idle convergence.
 - fix: prioritize finite quiescence checks ahead of recurring foreign-home deadline scans.
+- fix: cap machine snapshot publication at one heartbeat per second so fast polling cannot
+  keep on-demand qexp agents alive after finite Group and recovery work has converged.
 - compat: remove post-launch lease renewal/expiry writers and deadline-only termination decision
   creation for the 1.3.28 lifecycle boundary; retain exact historical ownership adoption,
   already-committed renewal recovery, and timeout-decision retirement through the transition window.
