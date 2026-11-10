@@ -1390,7 +1390,10 @@ def test_borrow_offer_survives_missed_request_grant_without_reusing_proof(
         executor.shutdown()
 
 
-def test_due_offer_worker_reports_noop_and_disabled_binding_starts_nothing(tmp_path: Path) -> None:
+def test_due_offer_worker_reports_noop_and_disabled_binding_starts_nothing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     runtime = MachineRuntime(tmp_path / "machine")
     initialize_machine(runtime, "gpu-1")
     _cfg, binding, revision, bindings = _registered(tmp_path, "project", runtime)
@@ -1419,8 +1422,28 @@ def test_due_offer_worker_reports_noop_and_disabled_binding_starts_nothing(tmp_p
         controller.advance_scheduler_due_offers(bindings, revision)
         assert not executor.unresolved_requests()
     clock[0] += 1.0
+    controller.advance_scheduler_due_offers(
+        bindings,
+        revision,
+        start_excluded_project_ids={binding.project_id},
+    )
+    assert not executor.unresolved_requests()
     controller.advance_scheduler_due_offers(bindings, revision)
     assert any(request.operation_kind == "scheduler_due_offer" for request in executor.unresolved_requests())
+    stale_resolutions = []
+    original_resolve_stale = executor.resolve_stale_scheduler_due_offer
+
+    def resolve_stale(request_id, request):
+        stale_resolutions.append(request_id)
+        return original_resolve_stale(request_id, request)
+
+    monkeypatch.setattr(executor, "resolve_stale_scheduler_due_offer", resolve_stale)
+    controller.advance_scheduler_due_offers(
+        bindings,
+        revision,
+        start_excluded_project_ids={binding.project_id},
+    )
+    assert stale_resolutions == []
     deadline = time.monotonic() + 5.0
     while time.monotonic() < deadline:
         if binding.project_id in controller.advance_scheduler_due_offers(bindings, revision):

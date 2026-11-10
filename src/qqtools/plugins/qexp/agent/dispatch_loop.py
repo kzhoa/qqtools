@@ -1678,9 +1678,11 @@ def _dispatch_isolated_machine_cycle(
     primary_unknown = False
 
     try:
+        pending_launch_projects = {project_id for project_id, _attempt_id in runtime.pending_launch_identities()}
         due_offer_completions = controller.advance_scheduler_due_offers(
             [binding for binding in ordered_bindings if binding.project_id not in blocked_projects],
             registry_revision,
+            start_excluded_project_ids=pending_launch_projects,
         )
         if any(
             evidence.get("outcome") == "offered"

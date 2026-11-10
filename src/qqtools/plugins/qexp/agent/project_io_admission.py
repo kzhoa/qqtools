@@ -521,9 +521,21 @@ class ProjectIOAdmission:
             )
 
             self._has_deferred_work = self._omitted_candidates or bool(self._collected)
+            scheduler_due_offer_granted = False
             for _ in range(self._free_slots):
+                owners_with_critical_work = {
+                    intent.owner
+                    for intent, _action in self._collected.values()
+                    if intent.service_class == "authority" or self._can_prefer_critical_chain(intent)
+                }
                 eligible = tuple(
-                    intent for intent, _action in self._collected.values() if intent.owner not in self._blocked
+                    intent
+                    for intent, _action in self._collected.values()
+                    if intent.owner not in self._blocked
+                    and (
+                        intent.operation_kind != "scheduler_due_offer"
+                        or (not scheduler_due_offer_granted and intent.owner not in owners_with_critical_work)
+                    )
                 )
                 due_authority = tuple(
                     intent
@@ -616,6 +628,8 @@ class ProjectIOAdmission:
                 else:
                     self._urgent_families.pop(key, None)
                     self._work_cursors[key] = family
+                if intent.operation_kind == "scheduler_due_offer":
+                    scheduler_due_offer_granted = True
                 self._record_critical_chain_grant(
                     intent,
                     used_preference=prefer_critical and self._can_prefer_critical_chain(intent),

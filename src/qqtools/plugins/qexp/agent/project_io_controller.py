@@ -11,7 +11,7 @@ import stat
 import time
 import uuid
 from bisect import bisect_right
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
@@ -2994,8 +2994,13 @@ class ProjectIOController:
         self,
         bindings: Sequence[ProjectBinding],
         registry_revision: int,
+        *,
+        start_excluded_project_ids: Collection[str] = (),
     ) -> dict[str, Mapping[str, Any]]:
         """Advance one fairly selected due-offer transaction."""
+        excluded_project_ids = frozenset(start_excluded_project_ids)
+        if any(type(project_id) is not str or not project_id for project_id in excluded_project_ids):
+            raise ValueError("start_excluded_project_ids must contain nonempty project IDs.")
         executor_status = self._poll_admission_executor()
         executor_epoch = executor_status.get("executor_epoch")
         if executor_status.get("envelope") == "unknown" or not isinstance(executor_epoch, str):
@@ -3094,6 +3099,8 @@ class ProjectIOController:
             self._due_offer_binding_cursor = owner
             identity, binding = by_owner[owner]
             if binding.project_id in processed:
+                continue
+            if binding.project_id in excluded_project_ids:
                 continue
             key = (identity, "scheduler_due_offer", "deadline", "advance")
             if not self._service_retry_is_due(key):

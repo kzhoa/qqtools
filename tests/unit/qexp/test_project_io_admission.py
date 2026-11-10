@@ -57,6 +57,37 @@ def test_capture_and_upgrade_prerequisites_do_not_starve_periodic_metadata():
     assert executed == expected * 2
 
 
+def test_deadline_scans_cannot_fill_every_executor_slot():
+    admission = ProjectIOAdmission()
+    owners = [_intent(f"project-{index}").owner for index in range(4)]
+    scans = [ServiceIntent(owner, "background", "scheduler_due_offer", ()) for owner in owners]
+    executed = []
+
+    admission.begin(owners, blocked=(), free_slots=4)
+    _offer_all(admission, scans, executed)
+    admission.finish()
+
+    assert len(executed) == 1
+    assert executed[0] in scans
+
+
+def test_deadline_scan_yields_owner_slot_to_finite_primary_work():
+    admission = ProjectIOAdmission()
+    owners = [_intent(f"project-{index}").owner for index in range(4)]
+    scans = [ServiceIntent(owner, "background", "scheduler_due_offer", ()) for owner in owners]
+    primary = [
+        ServiceIntent(owner, "primary", "scheduler_claim", ("epoch", f"attempt-{index}"), "gpu_primary")
+        for index, owner in enumerate(owners)
+    ]
+    executed = []
+
+    admission.begin(owners, blocked=(), free_slots=4)
+    _offer_all(admission, [*scans, *primary], executed)
+    admission.finish()
+
+    assert executed == primary
+
+
 def test_progress_publish_continuation_runs_once_before_ordinary_background_rotation():
     admission = ProjectIOAdmission()
     owner = _intent("a").owner
