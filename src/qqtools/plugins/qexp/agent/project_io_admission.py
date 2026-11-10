@@ -530,7 +530,7 @@ class ProjectIOAdmission:
                     or (
                         intent.service_class == "primary"
                         and (
-                            intent.operation_kind not in _CRITICAL_CHAIN_OPERATIONS
+                            intent.operation_kind == "scheduler_quiescence_probe"
                             or self._can_prefer_critical_chain(intent)
                         )
                     )
