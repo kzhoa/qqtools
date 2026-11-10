@@ -88,6 +88,20 @@ def test_deadline_scan_yields_owner_slot_to_finite_primary_work():
     assert executed == primary
 
 
+def test_deadline_scan_yields_owner_slot_to_noncritical_primary_work():
+    admission = ProjectIOAdmission()
+    owner = _intent("project").owner
+    scan = ServiceIntent(owner, "background", "scheduler_due_offer", ())
+    quiescence = ServiceIntent(owner, "primary", "scheduler_quiescence_probe", ())
+    executed = []
+
+    admission.begin([owner], blocked=(), free_slots=1)
+    _offer_all(admission, [scan, quiescence], executed)
+    admission.finish()
+
+    assert executed == [quiescence]
+
+
 def test_progress_publish_continuation_runs_once_before_ordinary_background_rotation():
     admission = ProjectIOAdmission()
     owner = _intent("a").owner
