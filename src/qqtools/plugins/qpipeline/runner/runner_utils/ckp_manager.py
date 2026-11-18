@@ -294,7 +294,6 @@ class CheckpointPlugin:
             (
                 ("after_validation", self.after_validation),
                 ("boundary_cursor", self.at_boundary_cursor),
-                ("after_epoch_commit", self.after_epoch_commit),
             ),
             provider_id="checkpoint.v1",
         )
@@ -337,15 +336,8 @@ class CheckpointPlugin:
         completion_save = context.terminal_candidate and self.policy.completion_save
         if not (is_due or completion_save):
             return
-        if context.is_epoch_end and context.terminal_candidate and completion_save:
-            return
         self._guard_save_nan(context.latest_train_loss)
         self._save("regular")
-
-    def after_epoch_commit(self, context: RunnerBoundaryContext) -> None:
-        if context.terminal_candidate and self.policy.completion_save:
-            self._guard_save_nan(context.latest_train_loss)
-            self._save("regular")
 
     def _guard_save_nan(self, latest_train_loss: Optional[float]) -> None:
         """Fail every rank before checkpoint persistence when the boundary has a NaN loss."""

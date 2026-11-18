@@ -27,7 +27,7 @@ from ..qlogger import ConsoleLogger, qLogger
 from ..task.qtask import TASK_LIFECYCLE_HOOKS, qTaskBase
 from ..types import Stage
 from .agent import NaNDetectedError, RunningAgent
-from .contracts import EventListenerBindings, ObserverBindings, TaskValidationContext
+from .contracts import EventListenerBindings, ObserverBindings, TaskValidationContext, dispatch_protected_boundary
 from .hooks import RunnerHooks
 from .observation_plugins import (
     ObservationContext,
@@ -235,18 +235,44 @@ def _close_runner_logger(logger: qLogger, owns_logger: bool) -> None:
         logging.shutdown()
 
 
+def _normalize_training_cursor(state: RunningState, total_batches: int) -> None:
+    """Interpret consumed-batch progress before starting a restored training session."""
+    cursor = state.batch_idx_in_epoch
+    if isinstance(cursor, bool) or not isinstance(cursor, int) or not 0 <= cursor <= total_batches:
+        raise ValueError(
+            f"Invalid checkpoint batch cursor: batch_idx_in_epoch={cursor!r}, len(train_loader)={total_batches}."
+        )
+    if cursor == total_batches:
+        state.epoch += 1
+        state.batch_idx_in_epoch = 0
+
+
 def _prepare_training_session(
     *,
     config: RunConfig,
     save_dir: str,
     logger: qLogger,
     checkpoint_plugin: CheckpointPlugin,
+    agent: RunningAgent,
     device: torch.device,
     progress_tracker: Optional[ProgressTracker],
 ) -> Tuple[Optional[ProgressTracker], Optional[profile]]:
     profiler: Optional[profile] = None
 
-    checkpoint_plugin.restore_if_requested(device)
+    def restore_training_progress() -> None:
+        is_restored = checkpoint_plugin.restore_if_requested(device)
+        total_batches = len(agent.train_loader)
+        if total_batches <= 0:
+            raise ValueError(f"Training requires a non-empty train_loader; len(train_loader)={total_batches}.")
+        if is_restored:
+            _normalize_training_cursor(agent.state, total_batches)
+
+    dispatch_protected_boundary(
+        restore_training_progress,
+        distributed=config.distributed,
+        requires_settlement=config.distributed,
+        boundary_name="training checkpoint restore",
+    )
 
     if config.use_profiler:
         profiler = profile(
@@ -755,6 +781,7 @@ def train_runner(
             save_dir=save_dir,
             logger=logger,
             checkpoint_plugin=checkpoint_plugin,
+            agent=agent,
             device=device,
             progress_tracker=progress_tracker,
         )

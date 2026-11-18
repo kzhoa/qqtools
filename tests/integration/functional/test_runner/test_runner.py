@@ -990,6 +990,7 @@ class TestTrainRunner:
                 captured["auto_offload"] = auto_offload
                 self.state = RunningState()
                 self.best_model_tracker = Mock()
+                self.train_loader = kwargs["task"].train_loader
 
             def run(self):
                 self.state.epoch = 1
@@ -1021,6 +1022,7 @@ class TestTrainRunner:
                 captured["auto_offload"] = auto_offload
                 self.state = RunningState()
                 self.best_model_tracker = Mock()
+                self.train_loader = kwargs["task"].train_loader
 
             def run(self):
                 self.state.epoch = 1

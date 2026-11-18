@@ -9,7 +9,7 @@ Design Philosophy:
 import gc
 import math
 import time
-from typing import Any, Callable, Dict, Literal, Optional, Tuple
+from typing import Any, Callable, Dict, Literal, Mapping, Optional, Tuple
 
 import torch
 import torch.distributed as dist
@@ -227,7 +227,8 @@ class RunningAgent:
             ),
         )
 
-    def _handle_epoch_end(self) -> EpochCommittedFact:
+    def _finalize_epoch(self) -> Mapping[str, Any]:
+        """Finalize epoch state without advancing the persisted progress cursor."""
         raw_epoch_metrics = self.train_avg_bank.gather_average(self.config.distributed)
         if self.use_tensor_bank and self.train_tensor_bank:
             gathered_cache = self.train_tensor_bank.gather(self.config.distributed, self.device)
@@ -255,9 +256,7 @@ class RunningAgent:
         self.train_avg_bank.reset()
         if self.train_tensor_bank:
             self.train_tensor_bank.reset()
-        self.state.epoch += 1
-        self.state.batch_idx_in_epoch = 0
-        observer_metrics = freeze_scalar_metrics(
+        return freeze_scalar_metrics(
             {
                 **epoch_results,
                 "train_loss": self._latest_train_loss,
@@ -266,12 +265,6 @@ class RunningAgent:
                 "val_metric_source": self.state.epoch_result_val_metric_source,
                 "test_metric_source": self.state.epoch_result_test_metric_source,
             }
-        )
-        return EpochCommittedFact(
-            completed_epoch=completed_epoch,
-            next_epoch=self.state.epoch,
-            global_step=self.state.global_step,
-            epoch_metrics=observer_metrics,
         )
 
     def _resolve_evaluation_loaders(
@@ -711,10 +704,32 @@ class RunningAgent:
             terminal_candidate=terminal_candidate,
             latest_train_loss=self._latest_train_loss,
         )
+        epoch_metrics = None
+        if is_epoch_end:
+
+            def finalize_epoch() -> None:
+                nonlocal epoch_metrics
+                epoch_metrics = self._finalize_epoch()
+
+            # Settle rank-local task failures before checkpoint collectives.
+            dispatch_protected_boundary(
+                finalize_epoch,
+                distributed=self.config.distributed,
+                requires_settlement=self.config.distributed,
+                boundary_name="epoch finalization",
+            )
+
         self.hooks.dispatch_at_boundary_cursor(boundary_context)
 
         if is_epoch_end:
-            epoch_fact = self._handle_epoch_end()
+            self.state.epoch += 1
+            self.state.batch_idx_in_epoch = 0
+            epoch_fact = EpochCommittedFact(
+                completed_epoch=boundary_context.epoch,
+                next_epoch=self.state.epoch,
+                global_step=self.state.global_step,
+                epoch_metrics=epoch_metrics,
+            )
             self.hooks.dispatch_after_epoch_commit(boundary_context)
             self.observers.dispatch("epoch_committed", epoch_fact)
 

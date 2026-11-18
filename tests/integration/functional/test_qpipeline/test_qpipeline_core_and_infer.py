@@ -72,15 +72,18 @@ def test_prepare_training_session_delegates_restore_to_checkpoint_plugin(tmp_pat
             "render_type": None,
             "rank": 0,
             "use_profiler": False,
+            "distributed": False,
         }
     )
 
     checkpoint_plugin = Mock()
+    checkpoint_plugin.restore_if_requested.return_value = False
     progress_tracker, profiler = runner_module._prepare_training_session(
         config=config,
         save_dir=str(tmp_path),
         logger=Mock(),
         checkpoint_plugin=checkpoint_plugin,
+        agent=Mock(train_loader=[object()]),
         device=torch.device("cpu"),
         progress_tracker=Mock(),
     )

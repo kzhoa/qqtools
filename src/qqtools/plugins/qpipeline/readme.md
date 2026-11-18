@@ -174,6 +174,59 @@ regular checkpoint, not a weights-only or best-checkpoint export. Actions run
 only after a processed boundary that finishes through a limit or early stop;
 they do not run after interruption, NaN detection, or an exception.
 
+## Checkpoint progress and training resume
+
+Set `args.ckp_file` (CLI `--ckp` / `--ckp-file`) and call `qPipeline.fit()` to
+resume training. The runner restores model, optimizer, scheduler, EMA, runner,
+best-tracker, early-stop, and task state when present. The standalone
+`qqtools.recover()` utility loads component state; it does not start the
+qpipeline training loop or normalize its progress cursor.
+
+The nested checkpoint `state` records consumed progress: `epoch` identifies the
+saved epoch and `batch_idx_in_epoch` is the number of consumed batches. For a
+seven-batch epoch, a natural epoch-end regular/completion checkpoint contains
+`epoch=0, batch_idx_in_epoch=7`, with task `on_epoch_end` changes already saved.
+The file is named `epoch0_stepN.pt`, and its checkpoint event uses epoch 0.
+The live runner advances its epoch only after the selected save succeeds.
+Completion-only saves use this same boundary epoch naming.
+
+Recovery handles the next position before checking run limits, setting the
+sampler epoch, or calling `on_epoch_start`. A cursor equal to the loader length
+advances the epoch once and resets the cursor to zero; a smaller cursor skips
+the consumed batches in the saved epoch. `global_step` is preserved. Negative,
+non-integer, or out-of-range cursors fail, as does an empty training loader.
+These rules apply in both epoch and step modes; step-mode intervals still count
+optimizer updates, including when gradient accumulation is enabled.
+
+Use the same dataset, loader length, batch size, and sampling configuration for
+resume. Cursor recovery alone does not reconstruct shuffle/RNG state or
+mid-epoch metric accumulators. This contract guarantees progress interpretation
+and the saved component state, not bitwise equivalence for arbitrary tasks.
+
+Best checkpoints are saved immediately after validation selects the model.
+They restore the validation-time model and other persisted component state.
+They may also resume training through `ckp_file`, using the same cursor rule,
+but do not contain later epoch-finalization task mutations. Simple tasks can
+continue directly. Tasks that require those mutations must reconstruct them
+explicitly or use a regular/completion checkpoint. Recovery never replays
+validation, scheduler steps, or task epoch-end callbacks.
+
+An epoch explicitly shortened with `LoopDirective(end_epoch=True)` before
+loader exhaustion is outside the exact epoch-boundary recovery guarantee for
+all checkpoint types. Its cursor is indistinguishable from a mid-epoch save:
+recovery continues that epoch from the saved batch, potentially consuming
+previously omitted batches and later finalizing the same epoch again. No
+special detection or rejection is performed.
+
+In distributed training, rank-local epoch-finalization errors are settled
+before regular/completion persistence. Any such failure prevents the save and
+epoch advance on all participating ranks. Task mutations are not rolled back;
+a failed run must restart from a persisted checkpoint. An already saved best
+model remains available.
+
+See [ADR-QPIPELINE-0005](../../../../docs/adr/qpipeline/0005-checkpoint-progress-cursor-semantics.md)
+for the checkpoint ordering decision.
+
 ## Tasks and metric aggregation
 
 A task connects dataset and model behavior through runner-defined interfaces.
