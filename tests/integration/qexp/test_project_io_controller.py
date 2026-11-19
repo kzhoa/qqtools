@@ -882,6 +882,49 @@ def test_isolated_idle_census_does_not_require_simultaneous_lane_receipts(tmp_pa
         executor.shutdown()
 
 
+def test_pending_launch_survives_one_unavailable_validation_snapshot(tmp_path, monkeypatch):
+    runtime = MachineRuntime(tmp_path / "machine")
+    initialize_machine(runtime, "gpu-1")
+    cfg, binding, _, _ = _registered(tmp_path, "project", runtime)
+    marker = tmp_path / "launched"
+    task = submit(cfg, ["touch", str(marker)], working_dir=tmp_path)
+    executor = ProjectIOExecutor(runtime)
+    executor.begin_epoch()
+    controller = ProjectIOController(runtime, executor)
+    runtime.project_io_executor = executor
+    runtime.project_io_controller = controller
+    validate = controller.advance_binding_validation
+    missed_validation = False
+
+    def validate_with_one_gap(bindings, revision):
+        nonlocal missed_validation
+        validated = validate(bindings, revision)
+        if not missed_validation and any(
+            request.operation_kind == "scheduler_launch_authorize" for request in executor.unresolved_requests()
+        ):
+            assert binding.project_id in validated
+            missed_validation = True
+            return {}
+        return validated
+
+    monkeypatch.setattr(controller, "advance_binding_validation", validate_with_one_gap)
+    try:
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline:
+            dispatch_machine_cycle_locked(runtime, available_gpus=[0], supervise=True, publish_snapshots=False)
+            if load_task(cfg, task.task_id).state["projection"] == "succeeded":
+                break
+            time.sleep(0.02)
+        assert missed_validation
+        assert marker.exists()
+        assert load_task(cfg, task.task_id).state["projection"] == "succeeded"
+    finally:
+        coordinator = getattr(runtime, "attempt_supervision_coordinator", None)
+        if coordinator is not None:
+            coordinator.close()
+        executor.shutdown()
+
+
 def test_isolated_dispatch_launches_healthy_peer_without_legacy_project_io(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -8130,6 +8173,36 @@ def test_idle_job_census_is_activation_scoped_and_does_not_retire_scheduler(tmp_
         advance_until("idle")
         advance_until("busy", capacity=2)
         assert "scheduler" not in state.acknowledged_lanes
+    finally:
+        executor.shutdown()
+
+
+def test_idle_job_probe_releases_owner_while_idle_admission_is_suspended(tmp_path):
+    runtime = MachineRuntime(tmp_path / "machine")
+    initialize_machine(runtime, "gpu-1")
+    cfg, binding, revision, bindings = _registered(tmp_path, "project", runtime)
+    repair_ready_index(cfg)
+    executor = ProjectIOExecutor(runtime)
+    executor.begin_epoch()
+    controller = ProjectIOController(runtime, executor)
+    try:
+        _advance_until_validated(controller, bindings, revision, binding.project_id)
+        _observe_working_set_activation(runtime, controller, bindings, revision)
+        assert (
+            controller.advance_idle_job_demand(
+                bindings, revision, gpu_capacity=1, cpu_capacity=1, capacity_key="one-gpu"
+            )
+            == "unknown"
+        )
+        assert any(request.operation_kind == "idle_job_probe" for request in executor.unresolved_requests())
+
+        # A busy machine suspends new Idle Job probes. The regular dispatch
+        # turn must still free the slot needed by training on this binding.
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and executor.unresolved_requests():
+            controller.advance_binding_validation(bindings, revision)
+            time.sleep(0.02)
+        assert not executor.unresolved_requests()
     finally:
         executor.shutdown()
 

@@ -557,6 +557,7 @@ _RUNNING_PUBLICATION_SOURCE_ERRORS = (OSError, RuntimeError, ValueError, TypeErr
 _MAX_PENDING_RUNNING_PUBLICATIONS = 256
 _MAX_RUNNING_PUBLICATION_BINDINGS = 64
 _MAX_CACHED_TERMINAL_CANDIDATES = 256
+_SETTLED_TERMINAL_RECHECK_SECONDS = 5.0
 _MAX_TERMINAL_BINDINGS = 64
 _MAX_TERMINAL_STATES = 256
 _MAX_TERMINATION_BINDINGS = 64
@@ -2037,6 +2038,7 @@ class AttemptSupervisionCoordinator:
         self._binding_offset = 0
         self._terminal_states: dict[tuple[str, ...], _TerminalBindingState] = {}
         self._terminal_candidates: dict[str, _TerminalCandidate] = {}
+        self._settled_terminal_rechecks: dict[tuple[tuple[str, ...], str, str], float] = {}
         self._terminal_binding_offset = 0
         self._termination_states: dict[tuple[str, ...], _TerminationBindingState] = {}
         self._termination_candidates: dict[tuple[str, str], _TerminationCandidate] = {}
@@ -2070,6 +2072,7 @@ class AttemptSupervisionCoordinator:
             state.close()
         self._terminal_states.clear()
         self._terminal_candidates.clear()
+        self._settled_terminal_rechecks.clear()
         self._terminal_binding_offset = 0
         for state in self._termination_states.values():
             state.close()
@@ -3282,6 +3285,15 @@ class AttemptSupervisionCoordinator:
             if observation is None:
                 _record_terminal_observation_problem(state, process, observation_path)
                 continue
+            recheck_key = (signature, process.identity, observation.identity)
+            if self._settled_terminal_rechecks.get(recheck_key, 0.0) > time.monotonic():
+                # Local capacity repair remains eligible even while repeated
+                # shared observations of this exact settled image are paced.
+                try:
+                    state.reconciler.reconcile_observation(observation_path, bounded=True)
+                except _RUNNING_PUBLICATION_SOURCE_ERRORS:
+                    pass
+                continue
             if len(self._terminal_candidates) >= _MAX_CACHED_TERMINAL_CANDIDATES:
                 continue
             parameters = dict(process.parameters)
@@ -3420,6 +3432,16 @@ class AttemptSupervisionCoordinator:
                 )
             except _RUNNING_PUBLICATION_SOURCE_ERRORS:
                 continue
+            if local_outcome == "applied" and candidate.post_update_process_identity is not None:
+                key = (
+                    candidate.binding_signature,
+                    candidate.post_update_process_identity,
+                    candidate.observation_identity,
+                )
+                self._settled_terminal_rechecks.pop(key, None)
+                if len(self._settled_terminal_rechecks) >= _MAX_CACHED_TERMINAL_CANDIDATES:
+                    self._settled_terminal_rechecks.pop(next(iter(self._settled_terminal_rechecks)))
+                self._settled_terminal_rechecks[key] = time.monotonic() + _SETTLED_TERMINAL_RECHECK_SECONDS
             if local_outcome in {"applied", "invalid"}:
                 self._terminal_candidates.pop(project_id, None)
 

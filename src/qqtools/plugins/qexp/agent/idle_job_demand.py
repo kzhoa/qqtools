@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import time
-from collections.abc import Callable, Hashable, Mapping, Sequence
+from collections.abc import Callable, Collection, Hashable, Mapping, Sequence
 from dataclasses import dataclass
 from functools import partial
 from typing import Any, Protocol
@@ -162,12 +162,8 @@ class IdleJobDemandCoordinator:
             if request_id in unresolved_ids
         }
 
-        remaining_unresolved = self._advance_requests(
-            controller,
-            unresolved,
-            current,
-            registry_revision,
-            capacity_key,
+        remaining_unresolved = self.advance_pending_probes(
+            controller, unresolved, {base_identity for base_identity, _binding in current.values()}
         )
 
         # A no-project daemon can be idle only once the executor itself is
@@ -305,17 +301,14 @@ class IdleJobDemandCoordinator:
                 continue
             self._rounds.pop(identity, None)
 
-    def _advance_requests(
+    def advance_pending_probes(
         self,
         controller: _DemandController,
         unresolved: Sequence[ProjectIORequest],
-        current: Mapping[tuple[Hashable, str], tuple[Hashable, ProjectBinding]],
-        registry_revision: int,
-        capacity_key: str,
+        current_identities: Collection[Hashable],
     ) -> tuple[ProjectIORequest, ...]:
-        current_by_base = {
-            base_identity: (cache_identity, binding) for cache_identity, (base_identity, binding) in current.items()
-        }
+        """Drain previously admitted probes even while new Idle Job admission is suspended."""
+        capacity_key = self._capacity_key
         remaining: list[ProjectIORequest] = []
         for request in unresolved:
             if request.operation_kind != "idle_job_probe":
@@ -326,15 +319,16 @@ class IdleJobDemandCoordinator:
                 request_identity = controller._request_identity(request)
             except (OSError, RuntimeError, ValueError, KeyError, TypeError):
                 request_identity = None
-            expected = None if request_identity is None else current_by_base.get(request_identity)
             is_current = (
                 association is not None
-                and expected is not None
-                and association.identity == expected[0]
+                and capacity_key is not None
+                and request_identity in current_identities
+                and association.identity == (request_identity, capacity_key)
                 and self._rounds.get(association.identity) is association.round
             )
             if not is_current:
                 if self._resolve_stale(controller, request):
+                    self._requests.pop(request.request_id, None)
                     self._drop_request(controller, request.request_id)
                 else:
                     remaining.append(request)

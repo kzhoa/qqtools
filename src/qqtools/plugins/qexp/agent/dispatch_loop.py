@@ -1615,7 +1615,11 @@ def _dispatch_isolated_machine_cycle(
     result_by_project = {item["project_id"]: item for item in results}
     supervision_bindings = [binding for binding in bindings if binding.project_id in validated_configs]
     reconciliation_bindings = list(supervision_bindings)
-    reconciliation_binding_by_project = {binding.project_id: binding for binding in reconciliation_bindings}
+    # A busy executor may hide validation for one turn. Keep exact active
+    # reservations in the census so their pending launch can consume its own
+    # result once validation returns. New reconciliation and launch still use
+    # the validated binding sets below.
+    resident_binding_by_project = {binding.project_id: binding for binding in bindings}
     coordinator = getattr(runtime, "attempt_supervision_coordinator", None)
     if not isinstance(coordinator, AttemptSupervisionCoordinator):
         raise RuntimeError("isolated dispatch requires the runtime-owned attempt supervision coordinator.")
@@ -1902,7 +1906,7 @@ def _dispatch_isolated_machine_cycle(
             runtime.last_cycle_had_demand = True
         reconcilable_records = _isolated_active_reservations(
             final_snapshot.active,
-            reconciliation_binding_by_project,
+            resident_binding_by_project,
             None,
             require_current_generation=False,
         )

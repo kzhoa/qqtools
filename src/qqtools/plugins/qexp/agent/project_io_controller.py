@@ -699,6 +699,7 @@ class ProjectIOController:
             current_bindings[identity] = binding
             ordered_bindings.append((identity, binding))
 
+        unresolved = self._idle_job_demand.advance_pending_probes(self, unresolved, current_bindings.keys())
         unresolved_request_ids = {request.request_id for request in unresolved}
         self._started_requests.intersection_update(unresolved_request_ids)
         self._advance_prevalidation_requests(

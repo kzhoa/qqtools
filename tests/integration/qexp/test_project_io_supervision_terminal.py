@@ -154,6 +154,10 @@ def test_terminal_coordinator_commits_natural_exit_and_converges_local_capacity(
         assert isinstance(process["observed_exited_at"], str)
         assert observation.exists()
         assert (paths["registrations"] / observation.name).exists()
+        for _ in range(3):
+            coordinator.advance_terminal_completions([binding], revision)
+        # A settled observation must leave service opportunities for this
+        # binding's pending scheduler work.
         assert not executor.has_unfinished_work()
     finally:
         coordinator.close()
