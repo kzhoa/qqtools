@@ -150,7 +150,7 @@ def evaluate_runner(
         if runtime is not None:
             avg_metrics = runtime.gather_avg_bank(eval_avg_bank, distributed, device)
         else:
-            avg_metrics = eval_avg_bank.gather_average(distributed)
+            avg_metrics = eval_avg_bank.gather_average(distributed, device)
         if use_tensor_bank_for_eval and eval_tensor_bank:
             if runtime is not None:
                 gathered_cache = runtime.gather_tensor_bank(eval_tensor_bank, distributed, device)

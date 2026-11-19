@@ -30,6 +30,8 @@ Inaccessible registered roots remain pending. Preserve unfinished registration
 journals and recovery evidence; stopped processes do not make those records
 disposable. Unknown or malformed records require diagnosis. The conversion
 preserves runtime IDs, names, generations, enablement and historical attribution.
+Starting in 1.3.29, registration writes require the version-3 replacement protocol.
+The converter can still read version-1 and version-2 registrations and publishes them as version 3.
 The source artifact is `qqtools-1.3.27-py3-none-any.whl`, SHA256
 `1c996115980d188858f87766455166059210f0ee51be5fb5e8d07481dcc1e4e7`.
 
@@ -809,7 +811,8 @@ In 1.3.28, new post-launch lease renewals and deadline-only termination decision
 removed. Pre-launch claims still use bounded leases. Exact historical ownership adoption,
 completion of already-committed renewals, and timeout-decision retirement remain available;
 incomplete ownership evidence cannot authorize another execution lease or signal. The registry
-records these items as `legacy_removed`, with temporary-transition purge due in 1.3.29.
+keeps these items at `legacy_removed` through the final 1.3.30 migration release.
+Temporary compatibility is scheduled for removal in 1.4.0.
 Supported upgrades and running legacy Attempts retain their existing recovery paths. The permanent
 source-evidence importer, ownership receipts, exact identity checks, and historical retirement
 interpretation remain supported after temporary cleanup.

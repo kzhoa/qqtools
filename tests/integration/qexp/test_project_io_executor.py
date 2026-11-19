@@ -92,6 +92,25 @@ def _registered(tmp_path: Path, name: str, runtime: MachineRuntime):
     return cfg, binding, revision
 
 
+def test_executor_rereads_live_evidence_after_same_path_replacement(tmp_path: Path) -> None:
+    runtime = MachineRuntime(tmp_path / "machine")
+    initialize_machine(runtime, "gpu-1")
+    _, binding, revision = _registered(tmp_path, "project", runtime)
+    executor = ProjectIOExecutor(runtime)
+    executor.begin_epoch()
+    request = executor.prepare_validate_binding(binding, revision)
+    assert executor.unresolved_requests() == (request,)
+
+    path = executor.paths["project_io_requests"] / f"{request.request_id}.json"
+    changed = request.to_dict()
+    changed["project_io_request"]["protocol_version"] = True
+    atomic_replace(path, changed)
+    with pytest.raises(ValueError):
+        executor.unresolved_requests()
+    atomic_replace(path, request.to_dict())
+    assert executor.unresolved_requests() == (request,)
+
+
 def _wait_for_result(executor: ProjectIOExecutor, request_id: str, timeout: float = 5.0):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:

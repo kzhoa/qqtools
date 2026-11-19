@@ -598,6 +598,17 @@ class ProjectIOAdmission:
                 key = (intent.owner, intent.service_class)
                 action = self._collected.pop(key)[1]
                 self._blocked.add(intent.owner)
+                background_key = (intent.owner, "background")
+                background = self._collected.get(background_key)
+                if (
+                    background is not None
+                    and background[0].operation_kind == "scheduler_due_offer"
+                    and (intent.owner in owners_with_priority_work or scheduler_due_offer_granted)
+                ):
+                    # The scan yielded this binding's slot. Rotate past it on the next
+                    # collection so recurring authority work cannot hide every other
+                    # background family behind the same ineligible scan indefinitely.
+                    self._work_cursors[background_key] = ("scheduler_due_offer", background[0].work_family)
                 if prefer_snapshot:
                     self._snapshot_yield_pending = True
                 elif not prefer_due_authority and not prefer_critical:

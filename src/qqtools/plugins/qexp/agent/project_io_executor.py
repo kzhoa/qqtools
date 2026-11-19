@@ -14,8 +14,9 @@ import time
 import uuid
 from collections.abc import Sequence
 from dataclasses import replace
+from functools import lru_cache
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, TypeVar
 
 from ..runtime.locks import exclusive
 from ..runtime.paths import machine_project_paths, machine_runtime_paths
@@ -26,7 +27,7 @@ from ..runtime.resources.reservations import (
     classify_executor_offer,
     release_executor_offer,
 )
-from ..runtime.store import atomic_replace, read_json_limited, require_json_size
+from ..runtime.store import atomic_replace, read_json_bytes_limited, read_json_limited, require_json_size
 from .group_service_transport import GroupServiceRequestSpec
 from .project_io_protocol import (
     PROJECT_IO_CAPACITY,
@@ -148,6 +149,15 @@ def _durable_unlink(path: Path) -> None:
     _fsync_directory(path.parent)
 
 
+_LiveRecord = TypeVar("_LiveRecord", ProjectIORequest, ProjectIOProcess, ProjectIOResult)
+
+
+@lru_cache(maxsize=3 * PROJECT_IO_CAPACITY)
+def _decode_live_record(record_class: type[_LiveRecord], encoded: bytes) -> _LiveRecord:
+    """Reuse immutable protocol objects only for byte-identical live evidence."""
+    return record_class.from_dict(json.loads(encoded.decode("utf-8")))
+
+
 class ProjectIOExecutor:
     """Controller and bounded durable store for one MachineRuntime."""
 
@@ -239,26 +249,28 @@ class ProjectIOExecutor:
             raise ProjectIOProtocolError("executor epoch belongs to a foreign runtime identity.")
         return epoch
 
+    def _read_live_record(
+        self, lane: str, request_id: str, record_type: str, record_class: type[_LiveRecord]
+    ) -> _LiveRecord:
+        path = self._record_path(lane, request_id)
+        self._validate_local_path(path, must_exist=True)
+        encoded = read_json_bytes_limited(path, max_bytes=PROJECT_IO_MAX_RECORD_BYTES, record_type=record_type)
+        return _decode_live_record(record_class, encoded)
+
     def _load_request(self, request_id: str) -> ProjectIORequest:
-        request = ProjectIORequest.from_dict(
-            self._read_record(self._record_path("requests", request_id), "project_io_request")
-        )
+        request = self._read_live_record("requests", request_id, "project_io_request", ProjectIORequest)
         if request.request_id != request_id or request.runtime_id != self.runtime_id:
             raise ProjectIOProtocolError("request record identity does not match its local runtime path.")
         return request
 
     def _load_process(self, request_id: str) -> ProjectIOProcess:
-        process = ProjectIOProcess.from_dict(
-            self._read_record(self._record_path("processes", request_id), "project_io_process")
-        )
+        process = self._read_live_record("processes", request_id, "project_io_process", ProjectIOProcess)
         if process.request.request_id != request_id or process.request.runtime_id != self.runtime_id:
             raise ProjectIOProtocolError("process record identity does not match its local runtime path.")
         return process
 
     def _load_result(self, request_id: str) -> ProjectIOResult:
-        result = ProjectIOResult.from_dict(
-            self._read_record(self._record_path("results", request_id), "project_io_result")
-        )
+        result = self._read_live_record("results", request_id, "project_io_result", ProjectIOResult)
         if result.request.request_id != request_id or result.request.runtime_id != self.runtime_id:
             raise ProjectIOProtocolError("result record identity does not match its local runtime path.")
         return result
@@ -2154,14 +2166,13 @@ class ProjectIOExecutor:
             epoch = self._load_epoch()
             if not epoch.active:
                 raise ProjectIOProtocolError("executor epoch is fenced.")
-            self._reconcile_locked(replay_archives=False)
+            requests = self._reconcile_locked(replay_archives=False)
             current_epoch = self._load_epoch()
             if not current_epoch.active or current_epoch.executor_epoch != epoch.executor_epoch:
                 raise ProjectIOProtocolError("executor epoch changed while reading unresolved requests.")
-            requests, _processes, _results = self._scan_records()
             return tuple(sorted(requests.values(), key=lambda request: request.request_id))
 
-    def _reconcile_locked(self, *, replay_archives: bool = True) -> None:
+    def _reconcile_locked(self, *, replay_archives: bool = True) -> dict[str, ProjectIORequest]:
         # Reap children owned by this controller before consulting /proc. An
         # exited but unreaped child still has the same PID/start identity and
         # would otherwise be misclassified as a live worker indefinitely.
@@ -2221,7 +2232,7 @@ class ProjectIOExecutor:
             self._children.pop(request_id, None)
         if replay_archives:
             epoch = self._load_epoch()
-            for request_id, request in requests.items():
+            for request_id, request in tuple(requests.items()):
                 if request_id in remaining_process_ids:
                     continue
                 archived = self._find_resolution(request_id, request)
@@ -2258,7 +2269,9 @@ class ProjectIOExecutor:
                 for lane in ("processes", "results", "requests"):
                     _durable_unlink(self._record_path(lane, request_id))
                 self._children.pop(request_id, None)
+                del requests[request_id]
         self._reconciliation_unknown = False
+        return requests
 
     def load_result(self, request_id: str) -> ProjectIOResult | None:
         try:

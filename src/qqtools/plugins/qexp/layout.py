@@ -28,6 +28,7 @@ from .runtime.protocol_compatibility import (
 )
 from .runtime.protocol_compatibility import LOCAL_RECOVERY_CAPABILITY as LOCAL_RECOVERY_CAPABILITY
 from .runtime.records import SCHEMA_VERSION, AttemptRecord, TaskRecord, utc_now
+from .runtime.registration_protocol import REGISTRATION_PROTOCOL, TARGET_REGISTRATION_VERSION
 from .runtime.store import atomic_replace, read_json
 
 
@@ -602,7 +603,17 @@ def load_machine_registration(cfg: RootConfig) -> dict[str, Any] | None:
 
 
 def save_machine_registration(cfg: RootConfig, record: dict[str, Any]) -> None:
-    """Persist the project-owned logical-machine registration atomically."""
+    """Publish a current-protocol registration after any source conversion."""
+    registration = record.get("registration")
+    if (
+        not isinstance(registration, dict)
+        or type(registration.get("version")) is not int
+        or registration["version"] != TARGET_REGISTRATION_VERSION
+        or type(registration.get("protocol_version")) is not int
+        or registration["protocol_version"] != TARGET_REGISTRATION_VERSION
+        or registration.get("registration_protocol") != REGISTRATION_PROTOCOL
+    ):
+        raise ValueError("Registration writes require the current replacement protocol; convert the source first.")
     atomic_replace(machine_registration_path(cfg.shared_root, cfg.machine_name), record)
 
 

@@ -9,7 +9,7 @@ import pytest
 
 from qqtools.plugins.qexp import init_shared_root
 from qqtools.plugins.qexp.agent.context import MachineRuntime
-from qqtools.plugins.qexp.layout import load_machine_registration
+from qqtools.plugins.qexp.layout import load_machine_registration, save_machine_registration
 from qqtools.plugins.qexp.runtime.store import atomic_replace, read_json
 
 pytestmark = [pytest.mark.integration, pytest.mark.qexp_fast_io]
@@ -49,6 +49,23 @@ def source_record(record, version):
     else:
         value["recovery_protocol"] = "qexp-local-responsibility-v1"
     return value
+
+
+@pytest.mark.parametrize("version", [1, 2])
+def test_source_registration_requires_conversion_before_publication(registered, version):
+    from qqtools.plugins.qexp.runtime.paths import machine_registration_path
+    from qqtools.plugins.qexp.runtime.registration_protocol import convert_registration
+
+    _runtime, binding, cfg = registered
+    path = machine_registration_path(cfg.shared_root, cfg.machine_name)
+    before = path.read_bytes()
+    source = source_record(load_machine_registration(cfg)["registration"], version)
+    with pytest.raises(ValueError, match="convert the source first"):
+        save_machine_registration(cfg, {"registration": source})
+    assert path.read_bytes() == before
+    converted = convert_registration(source, binding.project_id, cfg)
+    save_machine_registration(cfg, {"registration": converted})
+    assert load_machine_registration(cfg)["registration"] == converted
 
 
 @pytest.mark.parametrize("version", [1, 2])

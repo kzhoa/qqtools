@@ -2,10 +2,16 @@
 
 from __future__ import annotations
 
+from functools import lru_cache
 from pathlib import Path
 
 
 def shared_paths(root: Path) -> dict[str, Path]:
+    return _shared_paths(root).copy()
+
+
+@lru_cache(maxsize=64)
+def _shared_paths(root: Path) -> dict[str, Path]:
     return {
         "schema": root / "schema",
         "project": root / "project",
@@ -57,6 +63,11 @@ def shared_paths(root: Path) -> dict[str, Path]:
 
 
 def local_paths(root: Path) -> dict[str, Path]:
+    return _local_paths(root).copy()
+
+
+@lru_cache(maxsize=64)
+def _local_paths(root: Path) -> dict[str, Path]:
     return {
         "agent": root / "agent",
         "provisional": root / "reservations" / "provisional",
@@ -152,6 +163,11 @@ def attempt_control_lock_path(root: Path, attempt_id: str) -> Path:
 
 def machine_runtime_paths(root: Path) -> dict[str, Path]:
     root = Path(root).expanduser().resolve()
+    return _machine_runtime_paths(root).copy()
+
+
+@lru_cache(maxsize=64)
+def _machine_runtime_paths(root: Path) -> dict[str, Path]:
     project_io_root = root / "project-io-executor-v1"
     return {
         "root": root,

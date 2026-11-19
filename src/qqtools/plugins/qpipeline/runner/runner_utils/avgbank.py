@@ -26,14 +26,19 @@ class AverageMeter:
         self.count += n
         self.avg = self.sum / self.count
 
-    def get_average(self, ddp=False):
+    def get_average(self, ddp=False, device=None):
         if ddp:
-            return self.ddp_average()
+            return self.ddp_average(device)
         else:
             return self.avg
 
-    def ddp_average(self):
-        device = qt.parse_device(qdist.get_rank())
+    def ddp_average(self, device=None):
+        if device is None:
+            device = (
+                torch.device("cuda", torch.cuda.current_device())
+                if torch.distributed.get_backend() == "nccl"
+                else torch.device("cpu")
+            )
         data = torch.tensor([self.sum, self.count], dtype=torch.float64, device=device)
         data = qdist.all_reduce(data, device, "mean")
         ddp_avg = (data[0] / data[1]).item() if data[1] > 0 else 0
@@ -81,10 +86,10 @@ class AvgBank(object):
                     warnings.warn(f"[AvgBank] key: {k} not found in avgMeters, would be ignored upon printing.")
         self.key_order = key_order
 
-    def gather_average(self, ddp: bool):
+    def gather_average(self, ddp: bool, device: torch.device | None = None):
         result = dict()
         for k, meter in self.avgMeters.items():
-            result[k] = meter.get_average(ddp)
+            result[k] = meter.get_average(ddp, device)
         return result
 
     def __str__(self):

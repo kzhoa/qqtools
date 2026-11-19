@@ -382,7 +382,7 @@ class ProjectIOController:
         registry_revision: int,
     ) -> None:
         """Apply exact journal summaries locally and offer one fair upgrade slice."""
-        status = self._poll_admission_executor()
+        status, unresolved = self._poll_admission_executor()
         epoch = status.get("executor_epoch")
         if not isinstance(epoch, str) or status.get("envelope") == "unknown":
             self.runtime.upgrade_discovery_unknown = True
@@ -395,7 +395,7 @@ class ProjectIOController:
         }
         self._upgrade_status = {key: value for key, value in self._upgrade_status.items() if key in current}
         self._upgrade_due = {key: value for key, value in self._upgrade_due.items() if key in current}
-        unresolved = self.executor.unresolved_requests()
+
         owners = {self._request_identity(request).request_owner for request in unresolved}
         for request in unresolved:
             if request.operation_kind != "upgrade_service":
@@ -564,8 +564,8 @@ class ProjectIOController:
                 if self._admission.active:
                     # The last producer may have consumed a result after its
                     # snapshot. Grant against final occupancy, not call order.
-                    self._poll_admission_executor(force_poll=True)
-                    current_request_ids = {request.request_id for request in self.executor.unresolved_requests()}
+                    _, unresolved = self._poll_admission_executor(force_poll=True)
+                    current_request_ids = {request.request_id for request in unresolved}
                     self._needs_successor_turn = bool(self._initial_request_ids - current_request_ids)
             except BaseException:
                 if self._admission.active:
@@ -586,7 +586,9 @@ class ProjectIOController:
             self._admission_scope_active = False
             self._initial_request_ids.clear()
 
-    def _poll_admission_executor(self, *, force_poll: bool = False) -> dict[str, Any]:
+    def _poll_admission_executor(
+        self, *, force_poll: bool = False
+    ) -> tuple[dict[str, Any], tuple[ProjectIORequest, ...]]:
         """Reconcile live ownership per producer, replaying archives at turn boundaries."""
         if self._admission.active and not force_poll:
             # This read already reaps/reconciles workers under the executor lock.
@@ -603,7 +605,7 @@ class ProjectIOController:
             free_slots = 0
         if self._admission.active:
             self._admission.refresh_capacity(blocked=blocked, free_slots=free_slots)
-            return status
+            return status, unresolved
         _registry_revision, bindings = self.runtime.load_registry_snapshot()
         retained_request_identities = {self._request_identity(request) for request in unresolved}
         # Only observed registry/epoch changes invalidate retry state. A busy
@@ -634,7 +636,7 @@ class ProjectIOController:
             if isinstance(binding.registration_generation, str) and binding.registration_generation
         )
         self._admission.begin(owners, blocked=blocked, free_slots=free_slots)
-        return status
+        return status, unresolved
 
     def _offer_new_request(
         self,
@@ -681,7 +683,7 @@ class ProjectIOController:
         if type(registry_revision) is not int or registry_revision < 0:
             raise ValueError("registry_revision must be a nonnegative integer.")
 
-        executor_status = self._poll_admission_executor()
+        executor_status, unresolved = self._poll_admission_executor()
         executor_epoch = executor_status["executor_epoch"]
         if executor_status["envelope"] == "unknown" or not isinstance(executor_epoch, str):
             self._observed_executor_epoch = None
@@ -697,7 +699,6 @@ class ProjectIOController:
             current_bindings[identity] = binding
             ordered_bindings.append((identity, binding))
 
-        unresolved = self.executor.unresolved_requests()
         unresolved_request_ids = {request.request_id for request in unresolved}
         self._started_requests.intersection_update(unresolved_request_ids)
         self._advance_prevalidation_requests(
@@ -854,7 +855,7 @@ class ProjectIOController:
         if type(registry_revision) is not int or registry_revision < 0:
             raise ValueError("registry_revision must be a nonnegative integer.")
 
-        executor_status = self._poll_admission_executor()
+        executor_status, unresolved = self._poll_admission_executor()
         executor_epoch = executor_status["executor_epoch"]
         if executor_status["envelope"] == "unknown" or not isinstance(executor_epoch, str):
             self._observed_executor_epoch = None
@@ -888,7 +889,6 @@ class ProjectIOController:
             if key[1:] in valid_scheduler_services and (key[1:] != selected_service or key[0] in current_identities)
         }
 
-        unresolved = self.executor.unresolved_requests()
         unresolved_by_id = {request.request_id: request for request in unresolved}
         self._started_requests.intersection_update(unresolved_by_id)
         observations: dict[str, Mapping[str, Any]] = {
@@ -1148,7 +1148,7 @@ class ProjectIOController:
         for project_id, evidence in observations.items():
             self._validate_empty_observation(project_id, evidence, lane, admission_role)
 
-        executor_status = self._poll_admission_executor()
+        executor_status, unresolved = self._poll_admission_executor()
         executor_epoch = executor_status["executor_epoch"]
         if executor_status["envelope"] == "unknown" or not isinstance(executor_epoch, str):
             self._observed_executor_epoch = None
@@ -1201,7 +1201,6 @@ class ProjectIOController:
             is not None
         }
 
-        unresolved = self.executor.unresolved_requests()
         unresolved_by_id = {request.request_id: request for request in unresolved}
         self._started_requests.intersection_update(unresolved_by_id)
         unresolved_owners = {
@@ -1364,7 +1363,7 @@ class ProjectIOController:
     @_admission_operation
     def advance_group_service_probes(self, bindings: Sequence[ProjectBinding], registry_revision: int) -> None:
         """Advance closed censuses and exact bounded Group transactions."""
-        status = self._poll_admission_executor()
+        status, unresolved = self._poll_admission_executor()
         epoch = status.get("executor_epoch")
         if not isinstance(epoch, str) or status.get("envelope") == "unknown":
             return
@@ -1376,7 +1375,7 @@ class ProjectIOController:
             and (identity := self._binding_identity(binding, registry_revision, epoch)) is not None
             and identity in self._validated
         }
-        unresolved = self.executor.unresolved_requests()
+
         unresolved_ids = {request.request_id for request in unresolved}
         self._group_service.reconcile(current, unresolved_ids, self.runtime.working_set)
         for request in unresolved:
@@ -1505,7 +1504,7 @@ class ProjectIOController:
             raise ValueError("bindings must contain ProjectBinding values.")
         if type(registry_revision) is not int or registry_revision < 0:
             raise ValueError("registry_revision must be a nonnegative integer.")
-        status = self._poll_admission_executor()
+        status, unresolved = self._poll_admission_executor()
         epoch = status.get("executor_epoch")
         if not isinstance(epoch, str) or status.get("envelope") == "unknown":
             return
@@ -1531,7 +1530,7 @@ class ProjectIOController:
                 or self.runtime.working_set.is_turn_observation_pending(round_state.turn)
             )
         }
-        unresolved = self.executor.unresolved_requests()
+
         unresolved_ids = {request.request_id for request in unresolved}
         self._scheduler_quiescence_requests = {
             request_id: round_state
@@ -1634,7 +1633,7 @@ class ProjectIOController:
             or not 0 <= free_capacity <= visible_capacity <= 4096
         ):
             raise ValueError("primary probe capacities are invalid.")
-        status = self._poll_admission_executor()
+        status, unresolved = self._poll_admission_executor()
         executor_epoch = status.get("executor_epoch")
         if status.get("envelope") == "unknown" or not isinstance(executor_epoch, str):
             self.invalidate_borrow_admission(lane)
@@ -1666,7 +1665,7 @@ class ProjectIOController:
         if round_state is None or round_state.identities != identities or round_state.capacity_digest != digest:
             round_state = _PrimaryProbeRound(uuid.uuid4().hex, identities, digest, {}, set(), set())
             self._primary_rounds[lane] = round_state
-        unresolved = self.executor.unresolved_requests()
+
         for request in unresolved:
             if request.operation_kind != "scheduler_primary_probe" or request.parameters["lane"] != lane:
                 continue
@@ -1767,8 +1766,8 @@ class ProjectIOController:
             raise ValueError("lane must be 'gpu' or 'cpu'.")
         self._primary_rounds.pop(lane, None)
         self._borrow_grants.pop(lane, None)
-        self._poll_admission_executor()
-        for request in self.executor.unresolved_requests():
+        _, unresolved = self._poll_admission_executor()
+        for request in unresolved:
             if request.operation_kind == "scheduler_primary_probe" and request.parameters["lane"] == lane:
                 if self.executor.resolve_stale_primary_probe(request.request_id, request):
                     self._started_requests.discard(request.request_id)
@@ -1947,7 +1946,7 @@ class ProjectIOController:
             elif evidence["reason"] == "candidate_ready":
                 raise ValueError("empty scheduler observation cannot use candidate_ready reason.")
 
-        executor_status = self._poll_admission_executor()
+        executor_status, unresolved = self._poll_admission_executor()
         executor_epoch = executor_status["executor_epoch"]
         if executor_status["envelope"] == "unknown" or not isinstance(executor_epoch, str):
             self._observed_executor_epoch = None
@@ -1978,7 +1977,6 @@ class ProjectIOController:
                 and set(bindings) == enabled
             )
 
-        unresolved = self.executor.unresolved_requests()
         unresolved_by_id = {request.request_id: request for request in unresolved}
         self._started_requests.intersection_update(unresolved_by_id)
         unresolved_owners = {
@@ -2576,7 +2574,7 @@ class ProjectIOController:
         current_reservations = set(reservations)
         self._trusted_reservations = {item: None for item in self._trusted_reservations if item in current_reservations}
 
-        executor_status = self._poll_admission_executor()
+        executor_status, unresolved = self._poll_admission_executor()
         executor_epoch = executor_status["executor_epoch"]
         if executor_status["envelope"] == "unknown" or not isinstance(executor_epoch, str):
             return tuple(sorted(self._trusted_reservations, key=lambda item: item.reservation_id))
@@ -2591,7 +2589,6 @@ class ProjectIOController:
             current_bindings[identity] = binding
             bindings_by_project[binding.project_id] = (identity, binding)
 
-        unresolved = self.executor.unresolved_requests()
         retained_reconcile_identities = set(current_bindings) | {
             self._request_identity(request)
             for request in unresolved
@@ -2792,7 +2789,7 @@ class ProjectIOController:
             raise ValueError("reservations must have unique reservation IDs.")
         self._authorized_reservations.intersection_update(reservations)
 
-        executor_status = self._poll_admission_executor()
+        executor_status, unresolved = self._poll_admission_executor()
         executor_epoch = executor_status["executor_epoch"]
         if executor_status["envelope"] == "unknown" or not isinstance(executor_epoch, str):
             self._observed_executor_epoch = None
@@ -2813,7 +2810,6 @@ class ProjectIOController:
             current_bindings[identity] = binding
             bindings_by_project[binding.project_id] = (identity, binding)
 
-        unresolved = self.executor.unresolved_requests()
         unresolved_by_id = {request.request_id: request for request in unresolved}
         self._started_requests.intersection_update(unresolved_by_id)
         unresolved_owners = {
@@ -3001,7 +2997,7 @@ class ProjectIOController:
         excluded_project_ids = frozenset(start_excluded_project_ids)
         if any(type(project_id) is not str or not project_id for project_id in excluded_project_ids):
             raise ValueError("start_excluded_project_ids must contain nonempty project IDs.")
-        executor_status = self._poll_admission_executor()
+        executor_status, unresolved = self._poll_admission_executor()
         executor_epoch = executor_status.get("executor_epoch")
         if executor_status.get("envelope") == "unknown" or not isinstance(executor_epoch, str):
             return {}
@@ -3011,7 +3007,7 @@ class ProjectIOController:
             identity = self._binding_identity(binding, registry_revision, executor_epoch)
             if identity is not None and binding.enabled and identity in self._validated:
                 current[identity] = binding
-        unresolved = self.executor.unresolved_requests()
+
         unresolved_by_id = {request.request_id: request for request in unresolved}
         unresolved_owners = {
             (request.runtime_id, request.project_id, request.registration_generation) for request in unresolved
@@ -3164,7 +3160,7 @@ class ProjectIOController:
         """Advance one fairly selected ready-index build slice."""
         if type(observed_only) is not bool:
             raise ValueError("observed_only must be a boolean.")
-        executor_status = self._poll_admission_executor()
+        executor_status, unresolved = self._poll_admission_executor()
         executor_epoch = executor_status.get("executor_epoch")
         if executor_status.get("envelope") == "unknown" or not isinstance(executor_epoch, str):
             return {}
@@ -3182,7 +3178,6 @@ class ProjectIOController:
             if not observed_only or identity in self._ready_index_needed
         }
 
-        unresolved = self.executor.unresolved_requests()
         unresolved_by_id = {request.request_id: request for request in unresolved}
         unresolved_owners = {
             (request.runtime_id, request.project_id, request.registration_generation) for request in unresolved
@@ -3328,7 +3323,7 @@ class ProjectIOController:
         registry_revision: int,
     ) -> dict[str, Mapping[str, Any]]:
         """Advance one descriptor-maintenance slice for a fairly selected binding."""
-        executor_status = self._poll_admission_executor()
+        executor_status, unresolved = self._poll_admission_executor()
         executor_epoch = executor_status.get("executor_epoch")
         if executor_status.get("envelope") == "unknown" or not isinstance(executor_epoch, str):
             return {}
@@ -3349,7 +3344,6 @@ class ProjectIOController:
         }
         self._maintenance_descriptor_dirty.intersection_update(current)
 
-        unresolved = self.executor.unresolved_requests()
         unresolved_by_id = {request.request_id: request for request in unresolved}
         self._maintenance_descriptor_turns = {
             request_id: turn
@@ -3542,7 +3536,7 @@ class ProjectIOController:
         registry_revision: int,
     ) -> dict[str, Mapping[str, Any]]:
         """Advance one digest-bound local diagnostic flush per current binding."""
-        executor_status = self._poll_admission_executor()
+        executor_status, unresolved = self._poll_admission_executor()
         executor_epoch = executor_status.get("executor_epoch")
         if executor_status.get("envelope") == "unknown" or not isinstance(executor_epoch, str):
             return {}
@@ -3552,7 +3546,7 @@ class ProjectIOController:
             identity = self._binding_identity(binding, registry_revision, executor_epoch)
             if identity is not None and binding.enabled and identity in self._validated:
                 current[identity] = binding
-        unresolved = self.executor.unresolved_requests()
+
         unresolved_by_id = {request.request_id: request for request in unresolved}
         unresolved_owners = {
             (request.runtime_id, request.project_id, request.registration_generation) for request in unresolved
@@ -3746,7 +3740,7 @@ class ProjectIOController:
             self._snapshot_last_published.clear()
             self._snapshot_health_instance_id = instance_id
 
-        executor_status = self._poll_admission_executor()
+        executor_status, unresolved = self._poll_admission_executor()
         executor_epoch = executor_status.get("executor_epoch")
         if executor_status.get("envelope") == "unknown" or not isinstance(executor_epoch, str):
             return {}
@@ -3778,7 +3772,6 @@ class ProjectIOController:
             if key[1] == instance_id and key[0] in current_identities
         }
 
-        unresolved = self.executor.unresolved_requests()
         unresolved_by_id = {request.request_id: request for request in unresolved}
         unresolved_owners = {
             (request.runtime_id, request.project_id, request.registration_generation) for request in unresolved
@@ -4361,7 +4354,7 @@ class ProjectIOController:
         ):
             raise ValueError("renewal_horizon_seconds is invalid.")
 
-        executor_status = self._poll_admission_executor()
+        executor_status, unresolved = self._poll_admission_executor()
         executor_epoch = executor_status.get("executor_epoch")
         if executor_status.get("envelope") == "unknown" or not isinstance(executor_epoch, str):
             return {}
@@ -4377,7 +4370,6 @@ class ProjectIOController:
             if identity is not None and binding.enabled is True and identity not in current:
                 current[identity] = binding
 
-        unresolved = self.executor.unresolved_requests()
         unresolved_by_id = {request.request_id: request for request in unresolved}
         unresolved_owners = {
             (request.runtime_id, request.project_id, request.registration_generation) for request in unresolved
@@ -4880,7 +4872,7 @@ class ProjectIOController:
     @_admission_operation
     def advance_submission_control(self, bindings: Sequence[ProjectBinding], registry_revision: int) -> None:
         """Apply shared proof progress and fenced local service acknowledgements."""
-        status = self._poll_admission_executor()
+        status, _ = self._poll_admission_executor()
         epoch = status.get("executor_epoch")
         if status.get("envelope") == "unknown" or not isinstance(epoch, str):
             return
@@ -4935,7 +4927,7 @@ class ProjectIOController:
     @_admission_operation
     def advance_observation_maintenance(self, bindings: Sequence[ProjectBinding], registry_revision: int) -> None:
         """Apply projection maintenance completion to a captured local observation turn."""
-        status = self._poll_admission_executor()
+        status, _ = self._poll_admission_executor()
         epoch = status.get("executor_epoch")
         if status.get("envelope") == "unknown" or not isinstance(epoch, str):
             return
@@ -5087,7 +5079,7 @@ class ProjectIOController:
     ) -> dict[str, Mapping[str, Any]]:
         if type(registry_revision) is not int or registry_revision < 0:
             raise ValueError("registry_revision must be a nonnegative integer.")
-        executor_status = self._poll_admission_executor()
+        executor_status, unresolved = self._poll_admission_executor()
         executor_epoch = executor_status.get("executor_epoch")
         if executor_status.get("envelope") == "unknown" or not isinstance(executor_epoch, str):
             return {}
@@ -5121,7 +5113,6 @@ class ProjectIOController:
                 **(dict(raw_parameters) if raw_parameters is not None else {}),
             }
 
-        unresolved = self.executor.unresolved_requests()
         unresolved_by_id = {request.request_id: request for request in unresolved}
         maintenance_descriptor_unresolved = {
             self._request_identity(request)

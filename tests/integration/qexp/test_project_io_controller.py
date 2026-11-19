@@ -4024,7 +4024,7 @@ def test_admission_replays_archives_at_boundaries_and_rechecks_live_capacity(tmp
         with controller.admission_turn():
             controller.advance_binding_validation(bindings, revision)
             monkeypatch.setattr(executor, "status_view", changed_status)
-            observed = controller._poll_admission_executor()
+            observed, _ = controller._poll_admission_executor()
             assert observed["envelope"] == envelope
             assert observed["overdue_worker_count"] == (3 if envelope == "exceeded" else 0)
             for _ in range(5):

@@ -54,7 +54,9 @@ class _DemandController(Protocol):
     runtime: Any
     executor: Any
 
-    def _poll_admission_executor(self, *, force_poll: bool = False) -> Mapping[str, Any]: ...
+    def _poll_admission_executor(
+        self, *, force_poll: bool = False
+    ) -> tuple[Mapping[str, Any], tuple[ProjectIORequest, ...]]: ...
 
     def _binding_identity(
         self,
@@ -236,14 +238,13 @@ class IdleJobDemandCoordinator:
         controller: _DemandController,
     ) -> tuple[Mapping[str, Any] | None, tuple[ProjectIORequest, ...]]:
         try:
-            status = controller._poll_admission_executor()
+            status, unresolved = controller._poll_admission_executor()
             if not isinstance(status, Mapping):
                 return None, ()
             epoch = status.get("executor_epoch")
             envelope = status.get("envelope")
             if not isinstance(epoch, str) or not epoch or not isinstance(envelope, str) or envelope == "unknown":
                 return None, ()
-            unresolved = tuple(controller.executor.unresolved_requests())
             if any(not isinstance(request, ProjectIORequest) for request in unresolved):
                 return None, ()
             # The executor exposes this bound as part of its status.  Reject a

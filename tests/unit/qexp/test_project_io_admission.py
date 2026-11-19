@@ -102,6 +102,27 @@ def test_deadline_scan_yields_owner_slot_to_noncritical_primary_work():
     assert executed == [quiescence]
 
 
+def test_yielding_deadline_scan_cannot_pin_other_background_work():
+    admission = ProjectIOAdmission()
+    owner = _intent("project").owner
+    authority = ServiceIntent(owner, "authority", "authority_terminal_observe", ())
+    scan = ServiceIntent(owner, "background", "scheduler_due_offer", ())
+    maintenance = ServiceIntent(owner, "background", "maintenance_descriptor_advance", ())
+    executed = []
+
+    for _ in range(12):
+        admission.begin([owner], blocked=(), free_slots=1)
+        _offer_all(admission, [scan, maintenance, authority], executed)
+        admission.finish()
+
+    assert maintenance in executed
+    assert scan not in executed
+    admission.begin([owner], blocked=(), free_slots=1)
+    _offer_all(admission, [scan], executed)
+    admission.finish()
+    assert executed[-1] == scan
+
+
 def test_progress_publish_continuation_runs_once_before_ordinary_background_rotation():
     admission = ProjectIOAdmission()
     owner = _intent("a").owner

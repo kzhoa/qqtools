@@ -215,14 +215,14 @@ def replace_snapshot_if_changed(path: Path, value: dict[str, Any]) -> bool:
 
 
 @diagnostic_span("store.read_json_limited")
-def read_json_limited(
+def read_json_bytes_limited(
     path: Path,
     *,
     max_bytes: int,
     record_type: str = "json_record",
     io_step_observer: Callable[[str], None] | None = None,
-) -> dict[str, Any]:
-    """Read one JSON object after enforcing a durable record-size limit."""
+) -> bytes:
+    """Read encoded JSON within its durable record-size and migration I/O limits."""
     _require_migration_json_io_authorization()
     if type(max_bytes) is not int or max_bytes <= 0:
         raise ValueError("max_bytes must be a positive integer.")
@@ -246,6 +246,20 @@ def read_json_limited(
             actual_bytes=actual_bytes if actual_bytes >= 0 else len(encoded),
             limit_bytes=max_bytes,
         )
+    return encoded
+
+
+def read_json_limited(
+    path: Path,
+    *,
+    max_bytes: int,
+    record_type: str = "json_record",
+    io_step_observer: Callable[[str], None] | None = None,
+) -> dict[str, Any]:
+    """Read one JSON object after enforcing a durable record-size limit."""
+    encoded = read_json_bytes_limited(
+        path, max_bytes=max_bytes, record_type=record_type, io_step_observer=io_step_observer
+    )
     value = json.loads(encoded.decode("utf-8"))
     if not isinstance(value, dict):
         raise ValueError(f"Expected JSON object at {path}.")

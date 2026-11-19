@@ -229,7 +229,7 @@ class RunningAgent:
 
     def _finalize_epoch(self) -> Mapping[str, Any]:
         """Finalize epoch state without advancing the persisted progress cursor."""
-        raw_epoch_metrics = self.train_avg_bank.gather_average(self.config.distributed)
+        raw_epoch_metrics = self.train_avg_bank.gather_average(self.config.distributed, self.device)
         if self.use_tensor_bank and self.train_tensor_bank:
             gathered_cache = self.train_tensor_bank.gather(self.config.distributed, self.device)
             task_epoch_metrics = self.task.epoch_metric(gathered_cache)
@@ -556,7 +556,7 @@ class RunningAgent:
         val_loaders, test_loaders = self._resolve_evaluation_loaders()
         val_loaders, test_loaders = self._prepare_evaluation_loader_snapshot(val_loaders, test_loaders)
 
-        interval_metrics = self.interval_avg_bank.gather_average(self.config.distributed)
+        interval_metrics = self.interval_avg_bank.gather_average(self.config.distributed, self.device)
         self.interval_avg_bank = AvgBank()
 
         evaluation = self.evaluate_all_models(val_loaders, test_loaders)
