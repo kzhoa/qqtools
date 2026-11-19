@@ -295,7 +295,7 @@ def test_project_status_groups_state_actions_and_scheduler_diagnostics() -> None
         "local_participation": {"state": "registered"},
         "local_agent": {"state": "active", "configured_mode": "on_demand"},
         "task_observation": {"state": "absent", "reason": "projection_missing"},
-        "next_actions": ["qexp task list --project /work/project", "qexp machine list --project /work/project"],
+        "next_actions": ["qexp task list --project /work/project", "qexp agent diagnostics active"],
         "scheduler_diagnostics": {
             "status": "available",
             "coverage": "incomplete",
@@ -308,10 +308,10 @@ def test_project_status_groups_state_actions_and_scheduler_diagnostics() -> None
     output = _human(OutputKind.STATUS, payload)
 
     assert output.startswith("Project: /work/project")
-    assert "Local enrollment\n  Status: registered" in output
-    assert "Task observation reason: projection missing" in output
-    assert "Inspect Task observation: qexp task list --project /work/project" in output
-    assert "Inspect scheduling diagnostics: qexp agent diagnostics active" in output
+    assert "Local enrollment: registered" in output
+    assert "Task observation index: absent (projection missing)" in output
+    assert "Run: qexp task list --project /work/project" in output
+    assert "Run: qexp agent diagnostics active" in output
     assert "Scheduling diagnostics\n  State: available\n  Coverage: incomplete" in output
     assert "Reason: probe data unavailable" in output
 
@@ -323,7 +323,7 @@ def test_project_status_clean_active_observation_suppresses_actions() -> None:
         "local_participation": {"state": "registered"},
         "local_agent": {"state": "active", "configured_mode": "daemon", "observed_mode": "daemon"},
         "task_observation": {"state": "active", "reason": None},
-        "next_actions": ["qexp task list --project /work/project"],
+        "next_actions": [],
         "warnings": [],
         "scheduler_diagnostics": {
             "status": "available",
@@ -337,8 +337,10 @@ def test_project_status_clean_active_observation_suppresses_actions() -> None:
     output = _human(OutputKind.STATUS, payload)
 
     assert output.startswith("Project: /work/project")
-    assert "Local enrollment\n  Status: registered" in output
-    assert "Task observation: active" in output
+    assert "Local enrollment: registered" in output
+    assert output.splitlines()[1:3] == ["Local enrollment: registered", "Local agent: active"]
+    assert len(output.splitlines()) <= 8
+    assert max(map(len, output.splitlines())) <= 80
     assert "Next actions" not in output
     assert "running Tasks" not in output
 
@@ -357,7 +359,7 @@ def test_project_status_dirty_active_observation_keeps_task_action() -> None:
 
     output = _human(OutputKind.STATUS, payload)
 
-    assert "Inspect Task observation: qexp task list --project /work/project" in output
+    assert "Run: qexp task list --project /work/project" in output
 
 
 def test_project_status_unregistered_action_is_qualified_and_path_is_preserved() -> None:
@@ -371,17 +373,16 @@ def test_project_status_unregistered_action_is_qualified_and_path_is_preserved()
         "local_participation": {"state": "unregistered", "reason": "no_local_binding_or_inventory"},
         "local_agent": {"state": "unavailable"},
         "task_observation": {"state": "active"},
-        "next_actions": ["qexp project register /work/project with spaces"],
+        "next_actions": ["qexp project register '/work/project with spaces'"],
         "warnings": ["local agent status unavailable (record_missing)."],
     }
 
     output = _human(OutputKind.STATUS, payload)
 
     assert "Project: /work/project with spaces" in output
-    assert "Selection source: environment" in output
-    assert "Local enrollment\n  Status: not registered with the Project" in output
+    assert "Local enrollment: not registered" in output
     assert "To run Tasks on this machine" in output
-    assert "qexp project register /work/project with spaces" in output
+    assert "qexp project register '/work/project with spaces'" in output
 
 
 def test_project_status_renders_bounded_finding_scope_counts_and_command() -> None:
@@ -391,7 +392,9 @@ def test_project_status_renders_bounded_finding_scope_counts_and_command() -> No
         "local_participation": {"state": "registered"},
         "local_agent": {"state": "active", "configured_mode": "daemon", "observed_mode": "daemon"},
         "task_observation": {"state": "active"},
-        "next_actions": [],
+        "next_actions": [
+            "qexp agent diagnostics active --project-id project-1 --reason termination_process_identity_present"
+        ],
         "warnings": [],
         "scheduler_diagnostics": {
             "status": "available",

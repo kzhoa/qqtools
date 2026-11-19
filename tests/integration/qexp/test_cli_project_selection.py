@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shlex
 from pathlib import Path
 
 import pytest
@@ -25,6 +26,32 @@ def test_explicit_project_normalizes_directory_and_common_options_work_after_pat
     assert result["project"]["path"] == str(project)
     assert result["project"]["selection_source"] == "explicit"
     assert cfg.shared_root == project / ".qexp"
+
+
+def test_status_followups_execute_in_selected_machine_runtime(tmp_path: Path, monkeypatch, capsys) -> None:
+    default = tmp_path / "machine A"
+    selected = tmp_path / "machine B"
+    project = tmp_path / "Project with spaces"
+    monkeypatch.setenv("QEXP_MACHINE_RUNTIME_ROOT", str(default))
+    for root, name in ((default, "machine-a"), (selected, "machine-b")):
+        _status(["--machine-runtime-root", str(root), "init", "--machine", name], capsys)
+    _status(["project", "init", str(project)], capsys)
+
+    args = ["--machine-runtime-root", str(selected), "--project", str(project), "status"]
+    payload = _status(args, capsys)
+    actions = payload["next_actions"]
+    assert main(args) == 0
+    human = capsys.readouterr().out
+    assert all(human.count(command) == 1 for command in actions)
+    register = shlex.split(actions[0])
+    assert register == ["qexp", "--machine-runtime-root", str(selected), "project", "register", str(project)]
+    _status(register[1:], capsys)
+    assert _status(args, capsys)["local_participation"]["state"] == "registered"
+    assert _status(["--project", str(project), "status"], capsys)["local_participation"]["state"] == "unregistered"
+
+    diagnostics = next(shlex.split(command) for command in actions if "diagnostics" in shlex.split(command))
+    assert diagnostics[-2:] == ["--project-id", payload["project"]["project_id"]]
+    assert _status(diagnostics[1:], capsys)["machine_runtime_root"] == str(selected)
 
 
 def test_project_selection_precedence_is_explicit_environment_cwd_then_saved(

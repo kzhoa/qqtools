@@ -1,11 +1,20 @@
 from __future__ import annotations
 
+import shlex
 from pathlib import Path
+
+import pytest
 
 from qqtools.plugins.qexp import init_shared_root
 from qqtools.plugins.qexp.agent.context import MachineRuntime
 from qqtools.plugins.qexp.agent.setup import initialize_machine
-from qqtools.plugins.qexp.commands.status import MAX_READ_ATTEMPTS, MAX_RECORD_BYTES, machine_detail, project_status
+from qqtools.plugins.qexp.commands.status import (
+    MAX_READ_ATTEMPTS,
+    MAX_RECORD_BYTES,
+    _follow_up_actions,
+    machine_detail,
+    project_status,
+)
 from qqtools.plugins.qexp.runtime.store import atomic_replace
 
 
@@ -23,10 +32,9 @@ def test_project_status_is_useful_without_enumerating_large_histories(tmp_path: 
     assert result["project"]["selection_source"] == "explicit"
     assert result["totals"] == {"tasks": None, "machines": None, "reason": "not_available"}
     assert result["budget"]["read_attempts"] <= MAX_READ_ATTEMPTS
-    assert result["next_actions"][:2] == [
-        f"qexp task list --project {cfg.project_root}",
-        f"qexp machine list --project {cfg.project_root}",
-    ]
+    actions = [shlex.split(command) for command in result["next_actions"]]
+    assert all(args[:3] == ["qexp", "--machine-runtime-root", str(runtime.root)] for args in actions)
+    assert actions[0][3:] == ["project", "register", str(cfg.project_root)]
 
 
 def test_project_status_marks_oversized_optional_record_unavailable(tmp_path: Path) -> None:
@@ -37,6 +45,9 @@ def test_project_status_marks_oversized_optional_record_unavailable(tmp_path: Pa
 
     result = project_status(cfg, selection_source="environment", machine_runtime=runtime)
 
+    actions = [shlex.split(command) for command in result["next_actions"]]
+    assert actions[0] == ["ls", "-ld", "--", str(runtime.paths["registry"]), str(runtime.paths["inventory"])]
+    assert all("init" not in args and "register" not in args for args in actions)
     assert result["status"] == "partial"
     assert result["local_participation"]["state"] == "unavailable"
     assert any("record_oversized" in warning for warning in result["warnings"])
@@ -97,3 +108,44 @@ def test_project_status_malformed_agent_config_is_null_and_preserved(tmp_path: P
     assert result["local_agent"]["configured_mode"] is None
     assert any("agent config" in warning.lower() and "malformed" in warning.lower() for warning in result["warnings"])
     assert runtime.paths["global_config"].read_bytes() == malformed
+
+
+@pytest.mark.parametrize(
+    ("state", "reason", "diagnostic_changes", "expected"),
+    [
+        ("active", None, {}, []),
+        ("active", "projection_dirty", {}, ["task"]),
+        ("building", None, {}, ["task"]),
+        ("degraded", None, {}, ["task"]),
+        ("absent", None, {}, ["task"]),
+        ("unavailable", None, {}, ["task"]),
+        ("active", None, {"status": "unavailable", "coverage": "unknown", "reason": "store_corrupt"}, ["agent"]),
+        ("active", None, {"coverage": "incomplete"}, ["agent"]),
+        ("active", None, {"truncated": True}, ["agent"]),
+    ],
+)
+def test_project_status_action_policy(tmp_path, state, reason, diagnostic_changes, expected):
+    diagnostics = {
+        "status": "available",
+        "coverage": "complete",
+        "active_count": 0,
+        "active_findings": [],
+        "truncated": False,
+        **diagnostic_changes,
+    }
+    actions = _follow_up_actions(
+        tmp_path,
+        "project-a",
+        MachineRuntime(tmp_path / "rt"),
+        "registered",
+        {"state": "active", "configured_mode": "daemon", "observed_mode": "daemon"},
+        {"state": state, "reason": reason},
+        diagnostics,
+        [],
+    )
+    suffixes = [shlex.split(command)[3:] for command in actions]
+    options = {
+        "task": ["--project", str(tmp_path), "task", "list"],
+        "agent": ["agent", "diagnostics", "active", "--project-id", "project-a"],
+    }
+    assert suffixes == [options[kind] for kind in expected]

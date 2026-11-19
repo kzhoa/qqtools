@@ -1778,7 +1778,13 @@ section. Material enrollment, observation, agent, mode, warning, diagnostic-cove
 conditions retain bounded next actions, with the highest-priority action first. Scheduler findings
 show only the bounded samples returned by the Project summary, their stable reason, available
 Project or Attempt scope, observation time, aggregate and displayed counts, and a finite diagnostic
-command mapping. These presentation rules do not change the JSON status contract or read budget.
+command mapping. Human output prints the same ordered commands as the JSON
+`next_actions` string array. A normal observation returns an empty array. Each command
+pins the observed MachineRuntime and any relevant Project. Confirmed non-enrollment
+offers registration for local execution. Unreadable enrollment evidence calls for inspecting
+the selected registry and inventory paths with `ls -ld`. An unavailable, truncated, or incomplete
+scheduler summary offers a bounded Project-filtered diagnostics read. Sampled findings
+also filter by stable reason. These follow-ups require no additional reads during status.
 
 Initiating Group cancellation, worker removal, and Task cleanup results include an opaque versioned
 `operation_reference` plus the internal operation ID. The reference binds Project identity,

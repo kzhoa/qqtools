@@ -135,7 +135,7 @@ def _inventory_path(runtime: Any) -> Path:
     return _as_runtime(runtime).paths["inventory"]
 
 
-def _decode(value: dict[str, Any]) -> tuple[int, list[ProjectInventoryEntry]]:
+def decode_inventory(value: dict[str, Any]) -> tuple[int, list[ProjectInventoryEntry]]:
     raw = value.get("inventory")
     if not isinstance(raw, dict) or raw.get("version") != INVENTORY_VERSION:
         raise RuntimeError("machine Project inventory is malformed or unsupported.")
@@ -171,15 +171,15 @@ def ensure_inventory(runtime: Any, *, require_initialized: bool = True) -> tuple
         machine_runtime.require_initialized()
     path = _inventory_path(machine_runtime)
     if path.exists():
-        return _decode(read_json(path))
+        return decode_inventory(read_json(path))
     if getattr(machine_runtime, "_inventory_lock_depth", 0):
         if path.exists():
-            return _decode(read_json(path))
+            return decode_inventory(read_json(path))
         atomic_replace(path, _encode(0, ()))
         return 0, []
     with machine_runtime.inventory_guard():
         if path.exists():
-            return _decode(read_json(path))
+            return decode_inventory(read_json(path))
         atomic_replace(path, _encode(0, ()))
         return 0, []
 

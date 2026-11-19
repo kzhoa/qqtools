@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shlex
 from pathlib import Path
 
 import pytest
@@ -128,7 +129,24 @@ def test_project_status_reads_only_precomputed_selected_binding_summary(tmp_path
 
     summary = result["scheduler_diagnostics"]
     assert summary["status"] == "available"
-    assert all(item["identity"].get("project_id") == project_id for item in summary.get("items", []))
+    assert [item["identity"]["project_id"] for item in summary["active_findings"]] == [project_id]
+    assert (
+        shlex.join(
+            [
+                "qexp",
+                "--machine-runtime-root",
+                str(runtime.root),
+                "agent",
+                "diagnostics",
+                "active",
+                "--project-id",
+                project_id,
+                "--reason",
+                "ready_index_unreadable",
+            ]
+        )
+        in result["next_actions"]
+    )
     assert result["budget"]["read_attempts"] <= MAX_READ_ATTEMPTS
 
 

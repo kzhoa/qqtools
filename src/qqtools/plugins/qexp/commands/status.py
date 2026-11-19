@@ -8,10 +8,10 @@ import stat
 from pathlib import Path
 from typing import Any
 
-from ..agent.bindings import ProjectBinding
+from ..agent.bindings import ProjectBinding, decode_registry
 from ..agent.config import AgentConfig
 from ..agent.context import MachineRuntime
-from ..agent.inventory import ProjectInventoryEntry
+from ..agent.inventory import ProjectInventoryEntry, decode_inventory
 from ..agent.scheduler_diagnostics import SchedulerDiagnosticStore
 from ..config_types import RootConfig
 from ..layout import machine_path, project_id
@@ -136,40 +136,10 @@ def _project_identity(cfg: RootConfig, reader: _ReadBudget) -> str:
     return expected
 
 
-def _decode_registry(value: dict[str, Any]) -> list[ProjectBinding]:
-    registry = value.get("registry")
-    if not isinstance(registry, dict) or registry.get("version") != 1:
-        raise ValueError("machine registry is malformed or unsupported.")
-    revision = registry.get("revision")
-    bindings = registry.get("bindings")
-    if type(revision) is not int or revision < 0 or not isinstance(bindings, list):
-        raise ValueError("machine registry is malformed.")
-    try:
-        parsed = [ProjectBinding.from_dict(item) for item in bindings]
-    except (TypeError, ValueError) as exc:
-        raise ValueError("machine registry contains a malformed project binding.") from exc
-    return parsed
-
-
-def _decode_inventory(value: dict[str, Any]) -> list[ProjectInventoryEntry]:
-    inventory = value.get("inventory")
-    if not isinstance(inventory, dict) or inventory.get("version") != 1:
-        raise ValueError("machine Project inventory is malformed or unsupported.")
-    revision = inventory.get("revision")
-    entries = inventory.get("entries")
-    if type(revision) is not int or revision < 0 or not isinstance(entries, list):
-        raise ValueError("machine Project inventory is malformed.")
-    try:
-        parsed = [ProjectInventoryEntry.from_dict(item) for item in entries]
-    except (TypeError, ValueError) as exc:
-        raise ValueError("machine Project inventory contains a malformed entry.") from exc
-    return parsed
-
-
 def _matching_participation(
     cfg: RootConfig,
     selected_project_id: str,
-    registry: list[ProjectBinding] | None,
+    registry: tuple[ProjectBinding, ...] | None,
     inventory: list[ProjectInventoryEntry] | None,
     *,
     registry_failed: bool,
@@ -184,7 +154,7 @@ def _matching_participation(
     inventoried = any(
         entry.project_id == selected_project_id and entry.shared_root == cfg.shared_root for entry in inventory or []
     )
-    if inventoried:
+    if inventoried and not registry_failed:
         return "inventory_only", "inventory_entry_without_binding"
     if registry_failed or inventory_failed:
         return "unavailable", "local_registry_or_inventory_unavailable"
@@ -253,17 +223,55 @@ def _task_observation(
     return {"state": validated["state"], "reason": reason}
 
 
-def _follow_up_actions(cfg: RootConfig, participation: str) -> list[str]:
-    project = str(cfg.project_root)
-    actions = [
-        shlex.join(["qexp", "task", "list", "--project", project]),
-        shlex.join(["qexp", "machine", "list", "--project", project]),
-        shlex.join(["qexp", "agent", "status"]),
-    ]
-    if participation in {"inventory_only", "unregistered"}:
-        actions.append(shlex.join(["qexp", "project", "register", project]))
+def _follow_up_actions(
+    project: Path,
+    project_id: str,
+    runtime: MachineRuntime,
+    participation: str,
+    agent: dict[str, object],
+    observation: dict[str, object],
+    diagnostics: dict[str, Any],
+    warnings: list[str],
+) -> list[str]:
+    prefix = ["qexp", "--machine-runtime-root", str(runtime.root)]
+    actions: list[str] = []
+
+    def suggest(*args: str) -> None:
+        command = shlex.join([*prefix, *args])
+        if command not in actions:
+            actions.append(command)
+
+    if participation in {"unregistered", "inventory_only"}:
+        suggest("project", "register", str(project))
     elif participation == "unavailable":
-        actions.append(shlex.join(["qexp", "init", "--machine", cfg.machine_name]))
+        # Project list can initialize a missing inventory. Inspect the files directly.
+        actions.append(shlex.join(["ls", "-ld", "--", str(runtime.paths["registry"]), str(runtime.paths["inventory"])]))
+
+    diagnostic_args = ("agent", "diagnostics", "active", "--project-id", project_id)
+    has_reason = False
+    for sample in diagnostics["active_findings"]:
+        identity = sample.get("identity")
+        reason = identity.get("reason_code") if isinstance(identity, dict) else None
+        if isinstance(reason, str) and reason:
+            has_reason = True
+            suggest(*diagnostic_args, "--reason", reason)
+    if (
+        diagnostics["status"] != "available"
+        or diagnostics["coverage"] != "complete"
+        or diagnostics["truncated"]
+        or (diagnostics["active_count"] and not has_reason)
+    ):
+        suggest(*diagnostic_args)
+
+    if observation["state"] != "active" or observation["reason"] == "projection_dirty":
+        suggest("--project", str(project), "task", "list")
+    modes_conflict = (
+        agent["configured_mode"] and agent["observed_mode"] and agent["configured_mode"] != agent["observed_mode"]
+    )
+    if agent["configured_mode"] is None:
+        suggest("config", "show", "agent")
+    if agent["state"] in {"unavailable", "stopped"} or modes_conflict or (warnings and not actions):
+        suggest("agent", "status")
     return actions
 
 
@@ -315,18 +323,18 @@ def project_status(
 
     configured_agent_mode = _configured_agent_mode(reader, machine_runtime, warnings)
 
-    registry: list[ProjectBinding] | None = None
+    registry: tuple[ProjectBinding, ...] | None = None
     inventory: list[ProjectInventoryEntry] | None = None
     if registry_raw is not None:
         try:
-            registry = _decode_registry(registry_raw)
-        except (TypeError, ValueError) as exc:
+            _, registry = decode_registry(registry_raw)
+        except RuntimeError as exc:
             registry_failed = True
             warnings.append(f"local registry unavailable (malformed_record:{type(exc).__name__}).")
     if inventory_raw is not None:
         try:
-            inventory = _decode_inventory(inventory_raw)
-        except (TypeError, ValueError) as exc:
+            _, inventory = decode_inventory(inventory_raw)
+        except RuntimeError as exc:
             inventory_failed = True
             warnings.append(f"local inventory unavailable (malformed_record:{type(exc).__name__}).")
 
@@ -375,7 +383,16 @@ def project_status(
         "task_observation": task_observation,
         "scheduler_diagnostics": scheduler_diagnostics,
         "totals": {"tasks": None, "machines": None, "reason": "not_available"},
-        "next_actions": _follow_up_actions(cfg, participation_state),
+        "next_actions": _follow_up_actions(
+            cfg.project_root,
+            selected_project_id,
+            machine_runtime,
+            participation_state,
+            local_agent,
+            task_observation,
+            scheduler_diagnostics,
+            warnings,
+        ),
         "budget": reader.as_dict(),
         "warnings": warnings,
     }
