@@ -446,8 +446,7 @@ def _finalize_submission_group_locked(cfg: Any, submission: dict[str, Any]) -> N
     normalize_group_record(group)
     from .group_discovery.service import publish_group_locator_for_transition
 
-    # QQTOOLS-COMPAT-0017: the membership locator is dual-published before
-    # finalization clears the existing pending-commit recovery owner.
+    # Publish the membership locator before clearing the pending commit.
     publish_group_locator_for_transition(cfg, group_name, "membership", "submission_finalize")
     pending = group["group"].get("pending_submission_commit") or {}
     if not pending:

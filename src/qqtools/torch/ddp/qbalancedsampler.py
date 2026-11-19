@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import warnings
 from dataclasses import dataclass, field
 from typing import Sequence
 
@@ -8,14 +7,7 @@ import numpy as np
 import torch.distributed as dist
 from torch.utils.data import BatchSampler, Sampler
 
-from qqtools.data.qbalance import (
-    _LPT_STRATEGIES,
-    _assign_window_to_ranks_validated,
-    _normalize_lpt_strategy,
-    _plan_rank_batches,
-    compute_global_even_sort_order,
-    validate_balance_strategy,
-)
+from qqtools.data.qbalance import _normalize_lpt_strategy, _plan_rank_batches
 
 
 def _normalize_sample_costs(sample_costs: Sequence[float] | np.ndarray) -> np.ndarray:
@@ -29,36 +21,8 @@ def _normalize_sample_costs(sample_costs: Sequence[float] | np.ndarray) -> np.nd
     return np.ascontiguousarray(costs)
 
 
-def _validate_sample_order(
-    sample_order: Sequence[int] | np.ndarray,
-    total: int,
-) -> np.ndarray:
-    order = np.asarray(sample_order, dtype=np.int64)
-    if order.ndim != 1:
-        raise ValueError(f"sample_order must be 1D, got shape {order.shape}")
-    if order.shape != (total,):
-        raise ValueError(f"sample_order must have length {total}, got {order.shape[0]}")
-    if total == 0:
-        return np.ascontiguousarray(order)
-    if len(np.unique(order)) != total:
-        raise ValueError("sample_order must be a full permutation without duplicates")
-    if order.min(initial=0) != 0 or order.max(initial=-1) != total - 1:
-        raise ValueError("sample_order must be a full permutation covering [0, N)")
-    return np.ascontiguousarray(order)
-
-
 def _is_dist_ready() -> bool:
     return dist.is_available() and dist.is_initialized()
-
-
-def _build_prefix_padding(order: np.ndarray, target_size: int) -> np.ndarray:
-    if target_size <= order.shape[0]:
-        return np.ascontiguousarray(order.astype(np.int64, copy=False))
-    if order.shape[0] == 0:
-        return np.empty(0, dtype=np.int64)
-    repeat_count = int(np.ceil(target_size / order.shape[0]))
-    tiled = np.tile(order, repeat_count)
-    return np.ascontiguousarray(tiled[:target_size].astype(np.int64, copy=False))
 
 
 def _resolve_rank_and_world_size(
@@ -93,30 +57,26 @@ class _BalancedPlanCache:
     seed: int
     drop_last: bool
     pad: bool
-    sample_order: np.ndarray | None
     strategy: str
     epoch: int = 0
     rank_local_plan: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=np.int64))
-    _lpt_plan: np.ndarray | None = field(default=None, init=False, repr=False)
+    _lpt_plan: np.ndarray = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
         if self.batch_size <= 0:
             raise ValueError(f"batch_size must be positive, got {self.batch_size}")
         if self.pad and self.drop_last:
             raise ValueError("pad=True cannot be combined with drop_last=True")
-        if self.strategy in _LPT_STRATEGIES:
-            if self.sample_order is not None:
-                raise ValueError(f"strategy={self.strategy!r} cannot be combined with sample_order")
-            self._lpt_plan = _plan_rank_batches(
-                self.sample_costs,
-                batch_size=self.batch_size,
-                world_size=self.world_size,
-                seed=self.seed,
-                should_drop_last=self.drop_last,
-                should_shuffle=False,
-                strategy=self.strategy,
-            )
-            self._lpt_plan.setflags(write=False)
+        self._lpt_plan = _plan_rank_batches(
+            self.sample_costs,
+            batch_size=self.batch_size,
+            world_size=self.world_size,
+            seed=self.seed,
+            should_drop_last=self.drop_last,
+            should_shuffle=False,
+            strategy=self.strategy,
+        )
+        self._lpt_plan.setflags(write=False)
         self.rank_local_plan = self._build_rank_local_plan(self.epoch)
 
     def set_epoch(self, epoch: int) -> None:
@@ -129,81 +89,32 @@ class _BalancedPlanCache:
         self.epoch = epoch
 
     def _build_rank_local_plan(self, epoch: int) -> np.ndarray:
-        if self._lpt_plan is not None:
-            steps = np.arange(len(self._lpt_plan), dtype=np.int64)
-            rank_order = np.broadcast_to(np.arange(self.world_size), (len(steps), self.world_size))
-            if not self.shuffle:
-                pass
-            else:
-                rng = np.random.default_rng(self.seed + epoch)
-                steps = rng.permutation(len(self._lpt_plan))
-                rank_order = rng.permuted(rank_order, axis=1)
-            selected_batches = self._lpt_plan[steps, rank_order[:, self.rank], :]
-            if self.pad:
-                return np.ascontiguousarray(selected_batches.reshape(-1))
-
-            seen: set[int] = set()
-            local_indices: list[int] = []
-            for step_idx, rank_indices in zip(steps.tolist(), rank_order.tolist()):
-                for rank_idx in rank_indices:
-                    batch = self._lpt_plan[step_idx, rank_idx]
-                    for sample_idx in batch.tolist():
-                        if sample_idx in seen:
-                            continue
-                        seen.add(sample_idx)
-                        if rank_idx == self.rank:
-                            local_indices.append(int(sample_idx))
-            return np.asarray(local_indices, dtype=np.int64)
-        total = int(self.sample_costs.shape[0])
-        global_chunk_size = self.world_size * self.batch_size
+        steps = np.arange(len(self._lpt_plan), dtype=np.int64)
+        rank_order = np.broadcast_to(np.arange(self.world_size), (len(steps), self.world_size))
         if self.shuffle:
-            global_order = compute_global_even_sort_order(
-                self.sample_costs,
-                seed=self.seed + epoch,
-                strategy=self.strategy,
-            )
-        else:
-            # Shuffled plans validate costs in compute_global_even_sort_order above.
-            _normalize_sample_costs(self.sample_costs)
-            if self.sample_order is None:
-                global_order = np.arange(total, dtype=np.int64)
-            else:
-                global_order = self.sample_order.copy()
+            rng = np.random.default_rng(self.seed + epoch)
+            steps = rng.permutation(len(self._lpt_plan))
+            rank_order = rng.permuted(rank_order, axis=1)
+        selected_batches = self._lpt_plan[steps, rank_order[:, self.rank], :]
+        if self.pad:
+            return np.ascontiguousarray(selected_batches.reshape(-1))
 
-        if global_chunk_size > 0:
-            remainder = total % global_chunk_size
-        else:
-            remainder = 0
-
-        if remainder and self.drop_last:
-            global_order = global_order[: total - remainder]
-        elif remainder and self.pad:
-            target_size = total + (global_chunk_size - remainder)
-            global_order = _build_prefix_padding(global_order, target_size)
-
-        if global_order.size == 0:
-            return np.empty(0, dtype=np.int64)
-
-        rank_chunks: list[np.ndarray] = []
-        for start in range(0, int(global_order.shape[0]), global_chunk_size):
-            window = global_order[start : start + global_chunk_size]
-            assignment = _assign_window_to_ranks_validated(
-                window_indices=window,
-                costs=self.sample_costs,
-                world_size=self.world_size,
-                batch_size=self.batch_size,
-            )
-            rank_chunk = np.asarray(assignment[self.rank], dtype=np.int64)
-            if rank_chunk.size > 0:
-                rank_chunks.append(rank_chunk)
-
-        if not rank_chunks:
-            return np.empty(0, dtype=np.int64)
-        return np.ascontiguousarray(np.concatenate(rank_chunks).astype(np.int64, copy=False))
+        seen: set[int] = set()
+        local_indices: list[int] = []
+        for step_idx, rank_indices in zip(steps.tolist(), rank_order.tolist()):
+            for rank_idx in rank_indices:
+                batch = self._lpt_plan[step_idx, rank_idx]
+                for sample_idx in batch.tolist():
+                    if sample_idx in seen:
+                        continue
+                    seen.add(sample_idx)
+                    if rank_idx == self.rank:
+                        local_indices.append(int(sample_idx))
+        return np.asarray(local_indices, dtype=np.int64)
 
 
 class BalancedDistributedSampler(Sampler[int]):
-    """Balance fixed-size rank batches with order strategies or direct LPT planning.
+    """Balance fixed-size rank batches with LPT planning.
 
     Prefer BalancedBatchSampler with DataLoader(batch_sampler=...) to preserve batch
     boundaries automatically. With this index sampler, the DataLoader batch_size must
@@ -227,9 +138,7 @@ class BalancedDistributedSampler(Sampler[int]):
             Dropped or repeated sample occurrences stay fixed across epochs.
         pad: Boolean. Repeat deterministic tail occurrences when True. ``pad=True`` and
             ``drop_last=True`` are mutually exclusive.
-        sample_order: Legacy V-only permutation used when shuffle=False. LPT rejects it.
         strategy: Planning tier: lpt_fast, lpt-medium (alias/default lpt), or lpt_best.
-            Legacy v1 through v3 are deprecated and scheduled for removal in v1.4.0.
 
     Raises:
         TypeError: Boolean or integer settings have unsupported types.
@@ -248,15 +157,13 @@ class BalancedDistributedSampler(Sampler[int]):
     Base groups remain unchanged. All three cache final batch membership in memory. ``shuffle=True``
     shuffles steps and rank labels using seed + epoch, not samples within batches.
     Non-shuffled LPT is deterministic balanced order, not original dataset order.
-    LPT does not support ``sample_order``. Shuffled tails are selected/padded once
+    Shuffled tails are selected/padded once
     from a small repair pool using the base seed, or discarded with ``drop_last=True``;
     at most 2*world_size-1 base batches are regrouped by tail repair (derived step
     optimization can touch other batches in the derived plan). Changing epochs does
     not change those occurrences. ``pad=False`` preserves non-divisible input without tail
     duplicates; rank-local plans may end with an incomplete batch.
-    This strategy is sampler-only; dataset ordering and LMDB artifacts are unchanged.
-    Legacy sampler strategies ``v1`` through ``v3`` are deprecated and will be removed
-    in v1.4.0. The default is ``lpt``, normalized internally to ``lpt-medium``.
+    The default is ``lpt``, normalized internally to ``lpt-medium``.
     """
 
     def __init__(
@@ -270,7 +177,6 @@ class BalancedDistributedSampler(Sampler[int]):
         seed: int = 0,
         drop_last: bool = False,
         pad: bool = True,
-        sample_order: Sequence[int] | np.ndarray | None = None,
         strategy: str = "lpt",
     ) -> None:
         for name, value in (("shuffle", shuffle), ("drop_last", drop_last), ("pad", pad)):
@@ -282,19 +188,12 @@ class BalancedDistributedSampler(Sampler[int]):
             raise ValueError(f"seed must be non-negative, got {seed}")
         costs = _normalize_sample_costs(sample_costs)
         strategy = _normalize_lpt_strategy(strategy)
-        validated_strategy = strategy if strategy in _LPT_STRATEGIES else validate_balance_strategy(strategy)
-        if validated_strategy in _LPT_STRATEGIES:
-            for name, value in (("batch_size", batch_size), ("rank", rank), ("world_size", world_size)):
-                if value is not None and (
-                    isinstance(value, (bool, np.bool_)) or not isinstance(value, (int, np.integer))
-                ):
-                    raise TypeError(f"{name} must be an integer, got {value!r}")
-            # Cached grouping must not depend on subsequent caller-side array mutations.
-            costs = costs.copy()
-            costs.setflags(write=False)
-        validated_order = None
-        if sample_order is not None:
-            validated_order = _validate_sample_order(sample_order, int(costs.shape[0]))
+        for name, value in (("batch_size", batch_size), ("rank", rank), ("world_size", world_size)):
+            if value is not None and (isinstance(value, (bool, np.bool_)) or not isinstance(value, (int, np.integer))):
+                raise TypeError(f"{name} must be an integer, got {value!r}")
+        # Cached grouping must not depend on subsequent caller-side array mutations.
+        costs = costs.copy()
+        costs.setflags(write=False)
         resolved_rank, resolved_world_size = _resolve_rank_and_world_size(rank, world_size)
         self._plan_cache = _BalancedPlanCache(
             sample_costs=costs,
@@ -305,19 +204,9 @@ class BalancedDistributedSampler(Sampler[int]):
             seed=int(seed),
             drop_last=bool(drop_last),
             pad=bool(pad),
-            sample_order=validated_order,
-            strategy=validated_strategy,
+            strategy=strategy,
         )
         self.pad = bool(pad)
-        # QQTOOLS-COMPAT-0006: active until v1.4.0; remove legacy strategies and this warning then.
-        if validated_strategy not in _LPT_STRATEGIES:
-            warnings.warn(
-                f"Sampler strategy={validated_strategy!r} is deprecated and will be removed "
-                "in v1.4.0. Switch to 'lpt_fast', 'lpt-medium' (alias 'lpt'), or 'lpt_best'. "
-                "LPT changes sample grouping/order and does not accept sample_order.",
-                FutureWarning,
-                stacklevel=2,
-            )
 
     def __iter__(self):
         return iter(self._plan_cache.rank_local_plan.tolist())
@@ -350,9 +239,7 @@ class BalancedBatchSampler(BatchSampler):
             Dropped/repeated occurrences remain fixed across epochs for LPT.
         pad: Boolean. Repeat deterministic tail occurrences when True. ``pad=True`` and
             ``drop_last=True`` are mutually exclusive.
-        sample_order: Legacy V-only permutation for shuffle=False; invalid with LPT.
-        strategy: lpt_fast, lpt-medium (alias/default lpt), or lpt_best. Deprecated
-            v1 through v3 remain available until v1.4.0.
+        strategy: lpt_fast, lpt-medium (alias/default lpt), or lpt_best.
 
     Raises:
         TypeError: Boolean or integer settings have unsupported types.
@@ -371,7 +258,6 @@ class BalancedBatchSampler(BatchSampler):
         seed: int = 0,
         drop_last: bool = False,
         pad: bool = True,
-        sample_order: Sequence[int] | np.ndarray | None = None,
         strategy: str = "lpt",
     ) -> None:
         self.sampler = BalancedDistributedSampler(
@@ -383,7 +269,6 @@ class BalancedBatchSampler(BatchSampler):
             seed=seed,
             drop_last=drop_last,
             pad=pad,
-            sample_order=sample_order,
             strategy=strategy,
         )
         self.batch_size = int(batch_size)

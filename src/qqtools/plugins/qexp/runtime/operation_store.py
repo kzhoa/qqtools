@@ -61,8 +61,7 @@ def write_active_operation(
     operation_key: str,
     value: dict,
 ) -> Path:
-    # QQTOOLS-COMPAT-0020: operation-backed maintenance descriptors are prepared
-    # before active operation truth and remain discoverable until handoff.
+    # Prepare the descriptor first so an interrupted write stays discoverable.
     from .maintenance_outbox import activate_work, prepare_work
 
     section = "availability_operation" if kind == "availability" else kind

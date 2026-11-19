@@ -167,6 +167,8 @@ def advance_group_service(
     root = Path(cfg.shared_root)
 
     if lane == "legacy":
+        if activation.group_service_routing_state(root) in {"active", "degraded"}:
+            return {"state": "stale", "continuation": None, "probe": None}
         try:
             read_group(root, group)
         except (FileNotFoundError, GroupNotPublished, GroupPublicationUnavailable):

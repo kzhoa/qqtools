@@ -53,6 +53,16 @@ def test_legacy_discovery_continuation_converges_across_fresh_owners(tmp_path):
     assert GroupCoverage(cfg.shared_root, "experiment").status().is_complete
 
 
+def test_pre_activation_candidate_is_stale_after_cutover(tmp_path):
+    cfg = isolated_group(tmp_path, tail=0)
+    _activate(cfg)
+    candidate = {"group": "experiment", "lane": "legacy", "generation": None}
+    result = advance_group_service(
+        cfg, candidate, initial_discovery_continuation(), initial_group_service_probe_state()
+    )
+    assert result == {"state": "stale", "continuation": None, "probe": None}
+
+
 def test_membership_transaction_retires_exact_locator_generation(tmp_path):
     cfg = isolated_group(tmp_path, tail=0)
     cfg = replace(cfg, runtime_root=tmp_path / "runtime")

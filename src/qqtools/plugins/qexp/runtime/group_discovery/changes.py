@@ -148,8 +148,6 @@ def record_task_change(
         yield
         return
 
-    # QQTOOLS-COMPAT-0017: dual-publish while the historical Group service
-    # remains enabled; publication becomes mandatory after the writer fence.
     from .service import publish_group_locator_for_transition
 
     publish_group_locator_for_transition(

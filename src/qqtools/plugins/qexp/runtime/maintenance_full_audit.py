@@ -40,9 +40,6 @@ PHASES = (
     "final_verification",
 )
 
-# QQTOOLS-COMPAT-0018: an explicit full-audit request remains resumable across CLI slices.
-# QQTOOLS-COMPAT-0019: read Stage 1 full-audit descriptors and migrate them to
-# schema 2 without treating an unknown historical capture as complete.
 DESCRIPTOR_SCHEMA_VERSION = 2
 DESCRIPTOR_MAX_BYTES = 64 * 1024
 _MAX_SOURCE_RECORD_BYTES = maintenance_steps.SOURCE_RECORD_MAX_BYTES
@@ -298,18 +295,20 @@ def _validate_record(value: dict[str, Any], *, cfg: RootConfig, identity: dict[s
 def _load_descriptor(cfg: RootConfig, pointer: dict[str, Any]) -> dict[str, Any]:
     identity = pointer["identity"]
     value = _read_bounded_record(_descriptor_path(cfg, identity["work_generation"]), "maintenance_descriptor")
-    if value.get("schema_version") == 1 and set(value) == _STAGE1_RECORD_FIELDS:
+    is_stage1 = value.get("schema_version") == 1 and set(value) == _STAGE1_RECORD_FIELDS
+    if is_stage1:
         value = _migrate_stage1_descriptor(value, cfg=cfg, identity=identity)
-        _write_record(_descriptor_path(cfg, identity["work_generation"]), value)
-        _publish_pointer(cfg, value)
-        pointer["progress_revision"] = value["progress_revision"]
     record = _validate_record(value, cfg=cfg, identity=identity)
-    if record["progress_revision"] == pointer["progress_revision"] + 1:
-        # Recover the durable record-first half of an interrupted checkpoint.
-        _publish_pointer(cfg, record)
-        pointer["progress_revision"] = record["progress_revision"]
-    elif record["progress_revision"] != pointer["progress_revision"]:
+    revision = record["progress_revision"]
+    if revision not in (pointer["progress_revision"], pointer["progress_revision"] + 1):
         raise ValueError("maintenance current pointer revision does not match its descriptor.")
+    if is_stage1:
+        _write_record(_descriptor_path(cfg, identity["work_generation"]), record)
+    # QQTOOLS-COMPAT-0019: conversion preserves the revision. Recover a crash
+    # between descriptor and pointer publication even when revisions already match.
+    if is_stage1 or pointer["schema_version"] != DESCRIPTOR_SCHEMA_VERSION or pointer["progress_revision"] != revision:
+        _publish_pointer(cfg, record)
+        pointer.update(schema_version=DESCRIPTOR_SCHEMA_VERSION, progress_revision=revision)
     return record
 
 
@@ -1069,33 +1068,43 @@ def _advance_phase_name(record: dict[str, Any], *, done: bool) -> None:
 
 def ensure_full_audit_outbox(cfg: RootConfig) -> None:
     """Adopt one pre-Stage-3 full-audit checkpoint without scanning history."""
-    pointer = _read_pointer(cfg)
-    if pointer is None:
-        return
+    # QQTOOLS-COMPAT-0018: older checkpoints can predate their outbox entry.
     try:
-        record = _load_descriptor(cfg, pointer)
-    except (OSError, RuntimeError, TypeError, ValueError, KeyError):
+        _current_path(cfg).lstat()
+    except FileNotFoundError:
         return
-    if record["state"] in {"completed", "intervention"}:
-        return
-    identity = record["identity"]
-    work = read_work(
-        cfg,
-        kind="full_audit",
-        target_id="project",
-        work_generation=identity["work_generation"],
-    )
-    if work is None:
-        work = prepare_work(
+    # Descriptor adoption may finish a record-first checkpoint. Serialize it with
+    # explicit repair so a superseded generation cannot republish its pointer.
+    with _repair_lock(cfg) as acquired:
+        if not acquired:
+            return
+        pointer = _read_pointer(cfg)
+        if pointer is None:
+            return
+        try:
+            record = _load_descriptor(cfg, pointer)
+        except (OSError, RuntimeError, TypeError, ValueError, KeyError):
+            return
+        if record["state"] in {"completed", "intervention"}:
+            return
+        identity = record["identity"]
+        work = read_work(
             cfg,
             kind="full_audit",
             target_id="project",
             work_generation=identity["work_generation"],
-            phase=record["phase"],
-            cursor=record["cursor"],
         )
-    if work["state"] == "prepared":
-        activate_work(cfg, work)
+        if work is None:
+            work = prepare_work(
+                cfg,
+                kind="full_audit",
+                target_id="project",
+                work_generation=identity["work_generation"],
+                phase=record["phase"],
+                cursor=record["cursor"],
+            )
+        if work["state"] == "prepared":
+            activate_work(cfg, work)
 
 
 def _intervene(record: dict[str, Any], failure: dict[str, str]) -> None:

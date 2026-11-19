@@ -32,53 +32,7 @@ def _rank_plans(sample_costs, **kwargs):
     ]
 
 
-@pytest.mark.parametrize("total", [16, 160])
-@pytest.mark.parametrize("should_shuffle", [False, True])
-def test_window_plan_validates_full_costs_once(monkeypatch, total, should_shuffle):
-    _mock_dist(monkeypatch)
-    costs = np.arange(total, dtype=np.float64)
-    checked_sizes = []
-    original_isfinite = np.isfinite
-
-    def counted_isfinite(values, *args, **kwargs):
-        checked_sizes.append(np.size(values))
-        return original_isfinite(values, *args, **kwargs)
-
-    monkeypatch.setattr(np, "isfinite", counted_isfinite)
-    with pytest.warns(FutureWarning):
-        sampler = BalancedDistributedSampler(
-            costs, batch_size=4, rank=0, world_size=4, shuffle=should_shuffle, strategy="v3"
-        )
-    # One constructor validation and one plan validation, regardless of window count.
-    assert checked_sizes == [total, total]
-    checked_sizes.clear()
-    sampler._plan_cache._build_rank_local_plan(1)
-    assert checked_sizes == [total]
-
-
-@pytest.mark.parametrize("sampler_type", [BalancedDistributedSampler, BalancedBatchSampler])
-@pytest.mark.parametrize("strategy", ["v1", "v2", "v3"])
-@pytest.mark.parametrize("invalid_cost, message", [(np.nan, "finite"), (-1.0, "non-negative")])
-def test_epoch_rebuild_rejects_mutated_shared_costs(monkeypatch, sampler_type, strategy, invalid_cost, message):
-    _mock_dist(monkeypatch)
-    costs = np.arange(32, dtype=np.float64)
-    with pytest.warns(FutureWarning):
-        sampler = sampler_type(costs, batch_size=2, rank=0, world_size=2, shuffle=True, strategy=strategy)
-    sampler.set_epoch(1)
-    previous_plan = list(sampler)
-    costs[-1] = invalid_cost
-
-    with pytest.raises(ValueError, match=message):
-        sampler.set_epoch(2)
-
-    assert list(sampler) == previous_plan
-    assert sampler._plan_cache.epoch == 1
-    costs[-1] = 31.0
-    sampler.set_epoch(2)
-    assert sampler._plan_cache.epoch == 2
-
-
-@pytest.mark.parametrize("strategy", ["v1", "v2", "v3", "lpt"])
+@pytest.mark.parametrize("strategy", ["lpt_fast", "lpt", "lpt_best"])
 def test_sampler_covers_each_sample_once_across_ranks_without_padding(
     monkeypatch,
     strategy,
@@ -103,7 +57,7 @@ def test_sampler_covers_each_sample_once_across_ranks_without_padding(
         assert len(global_window) == len(set(global_window)) == 4
 
 
-@pytest.mark.parametrize("strategy", ["v1", "v2", "v3", "lpt"])
+@pytest.mark.parametrize("strategy", ["lpt_fast", "lpt", "lpt_best"])
 def test_shuffle_epoch_is_deterministic_and_changes_plan(monkeypatch, strategy):
     _mock_dist(monkeypatch)
     costs = np.linspace(1.0, 256.0, num=256)
@@ -126,28 +80,7 @@ def test_shuffle_epoch_is_deterministic_and_changes_plan(monkeypatch, strategy):
     assert list(first) != epoch0
 
 
-def test_non_shuffled_sampler_ignores_epoch_and_respects_sample_order(monkeypatch):
-    # QQTOOLS-COMPAT-0006: legacy sample_order support until v1.4.0.
-    _mock_dist(monkeypatch)
-    sampler = BalancedDistributedSampler(
-        [5.0, 4.0, 3.0, 2.0],
-        batch_size=2,
-        rank=0,
-        world_size=2,
-        shuffle=False,
-        sample_order=[3, 2, 1, 0],
-        strategy="v3",
-    )
-
-    before = list(sampler)
-    sampler.set_epoch(99)
-
-    assert list(sampler) == before
-    assert set(before).issubset({0, 1, 2, 3})
-
-
 def test_sampler_prefix_padding_equalizes_rank_lengths(monkeypatch):
-    # QQTOOLS-COMPAT-0006: legacy validation padding until v1.4.0.
     _mock_dist(monkeypatch)
     costs = [5.0, 4.0, 3.0, 2.0, 1.0]
 
@@ -157,7 +90,6 @@ def test_sampler_prefix_padding_equalizes_rank_lengths(monkeypatch):
         world_size=2,
         shuffle=False,
         drop_last=False,
-        strategy="v3",
     )
 
     assert [len(plan) for plan in plans] == [4, 4]
@@ -180,26 +112,7 @@ def test_sampler_prefix_padding_handles_dataset_smaller_than_global_batch(monkey
     assert plans == [[0, 0, 0], [0, 0, 0]]
 
 
-def test_sampler_drop_last_removes_incomplete_global_window(monkeypatch):
-    # QQTOOLS-COMPAT-0006: legacy prefix truncation until v1.4.0.
-    _mock_dist(monkeypatch)
-    costs = [5.0, 4.0, 3.0, 2.0, 1.0, 0.0, 6.0]
-
-    plans = _rank_plans(
-        costs,
-        batch_size=2,
-        world_size=2,
-        shuffle=False,
-        drop_last=True,
-        pad=False,
-        strategy="v3",
-    )
-
-    assert plans == [[0, 3], [1, 2]]
-    assert [len(plan) for plan in plans] == [2, 2]
-
-
-@pytest.mark.parametrize("strategy", ["v1", "v2", "v3", "lpt"])
+@pytest.mark.parametrize("strategy", ["lpt_fast", "lpt", "lpt_best"])
 def test_batch_sampler_is_batched_view_of_distributed_sampler(monkeypatch, strategy):
     _mock_dist(monkeypatch)
     kwargs = {
@@ -224,30 +137,6 @@ def test_batch_sampler_is_batched_view_of_distributed_sampler(monkeypatch, strat
     distributed.set_epoch(1)
     batched.set_epoch(1)
     assert [index for batch in batched for index in batch] == list(distributed)
-
-
-def test_batch_sampler_drop_last_preserves_equal_full_batches_per_rank(monkeypatch):
-    # QQTOOLS-COMPAT-0006: legacy prefix truncation until v1.4.0.
-    _mock_dist(monkeypatch)
-    costs = [5.0, 4.0, 3.0, 2.0, 1.0, 0.0, 6.0]
-    samplers = [
-        BalancedBatchSampler(
-            costs,
-            batch_size=2,
-            rank=rank,
-            world_size=2,
-            shuffle=False,
-            drop_last=True,
-            pad=False,
-            strategy="v3",
-        )
-        for rank in range(2)
-    ]
-
-    batches_by_rank = [list(sampler) for sampler in samplers]
-
-    assert batches_by_rank == [[[0, 3]], [[1, 2]]]
-    assert [len(sampler) for sampler in samplers] == [1, 1]
 
 
 def test_sampler_uses_initialized_distributed_rank_and_world_size(monkeypatch):
@@ -275,9 +164,6 @@ def test_sampler_uses_initialized_distributed_rank_and_world_size(monkeypatch):
         {"sample_costs": [1.0, 2.0], "batch_size": 0},
         {"sample_costs": [1.0, 2.0], "batch_size": 1, "world_size": 0},
         {"sample_costs": [1.0, 2.0], "batch_size": 1, "rank": 2, "world_size": 2},
-        {"sample_costs": [1.0, 2.0], "batch_size": 1, "sample_order": [0, 0]},
-        {"sample_costs": [1.0, 2.0], "batch_size": 1, "sample_order": [0]},
-        {"sample_costs": [1.0, 2.0], "batch_size": 1, "sample_order": [0, 2]},
         {"sample_costs": [1.0, 2.0], "batch_size": 1, "strategy": "unknown"},
     ],
 )

@@ -281,6 +281,22 @@ def test_stage1_descriptor_migration_fails_closed_without_capture_identity(tmp_p
     _, persisted = _maintenance_descriptor(cfg)
     assert persisted["schema_version"] == 2
     assert persisted["state"] == "intervention"
+    converted_pointer = read_json(pointer_path)
+    assert converted_pointer["schema_version"] == 2
+
+    # Simulate interruption after the descriptor rename but before the pointer rename.
+    atomic_replace(pointer_path, pointer)
+    with maintenance_full_audit._repair_lock(cfg) as acquired:
+        assert acquired
+        maintenance_full_audit.ensure_full_audit_outbox(cfg)
+        assert read_json(pointer_path) == pointer
+    maintenance_full_audit.ensure_full_audit_outbox(cfg)
+    assert read_json(pointer_path) == converted_pointer
+    for _ in range(2):
+        retried = repair_metadata(cfg, reservation_runtime_root=cfg.runtime_root, max_work_items=1)
+        assert retried["intervention"]["code"] == "legacy_capture_identity_unknown"
+        assert read_json(pointer_path) == converted_pointer
+        assert read_json(descriptor_path) == persisted
 
 
 def test_maintenance_outbox_selects_queue_order_not_directory_order(

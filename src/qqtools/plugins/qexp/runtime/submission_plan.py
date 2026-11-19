@@ -14,6 +14,7 @@ from typing import Any, Mapping
 from ..layout import (
     is_cpu_lane_root,
     is_group_ready_members_root,
+    is_submission_group_publication_root,
     is_task_dependencies_root,
     is_task_dependencies_v2_root,
 )
@@ -530,8 +531,11 @@ def _resolve_submission_plan(
         working_directory,
         allocate_task_ids=allocate_task_ids,
     )
-    if not dependencies_are_canonical and any(item["depends_on_task_ids"] for item in resolved):
-        raise ValueError("Task dependencies require an activated task-dependencies-v1 root.")
+    if any(item["depends_on_task_ids"] for item in resolved):
+        if not dependencies_are_canonical:
+            raise ValueError("Task dependencies require an activated task-dependencies-v1 root.")
+        if not dependencies_are_v2:
+            raise ValueError("New Task dependencies require task-dependencies-v2; check qexp admin upgrade status.")
     for item in resolved:
         _task_spec(item, is_canonical=is_canonical)
     tmux_overrides = tuple(validate_tmux_override(item.pop("tmux_override", None)) for item in resolved)
@@ -561,6 +565,8 @@ def _resolve_submission_plan(
         worker_additions = dict(request.worker_set_additions)
         if group is None and not request.worker_set_declared:
             worker_additions = {submitting_machine: {"scheduling_role": "primary", "gpu_limit_gpus": None}}
+        if group is None or worker_additions:
+            is_submission_group_publication_root(cfg, is_required=True)
         planned_workers = _planned_worker_set(group, worker_additions)
         _validate_placement_against_workers(resolved, group_name=request.group_name, planned_workers=planned_workers)
     else:

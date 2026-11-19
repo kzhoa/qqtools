@@ -1,7 +1,7 @@
 ---
 doc_type: spec
 status: active
-updated_at: 2026-11-02
+updated_at: 2026-11-19
 archived_at:
 ---
 
@@ -9,6 +9,28 @@ archived_at:
 
 This guide is for an existing qexp project rooted at `PROJECT_ROOT` (for example,
 `/mnt/share/myproject/.qexp`). Run commands with its explicit Project path.
+
+## Release 1.3.30 from 1.3.29
+
+Upgrade the package and restart each machine's agent. Running Attempts retain
+their identity. Use `qexp admin upgrade status --format json` to check each
+registered Project, including Projects that were offline during the rollout.
+Resolve inaccessible roots and reported blockers while 1.3.30 is installed.
+Agent readiness alone does not establish that every Project has finished migration.
+
+New dependency declarations and edits require the Project's `task-dependencies-v2`
+activation. Retry after the reverse-dependency projection finishes building.
+Submissions that create a Group or add Workers require the Group publication
+capability before the operation is persisted. Existing durable submissions
+retain their recovery path. Group discovery continues through bootstrap. An
+installed Group-service capability with a missing activation record requires
+repair and cannot authorize a return to historical Group scanning.
+
+Full-audit descriptors use schema v2 and deadline scans write v3 cursors.
+The 1.3.30 reader can still convert Stage 1 audit descriptors and restart
+obsolete scan cursors. Inspect any reported audit intervention before using
+`admin repair --retry-intervention`. Historical ownership, termination decisions,
+and registration conversion remain available throughout this release.
 
 ## Registration replacement upgrade (target 1.3.28)
 
@@ -156,7 +178,7 @@ Compatibility items `QQTOOLS-COMPAT-0018`, `0019`, and `0020` first ship in 1.3.
 Their `1.4.0-stage1` and `1.4.0-stage2` source labels refer only to earlier
 unreleased development data formats; they are not prerequisite package releases
 or intermediate upgrade steps. Retained adapters still recognize those formats.
-The existing 1.5.0 legacy-removal and 1.6.0 transition-purge deadlines are unchanged.
+The final migration release is 1.3.30. Temporary adapters are scheduled for removal in 1.4.0.
 
 Executor atomic-write temporaries are not committed request, process, result, or
 resolution evidence. Read-only status ignores recognized, locally owned regular

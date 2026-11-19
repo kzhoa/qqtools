@@ -1,6 +1,7 @@
 import numpy as np
 import pytest
 
+import qqtools.data.qbalance as qbalance
 import qqtools.torch.ddp.qbalancedsampler as qbs
 from qqtools.torch.ddp import BalancedBatchSampler, BalancedDistributedSampler
 
@@ -14,12 +15,7 @@ def test_lpt_builds_once_and_epoch_changes_only_step_and_rank_traversal(monkeypa
         calls.append(kwargs)
         return build(*args, **kwargs)
 
-    def unexpected_assignment(*args, **kwargs):
-        raise AssertionError("LPT batches must not be repartitioned or globally reordered")
-
     monkeypatch.setattr(qbs, "_plan_rank_batches", counted_build)
-    monkeypatch.setattr(qbs, "_assign_window_to_ranks_validated", unexpected_assignment)
-    monkeypatch.setattr(qbs, "compute_global_even_sort_order", unexpected_assignment)
     costs = np.arange(128, dtype=float)
     samplers = [
         BalancedBatchSampler(costs, batch_size=4, world_size=4, rank=rank, strategy=strategy, seed=7)
@@ -97,21 +93,6 @@ def test_lpt_tail_contract(total, world_size, should_shuffle, should_drop, strat
     assert sorted(reseeded) == sorted(actual)
 
 
-@pytest.mark.parametrize("should_shuffle", [True, False])
-@pytest.mark.parametrize("strategy", ["lpt_fast", "lpt", "lpt_best"])
-def test_lpt_rejects_sample_order_instead_of_ignoring_it(should_shuffle, strategy):
-    with pytest.raises(ValueError, match="sample_order"):
-        BalancedDistributedSampler(
-            [1, 2],
-            batch_size=1,
-            rank=0,
-            world_size=1,
-            strategy=strategy,
-            shuffle=should_shuffle,
-            sample_order=[1, 0],
-        )
-
-
 @pytest.mark.parametrize("strategy", ["lpt_fast", "lpt", "lpt_best"])
 def test_lpt_snapshots_input_costs(strategy):
     costs = np.arange(64, dtype=float)
@@ -135,7 +116,7 @@ def test_lpt_failed_epoch_update_does_not_commit_state(strategy):
 @pytest.mark.parametrize("strategy", ["lpt_fast", "lpt", "lpt_best"])
 def test_lpt_is_not_a_dataset_order_strategy(strategy):
     with pytest.raises(ValueError, match="Unsupported strategy"):
-        qbs.compute_global_even_sort_order([1, 2], strategy=strategy)
+        qbalance.compute_global_even_sort_order([1, 2], strategy=strategy)
 
 
 @pytest.mark.parametrize("strategy", ["lpt_fast", "lpt", "lpt_best"])
@@ -145,3 +126,45 @@ def test_lpt_rejects_noninteger_public_dimensions(strategy, name, value):
     kwargs = {"batch_size": 1, "rank": 0, "world_size": 1, name: value}
     with pytest.raises(TypeError, match=name):
         BalancedBatchSampler([1, 2], strategy=strategy, **kwargs)
+
+
+@pytest.mark.parametrize("sampler_type", [BalancedBatchSampler, BalancedDistributedSampler])
+@pytest.mark.parametrize("shuffle", [False, True])
+def test_medium_alias_normalizes_cache_and_matches_epochs(sampler_type, shuffle):
+    samplers = [
+        sampler_type(
+            np.arange(48),
+            batch_size=4,
+            rank=1,
+            world_size=2,
+            shuffle=shuffle,
+            seed=7,
+            strategy=strategy,
+        )
+        for strategy in ("lpt", "lpt-medium")
+    ]
+    samplers.append(
+        sampler_type(
+            np.arange(48),
+            batch_size=4,
+            rank=1,
+            world_size=2,
+            shuffle=shuffle,
+            seed=7,
+        )
+    )
+    for epoch in (0, 1, 9):
+        for sampler in samplers:
+            sampler.set_epoch(epoch)
+            assert sampler._plan_cache.strategy == "lpt-medium"
+        assert list(samplers[0]) == list(samplers[1]) == list(samplers[2])
+
+
+@pytest.mark.parametrize("size", [0, 48, 51])
+def test_low_level_medium_alias_matches_base_and_derived_plans(size):
+    costs = np.arange(size)
+    base = [qbalance._partition_rank_batches(costs, batch_size=4, strategy=s) for s in ("lpt", "lpt-medium")]
+    np.testing.assert_array_equal(base[0].full_batches, base[1].full_batches)
+    np.testing.assert_array_equal(base[0].remainder, base[1].remainder)
+    plans = [qbalance._plan_rank_batches(costs, batch_size=4, world_size=2, strategy=s) for s in ("lpt", "lpt-medium")]
+    np.testing.assert_array_equal(*plans)

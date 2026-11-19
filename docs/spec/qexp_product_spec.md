@@ -1,7 +1,7 @@
 ---
 doc_type: spec
 status: active
-updated_at: 2026-11-04
+updated_at: 2026-11-19
 archived_at:
 ---
 
@@ -2369,8 +2369,8 @@ the downstream Task. Cleanup rejects a Task while any direct dependent remains a
 Project.
 
 Fresh Projects activate both `task-dependencies-v1` and `task-dependencies-v2`. Existing Projects
-retain v1 same-Group behavior during the machine-rolling upgrade and expose Project-wide edges only
-after compatible writers are proven and reverse cleanup coverage is active. Missing or damaged
+continue evaluating existing same-Group dependencies during the machine-rolling upgrade. In 1.3.30,
+new dependency declarations and edits wait for v2 activation and audited reverse coverage. Missing or damaged
 coverage blocks cleanup and is repaired from Task truth; it does not change dependency-gate or
 claim behavior. A process that does not support the activated v2 capability rejects the Project
 before mutation or scheduling.

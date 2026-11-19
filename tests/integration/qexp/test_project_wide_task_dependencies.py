@@ -496,6 +496,23 @@ def test_projection_rebuild_uses_bounded_cursors_and_restores_reverse_coverage(t
     assert all("task_ids" not in (item.get("cursor") or {}) for item in results)
 
 
+def test_v1_root_defers_new_dependency_writes_until_activation(tmp_path: Path) -> None:
+    cfg = _config(tmp_path)
+    parent = submit(cfg, ["true"], task_id="parent", group="train", working_dir=tmp_path)
+    schema_path = cfg.shared_root / "schema" / "version.json"
+    schema = read_json(schema_path)
+    schema["schema"]["required_capabilities"].remove("task-dependencies-v2")
+    atomic_replace(schema_path, schema)
+
+    with pytest.raises(ValueError, match="task-dependencies-v2"):
+        edit_dependencies(cfg, parent.task_id, [])
+    with pytest.raises(ValueError, match="task-dependencies-v2"):
+        submit(cfg, ["true"], task_id="child", group="train", working_dir=tmp_path, depends_on_task_ids=["parent"])
+    assert load_task(cfg, "parent").meta["revision"] == parent.meta["revision"]
+    with pytest.raises(FileNotFoundError):
+        load_task(cfg, "child")
+
+
 def test_legacy_task_creation_invalidates_an_in_progress_projection_build(tmp_path: Path) -> None:
     cfg = _config(tmp_path)
     schema_path = cfg.shared_root / "schema" / "version.json"

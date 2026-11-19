@@ -483,9 +483,12 @@ def test_existing_group_worker_addition_requires_publication_capability(tmp_path
         encoding="utf-8",
     )
 
+    submissions = cfg.shared_root / "operations" / "submissions"
+    before = set(submissions.glob("*.json"))
     with pytest.raises(RuntimeError, match=SUBMISSION_GROUP_PUBLICATION_CAPABILITY):
         batch_submit(cfg, manifest)
 
+    assert set(submissions.glob("*.json")) == before
     assert list(read_json(group_path(cfg.shared_root, "existing"))["group"]["worker_set"]) == ["gpu-1"]
 
 

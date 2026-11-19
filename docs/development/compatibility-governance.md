@@ -1,7 +1,7 @@
 ---
 doc_type: spec
 status: active
-updated_at: 2026-09-16
+updated_at: 2026-11-19
 archived_at:
 ---
 
@@ -44,6 +44,22 @@ not ready to become public implementation intent stays outside the registry.
 Registry items use exact `X.Y.Z` versions. `introduced_in` must precede `legacy_removed_in`, and
 `transition_purged_in` must not precede `legacy_removed_in`. Equal removal and purge versions are
 allowed when no separate migration release is needed.
+
+### Removing a retired contract
+
+At `legacy_removed`, keep only the transition behavior required by the registered upgrade path.
+At purge, the implementation should read as if the retired contract had never existed. Delete
+branches that recognize an old name, value, or format solely to reject it or emit a tailored error.
+Remove their warnings, compatibility markers, stale comments, fixtures, and tests that assert the
+old input is rejected or produces a particular exception.
+
+For example, deleting a Python keyword argument from the signature is sufficient. Python handles
+unknown keywords. A strategy selector can likewise validate against its current set of supported
+strategies without keeping a list of retired names.
+
+For each remaining check, ask whether a project created entirely under the current contract still
+needs it for correctness. Checking that a reverse-dependency index is ready before writing an edge
+protects current data. Test that invariant directly. Record the user-facing change in release notes.
 
 ## Registry format
 

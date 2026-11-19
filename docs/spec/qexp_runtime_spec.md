@@ -1,7 +1,7 @@
 ---
 doc_type: spec
 status: active
-updated_at: 2026-11-04
+updated_at: 2026-11-19
 archived_at:
 ---
 
@@ -966,10 +966,11 @@ Task deletion, so a new edge and cleanup start cannot both commit. Deleting a do
 removes its outgoing reverse memberships before coverage returns to active.
 
 `task-dependencies-v2` is additive to `task-dependencies-v1`. Fresh roots install both and an empty
-active reverse projection before admission. Existing roots retain v1 same-Group semantics until
+active reverse projection before admission. Existing roots evaluate durable v1 dependencies until
 the machine-rolling coordinator proves every eligible writer meets the v2 writer floor, builds and
 audits the projection, and installs the v2 required capability. Running Attempts continue during
-this L1 rollout. The activation turn owns exclusive schema exclusion, which drains admitted
+this L1 rollout. New dependency declarations and edits in 1.3.30 require v2, while replay of
+already durable submissions retains its original protocol. The activation turn owns exclusive schema exclusion, which drains admitted
 schema-reader writers, and owns the dependency fence from its final projection check through the
 capability write. Every later mutation reacquires the schema reader fence and validates the full
 required-capability set; unfinished recovery and CLI operations therefore cannot cross the

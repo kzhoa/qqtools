@@ -1058,9 +1058,6 @@ def change_worker(
             }
             from ..runtime.group_discovery.service import publish_group_locator_for_transition
 
-            # QQTOOLS-COMPAT-0017: legacy removal remains dual-published while
-            # the historical service is active; the locator is required once
-            # the writer fence has been installed.
             publish_group_locator_for_transition(cfg, group_name, "control", "group_operation")
             write_active_operation(cfg, "group_control", operation_id, operation)
             blockers: list[str] = []

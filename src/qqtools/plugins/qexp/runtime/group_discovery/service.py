@@ -299,26 +299,13 @@ def publish_group_locator_for_transition(
     from . import activation, locator
 
     with project_activation_transaction(cfg, f"group_locator_{lane}", before_write=before_write):
-        activation_path = cfg.shared_root / "schema" / "group-service.json"
+        state = activation.group_service_routing_state(cfg.shared_root)
+        if before_write is not None:
+            before_write()
         try:
-            activation_record = read_json_limited(activation_path, max_bytes=_MAX_RECORD_BYTES)
-        except FileNotFoundError:
-            fenced = False
-        except (OSError, RuntimeError, ValueError, KeyError, TypeError):
-            # A present but unreadable activation record cannot lower the writer
-            # floor. Fail closed as though the fence had already been installed.
-            fenced = True
-        else:
-            state = activation_record.get("state")
-            fenced = state != "preparing"
-
-        active = activation.is_group_service_active(cfg.shared_root)
-        try:
-            if before_write is not None:
-                before_write()
             return locator.publish_group_locator_locked(cfg, group, lane, reason)
         except (OSError, RuntimeError, ValueError, KeyError, TypeError):
-            if fenced or active:
+            if state not in {None, "preparing"}:
                 raise
             return None
 
@@ -1485,17 +1472,9 @@ class MachineGroupDiscoveryWorker:
 
     @staticmethod
     def _activation_state(root: Path) -> str | None:
-        path = root / "schema" / "group-service.json"
-        try:
-            value = read_json_limited(path, max_bytes=_MAX_RECORD_BYTES)
-        except FileNotFoundError:
-            return None
-        except (OSError, RuntimeError, ValueError, KeyError, TypeError):
-            return "degraded"
-        if not isinstance(value, dict):
-            return "degraded"
-        state = value.get("state")
-        return state if state in {"preparing", "fenced", "building", "active", "degraded"} else "degraded"
+        from .activation import group_service_routing_state
+
+        return group_service_routing_state(root)
 
     def _close_legacy_binding_owners(
         self,

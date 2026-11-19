@@ -493,6 +493,30 @@ def test_activation_recovers_after_each_state_record_is_durable(tmp_path, monkey
     assert activate(cfg)["state"] == "active"
 
 
+@pytest.mark.parametrize("damage", ["missing", "preparing"])
+def test_schema_fence_prevents_fallback_after_activation_record_damage(tmp_path, monkeypatch, damage):
+    from qqtools.plugins.qexp.runtime.group_discovery import probe, service
+
+    cfg = isolated_group(tmp_path, tail=0)
+    record = activate(cfg)
+    path = activation.activation_path(cfg.shared_root)
+    if damage == "missing":
+        path.unlink()
+    else:
+        atomic_replace(path, dict(record, state="preparing"))
+
+    assert activation.group_service_routing_state(cfg.shared_root) == "degraded"
+    result = probe.probe_group_service(cfg.shared_root, probe.initial_group_service_probe_state())
+    assert result["state"] == "pending" and result["candidate"] is None
+
+    def unavailable(*args, **kwargs):
+        raise OSError("unavailable locator")
+
+    monkeypatch.setattr(locator, "publish_group_locator_locked", unavailable)
+    with group_writer_lock(cfg, "experiment"), pytest.raises(OSError, match="unavailable locator"):
+        service.publish_group_locator_for_transition(cfg, "experiment", "control", "task_change")
+
+
 def test_active_metadata_damage_transitions_to_degraded(tmp_path):
     cfg = isolated_group(tmp_path, tail=0)
     activate(cfg)

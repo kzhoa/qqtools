@@ -23,9 +23,6 @@ from ..store import atomic_replace, read_json, read_json_limited, require_json_s
 from . import locator
 from .activation_submission import advance_activation_submission_source
 
-# QQTOOLS-COMPAT-0017: dual publication and historical-discovery overlap exists
-# only while a Project moves through its fenced bootstrap activation window.
-
 PROTOCOL = "group-service-v1"
 WRITER_FLOOR = "1.3.22"
 ACTIVATION_VERSION = 1
@@ -57,6 +54,34 @@ _IDENTITY_FIELDS = frozenset({"project_id", "group_directory_identity"})
 
 def activation_path(root: Path) -> Path:
     return Path(root) / "schema" / "group-service.json"
+
+
+def group_service_routing_state(root: Path) -> str | None:
+    """Resolve the service route without lowering an installed schema fence."""
+    try:
+        try:
+            record = read_json_limited(activation_path(root), max_bytes=MAX_RECORD_BYTES)
+        except FileNotFoundError:
+            state = None
+        else:
+            state = record["state"]
+            if state not in _STATES:
+                return "degraded"
+            if state != "preparing":
+                return state
+        # QQTOOLS-COMPAT-0017: a missing or preparing record permits historical
+        # discovery only before the schema requires Group service locators.
+        schema = read_json_limited(root / "schema" / "version.json", max_bytes=MAX_RECORD_BYTES)["schema"]
+        capabilities = schema["required_capabilities"]
+        if (
+            not isinstance(capabilities, list)
+            or not all(isinstance(item, str) for item in capabilities)
+            or GROUP_SERVICE_CAPABILITY in capabilities
+        ):
+            return "degraded"
+        return state
+    except (OSError, RuntimeError, ValueError, KeyError, TypeError):
+        return "degraded"
 
 
 def read_group_service_activation_record(root: Path, *, storage: Any | None = None) -> dict[str, Any] | None:

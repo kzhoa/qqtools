@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- breaking: remove the deprecated `v1`, `v2`, and `v3` strategies and the
+  `sample_order` argument from both balanced samplers. Use an LPT tier for
+  sampling. Dataset ordering continues to support all three V strategies.
+- compat: require the activated qexp protocols before writing new dependency
+  edges or preparing Submission-owned Groups and Worker Set additions. Preserve
+  in-flight recovery and historical readers through the final 1.3.x migration.
+- fix: honor the installed Group-service fence when activation metadata is lost
+  and discard historical discovery candidates after locator activation.
+
 ## v1.3.29
 
 - fix: resume qpipeline training from a completed epoch boundary without repeating the epoch.

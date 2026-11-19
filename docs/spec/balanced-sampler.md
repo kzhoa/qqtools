@@ -1,7 +1,7 @@
 ---
 doc_type: spec
 status: active
-updated_at: 2026-09-05
+updated_at: 2026-11-19
 archived_at:
 ---
 
@@ -29,8 +29,7 @@ with an initialized process group. All ranks must use the same planning settings
 LPT `shuffle` changes step traversal and rank assignments, not batch membership;
 call `set_epoch` on every rank. `shuffle=False` means deterministic balanced order,
 not original dataset order. The tail policy below applies to a global batch, and
-dropped/repeated occurrences remain fixed across epochs. `sample_order` is a legacy
-V-only option, not an LPT tuning parameter.
+dropped/repeated occurrences remain fixed across epochs.
 
 `pad=True` is the default and repeats deterministic tail occurrences so every rank has
 the same number of batches. `pad=False` preserves every real occurrence without adding
@@ -88,77 +87,14 @@ it passes neither `strategy` nor the dataset's cached `sample_order`. Dataset-le
 tail rules: padding is enabled by default. Its `pad` argument defaults to True unless
 `drop_last=True`, where it resolves to False for compatibility with fixed-size training.
 
-### Legacy sampler strategy deprecation
+### Upgrading to 1.3.30
 
-Starting in v1.3.15, sampler settings `v1`, `v2`, and `v3` emit a visible
-`FutureWarning` once per successful sampler construction (not per epoch). They remain
-functional when explicitly selected until removal in v1.4.0. Default construction uses
-`lpt` and does not warn. This transition does not deprecate dataset
-ordering strategies or `compute_global_even_sort_order`, which cannot consume LPT plans.
-
-Choose `lpt_fast`, `lpt-medium` (or `lpt`), or `lpt_best` explicitly to migrate.
-Migration changes sample grouping and traversal; LPT rejects `sample_order` and preserves
-batch membership across epochs. It is the recommended fixed-size cost-balancing family, not a guarantee
-of better runtime or peak cost for every input, nor of equivalent training randomness.
-GPU memory safety and convergence remain unverified. The sampler default changes from
-`v3` to `lpt` in this release, so callers omitting `strategy` also adopt the grouping,
-shuffle and validation contracts above. Historical statements below about unchanged defaults
-describe earlier algorithm work and are superseded by this default-selection decision.
-
-### v1.4.0 maintainer removal checklist
-
-This checklist retires `QQTOOLS-COMPAT-0006`; follow the shared
-[compatibility governance](../development/compatibility-governance.md) and
-[publish pipeline](../../.github/publish.md). Removing the registry entry alone is not
-an implementation cleanup.
-
-1. Inspect the release obligations and locate temporary implementation/test markers:
-
-   ```bash
-   python scripts/checks/check_compatibility_registry.py plan --release-version 1.4.0
-   rg -n 'QQTOOLS-COMPAT-0006' src tests scripts
-   ```
-
-2. Remove `v1`, `v2`, and `v3` acceptance and legacy planning branches from both
-   `BalancedDistributedSampler` and `BalancedBatchSampler`, together with their
-   deprecation warning. Inspect `src/qqtools/torch/ddp/qbalancedsampler.py` and callers
-   of any helper before deleting it: a marker is a navigation aid, not an exhaustive
-   dependency inventory. Preserve dataset-level `balance_strategy`,
-   `compute_global_even_sort_order()`, their V implementations and shared helpers still
-   used by them. Preserve all LPT tiers, the default `lpt`, and its permanent alias
-   relationship to `lpt-medium`.
-3. Remove tests that exclusively assert legacy sampler support or its warning, including
-   marked fixtures in `tests/unit/torch/ddp/test_qbalancedsampler.py`. Update
-   `tests/unit/torch/ddp/test_balance_strategy_migration.py` to assert rejection of each
-   retired strategy by both sampler classes. Retain default/alias equivalence, LPT
-   behavior, and dataset/global-ordering V coverage; do not delete the migration test
-   file wholesale.
-4. Remove the temporary ID markers from source, tests and scripts, and delete only the
-   `QQTOOLS-COMPAT-0006` item from `compatibility-registry.toml`. Do not decrement
-   `next_id`, reuse the ID, or introduce a completed registry state. Both removal
-   deadlines are v1.4.0, so no separate `legacy_removed` transition release is needed.
-   Update this specification to describe the completed removal and record the breaking
-   change in `CHANGELOG.md`; Git history and release notes retain the historical record.
-5. Verify behavior and registry consistency:
-
-   ```bash
-   PYTHONPATH=src python -m pytest tests/unit/torch/ddp tests/integration/torch/test_lpt_dataloader.py -q
-   python scripts/checks/check_compatibility_registry.py validate
-   python scripts/checks/check_compatibility_registry.py check --release-version 1.4.0
-   ```
-
-   Also run the existing dataset/global-ordering tests if their shared code changes.
-   Resolve every other due registry item reported by the release check independently;
-   clearing this sampler item alone does not guarantee a passing release gate.
-6. Commit the cleanup candidate and confirm its normal feature gate. Before bumping
-   the source version to 1.4.0, inspect
-   `python scripts/checks/check_compatibility_registry.py plan --release-version 1.4.0`.
-   Finalize the version/changelog release commit only after every due action is resolved;
-   its exact SHA must pass the release-profile Dev Preflight before promotion and tagging.
-
-The gate verifies lifecycle state and marker cleanup, not the semantic removal of every
-legacy path. Code review and rejection tests remain required. The tag publish workflow
-does not repeat the source compatibility gate.
+Both samplers now accept the LPT planning tiers exclusively. Replace an explicit
+`v1`, `v2`, or `v3` sampler strategy with `lpt_fast`, `lpt-medium` (alias
+`lpt`), or `lpt_best`, and remove the sampler's `sample_order` argument.
+Default construction continues to select `lpt-medium`. Migrating an explicit
+V strategy changes batch membership and traversal. Dataset-level
+`balance_strategy` and `compute_global_even_sort_order` still accept V strategies.
 
 ```python
 from torch.utils.data import DataLoader
@@ -282,7 +218,7 @@ change memberships for divisible inputs because the third quality key changed.
 
 The fast tier actively balances costs; it does not promise to beat random sampling on all inputs.
 The middle tier now evaluates the fast candidate too, so its sample order can differ from the
-initial capacity-only `lpt` implementation. V1-V3 and the default selection are unaffected.
+initial capacity-only `lpt` implementation. The default tier is `lpt-medium`.
 
 The sampler snapshots costs and caches the complete static plan once per instance in memory.
 Base seed controls tail selection and equal-cost tie-breaking. Epoch is not part of static
@@ -295,11 +231,9 @@ costs, batch size, world size or the dataset/index mapping change.
 | `shuffle=True` | Shuffle step order and rank assignments with `seed + epoch` |
 | `shuffle=False` | Fixed balanced order; `set_epoch()` has no effect |
 | Within-batch order | Fixed across epochs in either mode |
-| `sample_order` | Rejected with LPT in either shuffle mode |
 
 Non-shuffled order is not original dataset order. Preserve sample indices when prediction outputs
-need to be restored to their original ordering. Other strategies retain their `sample_order`
-behavior; LPT rejects rather than silently disregarding it.
+need to be restored to their original ordering.
 
 ## Tail Contract
 

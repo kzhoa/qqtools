@@ -15,7 +15,6 @@ from ..store import read_json_limited
 from . import activation, locator
 
 _MAX_DIRECTORY_VISITS = 1024
-_MAX_ACTIVATION_BYTES = 16 * 1024
 _MAX_GROUP_BYTES = 8 * 1024 * 1024
 
 
@@ -85,12 +84,9 @@ def _directory_revision(path: Path) -> str:
 
 
 def _activation_mode(root: Path) -> str:
-    path = root / "schema" / "group-service.json"
-    try:
-        record = read_json_limited(path, max_bytes=_MAX_ACTIVATION_BYTES)
-    except FileNotFoundError:
+    state = activation.group_service_routing_state(root)
+    if state is None:
         return "legacy"
-    state = record.get("state")
     if state == "active":
         if not activation.is_group_service_active(root):
             raise RuntimeError("active Group service has invalid activation evidence")

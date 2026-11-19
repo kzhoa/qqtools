@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-from contextlib import nullcontext
 from pathlib import Path
 from typing import Any, Callable
 
@@ -29,16 +28,10 @@ from ..runtime.dependencies import (
     resolve_affected_dependency_locks,
     validate_group_dependencies,
 )
-from ..runtime.dependency_projection import (
-    begin_mutation,
-    complete_mutation,
-    invalidate_legacy_rebuild,
-    synchronize_task_edges,
-)
+from ..runtime.dependency_projection import begin_mutation, complete_mutation, synchronize_task_edges
 from ..runtime.group_discovery.changes import record_task_change
 from ..runtime.locks import (
     dependency_lock,
-    group_lock,
     group_writer_lock,
     schema_writer_lock,
     sorted_group_locks,
@@ -865,7 +858,6 @@ def edit_dependencies(
     validate_root_contract(cfg)
     if not is_task_dependencies_root(cfg):
         raise ValueError("Task dependencies require an activated task-dependencies-v1 root.")
-    is_v2 = is_task_dependencies_v2_root(cfg)
     requested = normalize_dependency_ids(dependency_ids)
 
     def edited_candidate(task: TaskRecord) -> TaskRecord:
@@ -880,65 +872,43 @@ def edit_dependencies(
             raise ValueError(f"unknown dependency edit action {action!r}.")
         return candidate
 
-    def edit_locked(expected: TaskRecord, *, task_is_locked: bool = False) -> TaskRecord:
-        task_context = nullcontext() if task_is_locked else task_lock(cfg.shared_root, task_id)
-        with task_context:
-            task = load_task(cfg, task_id)
-            reject_cleanup_blocked(cfg, task, "have dependencies edited")
-            if not is_committed_submission_task(cfg, task):
-                raise ValueError("a Task whose submission is not committed cannot have dependencies edited.")
-            if task.group_name != expected.group_name:
-                raise RuntimeError("Task Group changed while editing dependencies.")
-            if task.depends_on_task_ids != expected.depends_on_task_ids:
-                raise RuntimeError("Task dependencies changed while dependency locks were acquired.")
-            if task.state["projection"] in {"succeeded", "failed", "cancelled"}:
-                raise ValueError("terminal tasks cannot have dependencies edited.")
-            if task.claim_control.get("active_claim") or task.attempt_control["next_attempt_number"] != 1:
-                raise ValueError("a Task that has created an Attempt cannot have dependencies edited.")
-            edited = edited_candidate(task)
-            updated = edited.depends_on_task_ids
-            validate_group_dependencies(cfg, task.group_name, [edited])
-            before = TaskRecord.from_dict(task.to_dict())
-            projection_started = False
-            if is_v2:
-                begin_mutation(cfg)
-                projection_started = True
-            else:
-                invalidate_legacy_rebuild(cfg, "dependency edit")
-            try:
-                with record_task_change(
-                    cfg,
-                    task,
-                    "dependency_edit",
-                    details={"action": action},
-                ):
-                    task.depends_on_task_ids = updated
-                    task.meta["revision"] += 1
-                    task.meta["updated_at"] = utc_now()
-                    save_task(cfg, task)
-                if projection_started:
-                    synchronize_task_edges(cfg, before, task)
-                    complete_mutation(cfg)
-            except Exception:
-                raise
-            return task
+    def edit_locked(expected: TaskRecord) -> TaskRecord:
+        task = load_task(cfg, task_id)
+        reject_cleanup_blocked(cfg, task, "have dependencies edited")
+        if not is_committed_submission_task(cfg, task):
+            raise ValueError("a Task whose submission is not committed cannot have dependencies edited.")
+        if task.group_name != expected.group_name:
+            raise RuntimeError("Task Group changed while editing dependencies.")
+        if task.depends_on_task_ids != expected.depends_on_task_ids:
+            raise RuntimeError("Task dependencies changed while dependency locks were acquired.")
+        if task.state["projection"] in {"succeeded", "failed", "cancelled"}:
+            raise ValueError("terminal tasks cannot have dependencies edited.")
+        if task.claim_control.get("active_claim") or task.attempt_control["next_attempt_number"] != 1:
+            raise ValueError("a Task that has created an Attempt cannot have dependencies edited.")
+        edited = edited_candidate(task)
+        updated = edited.depends_on_task_ids
+        validate_group_dependencies(cfg, task.group_name, [edited])
+        before = TaskRecord.from_dict(task.to_dict())
+        begin_mutation(cfg)
+        with record_task_change(cfg, task, "dependency_edit", details={"action": action}):
+            task.depends_on_task_ids = updated
+            task.meta["revision"] += 1
+            task.meta["updated_at"] = utc_now()
+            save_task(cfg, task)
+        synchronize_task_edges(cfg, before, task)
+        complete_mutation(cfg)
+        return task
 
-    if not is_v2:
-        with schema_writer_lock(cfg, require_narrow=True):
-            with dependency_lock(cfg.shared_root):
-                initial = load_task(cfg, task_id)
-                if initial.group_name is None:
-                    raise ValueError("ungrouped tasks cannot declare dependencies.")
-                with group_lock(cfg.shared_root, initial.group_name):
-                    return edit_locked(initial)
     with schema_writer_lock(cfg, require_narrow=True):
+        if not is_task_dependencies_v2_root(cfg):
+            raise ValueError("Dependency edits require task-dependencies-v2; check qexp admin upgrade status.")
         with dependency_lock(cfg.shared_root):
             initial = load_task(cfg, task_id)
             candidate = edited_candidate(initial)
             lock_groups, lock_tasks = resolve_affected_dependency_locks(cfg, [initial, candidate])
             with sorted_group_locks(cfg.shared_root, lock_groups):
                 with task_locks(cfg.shared_root, lock_tasks):
-                    return edit_locked(initial, task_is_locked=True)
+                    return edit_locked(initial)
 
 
 def share(
