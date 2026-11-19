@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+## v1.3.29
+
+- fix: resume qpipeline training from a completed epoch boundary without repeating the epoch.
+- fix: reduce qpipeline distributed metrics on the configured runner device.
+- fix: keep qexp progress publication and maintenance eligible while a deadline scan yields
+  to supervision. Reduce repeated executor reads and decoding during scheduling.
+- fix: allow a running qexp task to finish under its old machine name when registration
+  replacement fences a pending running-state publication.
+- compat: require qexp registration writes to use protocol v3 and retain conversion of
+  v1/v2 registrations. Historical Attempt renewal replay and timeout-decision retirement
+  remain available through 1.3.30.
+
 ## v1.3.28
 
 - breaking: upgrading the qexp registration protocol from 1.3.27 requires one coordinated
