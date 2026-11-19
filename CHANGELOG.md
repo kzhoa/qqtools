@@ -10,6 +10,8 @@
   to supervision. Reduce repeated executor reads and decoding during scheduling.
 - fix: allow a running qexp task to finish under its old machine name when registration
   replacement fences a pending running-state publication.
+- fix: keep qexp launch authorizations consumable across transient binding validation gaps.
+  Drain outstanding Idle Job probes during training and pace repeat checks of settled Attempts.
 - compat: require qexp registration writes to use protocol v3 and retain conversion of
   v1/v2 registrations. Historical Attempt renewal replay and timeout-decision retirement
   remain available through 1.3.30.
