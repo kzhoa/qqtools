@@ -527,6 +527,7 @@ def test_active_metadata_damage_transitions_to_degraded(tmp_path):
 
 
 def test_active_worker_consumes_membership_locator_without_history_sweep(tmp_path, monkeypatch):
+    from qqtools.plugins.qexp.runtime.group_discovery import discovery
     from qqtools.plugins.qexp.runtime.group_discovery import service as service_module
 
     cfg = isolated_group(tmp_path, tail=0)
@@ -542,6 +543,7 @@ def test_active_worker_consumes_membership_locator_without_history_sweep(tmp_pat
         def __init__(self, *args, **kwargs):
             pytest.fail("active Group service created a historical sweep")
 
+    monkeypatch.setattr(discovery, "SubmissionSourceSweep", ForbiddenSweep)
     monkeypatch.setattr(service_module, "SubmissionSourceSweep", ForbiddenSweep)
     worker = service_module.MachineGroupDiscoveryWorker(runtime)
     worker.start()

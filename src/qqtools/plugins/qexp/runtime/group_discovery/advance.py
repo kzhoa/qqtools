@@ -11,9 +11,9 @@ from ..group_namespace import GroupNotPublished, GroupPublicationUnavailable, re
 from ..records import validate_group_name
 from . import activation, locator
 from .control import GroupControlCursor, advance_group_control_rechecks
+from .discovery import GroupDiscoveryService
 from .maintenance import GroupMaintenance
 from .probe import probe_group_service
-from .service import GroupDiscoveryService
 
 _REVISION_KEYS = {"device", "inode", "size", "mtime_ns", "ctime_ns"}
 # RecoverableSource publishes only phase-boundary checkpoints. One isolated

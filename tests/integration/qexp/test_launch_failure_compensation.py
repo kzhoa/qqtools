@@ -9,7 +9,7 @@ import pytest
 
 from qqtools.plugins.qexp import init_shared_root, runner, submit
 from qqtools.plugins.qexp.agent import dispatch_loop
-from qqtools.plugins.qexp.executor import LaunchHandoff
+from qqtools.plugins.qexp.executor import ExecutorLaunchFailure, LaunchHandle, LaunchHandoff
 from qqtools.plugins.qexp.runtime.paths import attempt_path, local_paths
 from qqtools.plugins.qexp.runtime.records import AttemptRecord
 from qqtools.plugins.qexp.runtime.resources.cpu_lane import set_cpu_lane_capacity
@@ -223,3 +223,21 @@ def test_another_machine_cannot_compensate_from_its_empty_local_inbox(tmp_path):
     )
     assert load_task(cfg, task.task_id).state["projection"] == "running"
     assert_reserved(cfg, task)
+
+
+def test_dispatch_compensates_before_cleaning_up_failed_launch(tmp_path):
+    cfg, task = prepare(tmp_path)
+    handle = LaunchHandle("detached", object())
+    cleaned = []
+
+    class FailedLaunch:
+        def launch_attempt(self, cfg, task_id, attempt):
+            raise ExecutorLaunchFailure("failed before intent", handle=handle)
+
+        def cleanup_launch(self, failed_handle):
+            record = read_json(attempt_path(cfg.shared_root, task.task_id, 1))["attempt"]
+            cleaned.append((failed_handle, record["phase"]))
+
+    assert run_dispatch_cycle(cfg, available_gpus=[0], executor=FailedLaunch()) == []
+    assert cleaned == [(handle, "failed")]
+    assert load_task(cfg, task.task_id).claim_control["active_claim"] is None

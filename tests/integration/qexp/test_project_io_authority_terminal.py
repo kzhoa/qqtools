@@ -756,7 +756,8 @@ def test_binding_validation_drains_cross_epoch_terminal_replay(tmp_path: Path) -
         restarted.shutdown()
 
 
-def test_cross_epoch_terminal_intent_without_committed_marker_cannot_publish(tmp_path: Path) -> None:
+@pytest.mark.parametrize("marker", ["absent", "other_request"])
+def test_cross_epoch_terminal_intent_without_committed_marker_cannot_publish(tmp_path: Path, marker: str) -> None:
     running = _running_attempt(tmp_path)
     executor = ProjectIOExecutor(running.runtime)
     executor.begin_epoch()
@@ -774,6 +775,35 @@ def test_cross_epoch_terminal_intent_without_committed_marker_cannot_publish(tmp
         transition_digest=parameters["transition_digest"],
     )
     task_file = running.cfg.shared_root / "tasks" / f"{running.task_id}.json"
+
+    def interrupt_after_attempt_write():
+        if AttemptRecord.from_dict(read_json(running.attempt_file)).phase == "succeeded":
+            raise RuntimeError("interrupted")
+
+    with pytest.raises(RuntimeError, match="interrupted"):
+        publish_project_io_terminal_transition(
+            running.cfg,
+            request_id="f" * 32,
+            machine_name=running.binding.machine_name,
+            **_attempt_parameters(running),
+            mode="active",
+            phase="succeeded",
+            reason="completed",
+            exit_code=0,
+            termination_result=None,
+            expected_task_revision=running.source_revisions["task"],
+            expected_attempt_digest=running.source_revisions["attempt_digest"],
+            transition_digest=parameters["transition_digest"],
+            mutation_fence=interrupt_after_attempt_write,
+        )
+    if marker == "absent":
+        partial = read_json(running.attempt_file)
+        del partial["attempt"]["termination"]["project_io_publication_id"]
+        atomic_replace(running.attempt_file, partial)
+    assert (
+        load_task(running.cfg, running.task_id).claim_control["active_claim"]["attempt_id"]
+        == request.parameters["attempt_id"]
+    )
     original_task, original_attempt = task_file.read_bytes(), running.attempt_file.read_bytes()
     restarted = ProjectIOExecutor(running.runtime)
     restarted.begin_epoch()

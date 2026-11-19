@@ -247,7 +247,7 @@ def test_common_arbiter_consumes_recovery_readiness_without_inline_shared_domain
     revision, _ = runtime.load_registry_snapshot()
     controller = ProjectIOController(runtime, executor)
     monkeypatch.setattr(
-        worker, "_recovery_admission", lambda *_: pytest.fail("coordinator ran shared preparation inline")
+        worker, "handle_recovery_request", lambda *_, **__: pytest.fail("coordinator ran shared preparation inline")
     )
     deadline = time.monotonic() + 5
     completed = {}

@@ -1073,7 +1073,7 @@ def _recheck_position(cfg: RootConfig, group_name: str) -> Any | None:
 def _persist_operation(cfg: RootConfig, operation: dict[str, Any], control: dict[str, Any]) -> None:
     group_name = control.get("group_name")
     if isinstance(group_name, str) and group_name:
-        from ..runtime.group_discovery.service import publish_group_locator_for_transition
+        from ..runtime.group_discovery.discovery import publish_group_locator_for_transition
 
         # QQTOOLS-COMPAT-0017: every durable control progress/retry update
         # refreshes its locator before replacing the active operation.

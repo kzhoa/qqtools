@@ -155,7 +155,7 @@ def group_control(
             indexed_cancel = is_group_authority_isolated(cfg.shared_root)
             if indexed_cancel:
                 initialize_cancel_discovery(cfg, operation["group_control"])
-                from ..runtime.group_discovery.service import publish_group_locator_for_transition
+                from ..runtime.group_discovery.discovery import publish_group_locator_for_transition
 
                 # QQTOOLS-COMPAT-0017: keep cancellation discoverable before
                 # publishing the operation and its Group barrier.
@@ -1066,7 +1066,7 @@ def change_worker(
                     "completed_at": None,
                 },
             }
-            from ..runtime.group_discovery.service import publish_group_locator_for_transition
+            from ..runtime.group_discovery.discovery import publish_group_locator_for_transition
 
             publish_group_locator_for_transition(cfg, group_name, "control", "group_operation")
             write_active_operation(cfg, "group_control", operation_id, operation)

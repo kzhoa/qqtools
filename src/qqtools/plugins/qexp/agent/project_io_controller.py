@@ -14,7 +14,7 @@ from bisect import bisect_right
 from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from functools import partial, wraps
 from typing import Any, Iterator
 
@@ -49,6 +49,7 @@ from .project_io_admission import ProjectIOAdmission, ServiceIntent
 from .project_io_executor import ProjectIOExecutor, ProjectIOProtocolError
 from .project_io_protocol import PROJECT_IO_OPERATIONS, ProjectIORequest
 from .ready_cursor_validation import validate_ready_cursor_transition
+from .snapshot_publication_health import SNAPSHOT_HEALTH_ITEM_LIMIT, SnapshotPublicationHealth
 from .working_set import BindingTurn
 
 _INITIAL_BACKOFF_SECONDS = 5.0
@@ -57,20 +58,6 @@ _RECOVERY_WAIT_RETRY_SECONDS = 1.0
 _SCHEDULER_DUE_OFFER_IDLE_RETRY_SECONDS = 1.0
 _MAX_RETAINED_SCHEDULER_INTENTS = 64
 _MAX_RETAINED_RESERVATION_RECONCILIATIONS = 256
-_MAX_MACHINE_SNAPSHOT_HEALTH_ITEMS = 8
-_MACHINE_SNAPSHOT_STAGES = frozenset(
-    {"intent", "queued", "started", "result_ready", "consumed", "backoff", "published"}
-)
-_MACHINE_SNAPSHOT_STAGE_ORDER = {
-    "backoff": 0,
-    "started": 1,
-    "intent": 2,
-    "queued": 3,
-    "result_ready": 4,
-    "consumed": 5,
-    "published": 6,
-}
-_MACHINE_SNAPSHOT_REASON_RE = re.compile(r"^[a-z][a-z0-9_]{0,95}$")
 _EVENT_FILENAME = re.compile(r"(?:[0-9a-f]{16}|[0-9a-f]{32})\.json\Z")
 _AUTHORITY_OPERATION_KINDS = frozenset(
     {
@@ -329,7 +316,6 @@ class ProjectIOController:
         self._initial_request_ids: set[str] = set()
         self._needs_successor_turn = False
         self._monotonic = monotonic
-        self._utc_clock = utc_clock
         self._observed_executor_epoch: str | None = None
         self._validated: set[_ValidationIdentity] = set()
         self._backoff: dict[_ValidationIdentity, _FailureBackoff] = {}
@@ -351,10 +337,9 @@ class ProjectIOController:
         self._maintenance_descriptor_turns: dict[str, BindingTurn] = {}
         self._ready_index_settled: dict[_ValidationIdentity, None] = {}
         self._ready_index_needed: dict[_ValidationIdentity, None] = {}
-        self._snapshot_last_published: dict[_ValidationIdentity, tuple[str, float]] = {}
-        self._snapshot_publication_progress: dict[tuple[_ValidationIdentity, str], dict[str, Any]] = {}
-        self._snapshot_worker_started: dict[tuple[_ValidationIdentity, str], float] = {}
-        self._snapshot_health_instance_id: str | None = None
+        self._snapshot_health = SnapshotPublicationHealth(
+            monotonic=monotonic, utc_clock=utc_clock, max_retry_seconds=_MAX_BACKOFF_SECONDS
+        )
         self._activation_offsets: dict[str, int] = {}
         self._primary_rounds: dict[str, _PrimaryProbeRound] = {}
         self._scheduler_quiescence_rounds: dict[_ValidationIdentity, _SchedulerQuiescenceRound] = {}
@@ -3735,11 +3720,7 @@ class ProjectIOController:
         if not isinstance(policy, dict):
             raise ValueError("gpu_policy must be an object.")
 
-        if self._snapshot_health_instance_id != instance_id:
-            self._snapshot_publication_progress.clear()
-            self._snapshot_worker_started.clear()
-            self._snapshot_last_published.clear()
-            self._snapshot_health_instance_id = instance_id
+        self._snapshot_health.reset_instance(instance_id)
 
         executor_status, unresolved = self._poll_admission_executor()
         executor_epoch = executor_status.get("executor_epoch")
@@ -3756,22 +3737,7 @@ class ProjectIOController:
                 and identity not in current
             ):
                 current[identity] = binding
-        current_identities = set(current)
-        self._snapshot_last_published = {
-            identity: state
-            for identity, state in self._snapshot_last_published.items()
-            if identity in current_identities
-        }
-        self._snapshot_publication_progress = {
-            key: entry
-            for key, entry in self._snapshot_publication_progress.items()
-            if key[1] == instance_id and key[0] in current_identities
-        }
-        self._snapshot_worker_started = {
-            key: started
-            for key, started in self._snapshot_worker_started.items()
-            if key[1] == instance_id and key[0] in current_identities
-        }
+        self._snapshot_health.prune(current)
 
         unresolved_by_id = {request.request_id: request for request in unresolved}
         unresolved_owners = {
@@ -3794,10 +3760,10 @@ class ProjectIOController:
             processed_projects.add(binding.project_id)
             service_key = self._snapshot_service_key(identity)
             heartbeat_interval = float(request.parameters.get("heartbeat_interval_seconds", heartbeat_interval_seconds))
-            progress = self._snapshot_publication_progress.get((identity, instance_id))
+            stage = self._snapshot_health.stage(identity, instance_id)
             retry_is_due = self._service_retry_is_due(service_key)
-            if progress is None or progress.get("stage") != "backoff" or retry_is_due:
-                self._snapshot_note_request(
+            if stage != "backoff" or retry_is_due:
+                self._snapshot_health.report_request(
                     identity,
                     instance_id,
                     heartbeat_interval,
@@ -3810,11 +3776,12 @@ class ProjectIOController:
                 self._started_requests.discard(request.request_id)
             else:
                 self._started_requests.add(request.request_id)
-                self._snapshot_note_worker_started(
+                self._snapshot_health.report_request(
                     identity,
                     instance_id,
                     heartbeat_interval,
                     request.request_id,
+                    stage="started",
                 )
                 continue
             result = self.executor.load_result(request.request_id)
@@ -3824,11 +3791,12 @@ class ProjectIOController:
                 continue
             if result.request != request:
                 raise ProjectIOProtocolError("machine snapshot result changed request identity.")
-            self._snapshot_mark_result_ready(
+            self._snapshot_health.report_request(
                 identity,
                 instance_id,
                 heartbeat_interval,
                 request.request_id,
+                stage="result_ready",
                 reason=result.reason_code,
             )
             if result.status == "outcome_unknown":
@@ -3848,11 +3816,12 @@ class ProjectIOController:
             consumed = self.executor.consume(request.request_id, request)
             if consumed is None:
                 continue
-            self._snapshot_mark_consumed(
+            self._snapshot_health.report_request(
                 identity,
                 instance_id,
                 heartbeat_interval,
                 request.request_id,
+                stage="consumed",
             )
             unresolved_by_id.pop(request.request_id, None)
             unresolved_owners.discard(identity.request_owner)
@@ -3862,13 +3831,15 @@ class ProjectIOController:
                 completions[binding.project_id] = evidence
                 if evidence.get("outcome") == "published":
                     self._service_backoff.pop(service_key, None)
-                    self._snapshot_mark_published(
+                    self._snapshot_health.report_request(
                         identity,
                         instance_id,
                         heartbeat_interval,
                         request.request_id,
+                        stage="published",
                     )
-                    self._snapshot_last_published[identity] = (
+                    self._snapshot_health.record_publication(
+                        identity,
                         self._machine_snapshot_signature(request.parameters),
                         self._monotonic(),
                     )
@@ -3901,9 +3872,8 @@ class ProjectIOController:
             for identity in current:
                 if identity.project_id in processed_projects:
                     continue
-                entry = self._snapshot_publication_progress.get((identity, instance_id))
-                if entry is None or entry.get("stage") == "published":
-                    self._snapshot_begin_intent(
+                if self._snapshot_health.stage(identity, instance_id) in {None, "published"}:
+                    self._snapshot_health.begin_intent(
                         identity,
                         instance_id,
                         heartbeat_interval_seconds,
@@ -3930,20 +3900,19 @@ class ProjectIOController:
                     "gpu_policy": policy,
                 }
             )
-            last_published = self._snapshot_last_published.get(identity)
+            last_published = self._snapshot_health.last_publication(identity)
             if (
                 last_published is not None
                 and last_published[0] == signature
                 and now - last_published[1] < heartbeat_interval_seconds
             ):
                 continue
-            entry = self._snapshot_publication_progress.get((identity, instance_id))
-            new_attempt = entry is None or entry.get("stage") == "published" or entry.get("stage") == "backoff"
-            entry = self._snapshot_begin_intent(
+            stage = self._snapshot_health.stage(identity, instance_id)
+            attempt_started = self._snapshot_health.begin_intent(
                 identity,
                 instance_id,
                 heartbeat_interval_seconds,
-                new_attempt=new_attempt,
+                new_attempt=stage in {None, "published", "backoff"},
             )
             self._offer_new_request(
                 identity,
@@ -3965,180 +3934,13 @@ class ProjectIOController:
                 # Prefer snapshots only as freshness becomes at risk, leaving
                 # one heartbeat for publication before the three-interval
                 # stale diagnostic without consuming early startup grants.
-                deadline=entry["_attempt_started_monotonic"] + 2 * heartbeat_interval_seconds,
+                deadline=attempt_started + 2 * heartbeat_interval_seconds,
             )
         return completions
 
-    def machine_snapshot_health_view(self, *, limit: int = _MAX_MACHINE_SNAPSHOT_HEALTH_ITEMS) -> dict[str, object]:
+    def machine_snapshot_health_view(self, *, limit: int = SNAPSHOT_HEALTH_ITEM_LIMIT) -> dict[str, object]:
         """Return a detached worst-first view of current snapshot publication progress."""
-        if type(limit) is not int or not 1 <= limit <= _MAX_MACHINE_SNAPSHOT_HEALTH_ITEMS:
-            raise ValueError(f"limit must be an integer from 1 through {_MAX_MACHINE_SNAPSHOT_HEALTH_ITEMS}.")
-        now = self._snapshot_monotonic()
-        entries: list[tuple[dict[str, Any], dict[str, object]]] = []
-        for key, entry in self._snapshot_publication_progress.items():
-            if key[1] != self._snapshot_health_instance_id:
-                continue
-            self._refresh_machine_snapshot_progress(key, entry, now)
-            public = {
-                field: _json_copy(entry[field])
-                for field in (
-                    "runtime_id",
-                    "agent_instance_id",
-                    "registry_revision",
-                    "executor_epoch",
-                    "project_id",
-                    "registration_generation",
-                    "operation_kind",
-                    "request_id",
-                    "stage",
-                    "last_attempt_at",
-                    "last_published_at",
-                    "consecutive_failures",
-                    "retry_at",
-                    "reason_code",
-                    "worker_elapsed_seconds",
-                    "overdue",
-                    "effective_stale_after_seconds",
-                )
-            }
-            entries.append((entry, public))
-        entries.sort(
-            key=lambda item: (
-                not item[0]["overdue"],
-                _MACHINE_SNAPSHOT_STAGE_ORDER.get(item[0]["stage"], len(_MACHINE_SNAPSHOT_STAGE_ORDER)),
-                item[0].get("_attempt_started_monotonic")
-                if type(item[0].get("_attempt_started_monotonic")) in {int, float}
-                else float("inf"),
-                item[0]["project_id"],
-            )
-        )
-        total = min((1 << 31) - 1, len(entries))
-        retained = [public for _entry, public in entries[:limit]]
-        omitted_count = min((1 << 31) - 1, max(0, total - len(retained)))
-        return {"total": total, "omitted_count": omitted_count, "items": retained}
-
-    def _snapshot_monotonic(self) -> float:
-        try:
-            value = float(self._monotonic())
-        except Exception:
-            return 0.0
-        return value if math.isfinite(value) else 0.0
-
-    def _snapshot_timestamp(self) -> str:
-        try:
-            value = self._utc_clock()
-        except Exception:
-            value = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-        return (
-            value[:64]
-            if isinstance(value, str) and value
-            else datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-        )
-
-    @staticmethod
-    def _snapshot_reason(value: object, *, fallback: str) -> str:
-        if isinstance(value, str) and _MACHINE_SNAPSHOT_REASON_RE.fullmatch(value):
-            return value
-        return fallback
-
-    def _machine_snapshot_progress(
-        self,
-        identity: _ValidationIdentity,
-        instance_id: str,
-        heartbeat_interval_seconds: int | float,
-    ) -> tuple[tuple[_ValidationIdentity, str], dict[str, Any]]:
-        key = (identity, instance_id)
-        entry = self._snapshot_publication_progress.get(key)
-        stale_after = float(heartbeat_interval_seconds) * 3.0
-        if entry is None:
-            entry = {
-                "runtime_id": identity.runtime_id,
-                "agent_instance_id": instance_id,
-                "registry_revision": identity.registry_revision,
-                "executor_epoch": identity.executor_epoch,
-                "project_id": identity.project_id,
-                "registration_generation": identity.registration_generation,
-                "operation_kind": "machine_snapshot_publish",
-                "request_id": None,
-                "stage": "intent",
-                "last_attempt_at": None,
-                "last_published_at": None,
-                "consecutive_failures": 0,
-                "retry_at": None,
-                "reason_code": None,
-                "worker_elapsed_seconds": None,
-                "overdue": False,
-                "effective_stale_after_seconds": stale_after,
-                "_attempt_started_monotonic": None,
-                "_last_published_monotonic": None,
-                "_retry_deadline": None,
-                "_worker_elapsed_seconds": None,
-            }
-            self._snapshot_publication_progress[key] = entry
-        else:
-            entry["effective_stale_after_seconds"] = stale_after
-        return key, entry
-
-    def _snapshot_begin_intent(
-        self,
-        identity: _ValidationIdentity,
-        instance_id: str,
-        heartbeat_interval_seconds: int | float,
-        *,
-        new_attempt: bool = False,
-    ) -> dict[str, Any]:
-        key, entry = self._machine_snapshot_progress(identity, instance_id, heartbeat_interval_seconds)
-        now = self._snapshot_monotonic()
-        if new_attempt or entry.get("_attempt_started_monotonic") is None:
-            entry["_attempt_started_monotonic"] = now
-            entry["last_attempt_at"] = self._snapshot_timestamp()
-            entry["request_id"] = None
-            entry["worker_elapsed_seconds"] = None
-            entry["_worker_elapsed_seconds"] = None
-            self._snapshot_worker_started.pop(key, None)
-        entry["stage"] = "intent"
-        entry["retry_at"] = None
-        entry["_retry_deadline"] = None
-        self._refresh_machine_snapshot_progress(key, entry, now)
-        return entry
-
-    def _snapshot_note_request(
-        self,
-        identity: _ValidationIdentity,
-        instance_id: str,
-        heartbeat_interval_seconds: int | float,
-        request_id: str,
-        *,
-        stage: str,
-    ) -> dict[str, Any]:
-        key, entry = self._machine_snapshot_progress(identity, instance_id, heartbeat_interval_seconds)
-        if entry.get("_attempt_started_monotonic") is None:
-            entry["_attempt_started_monotonic"] = self._snapshot_monotonic()
-            entry["last_attempt_at"] = self._snapshot_timestamp()
-        entry["request_id"] = request_id
-        entry["stage"] = stage
-        self._refresh_machine_snapshot_progress(key, entry, self._snapshot_monotonic())
-        return entry
-
-    def _snapshot_note_worker_started(
-        self,
-        identity: _ValidationIdentity,
-        instance_id: str,
-        heartbeat_interval_seconds: int | float,
-        request_id: str,
-    ) -> None:
-        key, entry = self._machine_snapshot_progress(identity, instance_id, heartbeat_interval_seconds)
-        self._snapshot_note_request(
-            identity,
-            instance_id,
-            heartbeat_interval_seconds,
-            request_id,
-            stage="started",
-        )
-        self._snapshot_worker_started.setdefault(key, self._snapshot_monotonic())
-        entry["retry_at"] = None
-        entry["_retry_deadline"] = None
-        self._refresh_machine_snapshot_progress(key, entry, self._snapshot_monotonic())
+        return self._snapshot_health.view(limit=limit)
 
     def _snapshot_record_failure(
         self,
@@ -4148,127 +3950,17 @@ class ProjectIOController:
         *,
         reason: object,
         request_id: str | None = None,
-        service_key: tuple[_ValidationIdentity, str, str, str] | None = None,
+        service_key: tuple[_ValidationIdentity, str, str, str],
     ) -> None:
-        key, entry = self._machine_snapshot_progress(identity, instance_id, heartbeat_interval_seconds)
-        if entry.get("_attempt_started_monotonic") is None:
-            entry["_attempt_started_monotonic"] = self._snapshot_monotonic()
-            entry["last_attempt_at"] = self._snapshot_timestamp()
-        if request_id is not None:
-            entry["request_id"] = request_id
-        entry["stage"] = "backoff"
-        entry["consecutive_failures"] = min((1 << 31) - 1, entry["consecutive_failures"] + 1)
-        entry["reason_code"] = self._snapshot_reason(reason, fallback="publication_failed")
-        if service_key is not None:
-            failure = self._service_backoff.get(service_key)
-            entry["_retry_deadline"] = failure.retry_at if failure is not None else None
-        else:
-            entry["_retry_deadline"] = None
-        self._snapshot_worker_started.pop(key, None)
-        self._refresh_machine_snapshot_progress(key, entry, self._snapshot_monotonic())
-
-    def _snapshot_mark_result_ready(
-        self,
-        identity: _ValidationIdentity,
-        instance_id: str,
-        heartbeat_interval_seconds: int | float,
-        request_id: str,
-        *,
-        reason: object = None,
-    ) -> None:
-        key, entry = self._machine_snapshot_progress(identity, instance_id, heartbeat_interval_seconds)
-        self._snapshot_note_request(
+        failure = self._service_backoff.get(service_key)
+        self._snapshot_health.report_failure(
             identity,
             instance_id,
             heartbeat_interval_seconds,
-            request_id,
-            stage="result_ready",
+            reason=reason,
+            request_id=request_id,
+            retry_deadline=failure.retry_at if failure is not None else None,
         )
-        if reason is not None:
-            entry["reason_code"] = self._snapshot_reason(reason, fallback="outcome_unknown")
-        self._refresh_machine_snapshot_progress(key, entry, self._snapshot_monotonic())
-        self._snapshot_worker_started.pop(key, None)
-
-    def _snapshot_mark_consumed(
-        self,
-        identity: _ValidationIdentity,
-        instance_id: str,
-        heartbeat_interval_seconds: int | float,
-        request_id: str,
-    ) -> None:
-        key, entry = self._machine_snapshot_progress(identity, instance_id, heartbeat_interval_seconds)
-        self._snapshot_note_request(
-            identity,
-            instance_id,
-            heartbeat_interval_seconds,
-            request_id,
-            stage="consumed",
-        )
-        self._refresh_machine_snapshot_progress(key, entry, self._snapshot_monotonic())
-
-    def _snapshot_mark_published(
-        self,
-        identity: _ValidationIdentity,
-        instance_id: str,
-        heartbeat_interval_seconds: int | float,
-        request_id: str,
-    ) -> None:
-        key, entry = self._machine_snapshot_progress(identity, instance_id, heartbeat_interval_seconds)
-        self._snapshot_note_request(
-            identity,
-            instance_id,
-            heartbeat_interval_seconds,
-            request_id,
-            stage="published",
-        )
-        entry["stage"] = "published"
-        entry["last_published_at"] = self._snapshot_timestamp()
-        entry["_last_published_monotonic"] = self._snapshot_monotonic()
-        entry["consecutive_failures"] = 0
-        entry["retry_at"] = None
-        entry["_retry_deadline"] = None
-        entry["reason_code"] = None
-        entry["overdue"] = False
-        self._snapshot_worker_started.pop(key, None)
-        self._refresh_machine_snapshot_progress(key, entry, self._snapshot_monotonic())
-
-    def _refresh_machine_snapshot_progress(
-        self,
-        key: tuple[_ValidationIdentity, str],
-        entry: dict[str, Any],
-        now: float,
-    ) -> None:
-        worker_started = self._snapshot_worker_started.get(key)
-        attempt_started = entry.get("_attempt_started_monotonic")
-        published_at = entry.get("_last_published_monotonic")
-        if entry.get("stage") == "published" and type(published_at) in {int, float}:
-            baseline = published_at
-        else:
-            baseline = worker_started if type(worker_started) in {int, float} else attempt_started
-        if type(baseline) in {int, float} and math.isfinite(float(baseline)):
-            elapsed = max(0.0, now - float(baseline))
-            entry["overdue"] = elapsed >= entry["effective_stale_after_seconds"]
-            if worker_started is not None:
-                entry["worker_elapsed_seconds"] = elapsed
-                entry["_worker_elapsed_seconds"] = elapsed
-            elif entry.get("_worker_elapsed_seconds") is not None:
-                entry["worker_elapsed_seconds"] = entry["_worker_elapsed_seconds"]
-        else:
-            entry["overdue"] = False
-        deadline = entry.get("_retry_deadline")
-        if type(deadline) in {int, float} and math.isfinite(float(deadline)):
-            remaining = min(_MAX_BACKOFF_SECONDS, max(0.0, float(deadline) - now))
-            try:
-                base = datetime.fromisoformat(self._snapshot_timestamp().replace("Z", "+00:00"))
-                if base.tzinfo is None or base.utcoffset() is None:
-                    raise ValueError
-                entry["retry_at"] = (
-                    (base + timedelta(seconds=remaining)).astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
-                )
-            except (TypeError, ValueError, OverflowError):
-                entry["retry_at"] = None
-        else:
-            entry["retry_at"] = None
 
     def _prepare_machine_snapshot_publish_request(
         self,
@@ -4296,9 +3988,7 @@ class ProjectIOController:
         if is_on_demand and binding not in self.runtime.working_set.resident_bindings():
             identity = self._binding_identity(binding, registry_revision, self._observed_executor_epoch)
             if identity is not None:
-                key = (identity, instance_id)
-                self._snapshot_publication_progress.pop(key, None)
-                self._snapshot_worker_started.pop(key, None)
+                self._snapshot_health.discard_progress(identity, instance_id)
             return
         try:
             request = self.executor.prepare_machine_snapshot_publish(
@@ -4327,7 +4017,7 @@ class ProjectIOController:
             return
         identity = self._binding_identity(binding, registry_revision, request.executor_epoch)
         if identity is not None:
-            self._snapshot_note_request(
+            self._snapshot_health.report_request(
                 identity,
                 instance_id,
                 heartbeat_interval_seconds,
@@ -5801,11 +5491,12 @@ class ProjectIOController:
         self._started_requests.add(request.request_id)
         self._service_backoff.pop(service_key, None)
         if has_progress_identity:
-            self._snapshot_note_worker_started(
+            self._snapshot_health.report_request(
                 identity,
                 instance_id,
                 heartbeat_interval,
                 request.request_id,
+                stage="started",
             )
 
     def _start_registration_renew_request(

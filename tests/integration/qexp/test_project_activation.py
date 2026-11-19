@@ -218,6 +218,8 @@ def test_ready_route_change_commits_activation_with_the_route_revision(tmp_path:
 def test_group_transition_wakes_through_compatibility_fallback(tmp_path: Path) -> None:
     cfg = isolated_group(tmp_path, tail=0)
 
+    before = _activation(cfg)
+
     with group_writer_lock(cfg, "experiment"):
         assert (
             group_service.publish_group_locator_for_transition(
@@ -234,7 +236,8 @@ def test_group_transition_wakes_through_compatibility_fallback(tmp_path: Path) -
         group_service.publish_group_locator_for_transition(cfg, "experiment", "invalid", "task_change")
 
     assert _activation(cfg) == published
-    assert published["sequence"] == 1
+    assert published["epoch"] == before["epoch"]
+    assert published["sequence"] == before["sequence"] + 1
     assert published["reason"] == "group_locator_control"
 
 
@@ -243,18 +246,12 @@ def test_fenced_group_locator_failure_stops_transition_after_wake(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     cfg = isolated_group(tmp_path, tail=0)
-    activation_path = cfg.shared_root / "schema" / "group-service.json"
-    original_read = group_service.read_json_limited
-
-    def fenced_read(path, **kwargs):
-        if path == activation_path:
-            return {"state": "fenced"}
-        return original_read(path, **kwargs)
+    from qqtools.plugins.qexp.runtime.group_discovery import activation
 
     def unavailable(*_args, **_kwargs):
         raise OSError("locator storage unavailable")
 
-    monkeypatch.setattr(group_service, "read_json_limited", fenced_read)
+    monkeypatch.setattr(activation, "group_service_routing_state", lambda _root: "fenced")
     monkeypatch.setattr(locator, "publish_group_locator_locked", unavailable)
 
     with group_writer_lock(cfg, "experiment"), pytest.raises(OSError, match="locator storage unavailable"):
@@ -330,6 +327,7 @@ def test_observation_rebuild_request_commits_wake_after_state_change(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     cfg = isolated_group(tmp_path, tail=0)
+    before = read_project_activation(cfg.shared_root)
     original_write = observation_projection.write_state
     published = []
 
@@ -342,7 +340,8 @@ def test_observation_rebuild_request_commits_wake_after_state_change(
     result = observation_maintenance.request_rebuild(cfg)
 
     assert result["reason"] == "rebuild_requested"
-    assert published == [None]
+    assert published == [before]
+    assert _activation(cfg)["sequence"] == before["project_activation"]["sequence"] + 1
     assert _activation(cfg)["reason"] == "observation_rebuild_request"
 
 

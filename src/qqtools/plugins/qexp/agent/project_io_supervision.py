@@ -21,8 +21,7 @@ from ..runtime.local_exit_reconciliation import LocalExitReconciler
 from ..runtime.paths import local_paths, machine_project_paths
 from ..runtime.process_evidence import inspect_local_group_identity, inspect_wrapper_identity
 from ..runtime.records import utc_now, validate_identifier
-from ..runtime.resources.cpu_lane import retag_cpu_if_matches
-from ..runtime.resources.reservations import ReservationIdentity, retag_if_matches
+from ..runtime.resources.reservations import ReservationIdentity
 from ..runtime.responsibility_cleanup import evidence_write_guard
 from ..runtime.store import atomic_replace, read_json_limited
 from ..runtime.termination import (
@@ -44,9 +43,12 @@ from ..runtime.work_budget import diagnostic_increment
 from .context import MachineRuntime, ProjectBinding
 from .process_reservation_recovery import ProcessReservationRecovery, registration_reservation
 from .project_io_controller import ProjectIOController
-from .project_io_process import PROCESS_IDENTITY_FIELDS
+from .project_io_orphan_recovery import OrphanRecovery
+from .project_io_process import PROCESS_IDENTITY_FIELDS, authority_evidence_matches_intent
 from .project_io_process import binding_prefix as _authority_due_binding_prefix
 from .project_io_process import binding_signature as _authority_binding_signature
+from .project_io_process import local_binding_config as _termination_local_config
+from .project_io_process import read_isolated_authority_manifest as _read_isolated_authority_manifest
 from .project_io_process import read_process_manifest as _read_process_manifest
 from .project_io_protocol import PROJECT_IO_CAPACITY, ProjectIORequest, authority_terminal_transition_digest
 from .project_io_terminal_proof import (
@@ -189,47 +191,6 @@ def _discard_authority_due_for_manifest(
             runtime.authority_process_next_due.pop(key, None)
 
 
-def _read_isolated_authority_manifest(
-    runtime: MachineRuntime,
-    binding: ProjectBinding,
-    path: Path,
-    binding_signature: tuple[str, ...],
-) -> dict[str, Any] | None:
-    """Read one exact local process manifest; never follow it into Project truth."""
-    entry = _read_process_manifest(runtime, binding, path, binding_signature)
-    if entry is None:
-        return None
-    paths = machine_project_paths(runtime.root, binding.project_id)
-    try:
-        observation_path = paths["observations"] / f"{entry['parameters']['attempt_id']}.json"
-        if is_path_present(observation_path):
-            if not validate_evidence_path(observation_path, paths["root"]):
-                return None
-            return None
-        wrapper = inspect_wrapper_identity(entry["process"])
-        group = inspect_local_group_identity(entry["process"])
-    except (OSError, RuntimeError, ValueError, TypeError, KeyError):
-        return None
-    if wrapper.state != "alive" and group.state != "alive":
-        return None
-    return entry
-
-
-def _authority_evidence_matches_intent(evidence: Mapping[str, Any], intent: Mapping[str, Any]) -> bool:
-    parameters = intent["parameters"]
-    return all(
-        evidence.get(field) == parameters[field]
-        for field in (
-            "task_id",
-            "attempt_id",
-            "attempt_number",
-            "fencing_token",
-            "reservation_id",
-            "process_identity",
-        )
-    )
-
-
 def _is_current_authority_observation(evidence: Mapping[str, Any], intent: Mapping[str, Any]) -> bool:
     revisions = evidence.get("source_revisions")
     if (
@@ -237,7 +198,7 @@ def _is_current_authority_observation(evidence: Mapping[str, Any], intent: Mappi
         or evidence.get("attempt_phase") != "running"
         or evidence.get("authority_granted") is not False
         or evidence.get("local_effects") not in ([], ())
-        or not _authority_evidence_matches_intent(evidence, intent)
+        or not authority_evidence_matches_intent(evidence, intent)
         or not isinstance(revisions, Mapping)
         or set(revisions) != {"task", "attempt_digest"}
         or type(revisions.get("task")) is not int
@@ -1043,20 +1004,6 @@ def _termination_decision_id(
         allow_nan=False,
     )
     return f"termination-{hashlib.sha256(canonical.encode('utf-8')).hexdigest()[:48]}"
-
-
-def _termination_local_config(
-    runtime: MachineRuntime,
-    binding: ProjectBinding,
-) -> RootConfig:
-    """Build local-only paths without consulting the binding's shared config."""
-    paths = machine_project_paths(runtime.root, binding.project_id)
-    return RootConfig.from_canonical_paths(
-        binding.shared_root,
-        binding.shared_root.parent,
-        binding.machine_name,
-        paths["root"],
-    )
 
 
 def _read_termination_decision(
@@ -2043,10 +1990,7 @@ class AttemptSupervisionCoordinator:
         self._termination_states: dict[tuple[str, ...], _TerminationBindingState] = {}
         self._termination_candidates: dict[tuple[str, str], _TerminationCandidate] = {}
         self._termination_binding_offset = 0
-        self._orphan_recovery_scans: dict[tuple[str, ...], EvidenceScan] = {}
-        self._orphan_recovery_scan_complete: set[tuple[str, ...]] = set()
-        self._orphan_recovery_entries: dict[str, Mapping[str, Any]] = {}
-        self._orphan_recovery_binding_offset = 0
+        self._orphan_recovery = OrphanRecovery(runtime, controller)
         self._initial_reconciliation_scans: dict[tuple[str, ...], dict[str, EvidenceScan]] = {}
         self._initial_termination_scans: dict[tuple[str, ...], dict[str, EvidenceScan]] = {}
         self._initial_termination_top_complete: set[tuple[str, ...]] = set()
@@ -2079,12 +2023,7 @@ class AttemptSupervisionCoordinator:
         self._termination_states.clear()
         self._termination_candidates.clear()
         self._termination_binding_offset = 0
-        for scan in self._orphan_recovery_scans.values():
-            scan.close()
-        self._orphan_recovery_scans.clear()
-        self._orphan_recovery_scan_complete.clear()
-        self._orphan_recovery_entries.clear()
-        self._orphan_recovery_binding_offset = 0
+        self._orphan_recovery.close()
         for scans in self._initial_reconciliation_scans.values():
             for scan in scans.values():
                 scan.close()
@@ -2144,7 +2083,7 @@ class AttemptSupervisionCoordinator:
             for candidate in self._termination_candidates.values()
         ):
             return True
-        if any(entry.get("binding_signature") == signature for entry in self._orphan_recovery_entries.values()):
+        if self._orphan_recovery.has_pending(signature):
             return True
         if signature in self._initial_deferred_lanes:
             return True
@@ -4038,268 +3977,13 @@ class AttemptSupervisionCoordinator:
         except _TERMINATION_SOURCE_ERRORS:
             return "deferred"
 
-    @staticmethod
-    def _orphan_binding_signature(binding: ProjectBinding) -> tuple[str, ...]:
-        """Return the stable binding identity persisted by shared recovery."""
-        return (
-            binding.project_id,
-            str(binding.shared_root),
-            binding.machine_name,
-            binding.registration_generation,
-            binding.runtime_instance_id,
-            binding.runtime_root,
-        )
-
-    def _recovery_reservation(
-        self,
-        reservation_id: str,
-        *,
-        allowed_states: frozenset[str] = frozenset({"active"}),
-    ) -> tuple[str, ReservationIdentity] | None:
-        paths = local_paths(self.runtime.root)
-        found: list[tuple[str, ReservationIdentity]] = []
-        lanes = (
-            ("active", "active"),
-            ("provisional", "provisional"),
-            ("released", "released"),
-            ("cpu_active", "active"),
-            ("cpu_provisional", "provisional"),
-            ("cpu_released", "released"),
-        )
-        for name, expected_state in lanes:
-            try:
-                envelope = read_json_limited(
-                    paths[name] / f"{reservation_id}.json",
-                    max_bytes=65_536,
-                    record_type="reservation",
-                )
-            except FileNotFoundError:
-                continue
-            reservation = envelope.get("reservation") if isinstance(envelope, dict) else None
-            if not isinstance(reservation, dict) or reservation.get("state") != expected_state:
-                return None
-            found.append((expected_state, ReservationIdentity.from_record(reservation)))
-        return found[0] if len(found) == 1 and found[0][0] in allowed_states else None
-
-    @staticmethod
-    def _orphan_recovery_proof(
-        evidence: Mapping[str, Any] | None,
-        entry: Mapping[str, Any],
-        binding_signature: tuple[str, ...],
-    ) -> bool:
-        if (
-            not isinstance(evidence, Mapping)
-            or evidence.get("outcome") not in {"recovered", "already_recovered"}
-            or evidence.get("reason") is not None
-            or not isinstance(evidence.get("binding_signature"), (list, tuple))
-            or tuple(evidence["binding_signature"]) != binding_signature
-            or evidence.get("authority_granted") is not False
-            or evidence.get("local_effects") not in ([], ())
-            or not _has_exact_terminal_revisions(evidence.get("source_revisions"))
-            or not _has_exact_terminal_revisions(evidence.get("committed_revisions"))
-            or not _authority_evidence_matches_intent(evidence, entry)
-        ):
-            return False
-        token = evidence.get("recovered_fencing_token")
-        return type(token) is int and token > entry["parameters"]["fencing_token"]
-
-    def _apply_orphan_recovery_local_effects(
-        self,
-        binding: ProjectBinding,
-        entry: Mapping[str, Any],
-        evidence: Mapping[str, Any],
-    ) -> bool:
-        parameters = entry["parameters"]
-        attempt_id = parameters["attempt_id"]
-        recovered_token = evidence["recovered_fencing_token"]
-        paths = machine_project_paths(self.runtime.root, binding.project_id)
-        cfg = _termination_local_config(self.runtime, binding)
-        try:
-            with evidence_write_guard(paths["root"], attempt_id) as evidence_acquired:
-                if not evidence_acquired:
-                    return False
-                with attempt_control_lock(cfg, attempt_id, blocking=False) as lock_acquired:
-                    if not lock_acquired:
-                        return False
-                    current = _read_process_manifest(
-                        self.runtime,
-                        binding,
-                        entry["path"],
-                        entry["binding_signature"],
-                    )
-                    if current is None or current["intent_signature"] != entry["intent_signature"]:
-                        return False
-                    reservation = self._recovery_reservation(
-                        parameters["reservation_id"],
-                        allowed_states=frozenset({"active", "released"}),
-                    )
-                    if reservation is None:
-                        return False
-                    reservation_state, identity = reservation
-                    if (
-                        identity.project_id != binding.project_id
-                        or identity.task_id != parameters["task_id"]
-                        or identity.attempt_id != attempt_id
-                        or identity.fencing_token not in {parameters["fencing_token"], recovered_token}
-                    ):
-                        return False
-                    if reservation_state == "active" and identity.fencing_token == parameters["fencing_token"]:
-                        retag = retag_cpu_if_matches if identity.cpu_slots is not None else retag_if_matches
-                        if not retag(self.runtime.root, identity, attempt_id, recovered_token):
-                            return False
-                    process = dict(current["process"])
-                    process.update(
-                        fencing_token=recovered_token,
-                        recovered_at=utc_now(),
-                        observed_state="running",
-                        supervisor="agent",
-                        authority_state="healthy",
-                        lease_expires_at=evidence["lease_expires_at"],
-                    )
-                    atomic_replace(entry["path"], {"process": process})
-                    return True
-        except _TERMINATION_SOURCE_ERRORS:
-            return False
-
     def advance_orphan_recoveries(
         self,
         bindings: Sequence[ProjectBinding],
         registry_revision: int,
     ) -> dict[str, Mapping[str, Any]]:
-        """Recover bounded live orphan manifests through one shared-only CAS."""
-        if type(registry_revision) is not int or registry_revision < 0:
-            raise ValueError("registry_revision must be a nonnegative integer.")
-        eligible = list(bindings)
-        current_signatures = {_authority_binding_signature(binding, registry_revision) for binding in eligible}
-        for signature in tuple(self._orphan_recovery_scans):
-            has_entry = any(
-                entry.get("binding_signature") == signature for entry in self._orphan_recovery_entries.values()
-            )
-            if signature not in current_signatures or (
-                signature in self._orphan_recovery_scan_complete and not has_entry
-            ):
-                self._orphan_recovery_scans.pop(signature).close()
-                self._orphan_recovery_scan_complete.discard(signature)
-        binding_by_project = {binding.project_id: binding for binding in eligible}
-        for project_id, entry in tuple(self._orphan_recovery_entries.items()):
-            binding = binding_by_project.get(project_id)
-            if binding is None or entry.get("binding_signature") != _authority_binding_signature(
-                binding, registry_revision
-            ):
-                self._orphan_recovery_entries.pop(project_id, None)
-        if eligible:
-            start = self._orphan_recovery_binding_offset % len(eligible)
-            rotated = eligible[start:] + eligible[:start]
-            selected = rotated[: min(_MAX_TERMINATION_BINDINGS, len(rotated))]
-            self._orphan_recovery_binding_offset = (start + len(selected)) % len(eligible)
-        else:
-            selected = []
-            self._orphan_recovery_binding_offset = 0
-
-        attempts: dict[str, Mapping[str, Any]] = {}
-        entries: dict[str, Mapping[str, Any]] = {}
-        request_bindings: list[ProjectBinding] = []
-        for binding in selected:
-            signature = _authority_binding_signature(binding, registry_revision)
-            paths = machine_project_paths(self.runtime.root, binding.project_id)
-            entry = self._orphan_recovery_entries.get(binding.project_id)
-            if entry is not None:
-                try:
-                    current = _read_process_manifest(
-                        self.runtime,
-                        binding,
-                        entry["path"],
-                        signature,
-                    )
-                except _TERMINATION_SOURCE_ERRORS:
-                    current = None
-                if current is None or current["intent_signature"] != entry["intent_signature"]:
-                    self._orphan_recovery_entries.pop(binding.project_id, None)
-                    entry = None
-            scan = self._orphan_recovery_scans.get(signature)
-            if scan is None:
-                if len(self._orphan_recovery_scans) >= _MAX_TERMINATION_STATES:
-                    diagnostic_increment("scheduler.isolated.orphan_scan_capacity_exhausted")
-                    continue
-                scan = EvidenceScan(paths["processes"])
-                self._orphan_recovery_scans[signature] = scan
-                self._orphan_recovery_scan_complete.discard(signature)
-            try:
-                if entry is None:
-                    page = scan.take(1)
-                    if page.is_complete:
-                        self._orphan_recovery_scan_complete.add(signature)
-                    if not page.paths:
-                        continue
-                    entry = _read_process_manifest(
-                        self.runtime,
-                        binding,
-                        page.paths[0],
-                        signature,
-                    )
-                    if entry is None or entry["process"].get("authority_state") in {"healthy", "local_safe"}:
-                        continue
-                    if len(self._orphan_recovery_entries) >= _MAX_TERMINATION_CANDIDATES:
-                        continue
-                reservation_id = entry["parameters"].get("reservation_id")
-                if not isinstance(reservation_id, str):
-                    continue
-                reservation_record = self._recovery_reservation(
-                    reservation_id,
-                    allowed_states=frozenset({"active", "released"}),
-                )
-                if (
-                    reservation_record is None
-                    or reservation_record[1].project_id != binding.project_id
-                    or reservation_record[1].task_id != entry["parameters"]["task_id"]
-                    or reservation_record[1].attempt_id != entry["parameters"]["attempt_id"]
-                    or type(reservation_record[1].fencing_token) is not int
-                    or reservation_record[1].fencing_token < entry["parameters"]["fencing_token"]
-                ):
-                    self._orphan_recovery_entries.pop(binding.project_id, None)
-                    continue
-                if binding.project_id not in self._orphan_recovery_entries:
-                    self._orphan_recovery_entries[binding.project_id] = entry
-            except _TERMINATION_SOURCE_ERRORS:
-                continue
-            entries[binding.project_id] = entry
-            attempts[binding.project_id] = {
-                **entry["parameters"],
-                "binding_signature": self._orphan_binding_signature(binding),
-                "source_revisions": {"task": None, "attempt_digest": None},
-                # A process may exit after shared recovery commits but before
-                # local application. Replay that exact marker, never create
-                # fresh live authority from a dead manifest.
-                "replay_only": reservation_record[0] == "released"
-                or _read_isolated_authority_manifest(self.runtime, binding, entry["path"], signature) is None,
-            }
-            request_bindings.append(binding)
-        if not attempts:
-            return {}
-        try:
-            results = self.controller.advance_authority_orphan_recoveries(
-                request_bindings,
-                registry_revision,
-                attempts,
-            )
-        except _TERMINATION_SOURCE_ERRORS:
-            return {}
-        for binding in request_bindings:
-            entry = entries[binding.project_id]
-            evidence = results.get(binding.project_id)
-            stable_signature = self._orphan_binding_signature(binding)
-            if self._orphan_recovery_proof(evidence, entry, stable_signature):
-                if self._apply_orphan_recovery_local_effects(binding, entry, evidence):
-                    self._orphan_recovery_entries.pop(binding.project_id, None)
-            elif isinstance(evidence, Mapping) and evidence.get("outcome") == "stale":
-                self._orphan_recovery_entries.pop(binding.project_id, None)
-        for signature, scan in tuple(self._orphan_recovery_scans.items()):
-            if signature in self._orphan_recovery_scan_complete and not any(
-                entry.get("binding_signature") == signature for entry in self._orphan_recovery_entries.values()
-            ):
-                self._orphan_recovery_scans.pop(signature, scan).close()
-                self._orphan_recovery_scan_complete.discard(signature)
-        return results
+        """Advance the machine-local orphan recovery lane."""
+        return self._orphan_recovery.advance(bindings, registry_revision)
 
     def advance_terminations(
         self,

@@ -102,7 +102,7 @@ def test_common_admission_consumes_source_retention_without_inline_domain_io(cas
     revision, _ = runtime.load_registry_snapshot()
     controller = ProjectIOController(runtime, executor)
     monkeypatch.setattr(
-        worker, "_recovery_source_hold", lambda *_: pytest.fail("controller ran source transaction inline")
+        worker, "handle_recovery_request", lambda *_, **__: pytest.fail("controller ran source transaction inline")
     )
     deadline = time.monotonic() + 5
     completed = {}

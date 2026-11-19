@@ -170,7 +170,7 @@ def _record_group_recheck(
         yield
         return
 
-    from .service import publish_group_locator_for_transition
+    from .discovery import publish_group_locator_for_transition
 
     publish_group_locator_for_transition(
         cfg,

@@ -214,7 +214,7 @@ def _finalize_cleanup_operation(
     task_id = cleanup["task_id"]
     group_name = cleanup.get("group_name")
     if isinstance(group_name, str) and group_name:
-        from .group_discovery.service import publish_group_locator_for_transition
+        from .group_discovery.discovery import publish_group_locator_for_transition
 
         # QQTOOLS-COMPAT-0017: refresh cleanup discovery before retiring the
         # cleanup owner and its Group membership evidence.

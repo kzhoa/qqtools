@@ -9,12 +9,13 @@ import time
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from qqtools.plugins.qexp import init_shared_root, submit
 from qqtools.plugins.qexp import project_maintenance as project_maintenance_module
-from qqtools.plugins.qexp.agent import dispatch_loop, project_io_supervision
+from qqtools.plugins.qexp.agent import dispatch_loop, project_io_process, project_io_supervision
 from qqtools.plugins.qexp.agent import project_io_admission as project_io_admission_module
 from qqtools.plugins.qexp.agent import project_io_controller as project_io_controller_module
 from qqtools.plugins.qexp.agent import project_io_executor as project_io_executor_module
@@ -540,6 +541,12 @@ def test_initial_reconciliation_is_fenced_by_registry_revision(tmp_path: Path) -
     controller = ProjectIOController(runtime, executor)
     coordinator = AttemptSupervisionCoordinator(runtime, controller)
     try:
+        signature = coordinator._initial_reconciliation_signature(binding, revision)
+        coordinator._orphan_recovery._entries[binding.project_id] = {"binding_signature": signature}
+        for _ in range(3):
+            coordinator._advance_initial_reconciliation([binding], revision)
+            assert not coordinator.initially_reconciled(binding, revision)
+        coordinator._orphan_recovery.close()
         coordinator._advance_initial_reconciliation([binding], revision)
         coordinator._advance_initial_reconciliation([binding], revision)
         assert coordinator.initially_reconciled(binding, revision)
@@ -925,8 +932,10 @@ def test_pending_launch_survives_one_unavailable_validation_snapshot(tmp_path, m
         executor.shutdown()
 
 
+@pytest.mark.parametrize("late_intent", [False, True])
 def test_isolated_dispatch_launches_healthy_peer_without_legacy_project_io(
     tmp_path: Path,
+    late_intent: bool,
     monkeypatch: pytest.MonkeyPatch,
     request: pytest.FixtureRequest,
 ) -> None:
@@ -1005,7 +1014,24 @@ def test_isolated_dispatch_launches_healthy_peer_without_legacy_project_io(
     launched: list[dict[str, object]] = []
     launch_attempts = 0
 
+    exited = False
+    completions = []
+    reauthorized = []
+    original_retry = controller.retry_scheduler_launch_authorization
+
+    def retry(identity):
+        reauthorized.append(identity)
+        original_retry(identity)
+
+    monkeypatch.setattr(controller, "retry_scheduler_launch_authorization", retry)
+
     class TicketExecutor:
+        def attach_observer(self, cfg, task_id, attempt_id, handle):
+            completions.append((task_id, attempt_id))
+
+        def cleanup_launch(self, _handle):
+            pytest.fail("an isolated timeout must retain its runner")
+
         def initiate_authorized_attempt(self, cfg, **ticket):
             nonlocal launch_attempts
             launch_attempts += 1
@@ -1015,10 +1041,15 @@ def test_isolated_dispatch_launches_healthy_peer_without_legacy_project_io(
             attempt_id = ticket["claim_identity"]["attempt_id"]
             intent = cfg.runtime_root / "launch-intents" / f"{attempt_id}.json"
             intent.parent.mkdir(parents=True, exist_ok=True)
-            intent.touch()
-            process = type("Process", (), {"pid": 4321})()
+
+            def poll():
+                if exited and late_intent:
+                    intent.touch()
+                return 0 if exited else None
+
+            process = SimpleNamespace(pid=4321, poll=poll)
             handle = LaunchHandle("detached", process, runner_process=process)
-            return handle, LaunchHandoff(attempt_id, intent, time.monotonic() + 60, handle)
+            return handle, LaunchHandoff(attempt_id, intent, time.monotonic() - 1, handle)
 
     def reject_legacy_project_io(*_args, **_kwargs):
         raise AssertionError("isolated dispatch entered the legacy synchronous Project-I/O path")
@@ -1075,6 +1106,40 @@ def test_isolated_dispatch_launches_healthy_peer_without_legacy_project_io(
     assert 1 <= status["active_worker_count"] <= 2
     assert sum(request.project_id == blocked.project_id for request in requests) == 1
     assert len(requests) == len({(request.project_id, request.registration_generation) for request in requests})
+    claim = launched[0]["claim_identity"]
+    key = (healthy.project_id, claim["attempt_id"])
+    pending = runtime.pending_launch_handoffs[key]
+    original_deadline = pending.handoff.deadline
+
+    def cycle():
+        dispatch_machine_cycle_locked(runtime, available_gpus=[0], executor=TicketExecutor(), publish_snapshots=False)
+
+    cycle()
+    assert launch_attempts == 2 and list(runtime.pending_launch_handoffs) == [key]
+    assert runtime.pending_launch_handoffs[key].handoff.deadline == original_deadline
+    assert runtime.pending_launch_handoffs[key].retry_not_before > original_deadline
+    assert (
+        load_task(healthy_cfg, healthy_task.task_id).claim_control["active_claim"]["attempt_id"] == claim["attempt_id"]
+    )
+    assert any(
+        record["reservation_id"] == claim["reservation_id"] for record in reservation_snapshot(runtime.root).active
+    )
+    assert not completions
+    reauthorized.clear()  # The initial failure occurred before a runner was created.
+    exited = True
+    deadline = time.monotonic() + 5
+    while not (completions or reauthorized) and time.monotonic() < deadline:
+        cycle()
+        time.sleep(0.01)
+    if late_intent:
+        assert completions == [(healthy_task.task_id, claim["attempt_id"])]
+        assert not reauthorized
+    else:
+        assert [(identity.attempt_id, identity.reservation_id) for identity in reauthorized] == [
+            (claim["attempt_id"], claim["reservation_id"])
+        ]
+        assert not completions
+    assert key not in runtime.pending_launch_handoffs
     project_io_executor.shutdown()
 
 
@@ -6650,10 +6715,8 @@ def test_isolated_dispatch_authority_router_adopts_legacy_from_local_manifest(
     if entry_point == "dispatch":
         runtime.project_io_executor = executor
         runtime.project_io_controller = controller
-    monkeypatch.setattr(project_io_supervision, "inspect_wrapper_identity", lambda _process: ProcessEvidence("alive"))
-    monkeypatch.setattr(
-        project_io_supervision, "inspect_local_group_identity", lambda _process: ProcessEvidence("alive")
-    )
+    monkeypatch.setattr(project_io_process, "inspect_wrapper_identity", lambda _process: ProcessEvidence("alive"))
+    monkeypatch.setattr(project_io_process, "inspect_local_group_identity", lambda _process: ProcessEvidence("alive"))
 
     def advance_with_local_io_only() -> None:
         # Guard only the controller process. Fresh worker interpreters must still
@@ -6752,10 +6815,8 @@ def test_isolated_authority_router_pins_one_manifest_until_definitive_result(
         )
 
     runtime_id = ProjectIOExecutor(runtime).runtime_id
-    monkeypatch.setattr(project_io_supervision, "inspect_wrapper_identity", lambda _process: ProcessEvidence("alive"))
-    monkeypatch.setattr(
-        project_io_supervision, "inspect_local_group_identity", lambda _process: ProcessEvidence("alive")
-    )
+    monkeypatch.setattr(project_io_process, "inspect_wrapper_identity", lambda _process: ProcessEvidence("alive"))
+    monkeypatch.setattr(project_io_process, "inspect_local_group_identity", lambda _process: ProcessEvidence("alive"))
 
     class FakeController:
         _observed_executor_epoch = "e" * 32
@@ -6861,10 +6922,8 @@ def test_isolated_authority_router_rehydrates_unresolved_owner_outside_next_sixt
     process.pop("reservation_id")
     process.pop("process_identity")
     atomic_replace(manifest, {"process": process})
-    monkeypatch.setattr(project_io_supervision, "inspect_wrapper_identity", lambda _process: ProcessEvidence("alive"))
-    monkeypatch.setattr(
-        project_io_supervision, "inspect_local_group_identity", lambda _process: ProcessEvidence("alive")
-    )
+    monkeypatch.setattr(project_io_process, "inspect_wrapper_identity", lambda _process: ProcessEvidence("alive"))
+    monkeypatch.setattr(project_io_process, "inspect_local_group_identity", lambda _process: ProcessEvidence("alive"))
     executor = ProjectIOExecutor(runtime)
     executor.begin_epoch()
     request = executor.prepare_authority_service(target, revision, **parameters)
@@ -6991,10 +7050,8 @@ def test_isolated_authority_due_keys_are_bounded_and_prune_attempt_identity_chur
             }
         },
     )
-    monkeypatch.setattr(project_io_supervision, "inspect_wrapper_identity", lambda _process: ProcessEvidence("alive"))
-    monkeypatch.setattr(
-        project_io_supervision, "inspect_local_group_identity", lambda _process: ProcessEvidence("alive")
-    )
+    monkeypatch.setattr(project_io_process, "inspect_wrapper_identity", lambda _process: ProcessEvidence("alive"))
+    monkeypatch.setattr(project_io_process, "inspect_local_group_identity", lambda _process: ProcessEvidence("alive"))
     prefix = project_io_supervision._authority_due_binding_prefix(binding)
     old_identity_key = (*prefix, "task-a", attempt_id, "1", "1", "", "11", "12", "13", "14")
     runtime.authority_process_next_due[old_identity_key] = time.monotonic() + 60.0
@@ -7077,8 +7134,8 @@ def test_isolated_authority_manifest_requires_live_process_without_exit_evidence
         else:
             observation.parent.mkdir(parents=True, exist_ok=True)
             os.mkfifo(observation)
-    monkeypatch.setattr(project_io_supervision, "inspect_wrapper_identity", lambda _process: wrapper)
-    monkeypatch.setattr(project_io_supervision, "inspect_local_group_identity", lambda _process: group)
+    monkeypatch.setattr(project_io_process, "inspect_wrapper_identity", lambda _process: wrapper)
+    monkeypatch.setattr(project_io_process, "inspect_local_group_identity", lambda _process: group)
 
     result = project_io_supervision._read_isolated_authority_manifest(
         runtime,
@@ -8125,6 +8182,14 @@ def test_deferred_snapshot_keeps_original_admission_deadline_and_then_publishes(
     assert {intent.service_class for intent in offered} == {"background"}
 
     defer[0] = False
+    with monkeypatch.context() as unavailable:
+        unavailable.setattr(executor, "start", lambda *_args, **_kwargs: None)
+        controller.advance_machine_snapshot_publications(bindings, revision, **kwargs)
+        failed = controller.machine_snapshot_health_view()["items"][0]
+        assert failed["stage"] == "backoff" and failed["consecutive_failures"] == 1
+        controller.advance_machine_snapshot_publications(bindings, revision, **kwargs)
+        assert controller.machine_snapshot_health_view()["items"][0]["stage"] == "backoff"
+    now[0] += 60
     deadline = time.monotonic() + 5.0
     completions = {}
     while time.monotonic() < deadline:
@@ -8133,6 +8198,12 @@ def test_deferred_snapshot_keeps_original_admission_deadline_and_then_publishes(
             break
         time.sleep(0.02)
     assert completions[binding.project_id]["outcome"] == "published"
+    published = controller.machine_snapshot_health_view()["items"][0]
+    assert published["stage"] == "published" and published["consecutive_failures"] == 0
+    assert published["retry_at"] is None
+    kwargs["instance_id"] = "replacement"
+    controller.advance_machine_snapshot_publications([], revision, **kwargs)
+    assert controller.machine_snapshot_health_view()["items"] == []
     assert read_json(machine_state_path(cfg, "agent.json"))["agent"]["instance_id"] == "agent-1"
 
 

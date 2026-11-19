@@ -166,7 +166,7 @@ def test_real_background_worker_advances_registered_group(tmp_path):
 
 def test_failed_debt_publication_retains_pending_and_recovery_completes(tmp_path, monkeypatch):
     from qqtools.plugins.qexp.runtime import submission as submission_module
-    from qqtools.plugins.qexp.runtime.group_discovery import service as service_module
+    from qqtools.plugins.qexp.runtime.group_discovery import discovery as service_module
     from qqtools.plugins.qexp.runtime.paths import group_path
 
     cfg = isolated_group(tmp_path, tail=0)
@@ -264,11 +264,11 @@ lifecycle.run_machine_agent_loop(sys.argv[1], loop_interval=0.05, available_gpus
 
 @pytest.mark.parametrize("cut", ["before_marker", "after_marker"])
 def test_new_commit_at_bootstrap_handoff_remains_discoverable(tmp_path, monkeypatch, cut):
-    from qqtools.plugins.qexp.runtime.group_discovery import service as service_module
+    from qqtools.plugins.qexp.runtime.group_discovery import discovery as discovery_module
 
     cfg = isolated_group(tmp_path, tail=1)
     source_file(submission_path(cfg.shared_root, "first"), operation="first")
-    original = service_module.atomic_replace
+    original = discovery_module.atomic_replace
     has_cut = False
 
     def arrive():
@@ -292,7 +292,7 @@ def test_new_commit_at_bootstrap_handoff_remains_discoverable(tmp_path, monkeypa
     service = GroupDiscoveryService(cfg.shared_root, "experiment")
     try:
         with monkeypatch.context() as crashing:
-            crashing.setattr(service_module, "atomic_replace", interrupted)
+            crashing.setattr(discovery_module, "atomic_replace", interrupted)
             for _ in range(10000):
                 try:
                     service.advance()

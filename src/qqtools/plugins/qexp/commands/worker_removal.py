@@ -40,7 +40,7 @@ def _persist_operation(cfg: RootConfig, operation: dict[str, Any]) -> None:
     control = operation["group_control"]
     group_name = control.get("group_name")
     if isinstance(group_name, str) and group_name:
-        from ..runtime.group_discovery.service import publish_group_locator_for_transition
+        from ..runtime.group_discovery.discovery import publish_group_locator_for_transition
 
         # QQTOOLS-COMPAT-0017: keep removal recovery discoverable before its
         # active operation is replaced or archived.
@@ -135,7 +135,7 @@ def begin_worker_removal_locked(
         from .worker_removal_discovery import initialize_removal_discovery
 
         initialize_removal_discovery(cfg, operation["group_control"], data)
-        from ..runtime.group_discovery.service import publish_group_locator_for_transition
+        from ..runtime.group_discovery.discovery import publish_group_locator_for_transition
 
         # QQTOOLS-COMPAT-0017: publish before creating Worker removal intent.
         publish_group_locator_for_transition(cfg, data["group"]["name"], "control", "group_operation")

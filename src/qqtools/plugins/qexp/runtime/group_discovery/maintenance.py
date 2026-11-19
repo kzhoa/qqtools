@@ -1422,7 +1422,7 @@ def enqueue_source_cleanup(root: Path, group: str, operation_id: str, revision: 
         return
     cfg = SimpleNamespace(shared_root=root)
     with group_writer_lock(cfg, group):
-        from .service import publish_group_locator_for_transition
+        from .discovery import publish_group_locator_for_transition
 
         # QQTOOLS-COMPAT-0017: create the maintenance wake-up before adding
         # source cleanup debt or clearing the active membership source owner.

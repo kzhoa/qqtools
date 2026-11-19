@@ -1,3 +1,4 @@
+import errno
 import time
 from pathlib import Path
 from threading import Event, Timer
@@ -449,7 +450,7 @@ def test_executor_reports_only_failed_handoffs_with_duplicate_attempt_ids(tmp_pa
 
 
 def test_launch_batch_isolates_duplicate_attempt_ids_across_projects(tmp_path: Path, monkeypatch):
-    from qqtools.plugins.qexp.agent import dispatch_loop
+    from qqtools.plugins.qexp.agent import launch_handoff
 
     successful_path = tmp_path / "project-a" / "intent.json"
     successful_path.parent.mkdir()
@@ -463,10 +464,10 @@ def test_launch_batch_isolates_duplicate_attempt_ids_across_projects(tmp_path: P
 
     cfg_a = RootConfig(tmp_path / "a" / ".qexp", tmp_path / "a", "gpu-1", tmp_path / "a" / "rt")
     cfg_b = RootConfig(tmp_path / "b" / ".qexp", tmp_path / "b", "gpu-1", tmp_path / "b" / "rt")
-    batch = dispatch_loop._LaunchHandoffBatch(_BatchExecutor(), tmp_path / "machine")
+    batch = launch_handoff._LaunchHandoffBatch(_BatchExecutor(), tmp_path / "machine")
     batch._pending = [
-        dispatch_loop._PendingLaunchHandoff(cfg_a, "task", "shared-attempt", 7, "project-a", successful),
-        dispatch_loop._PendingLaunchHandoff(cfg_b, "task", "shared-attempt", 8, "project-b", failed),
+        launch_handoff._PendingLaunchHandoff(cfg_a, "task", "shared-attempt", 7, "project-a", successful),
+        launch_handoff._PendingLaunchHandoff(cfg_b, "task", "shared-attempt", 8, "project-b", failed),
     ]
     failed_attempts = []
 
@@ -474,7 +475,7 @@ def test_launch_batch_isolates_duplicate_attempt_ids_across_projects(tmp_path: P
         failed_attempts.append((cfg.shared_root, task_id, attempt_id, fencing_token, reason))
         return True
 
-    monkeypatch.setattr(dispatch_loop, "fail_attempt", record_failure)
+    monkeypatch.setattr(launch_handoff, "fail_attempt", record_failure)
     results = {
         "project-a": {"launched": ["task"], "status": "dispatched"},
         "project-b": {"launched": ["task"], "status": "dispatched"},
@@ -490,7 +491,7 @@ def test_launch_batch_isolates_duplicate_attempt_ids_across_projects(tmp_path: P
 
 
 def test_launch_batch_cleans_exact_handle_only_after_compensation_commits(tmp_path: Path, monkeypatch):
-    from qqtools.plugins.qexp.agent import dispatch_loop
+    from qqtools.plugins.qexp.agent import launch_handoff
 
     handoff = LaunchHandoff("attempt", tmp_path / "missing.json", 0.0)
     process = _FakeProcess(4321)
@@ -502,24 +503,24 @@ def test_launch_batch_cleans_exact_handle_only_after_compensation_commits(tmp_pa
             cleaned.append(candidate)
 
     cfg = RootConfig(tmp_path / ".qexp", tmp_path, "gpu-1", tmp_path / "rt")
-    batch = dispatch_loop._LaunchHandoffBatch(_BatchExecutor(), tmp_path / "machine")
-    pending = dispatch_loop._PendingLaunchHandoff(cfg, "task", "attempt", 7, "project", handoff, handle)
+    batch = launch_handoff._LaunchHandoffBatch(_BatchExecutor(), tmp_path / "machine")
+    pending = launch_handoff._PendingLaunchHandoff(cfg, "task", "attempt", 7, "project", handoff, handle)
     result = {"project": {"launched": ["task"], "status": "dispatched"}}
 
-    monkeypatch.setattr(dispatch_loop, "fail_attempt", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr(launch_handoff, "fail_attempt", lambda *_args, **_kwargs: False)
     batch._pending = [pending]
     batch.finish(result)
     assert cleaned == []
 
     result = {"project": {"launched": ["task"], "status": "dispatched"}}
-    monkeypatch.setattr(dispatch_loop, "fail_attempt", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(launch_handoff, "fail_attempt", lambda *_args, **_kwargs: True)
     batch._pending = [pending]
     batch.finish(result)
     assert cleaned == [handle]
 
 
 def test_machine_launch_batch_retains_future_handoff_across_cycles(tmp_path: Path):
-    from qqtools.plugins.qexp.agent import dispatch_loop
+    from qqtools.plugins.qexp.agent import launch_handoff
 
     runtime = MachineRuntime(tmp_path / "machine")
     cfg = RootConfig(tmp_path / ".qexp", tmp_path, "gpu-1", tmp_path / "rt")
@@ -534,27 +535,27 @@ def test_machine_launch_batch_retains_future_handoff_across_cycles(tmp_path: Pat
         def attach_observer(self, *args):
             attached.append(args)
 
-    pending = dispatch_loop._PendingLaunchHandoff(cfg, "task", "attempt", 7, "project", handoff)
+    pending = launch_handoff._PendingLaunchHandoff(cfg, "task", "attempt", 7, "project", handoff)
     runtime.pending_launch_handoffs[("project", "attempt")] = pending
 
-    dispatch_loop._LaunchHandoffBatch(_BatchExecutor(), runtime).finish()
+    launch_handoff._LaunchHandoffBatch(_BatchExecutor(), runtime).finish()
     assert runtime.pending_launch_handoffs == {("project", "attempt"): pending}
 
     intent.touch()
-    dispatch_loop._LaunchHandoffBatch(_BatchExecutor(), runtime).finish()
+    launch_handoff._LaunchHandoffBatch(_BatchExecutor(), runtime).finish()
     assert runtime.pending_launch_handoffs == {}
     assert attached == []  # There is no exact launch handle to observe.
 
 
 def test_machine_launch_batch_retries_compensation_errors(tmp_path: Path, monkeypatch):
-    from qqtools.plugins.qexp.agent import dispatch_loop
+    from qqtools.plugins.qexp.agent import launch_handoff
 
     clock = [10.0]
-    monkeypatch.setattr(dispatch_loop.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(launch_handoff.time, "monotonic", lambda: clock[0])
     runtime = MachineRuntime(tmp_path / "machine")
     cfg = RootConfig(tmp_path / ".qexp", tmp_path, "gpu-1", tmp_path / "rt")
     handoff = LaunchHandoff("attempt", tmp_path / "missing.json", 0.0)
-    pending = dispatch_loop._PendingLaunchHandoff(cfg, "task", "attempt", 7, "project", handoff)
+    pending = launch_handoff._PendingLaunchHandoff(cfg, "task", "attempt", 7, "project", handoff)
     runtime.pending_launch_handoffs[("project", "attempt")] = pending
     calls = []
 
@@ -564,8 +565,8 @@ def test_machine_launch_batch_retries_compensation_errors(tmp_path: Path, monkey
             raise OSError("authority temporarily unavailable")
         return False
 
-    monkeypatch.setattr(dispatch_loop, "fail_attempt", fail_once)
-    batch = dispatch_loop._LaunchHandoffBatch(Executor(), runtime)
+    monkeypatch.setattr(launch_handoff, "fail_attempt", fail_once)
+    batch = launch_handoff._LaunchHandoffBatch(Executor(), runtime)
     batch.finish()
     assert set(runtime.pending_launch_handoffs) == {("project", "attempt")}
     assert runtime.pending_launch_handoffs[("project", "attempt")].retry_failures == 1
@@ -577,11 +578,13 @@ def test_machine_launch_batch_retries_compensation_errors(tmp_path: Path, monkey
     assert len(calls) == 2
 
 
+@pytest.mark.parametrize("uncertain_read", [None, 1, 2])
 def test_isolated_launch_handoff_retries_only_after_exact_runner_exit(
     tmp_path: Path,
+    uncertain_read: int | None,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from qqtools.plugins.qexp.agent import dispatch_loop
+    from qqtools.plugins.qexp.agent import launch_handoff
 
     runtime = MachineRuntime(tmp_path / "machine")
     cfg = RootConfig(tmp_path / ".qexp", tmp_path, "gpu-1", tmp_path / "runtime")
@@ -589,7 +592,7 @@ def test_isolated_launch_handoff_retries_only_after_exact_runner_exit(
     process.poll = lambda: process.returncode
     handle = LaunchHandle("detached", process, runner_process=process)
     handoff = LaunchHandoff("task-attempt-1", tmp_path / "missing.json", 0.0, handle)
-    pending = dispatch_loop._PendingLaunchHandoff(
+    pending = launch_handoff._PendingLaunchHandoff(
         cfg,
         "task",
         "task-attempt-1",
@@ -620,7 +623,7 @@ def test_isolated_launch_handoff_retries_only_after_exact_runner_exit(
         },
     }
     monkeypatch.setattr(
-        dispatch_loop,
+        launch_handoff,
         "reservation_snapshot",
         lambda _root: SimpleNamespace(active=(record,)),
     )
@@ -630,7 +633,29 @@ def test_isolated_launch_handoff_retries_only_after_exact_runner_exit(
         def cleanup_launch(_candidate):
             raise AssertionError("isolated timeout must not terminate an ambiguous live runner")
 
-    dispatch_loop._LaunchHandoffBatch(LocalExecutor(), runtime).poll(isolated=True)
+    if uncertain_read:
+        reads = 0
+
+        original_stat = Path.stat
+
+        def observe(path, *args, **kwargs):
+            nonlocal reads
+            if path != handoff.intent_path:
+                return original_stat(path, *args, **kwargs)
+            reads += 1
+            if reads == uncertain_read:
+                raise NotADirectoryError(errno.ENOTDIR, "intent parent is inaccessible")
+            return original_stat(path, *args, **kwargs)
+
+        with monkeypatch.context() as fault:
+            fault.setattr(Path, "stat", observe)
+            launch_handoff._LaunchHandoffBatch(LocalExecutor(), runtime).poll(isolated=True)
+        retained = runtime.pending_launch_handoffs[("project-a", "task-attempt-1")]
+        assert reads == uncertain_read and not retried
+        assert retained.handoff.deadline == pending.handoff.deadline
+        assert retained.retry_not_before > 0
+        monkeypatch.setattr(launch_handoff.time, "monotonic", lambda: retained.retry_not_before)
+    launch_handoff._LaunchHandoffBatch(LocalExecutor(), runtime).poll(isolated=True)
 
     assert len(retried) == 1
     assert retried[0].reservation_id == "reservation-1"
@@ -642,16 +667,16 @@ def test_isolated_launch_handoff_retains_live_runner_across_timeout_race(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from qqtools.plugins.qexp.agent import dispatch_loop
+    from qqtools.plugins.qexp.agent import launch_handoff
 
     now = [10.0]
-    monkeypatch.setattr(dispatch_loop.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(launch_handoff.time, "monotonic", lambda: now[0])
     runtime = MachineRuntime(tmp_path / "machine")
     cfg = RootConfig(tmp_path / ".qexp", tmp_path, "gpu-1", tmp_path / "runtime")
     intent = tmp_path / "intent.json"
     process = SimpleNamespace(pid=4321, poll=lambda: None)
     handle = LaunchHandle("detached", process, runner_process=process)
-    pending = dispatch_loop._PendingLaunchHandoff(
+    pending = launch_handoff._PendingLaunchHandoff(
         cfg,
         "task",
         "task-attempt-1",
@@ -675,7 +700,7 @@ def test_isolated_launch_handoff_retains_live_runner_across_timeout_race(
             observed.append(args)
             observed_event.set()
 
-    batch = dispatch_loop._LaunchHandoffBatch(LocalExecutor(), runtime)
+    batch = launch_handoff._LaunchHandoffBatch(LocalExecutor(), runtime)
     batch.poll(isolated=True)
     assert runtime.pending_launch_handoffs
     retry_at = runtime.pending_launch_handoffs[("project-a", "task-attempt-1")].retry_not_before
@@ -693,7 +718,7 @@ def test_authorized_launch_reaper_failure_retains_live_handle_without_retry(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from qqtools.plugins.qexp.agent import dispatch_loop
+    from qqtools.plugins.qexp.agent import launch_handoff
 
     runtime = MachineRuntime(tmp_path / "machine")
     cfg = RootConfig(tmp_path / ".qexp", tmp_path, "gpu-1", tmp_path / "runtime")
@@ -711,7 +736,7 @@ def test_authorized_launch_reaper_failure_retains_live_handle_without_retry(
         lambda _process: (_ for _ in ()).throw(RuntimeError("reaper unavailable")),
     )
     executor = Executor(spawn_runner=spawn)
-    batch = dispatch_loop._LaunchHandoffBatch(executor, runtime)
+    batch = launch_handoff._LaunchHandoffBatch(executor, runtime)
     evidence = {
         "outcome": "authorized",
         "claim_identity": {
@@ -735,7 +760,7 @@ def test_authorized_launch_reaper_failure_retains_live_handle_without_retry(
 
 
 def test_isolated_launch_handoff_queues_observer_after_intent(tmp_path: Path) -> None:
-    from qqtools.plugins.qexp.agent import dispatch_loop
+    from qqtools.plugins.qexp.agent import launch_handoff
 
     runtime = MachineRuntime(tmp_path / "machine")
     cfg = RootConfig(tmp_path / ".qexp", tmp_path, "gpu-1", tmp_path / "runtime")
@@ -744,7 +769,7 @@ def test_isolated_launch_handoff_queues_observer_after_intent(tmp_path: Path) ->
     process = SimpleNamespace(pid=4321)
     handle = LaunchHandle("detached", process, runner_process=process)
     handoff = LaunchHandoff("task-attempt-1", intent, time.monotonic() + 60, handle)
-    pending = dispatch_loop._PendingLaunchHandoff(
+    pending = launch_handoff._PendingLaunchHandoff(
         cfg,
         "task",
         "task-attempt-1",
@@ -757,7 +782,7 @@ def test_isolated_launch_handoff_queues_observer_after_intent(tmp_path: Path) ->
     observed = []
     executor = SimpleNamespace(attach_observer=lambda *args: observed.append(args))
 
-    dispatch_loop._LaunchHandoffBatch(executor, runtime).poll(isolated=True)
+    launch_handoff._LaunchHandoffBatch(executor, runtime).poll(isolated=True)
 
     deadline = time.monotonic() + 1.0
     while not observed and time.monotonic() < deadline:

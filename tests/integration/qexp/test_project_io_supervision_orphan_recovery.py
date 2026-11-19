@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 
 from qqtools.plugins.qexp import init_shared_root, submit
-from qqtools.plugins.qexp.agent import project_io_supervision
+from qqtools.plugins.qexp.agent import project_io_orphan_recovery
 from qqtools.plugins.qexp.agent.context import MachineRuntime
 from qqtools.plugins.qexp.agent.project_io_controller import ProjectIOController
 from qqtools.plugins.qexp.agent.project_io_executor import ProjectIOExecutor
@@ -221,8 +221,8 @@ def test_orphan_recovery_restart_finishes_local_effect_after_shared_commit(
     executor.begin_epoch()
     controller = ProjectIOController(runtime, executor)
     coordinator = AttemptSupervisionCoordinator(runtime, controller)
-    original = project_io_supervision.retag_if_matches
-    monkeypatch.setattr(project_io_supervision, "retag_if_matches", lambda *_args, **_kwargs: False)
+    original = project_io_orphan_recovery.retag_if_matches
+    monkeypatch.setattr(project_io_orphan_recovery, "retag_if_matches", lambda *_args, **_kwargs: False)
     try:
         _until(lambda: controller.advance_binding_validation([binding], revision), bool)
         committed = _until(
@@ -233,7 +233,7 @@ def test_orphan_recovery_restart_finishes_local_effect_after_shared_commit(
     finally:
         coordinator.close()
 
-    monkeypatch.setattr(project_io_supervision, "retag_if_matches", original)
+    monkeypatch.setattr(project_io_orphan_recovery, "retag_if_matches", original)
     restarted = AttemptSupervisionCoordinator(runtime, controller)
     try:
         _until(
@@ -301,8 +301,8 @@ def test_orphan_recovery_applies_committed_identity_after_process_exits(
     controller = ProjectIOController(runtime, executor)
     coordinator = AttemptSupervisionCoordinator(runtime, controller)
     retag_name = "retag_cpu_if_matches" if is_cpu else "retag_if_matches"
-    original = getattr(project_io_supervision, retag_name)
-    monkeypatch.setattr(project_io_supervision, retag_name, lambda *_args, **_kwargs: False)
+    original = getattr(project_io_orphan_recovery, retag_name)
+    monkeypatch.setattr(project_io_orphan_recovery, retag_name, lambda *_args, **_kwargs: False)
     try:
         _until(lambda: controller.advance_binding_validation([binding], revision), bool)
         committed = _until(
@@ -325,7 +325,7 @@ def test_orphan_recovery_applies_committed_identity_after_process_exits(
                 }
             },
         )
-        monkeypatch.setattr(project_io_supervision, retag_name, original)
+        monkeypatch.setattr(project_io_orphan_recovery, retag_name, original)
         if should_restart:
             coordinator.close()
             coordinator = AttemptSupervisionCoordinator(runtime, controller)
@@ -495,14 +495,14 @@ def test_orphan_recovery_restart_finishes_after_reservation_retag(
     executor.begin_epoch()
     controller = ProjectIOController(runtime, executor)
     coordinator = AttemptSupervisionCoordinator(runtime, controller)
-    original = project_io_supervision.atomic_replace
+    original = project_io_orphan_recovery.atomic_replace
 
     def fail_manifest_update(path, value):
         if path == manifest and value.get("process", {}).get("fencing_token") == 2:
             raise OSError("injected after reservation retag")
         return original(path, value)
 
-    monkeypatch.setattr(project_io_supervision, "atomic_replace", fail_manifest_update)
+    monkeypatch.setattr(project_io_orphan_recovery, "atomic_replace", fail_manifest_update)
     try:
         _until(lambda: controller.advance_binding_validation([binding], revision), bool)
         _until(
@@ -513,7 +513,7 @@ def test_orphan_recovery_restart_finishes_after_reservation_retag(
     finally:
         coordinator.close()
 
-    monkeypatch.setattr(project_io_supervision, "atomic_replace", original)
+    monkeypatch.setattr(project_io_orphan_recovery, "atomic_replace", original)
     restarted = AttemptSupervisionCoordinator(runtime, controller)
     try:
         _until(
@@ -577,7 +577,7 @@ def test_orphan_recovery_rechecks_twins_atomically_before_retag(
     injected = False
 
     retag_name = "retag_cpu_if_matches" if is_cpu else "retag_if_matches"
-    original_retag = getattr(project_io_supervision, retag_name)
+    original_retag = getattr(project_io_orphan_recovery, retag_name)
 
     def inject_twin_before_locked_retag(runtime_root, identity, attempt_id, fencing_token):
         nonlocal injected
@@ -593,7 +593,7 @@ def test_orphan_recovery_rechecks_twins_atomically_before_retag(
             atomic_replace(paths["cpu_released" if is_cpu else "released"] / reservation.name, duplicate)
         return original_retag(runtime_root, identity, attempt_id, fencing_token)
 
-    monkeypatch.setattr(project_io_supervision, retag_name, inject_twin_before_locked_retag)
+    monkeypatch.setattr(project_io_orphan_recovery, retag_name, inject_twin_before_locked_retag)
     try:
         _until(lambda: controller.advance_binding_validation([binding], revision), bool)
         committed = _until(
@@ -667,8 +667,8 @@ def test_orphan_recovery_scan_state_is_bounded_beyond_sixty_four_bindings(tmp_pa
     try:
         for _ in range(6):
             assert coordinator.advance_orphan_recoveries(bindings, revision) == {}
-        assert len(coordinator._orphan_recovery_scans) <= 256
-        assert len(coordinator._orphan_recovery_entries) <= 256
+        assert len(coordinator._orphan_recovery._scans) <= 256
+        assert len(coordinator._orphan_recovery._entries) <= 256
     finally:
         coordinator.close()
         executor.shutdown()
@@ -691,14 +691,14 @@ def test_orphan_recovery_scan_reaches_tail_pages_beyond_state_capacity(
 
     tail_processes = runtime.project_paths(bindings[-1].project_id)["processes"]
     tail_paths: list[Path] = []
-    original = project_io_supervision._read_process_manifest
+    original = project_io_orphan_recovery.read_process_manifest
 
     def record_tail(runtime_arg, binding_arg, path, signature):
         if path.parent == tail_processes:
             tail_paths.append(path)
         return original(runtime_arg, binding_arg, path, signature)
 
-    monkeypatch.setattr(project_io_supervision, "_read_process_manifest", record_tail)
+    monkeypatch.setattr(project_io_orphan_recovery, "read_process_manifest", record_tail)
     executor = ProjectIOExecutor(runtime)
     executor.begin_epoch()
     controller = ProjectIOController(runtime, executor)
@@ -708,7 +708,7 @@ def test_orphan_recovery_scan_reaches_tail_pages_beyond_state_capacity(
             coordinator.advance_orphan_recoveries(bindings, revision)
 
         assert len(set(tail_paths)) >= 2
-        assert len(coordinator._orphan_recovery_scans) <= 256
+        assert len(coordinator._orphan_recovery._scans) <= 256
     finally:
         coordinator.close()
         executor.shutdown()

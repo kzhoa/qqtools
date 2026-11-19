@@ -38,17 +38,56 @@ def _advance_until_terminal(cfg, candidate, continuation, *, limit=2_000):
     raise AssertionError(f"Group-service transaction did not converge: {result}")
 
 
-def test_legacy_discovery_continuation_converges_across_fresh_owners(tmp_path):
+@pytest.mark.parametrize("slice_steps", [2, 3])
+def test_legacy_discovery_continuation_converges_across_fresh_owners(tmp_path, monkeypatch, slice_steps):
     cfg = isolated_group(tmp_path, tail=1)
     cfg = replace(cfg, runtime_root=tmp_path / "runtime")
     source_file(submission_path(cfg.shared_root, "batch"), operation="batch")
 
-    result = _advance_until_terminal(
-        cfg,
-        {"group": "experiment", "lane": "legacy", "generation": None},
-        initial_discovery_continuation(),
-    )
+    candidate = {"group": "experiment", "lane": "legacy", "generation": None}
+    with monkeypatch.context() as bounded:
+        bounded.setattr(
+            "qqtools.plugins.qexp.runtime.group_discovery.advance._DISCOVERY_ADVANCES_PER_SLICE", slice_steps
+        )
+        first = advance_group_service(
+            cfg, candidate, initial_discovery_continuation(), initial_group_service_probe_state()
+        )
+    assert first["state"] == "progress"
+    assert first["continuation"]["bootstrap_revision"] is not None
+    result = _advance_until_terminal(cfg, candidate, first["continuation"])
 
+    assert result["state"] == "quiescent"
+    assert GroupCoverage(cfg.shared_root, "experiment").status().is_complete
+
+
+@pytest.mark.parametrize("lane", ["legacy", "membership"])
+def test_resume_after_failed_active_source_write(tmp_path, monkeypatch, lane):
+    from qqtools.plugins.qexp.runtime.group_discovery import discovery
+
+    cfg = replace(isolated_group(tmp_path, tail=1), runtime_root=tmp_path / "runtime")
+    source_file(submission_path(cfg.shared_root, "batch"), operation="batch")
+    candidate = {"group": "experiment", "lane": "legacy", "generation": None}
+    if lane == "membership":
+        _activate(cfg)
+        discovery.publish_submission_debt(cfg.shared_root, "experiment", "batch")
+        with group_writer_lock(cfg, "experiment"):
+            record = locator.publish_group_locator_locked(cfg, "experiment", lane, "submission_commit")
+        candidate.update(lane=lane, generation=record["generation"])
+    original = discovery.atomic_replace
+
+    def fail_active(path, value):
+        if path.name == "active-source.json":
+            raise OSError("active source unavailable")
+        return original(path, value)
+
+    with monkeypatch.context() as fault:
+        fault.setattr(discovery, "atomic_replace", fail_active)
+        failed = advance_group_service(
+            cfg, candidate, initial_discovery_continuation(), initial_group_service_probe_state()
+        )
+    assert failed["state"] == "blocked"
+    assert failed["continuation"]["debt_offset"] == 0
+    result = _advance_until_terminal(cfg, candidate, failed["continuation"])
     assert result["state"] == "quiescent"
     assert GroupCoverage(cfg.shared_root, "experiment").status().is_complete
 

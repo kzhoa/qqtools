@@ -456,7 +456,7 @@ def _finalize_submission_group_locked(cfg: Any, submission: dict[str, Any]) -> N
             operation_id=submission["operation_id"],
             idempotency_key=submission.get("idempotency_key"),
         )
-    from .group_discovery.service import publish_group_locator_for_transition
+    from .group_discovery.discovery import publish_group_locator_for_transition
 
     # Publish the membership locator before clearing the pending commit.
     publish_group_locator_for_transition(cfg, group_name, "membership", "submission_finalize")
@@ -472,7 +472,7 @@ def _finalize_submission_group_locked(cfg: Any, submission: dict[str, Any]) -> N
     group["group"]["next_membership_sequence"] = max(
         group["group"]["next_membership_sequence"], max(sequences, default=0) + 1
     )
-    from .group_discovery.service import publish_submission_debt
+    from .group_discovery.discovery import publish_submission_debt
 
     publish_submission_debt(cfg.shared_root, group_name, submission["operation_id"])
     finalize_submission_activity(cfg, group_name, submission)
@@ -882,7 +882,7 @@ def _execute_submission_locked(
 
     if group_name:
         with group_lock(cfg.shared_root, group_name):
-            from .group_discovery.service import publish_group_locator_for_transition
+            from .group_discovery.discovery import publish_group_locator_for_transition
 
             # QQTOOLS-COMPAT-0017: publish before the first Group pending or
             # staged membership write; the submission operation owns recovery.

@@ -138,7 +138,7 @@ def _start_cleanup_operation(cfg: RootConfig, task: TaskRecord) -> dict[str, Any
         cleanup = operation.get("cleanup", {})
         if cleanup.get("state") != "completed":
             if task.group_name:
-                from ..runtime.group_discovery.service import publish_group_locator_for_transition
+                from ..runtime.group_discovery.discovery import publish_group_locator_for_transition
 
                 # QQTOOLS-COMPAT-0017: refresh maintenance discovery before
                 # repairing Task cleanup ownership from an existing operation.
@@ -173,7 +173,7 @@ def _start_cleanup_operation(cfg: RootConfig, task: TaskRecord) -> dict[str, Any
     }
     operation_path = active_operation_path(cfg, "cleanup", task.task_id)
     if task.group_name:
-        from ..runtime.group_discovery.service import publish_group_locator_for_transition
+        from ..runtime.group_discovery.discovery import publish_group_locator_for_transition
 
         # QQTOOLS-COMPAT-0017: the maintenance locator precedes cleanup's first
         # durable operation or Task-side ownership effect.

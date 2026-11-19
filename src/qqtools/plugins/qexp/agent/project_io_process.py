@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
-from ..runtime.authority_scan import validate_evidence_path
+from ..config_types import RootConfig
+from ..runtime.authority_scan import is_path_present, validate_evidence_path
 from ..runtime.paths import machine_project_paths
+from ..runtime.process_evidence import inspect_local_group_identity, inspect_wrapper_identity
 from ..runtime.records import validate_identifier
 from ..runtime.store import read_json_limited
 from .context import MachineRuntime, ProjectBinding
@@ -40,6 +43,20 @@ def binding_prefix(binding: ProjectBinding) -> tuple[str, ...]:
         binding.registration_generation or "",
         binding.runtime_instance_id or "",
         binding.runtime_root or "",
+    )
+
+
+def local_binding_config(
+    runtime: MachineRuntime,
+    binding: ProjectBinding,
+) -> RootConfig:
+    """Build local-only paths without consulting the binding's shared config."""
+    paths = machine_project_paths(runtime.root, binding.project_id)
+    return RootConfig.from_canonical_paths(
+        binding.shared_root,
+        binding.shared_root.parent,
+        binding.machine_name,
+        paths["root"],
     )
 
 
@@ -123,6 +140,47 @@ def read_process_manifest(
         },
         "process": process,
     }
+
+
+def read_isolated_authority_manifest(
+    runtime: MachineRuntime,
+    binding: ProjectBinding,
+    path: Path,
+    binding_signature: tuple[str, ...],
+) -> dict[str, Any] | None:
+    """Read one exact local process manifest; never follow it into Project truth."""
+    entry = read_process_manifest(runtime, binding, path, binding_signature)
+    if entry is None:
+        return None
+    paths = machine_project_paths(runtime.root, binding.project_id)
+    try:
+        observation_path = paths["observations"] / f"{entry['parameters']['attempt_id']}.json"
+        if is_path_present(observation_path):
+            if not validate_evidence_path(observation_path, paths["root"]):
+                return None
+            return None
+        wrapper = inspect_wrapper_identity(entry["process"])
+        group = inspect_local_group_identity(entry["process"])
+    except (OSError, RuntimeError, ValueError, TypeError, KeyError):
+        return None
+    if wrapper.state != "alive" and group.state != "alive":
+        return None
+    return entry
+
+
+def authority_evidence_matches_intent(evidence: Mapping[str, Any], intent: Mapping[str, Any]) -> bool:
+    parameters = intent["parameters"]
+    return all(
+        evidence.get(field) == parameters[field]
+        for field in (
+            "task_id",
+            "attempt_id",
+            "attempt_number",
+            "fencing_token",
+            "reservation_id",
+            "process_identity",
+        )
+    )
 
 
 def read_exit_code(runtime: MachineRuntime, binding: ProjectBinding, entry: dict[str, Any]) -> int | None:
