@@ -8,7 +8,7 @@ This protocol makes routine Group discovery and metadata maintenance proportiona
 obligations. Retained Group and Task history remains authoritative and queryable, but history alone
 does not allocate a resident service session or require a recurring Group-directory sweep.
 
-The protocol preserves the existing `open|sealed` admission states, `active|paused` dispatch states,
+The protocol preserves `active|paused` dispatch states,
 Submission Operation commit point, Group and Task lock order, ready and due-work indexes, local
 Attempt responsibility ledger, Group control operations, and machine-global `daemon|on_demand`
 residency policy. It introduces no user-visible inactive state, automatic seal or pause, Task-history
@@ -461,7 +461,7 @@ B2 implementation is authorized only after review accepts these decisions:
 
 Implementation must add deterministic tests for every crash-matrix row and operation counts with
 0, 1,000, 10,000 and 100,000 unrelated completed Groups. Qualification varies Group count
-independently of Task count and covers open, sealed and paused Groups; append/retry after quiescence;
+independently of Task count and covers active and paused Groups; append/retry after quiescence;
 offline consumers; concurrent publishers; session eviction while an Attempt remains supervised;
 on-demand exit; storage failure; and active-locator overload.
 

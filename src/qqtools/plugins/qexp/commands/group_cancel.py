@@ -15,7 +15,7 @@ from typing import Any
 from ..config_types import RootConfig
 from ..runtime.group_discovery.coverage import GroupCoverage, MemberIdentity
 from ..runtime.group_namespace import group_authority_identity
-from ..runtime.locks import group_writer_lock, task_lock
+from ..runtime.locks import group_record_writer_lock, task_lock
 from ..runtime.operation_store import archive_operation, write_active_operation
 from ..runtime.paths import attempt_path, group_path, task_path
 from ..runtime.records import AttemptRecord, new_id, normalize_group_record, utc_now, validate_identifier
@@ -87,7 +87,7 @@ def advance_indexed_cancel(
 
     terminal_results: list[Any] = []
     summary: dict[str, Any] | None = None
-    with group_writer_lock(cfg, group_name):
+    with group_record_writer_lock(cfg, group_name):
         if not operation_path.exists():
             return None
         operation = _read_optional_operation(operation_path)

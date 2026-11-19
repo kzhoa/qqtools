@@ -57,7 +57,6 @@ def _group(name: str, *, dispatch: str = "active", worker_state: str = "active")
         "meta": {"schema_version": SCHEMA_VERSION, "revision": 1},
         "group": {
             "name": name,
-            "admission_state": "open",
             "dispatch_state": dispatch,
             "pending_submission_commit": None,
             "worker_set": {"gpu-1": {"state": worker_state}},
@@ -68,7 +67,7 @@ def _group(name: str, *, dispatch: str = "active", worker_state: str = "active")
 def test_group_pages_are_name_ordered_and_filter_bound(monkeypatch, tmp_path: Path) -> None:
     cfg = RootConfig(tmp_path / ".qexp", tmp_path, "gpu-1", tmp_path / "runtime")
     groups = [_group("group-c"), _group("group-a"), _group("group-b", dispatch="paused")]
-    monkeypatch.setattr(observer, "list_groups", lambda _cfg: groups)
+    monkeypatch.setattr(observer, "iter_published_groups", lambda _cfg: groups)
 
     first = observer.list_groups_page(cfg, page_size=2)
     second = observer.list_groups_page(cfg, page_size=2, cursor=first["next_cursor"])
@@ -86,7 +85,9 @@ def test_group_pages_are_name_ordered_and_filter_bound(monkeypatch, tmp_path: Pa
 
 def test_group_page_defaults_to_fifty_items(monkeypatch, tmp_path: Path) -> None:
     cfg = RootConfig(tmp_path / ".qexp", tmp_path, "gpu-1", tmp_path / "runtime")
-    monkeypatch.setattr(observer, "list_groups", lambda _cfg: [_group(f"group-{index:03}") for index in range(51)])
+    monkeypatch.setattr(
+        observer, "iter_published_groups", lambda _cfg: [_group(f"group-{index:03}") for index in range(51)]
+    )
 
     page = observer.list_groups_page(cfg)
 
@@ -103,7 +104,7 @@ def test_group_page_filters_intersect_and_attention_finds_abnormal_workers(monke
         _group("removing", worker_state="removing"),
         _group("paused-removing", dispatch="paused", worker_state="removing"),
     ]
-    monkeypatch.setattr(observer, "list_groups", lambda _cfg: groups)
+    monkeypatch.setattr(observer, "iter_published_groups", lambda _cfg: groups)
 
     attention = observer.list_groups_page(cfg, attention=True)
     selected = observer.list_groups_page(cfg, dispatch="paused", worker_state="removing", attention=True)

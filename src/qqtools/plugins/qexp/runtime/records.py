@@ -19,7 +19,6 @@ TASK_PHASES = ("queued", "running", "succeeded", "failed", "cancelled", "blocked
 ATTEMPT_PHASES = ("claimed", "starting", "running", "succeeded", "failed", "cancelled", "orphaned")
 QUEUE_SCOPES = ("home", "shared")
 SHARING_MODES = ("private", "spillover")
-GROUP_ADMISSION_STATES = ("open", "sealed")
 GROUP_DISPATCH_STATES = ("active", "paused")
 WORKER_STATES = ("active", "draining", "removing")
 WORKER_ROLES = ("primary", "borrow")
@@ -490,7 +489,6 @@ def new_group(name: str, machine: str, *, creation_operation_id: str | None = No
         "group": {
             "name": name,
             "creation_operation_id": creation_operation_id,
-            "admission_state": "open",
             "dispatch_state": "active",
             "dispatch_epoch": 0,
             "worker_set_epoch": 0,

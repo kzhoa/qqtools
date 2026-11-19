@@ -726,6 +726,9 @@ def build_parser() -> argparse.ArgumentParser:
         output_kinds=OutputKind.GROUP_STATE_CHANGE,
     )
     group_list = group_sub.add_parser("list", help="List one bounded page of Groups in the selected Project.")
+    group_list.add_argument(
+        "--all", dest="all_groups", action="store_true", help="Include published Groups outside the working set."
+    )
     group_list.add_argument("--page-size", default=None, help="Groups per page, from 1 through 1000 (default: 50).")
     group_list.add_argument("--cursor", help="Opaque continuation cursor from a previous Group page.")
     group_list.add_argument("--dispatch", choices=("active", "paused"), help="Select one dispatch state.")
@@ -785,8 +788,11 @@ def build_parser() -> argparse.ArgumentParser:
         modes=OutputMode.FINITE,
         output_kinds=OutputKind.GROUP_PROGRESS_POLICY,
     )
-    for name in ("seal", "reopen", "pause", "resume", "cancel", "retry"):
-        action = group_sub.add_parser(name, help=f"{name.capitalize()} Group control state.")
+    for name in ("pause", "resume", "cancel", "retry", "wake"):
+        help_text = (
+            "Return a Group to the working set." if name == "wake" else f"{name.capitalize()} Group control state."
+        )
+        action = group_sub.add_parser(name, help=help_text)
         action.add_argument("name")
         if name == "cancel":
             action.add_argument("--all", action="store_true", help="Include launch-authorized and running Tasks.")

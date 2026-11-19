@@ -10,6 +10,7 @@ from threading import Event, Thread
 from typing import Any
 
 from ...agent.context import MachineRuntime, ProjectBinding
+from ...runtime.protocol_compatibility import GROUP_WORKING_SET_CAPABILITY
 from ...runtime.store import atomic_replace, read_json
 from .framework import UpgradeCoordinator, pending_upgrade_requires_completion
 
@@ -331,6 +332,7 @@ class MachineUpgradeWorker:
     def __init__(self, runtime: MachineRuntime, budget: MachineUpgradeBudget | None = None) -> None:
         self.runtime = runtime
         self.budget = budget or MachineUpgradeBudget()
+        self._advance_budget = budget
         self._stop = Event()
         self._thread = Thread(target=self._run, name="qexp-machine-upgrade", daemon=True)
 
@@ -355,7 +357,7 @@ class MachineUpgradeWorker:
             # another invocation; a migration can never monopolize the machine process until its
             # full history is converted.
             if not self._stop.is_set():
-                advance_registered_upgrades(self.runtime, budget=self.budget)
+                advance_registered_upgrades(self.runtime, budget=self._advance_budget)
         finally:
             # No worker or timer is retained.  The cache contains only bounded journal deadlines;
             # it is refreshed after each executed slice or at the declared next probe deadline.
@@ -476,9 +478,12 @@ def _discover_registered_upgrades_locked(runtime: MachineRuntime, *, force: bool
             try:
                 coordinator = UpgradeCoordinator(binding.root_config())
                 status = coordinator.status()
-                if status.get("state") == "idle":
-                    # An inaccessible first probe has no project journal to consult.  Re-run the
-                    # bounded applicability check after storage recovers instead of caching idle.
+                if status.get("state") == "idle" or (
+                    status.get("state") == "waiting"
+                    and all(item.get("state") == "completed" for item in status.get("migrations", ()))
+                ):
+                    # A remounted Project may have only completed historical migrations.
+                    # Discover newly applicable work under the coordinator lock.
                     status = coordinator.discover()
             except (OSError, RuntimeError, ValueError, KeyError, TypeError):
                 deadlines[project_id] = _inaccessible_probe_deadline()
@@ -536,6 +541,7 @@ def _advance_registered_upgrades_locked(
     budget: MachineUpgradeBudget | None = None,
 ) -> dict[str, Any]:
     """Discover applicable work and advance pending projects in fair bounded slices."""
+    allow_dedicated_budget = budget is None
     budget = budget or MachineUpgradeBudget()
     discovery = _discover_registered_upgrades_locked(runtime, force=force_discovery)
     _revision, bindings = runtime.load_registry()
@@ -579,7 +585,12 @@ def _advance_registered_upgrades_locked(
         # budget.  This preserves a hard per-pass cap independent of registered-root count.
         status = UpgradeCoordinator(binding.root_config()).status()
         active = next((item for item in status.get("migrations", ()) if item.get("state") != "completed"), {})
-        if (
+        dedicated = allow_dedicated_budget and active.get("name") == GROUP_WORKING_SET_CAPABILITY
+        if dedicated and results:
+            # One Group conversion slice owns the pass. Rotate towards it on
+            # the next pass after the ordinary work already admitted here.
+            break
+        if not dedicated and (
             records_used + int(active.get("max_records_per_slice", 1)) > budget.max_records
             or metadata_ops_used + int(active.get("max_metadata_ops_per_slice", 1)) > budget.max_metadata_ops
             or io_bytes_used + int(active.get("max_io_bytes_per_slice", 1)) > budget.max_io_bytes
@@ -613,6 +624,8 @@ def _advance_registered_upgrades_locked(
         else:
             pending_ids.discard(binding.project_id)
         cursor = binding.project_id
+        if dedicated:
+            break
     runtime.upgrade_pending_projects = pending_ids
     current_projects = {
         item.get("project_id"): item for item in discovered_projects if isinstance(item.get("project_id"), str)

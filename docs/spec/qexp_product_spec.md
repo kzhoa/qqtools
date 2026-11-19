@@ -546,8 +546,7 @@ It may receive Tasks:
 - at different times
 - with different home or fallback placement
 
-An open Group may accept a few later control experiments. A sealed Group rejects additions
-until explicitly reopened.
+Every published Group accepts later submissions, including while dispatch is paused.
 
 Group is the primary observation and management boundary.
 
@@ -888,22 +887,16 @@ must reject unsupported old schema instead of preserving a legacy Batch surface.
 
 ## 8. Experiment Group Lifecycle
 
-Group uses separate admission and dispatch controls:
+All Groups accept new Tasks. Active dispatch permits claims. Paused dispatch holds
+queued work and allows running Attempts to continue. Operators taking a final
+cohort snapshot must coordinate all submitting clients.
 
-```text
-admission_state: open | sealed
-dispatch_state: active | paused
-```
-
-Rules:
-
-- `open` accepts new Tasks
-- `sealed` rejects new Tasks
-- `active` permits new claims
-- `paused` prevents new claims while running Attempts continue
-- sealing does not pause work
-- pausing does not prevent an open Group from receiving queued Tasks
-- completion is derived from Task truth and does not permanently close the Group
+The Project working set records daily visibility. Group creation, committed append,
+Task state changes, Group or Worker controls, and explicit wake refresh activity.
+After seven days of inactivity, an eligible agent can remove a settled Group from
+the working set once coverage is complete and all obligations are resolved.
+With agents offline the Group stays visible until an agent processes its deadline.
+Showing or listing Groups leaves this deadline alone.
 
 Derived work labels are:
 
@@ -912,13 +905,12 @@ Derived work labels are:
 - `blocked`: at least one Task has unresolved execution safety
 
 `settled` does not imply success; a settled Group may contain failed or cancelled Tasks.
-An `open + settled` Group is valid. Adding later control experiments makes it active again.
+A settled Group accepts new work. Adding later control experiments makes it active again.
 
 Required operations:
 
 ```bash
-qexp group seal <group>
-qexp group reopen <group>
+qexp group wake <group>
 qexp group pause <group>
 qexp group resume <group>
 qexp group cancel <group>
@@ -929,8 +921,7 @@ qexp group retry <group>
 Default Group cancellation cancels current queued Tasks and allows running Attempts to
 finish. The operation targets the Group membership snapshot captured when cancellation
 starts. It does not cancel Tasks appended later and does not permanently change Group
-admission or dispatch state. Users who need a sustained stop should pause and, if needed,
-seal the Group before cancelling current work.
+dispatch state. Pause the Group to hold subsequent Tasks in the queue.
 
 Pause and cancellation must linearize against process launch through one shared-state
 transition. For a pre-launch Attempt in `claimed`, exactly one outcome wins:
@@ -1394,7 +1385,7 @@ Expected behavior:
 - prior Task and Attempt history is unchanged
 - the Group becomes active again
 - new control Tasks may use different home or fallback policy
-- a sealed Group rejects the addition until explicitly reopened
+- a paused Group accepts the addition and queues its Tasks
 
 ### 11.6 Add or Remove Machines During Execution
 
@@ -1841,7 +1832,7 @@ Attempt/file boundaries use stderr; stdout remains only application log bytes.
 
 Group output should show:
 
-- admission and dispatch controls
+- dispatch controls and working-set visibility
 - `queued_home` and `queued_shared` counts
 - logical Task totals
 - Attempt totals and historical failures
@@ -2362,8 +2353,8 @@ or `invalid`; each reason is an object containing the prerequisite `task_id` and
 
 Dependency Task IDs are resolved only within the selected Project. An edge may cross Group
 boundaries or connect grouped and ungrouped Tasks. It grants no control over the prerequisite's
-Group: seal, pause, reopen, cancel, placement, and Worker Set actions remain scoped to each Group's
-own membership. A sealed Group's existing Tasks remain valid prerequisites; an upstream pause may
+Group: wake, pause, cancel, placement, and Worker Set actions remain scoped to each Group's
+own membership. Existing Tasks remain valid prerequisites. An upstream pause may
 leave downstream work waiting, while upstream failure or cancellation blocks rather than cancels
 the downstream Task. Cleanup rejects a Task while any direct dependent remains anywhere in the
 Project.
@@ -2391,19 +2382,25 @@ retry. It performs direct bounded Task, selected-Attempt, and dependency reads. 
 - `qexp group create`
 - `qexp group list`
 - `qexp group show`
-- `qexp group seal`
-- `qexp group reopen`
+- `qexp group wake`
 - `qexp group pause`
 - `qexp group resume`
 - `qexp group cancel`
 - `qexp group retry`
 - `qexp group worker list | add | set | drain | resume | remove`
 
-`qexp group list` returns one Group-name-ascending live page and defaults to 50
-Groups. `--page-size N` accepts 1–1000 and `--cursor TOKEN` continues a prior
-page. JSON contains `items`, `next_cursor`, `consistency: "live"`, and
-`stop_reason` (`page_full` or `exhausted`). Cursors are opaque and bind the
-selected filters; changing a filter requires restarting without a cursor.
+`qexp group list` pages through the Project working set in Group-name order.
+Use `--all` to inventory all published Groups, including history. Both views
+support `--page-size N` (1–1000, default 50). A live page contains `items`,
+`next_cursor`, `consistency` and `stop_reason`. An exhausted index returns
+`exhausted` and a null cursor. A full intermediate page returns `page_full`.
+A scan that reaches its candidate budget before filling the page returns
+`budget_exhausted`, including when it found zero matches. Both cursors continue
+after the last examined Group and bind the selected view and filters.
+
+`qexp group wake NAME` restores an existing Group and restarts its inactivity
+interval. It preserves dispatch state and creates no Task. Unknown names fail.
+`group show NAME` resolves historical Groups directly.
 
 Compatibility decision (2026-10-05): the default human result changes from an
 unbounded table to the first bounded page, and the default JSON result changes

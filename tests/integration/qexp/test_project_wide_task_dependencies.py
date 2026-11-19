@@ -227,7 +227,7 @@ def test_group_lifecycle_actions_do_not_propagate_across_dependency(tmp_path: Pa
         depends_on_task_ids=[parent.task_id],
     )
 
-    group_control(cfg, "train", "seal")
+    group_control(cfg, "train", "pause")
 
     assert load_task(cfg, parent.task_id).state["projection"] == "queued"
     assert load_task(cfg, child.task_id).state["projection"] == "queued"

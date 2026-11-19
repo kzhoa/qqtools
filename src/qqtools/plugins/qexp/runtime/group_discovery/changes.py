@@ -13,6 +13,7 @@ from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, Callable, Iterator
 
 from ...config_types import RootConfig
+from ..group_activity import record_group_task_activity
 from ..group_namespace import is_group_authority_isolated
 from ..operation_store import locate_operation_path
 from ..paths import attempt_path
@@ -144,6 +145,27 @@ def record_task_change(
     from a fresh persisted Task read.
     """
 
+    if task.group_name is None:
+        yield
+        return
+    persisted_task = load_task(cfg, task.task_id)
+    cleanup_id = (details or {}).get("cleanup_operation_id") if owner == "cleanup" else None
+    with (
+        record_group_task_activity(cfg, persisted_task, cleanup_id=cleanup_id, mutation_fence=mutation_fence),
+        _record_group_recheck(cfg, persisted_task, owner, details=details, mutation_fence=mutation_fence),
+    ):
+        yield
+
+
+@contextmanager
+def _record_group_recheck(
+    cfg: RootConfig,
+    task: TaskRecord,
+    owner: str,
+    *,
+    details: dict[str, Any] | None,
+    mutation_fence: Callable[[], None] | None,
+) -> Iterator[None]:
     if task.group_name is None or not is_group_authority_isolated(cfg.shared_root):
         yield
         return
@@ -173,8 +195,7 @@ def record_task_change(
         before_write=mutation_fence,
     )
 
-    persisted_task = load_task(cfg, task.task_id)
-    evidence = _before_evidence(cfg, persisted_task, {} if details is None else details)
+    evidence = _before_evidence(cfg, task, {} if details is None else details)
     try:
         ticket = journal.begin(
             task.task_id,

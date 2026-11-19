@@ -57,7 +57,6 @@ def test_group_page_renders_stop_reason_and_continuation() -> None:
             {
                 "group": {
                     "name": "experiment",
-                    "admission_state": "open",
                     "dispatch_state": "active",
                     "worker_set": {"gpu-1": {"state": "active"}},
                 }
@@ -269,7 +268,6 @@ def test_group_show_highlights_abnormal_state_and_existing_operations() -> None:
         {
             "group": {
                 "name": "experiment",
-                "admission_state": "open",
                 "dispatch_state": "paused",
                 "worker_set": {
                     "gpu-1": {"state": "active"},
@@ -356,7 +354,6 @@ def test_worker_change_renders_effective_policy_and_blockers() -> None:
             "blockers": ["task-1"],
             "group": {
                 "name": "experiment",
-                "admission_state": "open",
                 "dispatch_state": "active",
                 "worker_set": {},
             },

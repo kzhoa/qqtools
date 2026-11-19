@@ -16,9 +16,10 @@ from ..lifecycle import (
 )
 from ..runtime.claims import archive_claim
 from ..runtime.directory_capture import read_directory_entry
+from ..runtime.group_activity import record_group_activity, require_activity_writer, wake_group
 from ..runtime.group_discovery.changes import record_task_change
 from ..runtime.group_namespace import has_group_authority_cutover, is_group_authority_isolated, read_group
-from ..runtime.locks import group_writer_lock, task_lock
+from ..runtime.locks import group_record_writer_lock, task_lock
 from ..runtime.operation_store import (
     active_operation_path,
     archive_operation,
@@ -63,7 +64,7 @@ from .worker_removal import (
 def _finalize_pending_submission_before_group_mutation(cfg: RootConfig, name: str, path: Path) -> None:
     """Reconcile an occupying Submission before taking a Group mutation lock."""
     owner: str | None = None
-    with group_writer_lock(cfg, name):
+    with group_record_writer_lock(cfg, name):
         path = group_path(cfg.shared_root, name)
         if not path.exists():
             return
@@ -86,13 +87,18 @@ def group_control(
     terminate_running: bool = False,
     reservation_runtime_root: Path | None = None,
 ) -> dict[str, Any]:
+    if action == "wake":
+        return wake_group(cfg, name)
+    if action not in ("pause", "resume", "cancel"):
+        raise ValueError(f"unknown group action {action!r}.")
+
     from ..agent.context import resolve_execution_context
 
     reservation_runtime_root = reservation_runtime_root or resolve_execution_context(cfg).reservation_root
     path = group_path(cfg.shared_root, validate_group_name(name) or name)
     _finalize_pending_submission_before_group_mutation(cfg, name, path)
     post_commit_results = []
-    with group_writer_lock(cfg, name):
+    with group_record_writer_lock(cfg, name):
         path = group_path(cfg.shared_root, name)
         data = read_json(path)
         group = data["group"]
@@ -104,6 +110,7 @@ def group_control(
             raise RuntimeError(f"Group {name!r} received a concurrent submission commit; retry the mutation.")
         indexed_cancel = False
         if action == "cancel":
+            require_activity_writer(cfg.shared_root)
             operation_id = new_id()
             high_watermark = group["next_membership_sequence"] - 1
             operation_path = active_operation_path(cfg, "group_control", operation_id)
@@ -165,7 +172,8 @@ def group_control(
             data["cancellation_operation"] = operation["group_control"]
             data["meta"]["revision"] += 1
             data["meta"]["updated_at"] = utc_now()
-            atomic_replace(path, data)
+            with record_group_activity(cfg, data, cancellation=operation_id):
+                atomic_replace(path, data)
             operation["group_control"]["state"] = "converging"
             operation["group_control"]["updated_at"] = utc_now()
             write_active_operation(cfg, "group_control", operation_id, operation)
@@ -206,21 +214,19 @@ def group_control(
                 if operation["group_control"]["state"] == "completed":
                     operation_path = archive_operation(cfg, "group_control", operation_id, operation)
             data["cancellation_operation"] = operation["group_control"]
-        elif action == "seal":
-            group["admission_state"] = "sealed"
-        elif action == "reopen":
-            group["admission_state"] = "open"
         elif action == "pause":
             group["dispatch_state"] = "paused"
             group["dispatch_epoch"] += 1
-        elif action == "resume":
+        else:
             group["dispatch_state"] = "active"
             group["dispatch_epoch"] += 1
-        else:
-            raise ValueError(f"unknown group action {action!r}.")
         data["meta"]["revision"] += 1
         data["meta"]["updated_at"] = utc_now()
-        atomic_replace(path, data)
+        if action == "cancel":
+            atomic_replace(path, data)
+        else:
+            with record_group_activity(cfg, data, is_dispatch_change=True):
+                atomic_replace(path, data)
         result_data = data
     if indexed_cancel:
         advance_indexed_cancel(cfg, operation_path, reservation_runtime_root=reservation_runtime_root)
@@ -377,7 +383,7 @@ def reconcile_group_cancel_operations(
             )
             continue
         post_commit_results = []
-        with group_writer_lock(cfg, name):
+        with group_record_writer_lock(cfg, name):
             # The creator or another reconciler may have completed while we waited.
             if not operation_path.exists():
                 continue
@@ -607,7 +613,7 @@ def advance_legacy_cancel_step(
 
     post_commit_results: list[TerminalCommitResult] = []
     result: dict[str, Any]
-    with group_writer_lock(cfg, name, blocking=False) as has_group_lock:
+    with group_record_writer_lock(cfg, name, blocking=False) as has_group_lock:
         if not has_group_lock:
             return {"state": "waiting", "reason": "group_lock_busy", "cursor": child}
         if not operation_path.exists():
@@ -787,7 +793,7 @@ def _reconcile_worker_remove_operation(
     machine = control.get("machine_name")
     if not name or not machine or (group_name is not None and name != group_name):
         return None
-    with group_writer_lock(cfg, name):
+    with group_record_writer_lock(cfg, name):
         if not operation_path.exists():
             return None
         operation = read_json(operation_path)
@@ -895,7 +901,7 @@ def _reconcile_worker_remove_operation(
 def create_group(cfg: RootConfig, name: str, workers: list[str] | None = None) -> dict[str, Any]:
     path = group_path(cfg.shared_root, validate_group_name(name) or name)
     _finalize_pending_submission_before_group_mutation(cfg, name, path)
-    with group_writer_lock(cfg, name):
+    with group_record_writer_lock(cfg, name):
         path = group_path(cfg.shared_root, name)
         if path.exists():
             return read_json(path)
@@ -908,13 +914,16 @@ def create_group(cfg: RootConfig, name: str, workers: list[str] | None = None) -
                 raise ValueError(f"group workers must not contain duplicate machine {machine!r}.")
             seen.add(machine)
             data["group"]["worker_set"][machine] = new_worker_member()
-        atomic_replace(path, data)
+        from ..runtime.group_control_coverage import begin_empty_group
+
+        begin_empty_group(cfg.shared_root, name)
+        with record_group_activity(cfg, data):
+            atomic_replace(path, data)
         return data
 
 
 def show_group(cfg: RootConfig, name: str) -> dict[str, Any]:
     name = validate_group_name(name) or name
-    reconcile_group_cancel_operations(cfg, name)
     result = read_group(cfg.shared_root, name)
     normalize_group_record(result)
     return result
@@ -934,7 +943,7 @@ def change_worker(
     validate_identifier(machine, "worker_machine")
     path = group_path(cfg.shared_root, validate_group_name(group_name) or group_name)
     _finalize_pending_submission_before_group_mutation(cfg, group_name, path)
-    with group_writer_lock(cfg, group_name):
+    with group_record_writer_lock(cfg, group_name):
         path = group_path(cfg.shared_root, group_name)
         if is_group_ready_members_root(cfg):
             assert_group_ready_members_writable(cfg)
@@ -1019,6 +1028,7 @@ def change_worker(
             workers[machine]["state_epoch"] += 1
             workers[machine]["drain_requested_at"] = utc_now()
         elif action == "remove":
+            require_activity_writer(cfg.shared_root)
             if can_bind_worker_removal(cfg):
                 return begin_worker_removal_locked(cfg, data, machine, terminate_running=terminate_running)
             if has_group_authority_cutover(cfg.shared_root):
@@ -1072,17 +1082,18 @@ def change_worker(
                             task = load_task(cfg, task.task_id)
                             current_claim = task.claim_control.get("active_claim") or {}
                             if current_claim.get("machine_name") == machine:
-                                task.control.update(
-                                    {
-                                        "cancellation_requested_at": utc_now(),
-                                        "terminate_running": True,
-                                        "requested_by": cfg.machine_name,
-                                        "cancellation_operation_id": operation_id,
-                                    }
-                                )
-                                task.meta["revision"] += 1
-                                task.meta["updated_at"] = utc_now()
-                                save_task(cfg, task)
+                                with record_task_change(cfg, task, "task_cancel"):
+                                    task.control.update(
+                                        {
+                                            "cancellation_requested_at": utc_now(),
+                                            "terminate_running": True,
+                                            "requested_by": cfg.machine_name,
+                                            "cancellation_operation_id": operation_id,
+                                        }
+                                    )
+                                    task.meta["revision"] += 1
+                                    task.meta["updated_at"] = utc_now()
+                                    save_task(cfg, task)
                     blockers.append(task.task_id)
                 if task.state["projection"] == "queued" and task.placement_policy["home_machine"] == machine:
                     blockers.append(task.task_id)
@@ -1101,8 +1112,11 @@ def change_worker(
             data["worker_control"] = operation["group_control"]
             data["meta"]["revision"] += 1
             data["meta"]["updated_at"] = utc_now()
-            with primary_route_update_transaction(
-                cfg, sorted(set(projection_routes + [("shared", machine), ("home", machine)]))
+            with (
+                primary_route_update_transaction(
+                    cfg, sorted(set(projection_routes + [("shared", machine), ("home", machine)]))
+                ),
+                record_group_activity(cfg, data, worker=machine),
             ):
                 atomic_replace(path, data)
                 sync_primary_ready_group(cfg, group_name, previous_workers=previous_workers)
@@ -1111,22 +1125,20 @@ def change_worker(
             raise ValueError(f"unknown Worker Set action {action!r}.")
         if not worker_changed:
             return data
-        if worker_changed:
-            data["group"]["worker_set_epoch"] += 1
-            if action in {"add", "set", "resume"} and machine in workers:
-                workers[machine]["state_epoch"] = data["group"]["worker_set_epoch"]
+        data["group"]["worker_set_epoch"] += 1
+        if action in {"add", "set", "resume"} and machine in workers:
+            workers[machine]["state_epoch"] = data["group"]["worker_set_epoch"]
         data["meta"]["revision"] += 1
         data["meta"]["updated_at"] = utc_now()
-        if worker_changed:
-            # Keep borrow admission closed from the role mutation until the
-            # corresponding primary candidate projection is published.
-            with primary_route_update_transaction(
+        # Keep borrow admission closed until the candidate projection is published.
+        with (
+            primary_route_update_transaction(
                 cfg, sorted(set(projection_routes + [("shared", machine), ("home", machine)]))
-            ):
-                atomic_replace(path, data)
-                sync_primary_ready_group(cfg, group_name, previous_workers=previous_workers)
-        else:
+            ),
+            record_group_activity(cfg, data, worker=machine),
+        ):
             atomic_replace(path, data)
+            sync_primary_ready_group(cfg, group_name, previous_workers=previous_workers)
         return data
 
 
@@ -1147,7 +1159,7 @@ def group_retry_failed(cfg: RootConfig, name: str) -> dict[str, Any]:
     selected: list[dict[str, Any]] = []
     retried_task_ids: list[str] = []
     skipped: dict[str, list[str]] = {"blocked": [], "orphaned": [], "other": []}
-    with group_writer_lock(cfg, name):
+    with group_record_writer_lock(cfg, name):
         group_data = read_group(cfg.shared_root, name)
         normalize_group_record(group_data)
         group = group_data["group"]

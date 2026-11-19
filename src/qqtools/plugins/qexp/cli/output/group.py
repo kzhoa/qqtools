@@ -107,7 +107,6 @@ def _group_values(result: Mapping[str, Any], presentation: Mapping[str, object])
         queue_summary = result.get("queue_summary", "-")
     return (
         name,
-        group.get("admission_state"),
         group.get("dispatch_state"),
         workers,
         task_summary,
@@ -120,7 +119,6 @@ def _group_values(result: Mapping[str, Any], presentation: Mapping[str, object])
 def _group_fields(result: Mapping[str, Any], presentation: Mapping[str, object]) -> tuple[tuple[str, Any], ...]:
     labels = (
         "Group",
-        "Admission",
         "Dispatch",
         "Workers",
         "Task summary",
@@ -132,36 +130,18 @@ def _group_fields(result: Mapping[str, Any], presentation: Mapping[str, object])
 
 
 def _render_group_list(result: Mapping[str, Any], presentation: Mapping[str, object]) -> str:
-    items = result["items"]
-    if not items:
-        return "No Groups."
+    has_more = result["next_cursor"] is not None
+    rows = []
+    for item in result["items"]:
+        name, dispatch, workers, task_summary, _, control_operation, reason = _group_values(item, {})
+        rows.append((name, dispatch, workers, task_summary, control_operation, reason))
     rendered = _table(
-        (
-            "Group",
-            "Admission",
-            "Dispatch",
-            "Workers",
-            "Task summary",
-            "Control operation",
-            "Reason",
-        ),
-        [
-            (
-                values[0],
-                values[1],
-                values[2],
-                values[3],
-                values[4],
-                values[6],
-                values[7],
-            )
-            for item in items
-            for values in (_group_values(item, {}),)
-        ],
-        empty_message="No Groups.",
+        ("Group", "Dispatch", "Workers", "Task summary", "Control operation", "Reason"),
+        rows,
+        empty_message="No Groups matched in this slice." if has_more else "No Groups.",
     )
     lines = [rendered]
-    if result.get("next_cursor") is not None:
+    if has_more:
         lines.append(f"Stop reason: {result['stop_reason']}")
     command = presentation.get("continuation_command")
     if command is not None:
@@ -209,7 +189,7 @@ def _render_group_show(result: Mapping[str, Any], presentation: Mapping[str, obj
     )
     values = dict(_group_fields(result, presentation))
     sections = [
-        _section("Group", (("Name", values["Group"]), ("Admission", values["Admission"]), ("Dispatch", dispatch))),
+        _section("Group", (("Name", values["Group"]), ("Dispatch", dispatch))),
         _section("Attention required", attention),
         _section(
             "Current workload",
@@ -297,7 +277,6 @@ def _validate_group_record(value: Any, label: str) -> None:
     group = _required_mapping(group_value, "group", label)
     _required(group, "name", f"{label}.group")
     _required_mapping(group, "worker_set", f"{label}.group")
-    _required(group, "admission_state", f"{label}.group")
     _required(group, "dispatch_state", f"{label}.group")
 
 
@@ -311,8 +290,8 @@ def _validate_group_list(result: Any) -> None:
         raise TypeError("group-list payload.next_cursor must be a string or null")
     if _required(page, "consistency", "group-list payload") != "live":
         raise ValueError("group-list payload.consistency must be live")
-    if _required(page, "stop_reason", "group-list payload") not in {"page_full", "exhausted"}:
-        raise ValueError("group-list payload.stop_reason must be page_full or exhausted")
+    if _required(page, "stop_reason", "group-list payload") not in {"page_full", "budget_exhausted", "exhausted"}:
+        raise ValueError("group-list payload.stop_reason must be page_full, budget_exhausted, or exhausted")
 
 
 def _validate_group_show(result: Any) -> None:

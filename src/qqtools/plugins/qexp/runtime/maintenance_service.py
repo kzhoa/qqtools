@@ -3,11 +3,16 @@
 from __future__ import annotations
 
 import random
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 from ..config_types import RootConfig
+from ..runtime.group_activity import has_any_activity_repair
+from ..runtime.group_working_set import GroupWorkingSetUnavailable, next_check_time
+from ..runtime.group_working_set_expiry import expire_due_groups
+from ..runtime.group_working_set_migration import index_active
 from ..runtime.maintenance_outbox import activate_work, read_work, retire_work, select_due_work, update_work
 from ..runtime.observation.projection import inspect_observation
 from ..runtime.operation_store import locate_operation_path
@@ -430,7 +435,50 @@ def advance_maintenance_work(
     reservation_runtime_root: Path | None,
     max_scan: int = 1,
 ) -> dict[str, Any]:
-    """Advance one durable descriptor selected from the Project-local outbox."""
+    """Advance both the Group working-set check and Project maintenance outbox."""
+    group_check_at = _advance_group_working_set(cfg)
+    progress = _advance_outbox(cfg, reservation_runtime_root=reservation_runtime_root, max_scan=max_scan)
+    if group_check_at is None or progress["maintenance_state"] not in {"idle", "waiting"}:
+        return progress
+    existing_due = progress.get("next_due_at")
+    if isinstance(existing_due, str):
+        existing_due = datetime.fromisoformat(existing_due.replace("Z", "+00:00"))
+        group_check_at = min(group_check_at, existing_due)
+    return {
+        **progress,
+        "maintenance_state": "waiting",
+        "next_due_at": group_check_at.isoformat(),
+        "idle_blocking": progress.get("idle_blocking", progress["maintenance_state"] == "waiting"),
+    }
+
+
+def _advance_group_working_set(cfg: RootConfig) -> datetime | None:
+    root = cfg.shared_root
+    next_check = None
+    try:
+        if not index_active(root):
+            return None
+        expire_due_groups(cfg, limit=1)
+        next_check = next_check_time(root, blocking=False)
+        if next_check is None and not has_any_activity_repair(root):
+            return None
+    except (GroupWorkingSetUnavailable, OSError, ValueError, KeyError, TypeError):
+        # The outbox and Group service retain their independent authorities.
+        # Retry a temporarily unavailable working set through the idle wake.
+        pass
+    # Another producer can create an earlier check or leave an activity intent
+    # while this partition is active. The first producer wakes an idle Project.
+    now = time.time()
+    wake_at = now + 60 if next_check is None else min(now + 60, max(now + 1, next_check))
+    return datetime.fromtimestamp(wake_at, timezone.utc)
+
+
+def _advance_outbox(
+    cfg: RootConfig,
+    *,
+    reservation_runtime_root: Path | None,
+    max_scan: int,
+) -> dict[str, Any]:
     ledger = maintenance_full_audit.create_invocation_ledger(1)
     ledger.charge_operations(operations=32)
     maintenance_full_audit.ensure_full_audit_outbox(cfg)

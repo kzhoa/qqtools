@@ -1,4 +1,4 @@
-next_id = 25
+next_id = 26
 
 [[items]]
 id = "QQTOOLS-COMPAT-0024"
@@ -276,10 +276,33 @@ owner = "qexp.runtime.upgrade"
 verification = ["tests/integration/qexp/test_upgrade_coordinator.py"]
 normal_level = "L1"
 recovery_level = "L2"
-source_versions = ["1.3.16"]
+source_versions = ["1.3.30"]
 target_version = "1.4.0"
-mixed_version_range = ["1.3.16-1.4.x"]
+mixed_version_range = ["1.3.30-1.4.x"]
 normal_commands = ["python -m pip install --upgrade qqtools", "qexp agent restart"]
+machine_status_command = "qexp admin upgrade status"
+recovery_command = "qexp admin upgrade advance"
+workload_continuity = true
+interruption_budget_seconds = 1.0
+
+[[items]]
+id = "QQTOOLS-COMPAT-0025"
+component = "qexp.group-working-set"
+kind = "runtime_protocol"
+status = "compatibility_active"
+summary = "Convert published 1.3.29 Groups to always-open submissions and certified shared listing indexes."
+introduced_in = "1.3.30"
+legacy_removed_in = "1.4.0"
+transition_purged_in = "1.4.0"
+marker = "QQTOOLS-COMPAT-0025"
+owner = "qexp.runtime.upgrade"
+verification = ["tests/integration/qexp/test_group_working_set_migration.py"]
+normal_level = "L2"
+recovery_level = "L2"
+source_versions = ["1.3.29"]
+target_version = "1.3.30"
+mixed_version_range = ["coordinated switch, existing training may continue"]
+normal_commands = ["Quiesce submitting clients and old Group writers on all machines", "python -m pip install --upgrade qqtools", "qexp agent restart"]
 machine_status_command = "qexp admin upgrade status"
 recovery_command = "qexp admin upgrade advance"
 workload_continuity = true

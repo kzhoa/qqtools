@@ -18,6 +18,7 @@ from .runtime.paths import local_paths, machine_path, machine_registration_path,
 from .runtime.protocol_compatibility import (
     CPU_LANE_CAPABILITY,
     GROUP_READY_MEMBERS_CAPABILITY,
+    GROUP_WORKING_SET_CAPABILITY,
     OBSERVATION_CAPABILITY,
     READY_WRITER_CAPABILITY,
     REGISTRATION_REPLACEMENT_CAPABILITY,
@@ -277,10 +278,14 @@ def initialize_shared_root(cfg: RootConfig) -> None:
                         OBSERVATION_CAPABILITY,
                         SUBMISSION_GROUP_PUBLICATION_CAPABILITY,
                         REGISTRATION_REPLACEMENT_CAPABILITY,
+                        GROUP_WORKING_SET_CAPABILITY,
                     ],
                     "writer_capabilities": [READY_WRITER_CAPABILITY],
                 }
             }
+            from .runtime.group_working_set_migration import initialize_fresh as initialize_group_working_set
+
+            initialize_group_working_set(cfg.shared_root)
             atomic_replace(_schema_path(cfg), schema)
             from .runtime.upgrade.production import initialize_upgrade_journal_manifest
 

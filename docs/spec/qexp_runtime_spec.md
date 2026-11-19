@@ -753,7 +753,6 @@ Required logical shape:
 group:
   name: str
   creation_operation_id: str | null
-  admission_state: open | sealed
   dispatch_state: active | paused
   dispatch_epoch: int
   worker_set_epoch: int
@@ -2773,10 +2772,19 @@ Crash behavior:
 
 ## 11. Group Control Protocol
 
-### 11.1 Admission and Dispatch
+### 11.1 Working-set activity and dispatch
 
-`qexp group seal`, `reopen`, `pause`, and `resume` acquire the Group lock and update one
-Group revision.
+All published Groups accept submissions. The Group writer lock orders membership
+publication against the cancellation high-water mark. Pause and resume advance the
+dispatch epoch. Wake refreshes the shared working-set entry under this same lock.
+The ordered published-name index includes every published Group. A separate ordered
+subset drives the default list. Neither index authorizes dispatch or recovery.
+Activity refresh and expiry use revision-bound, replayable changes. An agent
+with qualified time checks only due entries. Incomplete coverage, unsettled
+Tasks and outstanding obligations defer that entry behind other due work.
+A machine with unreliable time leaves the shared schedule for another agent.
+The shared filesystem timestamps each durable activity intent and historical
+enrollment. Its metadata clock must use synchronized UTC along with the agents.
 
 Pause behavior:
 
@@ -2784,7 +2792,7 @@ Pause behavior:
 - increments `dispatch_epoch`
 - prevents new claims and new launch authorizations
 - does not terminate Attempts whose launch authorization already won
-- does not prevent an open Group from receiving queued Tasks
+- does not prevent a Group from receiving queued Tasks
 
 ### 11.2 Group Cancellation
 

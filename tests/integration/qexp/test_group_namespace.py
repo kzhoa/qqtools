@@ -227,14 +227,14 @@ def test_current_ready_repair_keeps_enforced_writer_floor(project, damage):
         state.assert_ready_writer_compatible(cfg, "ready-v1")
 
 
-@pytest.mark.parametrize("command", ["create", "set", "seal"])
+@pytest.mark.parametrize("command", ["create", "set", "pause"])
 def test_writer_resolves_namespace_after_acquiring_schema_lock(project, monkeypatch, command):
     from contextlib import contextmanager
 
     from qqtools.plugins.qexp.commands import group as commands
 
     cfg = project
-    writer_lock = commands.group_writer_lock
+    writer_lock = commands.group_record_writer_lock
     calls = 0
 
     @contextmanager
@@ -246,7 +246,7 @@ def test_writer_resolves_namespace_after_acquiring_schema_lock(project, monkeypa
         with writer_lock(*args, **kwargs) as acquired:
             yield acquired
 
-    monkeypatch.setattr(commands, "group_writer_lock", racing_lock)
+    monkeypatch.setattr(commands, "group_record_writer_lock", racing_lock)
     if command == "create":
         commands.create_group(cfg, "later")
         assert read_group(cfg.shared_root, "later")["group"]["name"] == "later"
@@ -254,8 +254,8 @@ def test_writer_resolves_namespace_after_acquiring_schema_lock(project, monkeypa
         commands.change_worker(cfg, "experiment", "g1", "set", role="borrow")
         assert read_group(cfg.shared_root, "experiment")["group"]["worker_set"]["g1"]["scheduling_role"] == "borrow"
     else:
-        commands.group_control(cfg, "experiment", "seal")
-        assert read_group(cfg.shared_root, "experiment")["group"]["admission_state"] == "sealed"
+        commands.group_control(cfg, "experiment", "pause")
+        assert read_group(cfg.shared_root, "experiment")["group"]["dispatch_state"] == "paused"
     assert not (cfg.shared_root / "groups").exists()
 
 

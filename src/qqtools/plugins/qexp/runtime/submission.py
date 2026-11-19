@@ -25,8 +25,10 @@ from .dependency_projection import (
     read_projection_state,
     synchronize_task_edges,
 )
+from .group_activity import finalize_submission_activity, prepare_submission_activity, require_activity_writer
 from .group_namespace import provisional_group_reader
 from .group_observation_policy import read_policy_snapshot
+from .group_working_set_migration import require_group_append, require_group_mutation
 from .locks import (
     dependency_lock,
     group_lock,
@@ -83,6 +85,7 @@ from .tasks import save_task
 
 def _write_group_record(cfg: object, path: Path, data: dict[str, Any]) -> None:
     """Persist a Group through this module's patchable atomic writer."""
+    require_group_mutation(cfg.shared_root, path.stem)
     atomic_replace(path, data)
 
 
@@ -444,10 +447,6 @@ def _finalize_submission_group_locked(cfg: Any, submission: dict[str, Any]) -> N
         )
     group = read_json(group_file)
     normalize_group_record(group)
-    from .group_discovery.service import publish_group_locator_for_transition
-
-    # Publish the membership locator before clearing the pending commit.
-    publish_group_locator_for_transition(cfg, group_name, "membership", "submission_finalize")
     pending = group["group"].get("pending_submission_commit") or {}
     if not pending:
         return
@@ -457,6 +456,10 @@ def _finalize_submission_group_locked(cfg: Any, submission: dict[str, Any]) -> N
             operation_id=submission["operation_id"],
             idempotency_key=submission.get("idempotency_key"),
         )
+    from .group_discovery.service import publish_group_locator_for_transition
+
+    # Publish the membership locator before clearing the pending commit.
+    publish_group_locator_for_transition(cfg, group_name, "membership", "submission_finalize")
     sequences = pending.get("membership_sequences")
     if sequences is None:
         sequences = submission["commit_plan"].get("group_membership_sequences")
@@ -472,6 +475,7 @@ def _finalize_submission_group_locked(cfg: Any, submission: dict[str, Any]) -> N
     from .group_discovery.service import publish_submission_debt
 
     publish_submission_debt(cfg.shared_root, group_name, submission["operation_id"])
+    finalize_submission_activity(cfg, group_name, submission)
     group["meta"]["revision"] += 1
     group["meta"]["updated_at"] = utc_now()
     group["group"]["pending_submission_commit"] = None
@@ -594,6 +598,7 @@ def _cleanup_aborted_submission(
                 ) == operation_id
                 creation_owner = group["group"].get("creation_operation_id")
                 if has_pending_commit and plan.create_group and creation_owner == operation_id:
+                    require_group_mutation(cfg.shared_root, group_file.stem)
                     group_file.unlink()
                 else:
                     previous_workers = {
@@ -720,6 +725,7 @@ def advance_submission_cleanup_step(cfg: Any, operation_id: str) -> dict[str, An
                     owns_creation = group_control.get("creation_operation_id") == operation_id
                     if stage == "group":
                         if owns_creation and (not pending or owns_pending):
+                            require_group_mutation(cfg.shared_root, group_file.stem)
                             group_file.unlink()
                             progress["stage"] = "tasks"
                         elif plan.worker_set_additions:
@@ -841,6 +847,9 @@ def _execute_submission_locked(
     resolved = _plan_specs(plan)
     operation_id = plan.operation_id
     group_name = plan.target_group
+    if group_name:
+        require_group_mutation(cfg.shared_root, group_name)
+        require_activity_writer(cfg.shared_root)
     is_canonical = is_cpu_lane_root(cfg)
     prepared_candidates = [
         _new_task_from_resolved(
@@ -897,6 +906,7 @@ def _execute_submission_locked(
             else:
                 group = read_json(group_file)
                 normalize_group_record(group)
+            require_group_append(cfg.shared_root, group["group"])
             precondition = plan.group_precondition
             pending = group["group"].get("pending_submission_commit") or {}
             has_own_pending_commit = pending.get("operation_id") == operation_id
@@ -919,11 +929,6 @@ def _execute_submission_locked(
                 operation["submission"]["failure_reason"] = f"Group {group_name!r} changed during submission."
                 publish_submission(cfg, operation)
                 raise SubmissionRejected(f"Group {group_name!r} changed during submission.")
-            if group["group"]["admission_state"] != "open":
-                operation["submission"]["state"] = "aborted"
-                operation["submission"]["failure_reason"] = f"Group {group_name!r} is sealed."
-                publish_submission(cfg, operation)
-                raise SubmissionRejected(f"Group {group_name!r} is sealed.")
             additions = _thaw(plan.worker_set_additions)
             planned_workers = _planned_worker_set(group, additions)
             _validate_placement_against_workers(resolved, group_name=group_name, planned_workers=planned_workers)
@@ -1057,6 +1062,8 @@ def _execute_submission_locked(
             staged.append(task)
         operation["submission"]["state"] = "committed"
         operation["submission"]["committed_at"] = utc_now()
+        if group_name:
+            prepare_submission_activity(cfg, group_name, operation["submission"])
         try:
             publish_submission(cfg, operation)
         except Exception:
@@ -1069,6 +1076,10 @@ def _execute_submission_locked(
         if projection_started:
             complete_mutation(cfg)
         commit_durable = True
+        if group_name:
+            # Readers can see committed membership as soon as this lock drops.
+            # Complete the prepared activity before entering optional finalization.
+            finalize_submission_activity(cfg, group_name, operation["submission"])
 
     try:
         # Validation and publication must be one Group-linearized operation. Otherwise a
@@ -1219,6 +1230,7 @@ def _abort_submission_owned(cfg: Any, operation: dict[str, Any], plan: Submissio
                 own_pending = pending.get("operation_id") == plan.operation_id
                 own_creation = group["group"].get("creation_operation_id") == plan.operation_id
                 if own_creation and (not pending or own_pending):
+                    require_group_mutation(cfg.shared_root, group_file.stem)
                     group_file.unlink()
                 else:
                     previous_workers = {
@@ -1398,6 +1410,9 @@ def submit_specs(
                     idempotency_key=key,
                 )
             if submission.get("state") not in {"committed", "aborted"}:
+                if plan.target_group:
+                    require_group_mutation(cfg.shared_root, plan.target_group)
+                    require_activity_writer(cfg.shared_root)
                 work_descriptor = _prepare_submission_work(cfg, operation)
         else:
             plan = prepare_submission_plan(
@@ -1406,6 +1421,9 @@ def submit_specs(
                 idempotency_key=key,
                 policy_snapshot=policy_snapshot,
             )
+            if plan.target_group:
+                require_group_mutation(cfg.shared_root, plan.target_group)
+                require_activity_writer(cfg.shared_root)
             operation = encode_submission_plan(plan)
             _reject_cleanup_tombstones(cfg, _plan_specs(plan))
             # The operation outbox is the crash-recovery handoff for this

@@ -258,6 +258,16 @@ def group_writer_lock(cfg: object, name: str, *, blocking: bool = True) -> Itera
 
 
 @contextmanager
+def group_record_writer_lock(cfg: object, name: str, *, blocking: bool = True) -> Iterator[bool]:
+    from .group_working_set_migration import require_group_mutation
+
+    with group_writer_lock(cfg, name, blocking=blocking) as acquired:
+        if acquired:
+            require_group_mutation(cfg.shared_root, name)
+        yield acquired
+
+
+@contextmanager
 def task_lock(root: Path, task_id: str, *, blocking: bool = True) -> Iterator[bool]:
     with exclusive(lock_path(root, "tasks", task_id), blocking=blocking) as acquired:
         yield acquired

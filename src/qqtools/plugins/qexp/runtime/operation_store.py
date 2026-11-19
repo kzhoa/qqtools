@@ -70,6 +70,10 @@ def write_active_operation(
     if not isinstance(operation_id, str) or not operation_id:
         operation_id = operation_key
     descriptor_kind = "group_cancel" if kind == "group_control" else kind
+    if kind == "group_control" and control.get("group_name"):
+        from .group_control_coverage import prepare_control
+
+        prepare_control(cfg.shared_root, control["group_name"], operation_id)
     descriptor = None
     if not _operation_is_terminal(kind, value):
         descriptor = prepare_work(
@@ -135,6 +139,10 @@ def archive_operation(
             "state": _operation_state(kind, value),
         },
     )
+    if terminal and kind == "group_control" and control.get("group_name"):
+        from .group_control_coverage import finish_control
+
+        finish_control(cfg.shared_root, control["group_name"], operation_id)
     return archived
 
 

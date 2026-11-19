@@ -374,8 +374,6 @@ def _group_precondition(group: dict[str, Any] | None) -> dict[str, Any]:
 
 
 def _validate_group_precondition(group: dict[str, Any], precondition: Mapping[str, Any], group_name: str) -> None:
-    if group["group"]["admission_state"] != "open":
-        raise ValueError(f"Group {group_name!r} is sealed.")
     if group["meta"]["revision"] != precondition["revision"]:
         raise RuntimeError(f"Group {group_name!r} changed during submission.")
     if group["group"]["worker_set_epoch"] != precondition["worker_set_epoch"]:
@@ -558,9 +556,10 @@ def _resolve_submission_plan(
             else:
                 group = None
             if group is not None:
+                from .group_working_set_migration import require_group_append
+
+                require_group_append(cfg.shared_root, group["group"])
                 normalize_group_record(group)
-            if group is not None and group["group"]["admission_state"] != "open":
-                raise ValueError(f"Group {request.group_name!r} is sealed.")
             group_precondition = _group_precondition(group)
         worker_additions = dict(request.worker_set_additions)
         if group is None and not request.worker_set_declared:

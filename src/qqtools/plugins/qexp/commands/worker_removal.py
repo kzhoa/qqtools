@@ -3,14 +3,16 @@
 from __future__ import annotations
 
 import os
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 
 from ..config_types import RootConfig
 from ..layout import LOCAL_RECOVERY_CAPABILITY
 from ..lifecycle import TerminalCommitResult
+from ..runtime.group_activity import record_group_activity
 from ..runtime.group_namespace import group_authority_identity, is_group_authority_isolated
-from ..runtime.locks import group_writer_lock
+from ..runtime.locks import group_record_writer_lock
 from ..runtime.operation_store import archive_operation, locate_operation_path, write_active_operation
 from ..runtime.paths import group_path, shared_paths
 from ..runtime.ready import (
@@ -54,7 +56,9 @@ def _persist_operation(cfg: RootConfig, operation: dict[str, Any]) -> None:
         write_active_operation(cfg, "group_control", control["operation_id"], operation)
 
 
-def _publish_group(cfg: RootConfig, data: dict[str, Any], previous_workers: dict[str, Any]) -> None:
+def _publish_group(
+    cfg: RootConfig, data: dict[str, Any], previous_workers: dict[str, Any], *, activity_worker: str | None = None
+) -> None:
     name = data["group"]["name"]
     data["meta"]["revision"] += 1
     data["meta"]["updated_at"] = utc_now()
@@ -62,7 +66,8 @@ def _publish_group(cfg: RootConfig, data: dict[str, Any], previous_workers: dict
         atomic_replace(group_path(cfg.shared_root, name), data)
         return
     routes = primary_projection_routes_for_group(cfg, name)
-    with primary_route_update_transaction(cfg, routes):
+    activity = nullcontext() if activity_worker is None else record_group_activity(cfg, data, worker=activity_worker)
+    with primary_route_update_transaction(cfg, routes), activity:
         atomic_replace(group_path(cfg.shared_root, name), data)
         sync_primary_ready_group(cfg, name, previous_workers=previous_workers)
 
@@ -157,7 +162,7 @@ def reconcile_worker_removal(
     validate_identifier(name, "group_name")
     post_commit_results: list[TerminalCommitResult] = []
     result: dict[str, Any] | None = None
-    with group_writer_lock(cfg, name):
+    with group_record_writer_lock(cfg, name):
         if not operation_path.exists():
             return None
         operation = read_json(operation_path)
@@ -248,7 +253,7 @@ def _reconcile_locked(
         )
         data["group"]["worker_set_epoch"] = max(data["group"]["worker_set_epoch"] + 1, control["draining_state_epoch"])
         data["worker_control"] = _control_snapshot(control)
-        _publish_group(cfg, data, previous)
+        _publish_group(cfg, data, previous, activity_worker=machine)
     if has_binding and worker["state"] == "removing":
         # This bound incarnation already crossed the removal linearization point.
         # An archive failure must not resubscribe it to later independent work.
@@ -299,7 +304,7 @@ def _reconcile_locked(
     if (data.get("worker_control") or {}).get("operation_id") == operation_id:
         data["worker_control"] = _control_snapshot(control)
     # The authoritative removing state must be durable before retiring recovery.
-    _publish_group(cfg, data, previous)
+    _publish_group(cfg, data, previous, activity_worker=machine)
     _persist_operation(cfg, operation)
     return post_commit_results
 

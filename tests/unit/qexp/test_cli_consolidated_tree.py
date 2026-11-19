@@ -161,8 +161,7 @@ def test_every_command_leaf_retains_its_frozen_dispatch_contract() -> None:
         ("group", "config", "set"): ("group_config_set", "project-write", "group-operation"),
         ("group", "list"): ("group_list", "project-read", "group-list"),
         ("group", "show"): ("group_show", "project-read", "group-show"),
-        ("group", "seal"): ("group_seal", "project-write", "group-operation"),
-        ("group", "reopen"): ("group_reopen", "project-write", "group-operation"),
+        ("group", "wake"): ("group_wake", "project-write", "group-operation"),
         ("group", "pause"): ("group_pause", "project-write", "group-operation"),
         ("group", "resume"): ("group_resume", "project-write", "group-operation"),
         ("group", "cancel"): ("group_cancel", "project-write", "group-operation"),
@@ -259,8 +258,8 @@ def test_normalized_leaf_help_matches_the_characterization_baseline() -> None:
     # argparse produces distinct stable normalized forms on Python 3.12 and the
     # standard Python 3.13 toolchain even though the parser definitions match.
     assert hashlib.sha256(text.encode()).hexdigest() in {
-        "99f444acfb631ce900aeebe804c12abcd3fb4c071adb172d1d71a7f200a11716",
-        "476941f0478b1bd4ca868eed124623856699bd2038ca315f582508fe4265821a",
+        "6e1705e7b3e6fc00dd9463c938a7b65928f842374d0ee7c176204b4c011098ae",
+        "ae87b4b0f7b698d067c2796ca47c875302de8ab1949fd4d8c2ada772851699b4",
     }
 
 

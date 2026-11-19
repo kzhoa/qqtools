@@ -7,6 +7,7 @@ import os
 import stat
 import uuid
 from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Iterator
@@ -15,6 +16,8 @@ from .locks import exclusive
 from .paths import shared_paths
 from .records import utc_now
 from .store import atomic_replace, check_mutation_fence, require_json_size
+
+_active_activation_root: ContextVar[Path | None] = ContextVar("active_activation_root", default=None)
 
 ACTIVATION_VERSION = 1
 MAX_RECORD_BYTES = 16 * 1024
@@ -919,7 +922,11 @@ def project_activation_transaction(
         record = {"project_activation": activation.copy()}
 
         try:
-            yield record
+            token = _active_activation_root.set(root)
+            try:
+                yield record
+            finally:
+                _active_activation_root.reset(token)
         except BaseException as body_error:
             try:
                 committed = _recover_pending_locked(root, project_id, before_write=before_write)
@@ -936,6 +943,12 @@ def project_activation_transaction(
                 raise RuntimeError("Project activation transaction did not commit its pending record.")
             if before_write is None:
                 _maybe_compact_activation_locked(root, project_id, committed)
+
+
+def notify_group_activity(cfg: object) -> None:
+    """Wake maintenance unless the surrounding mutation already publishes an event."""
+    if _active_activation_root.get() != cfg.shared_root:
+        publish_project_activation(cfg, "group_activity")
 
 
 def publish_project_activation(cfg: object, reason: str) -> dict[str, Any]:

@@ -28,13 +28,13 @@ def test_group_membership_sequences_and_workers_are_authoritative(tmp_path: Path
     assert set(group["worker_set"]) == {"g1"}
 
 
-def test_sealed_group_rejects_new_tasks(tmp_path: Path):
+def test_paused_group_accepts_new_queued_tasks(tmp_path: Path):
     cfg = init_shared_root(tmp_path / ".qexp", "g1", runtime_root=tmp_path / "rt")
-    create_group(cfg, "exp")
-    submit(cfg, ["echo", "one"], group="exp")
-    group_control(cfg, "exp", "seal")
-    with pytest.raises(ValueError, match="sealed"):
-        submit(cfg, ["echo", "two"], group="exp")
+    assert "admission_state" not in create_group(cfg, "exp")["group"]
+    group_control(cfg, "exp", "pause")
+    task = submit(cfg, ["echo", "two"], group="exp")
+    assert task.state["projection"] == "queued"
+    assert list_groups(cfg)[0]["group"]["dispatch_state"] == "paused"
 
 
 def test_pause_and_resume_change_dispatch_epoch(tmp_path: Path):
@@ -92,7 +92,7 @@ def test_group_retry_does_not_expand_to_members_added_after_selection(tmp_path: 
     assert first_attempt is not None
     assert fail_attempt(cfg, first.task_id, first_attempt.attempt_id, first_attempt.current_fencing_token, "failed")
 
-    real_group_writer_lock = group_commands.group_writer_lock
+    real_group_writer_lock = group_commands.group_record_writer_lock
     lock_calls = 0
 
     @contextmanager
@@ -109,7 +109,7 @@ def test_group_retry_does_not_expand_to_members_added_after_selection(tmp_path: 
                 cfg, late.task_id, late_attempt.attempt_id, late_attempt.current_fencing_token, "late_failure"
             )
 
-    monkeypatch.setattr(group_commands, "group_writer_lock", racing_group_writer_lock)
+    monkeypatch.setattr(group_commands, "group_record_writer_lock", racing_group_writer_lock)
 
     result = group_retry_failed(cfg, "exp")
 
@@ -126,7 +126,7 @@ def test_group_retry_classifies_selected_failure_changed_before_application(tmp_
     assert attempt is not None
     assert fail_attempt(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token, "failed")
 
-    real_group_writer_lock = group_commands.group_writer_lock
+    real_group_writer_lock = group_commands.group_record_writer_lock
     real_task_retry = group_commands.retry
     lock_calls = 0
 
@@ -139,7 +139,7 @@ def test_group_retry_classifies_selected_failure_changed_before_application(tmp_
         if lock_calls == 2:
             real_task_retry(cfg, task.task_id)
 
-    monkeypatch.setattr(group_commands, "group_writer_lock", racing_group_writer_lock)
+    monkeypatch.setattr(group_commands, "group_record_writer_lock", racing_group_writer_lock)
 
     result = group_retry_failed(cfg, "exp")
 

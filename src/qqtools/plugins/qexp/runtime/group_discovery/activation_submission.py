@@ -6,7 +6,7 @@ import base64
 import hashlib
 import json
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
@@ -640,6 +640,8 @@ def advance_activation_submission_source(
     operation_id: str,
     checkpoint_path: os.PathLike[str] | str,
     checkpoint_namespace: str,
+    *,
+    mount_independent: bool = False,
 ) -> ActivationSubmissionStep:
     """Advance one bounded, revision-bound activation projection step."""
     from ..upgrade.contracts import UpgradeStorage
@@ -681,6 +683,9 @@ def advance_activation_submission_source(
 
     read = storage.read_regular_bytes(source, offset, STREAM_CHUNK_BYTES)
     source_revision = _coerce_revision(read)
+    if expected_revision is not None and mount_independent:
+        # Paths are bound to the shared Project in the envelope. Device IDs are mount-local.
+        expected_revision = replace(expected_revision, device=source_revision.device)
     if expected_revision is not None and source_revision != expected_revision:
         # The bytes read at a stale nonzero offset cannot be reused for a fresh
         # parse. Persist a zero-offset checkpoint and let the next bounded call

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from .runtime.records import (
     ATTEMPT_PHASES,
-    GROUP_ADMISSION_STATES,
     GROUP_DISPATCH_STATES,
     SCHEMA_VERSION,
     TASK_PHASES,

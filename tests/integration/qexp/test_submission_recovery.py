@@ -16,18 +16,14 @@ class AbruptSubmissionInterruption(BaseException):
     """Simulate process loss without normal submission rollback."""
 
 
-def test_sealed_group_does_not_poison_idempotency_key(tmp_path: Path):
+def test_invalid_placement_does_not_poison_idempotency_key(tmp_path: Path):
     cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")
-    create_group(cfg, "exp")
-    submit(cfg, ["echo", "first"], group="exp")
-    from qqtools.plugins.qexp.commands.group import group_control
-
-    group_control(cfg, "exp", "seal")
-    with pytest.raises(ValueError, match="sealed"):
-        submit(cfg, ["echo", "second"], group="exp", idempotency_key="sealed-key")
-    with pytest.raises(ValueError, match="sealed"):
-        submit(cfg, ["echo", "second"], group="exp", idempotency_key="sealed-key")
-    mapping = idempotency_path(cfg.shared_root, semantic_digest({"project": str(cfg.shared_root), "key": "sealed-key"}))
+    create_group(cfg, "exp", workers=[])
+    key = "placement-key"
+    for _ in range(2):
+        with pytest.raises(ValueError, match="not an active worker"):
+            submit(cfg, ["echo", "second"], group="exp", idempotency_key=key)
+    mapping = idempotency_path(cfg.shared_root, semantic_digest({"project": str(cfg.shared_root), "key": key}))
     assert not mapping.exists()
 
 

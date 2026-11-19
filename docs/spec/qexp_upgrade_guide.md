@@ -869,3 +869,60 @@ its `task_observation` status. Interrupted publication is recovered automaticall
 after correcting damaged source data, `qexp admin repair --project PATH` requests another build.
 Do not remove required capabilities or downgrade writers to bypass the gate.
 A rebuild invalidates old cursors; restart explicitly without `--cursor`.
+
+## Group working-set cutover from 1.3.29
+
+Coordinate the 1.3.30 package switch across submitting clients, automation,
+agents and workers. Pause Group mutations, wait for in-flight commands to exit,
+and stop processes that can still mutate Group state. Upgrade the packages
+before restarting those processes. Keep launched training and its runner alive.
+The 1.3.29 runner records the exit outcome in machine-local process evidence
+for the restarted agent to reconcile.
+
+During each Project's name inventory, submissions and Group-record controls
+pause on that Project. Running training continues. After inventory, unsealed
+Groups accept changes while enrollment continues. A Group record over 8 MiB
+gets its own write pause while the converter streams that record. Other Groups
+remain available. Retry a fenced command after its record finishes. Formerly sealed Groups open
+when the Project activates its complete index. Restart cached readers as well as
+writers so all clients use the converted format.
+
+After restart, inspect `qexp admin upgrade status` on machines with registered
+Projects. Bring inaccessible Projects back online and finish their conversion
+on 1.3.30 before installing 1.4.0. Use `qexp admin upgrade advance` for bounded
+recovery. 1.4.0 requires the converted Project format.
+
+Replace inventory scripts with `group list --all` and follow every continuation
+cursor. Remove uses of `admission_state`, `group seal`, and `group reopen`.
+Coordinate all submitters when freezing a cohort. Cancellation captures current
+membership and subsequent submissions may run.
+
+### Working-set qualification
+
+The first default page returned the ten current Groups in each Linux fixture.
+The history index and historical Group files were populated before measurement.
+The cold measurement used POSIX cache eviction advice on the selected Group and
+index files. Bytes sum the JSON file sizes opened by the page. Each page opened
+55 files, with zero historical Group-detail opens and zero directory enumerations.
+
+| Historical Groups | JSON bytes | Cold-advised ms | Warm ms |
+| ---: | ---: | ---: | ---: |
+| 0 | 24,915 | 4.55 | 3.24 |
+| 1,000 | 24,918 | 3.39 | 2.71 |
+| 100,000 | 24,920 | 10.92 | 6.64 |
+
+In a separate injected-clock expiry run, an empty queue took 0.71 ms (seven
+opens). With 64 entries scheduled in the future, the poll took 0.71 ms (eight
+opens) and examined zero candidates. With all 64 due, the first eight-candidate
+slice took 32.39 ms (331 opens). After all 64 settled Groups retired, a poll
+examined zero candidates in 0.72 ms. Four explicit wakes restored four entries.
+Seven days is the initial shipping interval. The workload measured retention
+and explicit wake behavior under controlled inputs. Production wake frequency
+has not been measured.
+
+A released 1.3.29 runner kept its training process through agent shutdown,
+interrupted Project conversion and agent restart. The same Attempt finished
+successfully with one launch. A local 1.4.0 candidate with the Group converter
+and bootstrap list fallback removed listed the converted Project in both views.
+After a forced exit during Submission finalization, it recovered the committed
+operation, replayed its idempotency key and appended the next membership sequence.

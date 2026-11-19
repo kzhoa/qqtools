@@ -73,12 +73,6 @@ class _BudgetExceeded(Exception):
     """Internal signal for a candidate read that reached its I/O budget."""
 
 
-@dataclass(frozen=True, slots=True)
-class _DiscardResult:
-    changed: bool
-    empty: bool
-
-
 def _partition_value(value: str | None, label: str) -> str | None:
     if value is not None and not isinstance(value, str):
         raise ValueError(f"{label} must be a string or None.")
@@ -182,7 +176,14 @@ class IndexTree:
         root = self._load_root()
         if root is None:
             return
-        self._discard_at(root, task_id, depth=0)
+        detached: list[str] = []
+        if self._discard_at(root, task_id, detached, depth=0):
+            self._persist_node(_Node(prefix="", keys=()))
+        # The reachable tree no longer references these nodes. An interrupted
+        # cleanup may leave orphans, but replay can still traverse the tree.
+        for prefix in detached:
+            if prefix:
+                self._unlink_node(prefix)
 
     def contains(self, task_id: str) -> bool:
         """Return whether a Task ID is present using direct bounded descent."""
@@ -355,48 +356,46 @@ class IndexTree:
         self._persist_node(_Node(prefix=node.prefix, children=tuple(sorted(children)), terminal=bool(node.terminal)))
         return True
 
-    def _discard_at(self, node: _Node, task_id: str, *, depth: int) -> _DiscardResult:
+    def _discard_at(self, node: _Node, task_id: str, detached: list[str], *, depth: int) -> bool:
+        """Return whether the parent must detach this node."""
         if depth > _MAX_TASK_ID_LENGTH + 1:
             raise ValueError("observation index depth exceeds its bounded limit.")
         if node.is_leaf:
             keys = node.keys or ()
             position = bisect_right(keys, task_id)
             if position == 0 or keys[position - 1] != task_id:
-                return _DiscardResult(changed=False, empty=False)
+                return False
             remaining = keys[: position - 1] + keys[position:]
             if remaining:
                 self._persist_node(_Node(prefix=node.prefix, keys=remaining))
-                return _DiscardResult(changed=True, empty=False)
-            self._unlink_node(node.prefix)
-            return _DiscardResult(changed=True, empty=True)
+                return False
+            detached.append(node.prefix)
+            return True
 
         if task_id == node.prefix:
             if not node.terminal:
-                return _DiscardResult(changed=False, empty=False)
+                return False
             children = node.children or ()
             if children:
                 self._persist_node(_Node(prefix=node.prefix, children=children, terminal=False))
-                return _DiscardResult(changed=True, empty=False)
-            self._unlink_node(node.prefix)
-            return _DiscardResult(changed=True, empty=True)
+                return False
+            detached.append(node.prefix)
+            return True
         if not task_id.startswith(node.prefix):
             raise ValueError("observation index prefix invariant is violated.")
 
         child_prefix = self._matching_child(node, task_id)
         if child_prefix is None or not task_id.startswith(child_prefix):
-            return _DiscardResult(changed=False, empty=False)
+            return False
         child = self._load_required(child_prefix)
-        result = self._discard_at(child, task_id, depth=depth + 1)
-        if not result.changed:
-            return result
-        children = node.children or ()
-        if result.empty:
-            children = tuple(item for item in children if item != child_prefix)
+        if not self._discard_at(child, task_id, detached, depth=depth + 1):
+            return False
+        children = tuple(item for item in node.children or () if item != child_prefix)
         if children or node.terminal:
             self._persist_node(_Node(prefix=node.prefix, children=children, terminal=bool(node.terminal)))
-            return _DiscardResult(changed=True, empty=False)
-        self._unlink_node(node.prefix)
-        return _DiscardResult(changed=True, empty=True)
+            return False
+        detached.append(node.prefix)
+        return True
 
     def _matching_child(self, node: _Node, task_id: str) -> str | None:
         children = node.children or ()
@@ -602,8 +601,8 @@ class IndexTree:
         path = self._node_path(prefix)
         try:
             metadata = os.lstat(path)
-        except FileNotFoundError as exc:
-            raise ValueError(f"observation index node is missing for prefix {prefix!r}: {path}") from exc
+        except FileNotFoundError:
+            return
         if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
             raise ValueError(f"observation index node must be a regular file: {path}")
         check_mutation_fence(path)

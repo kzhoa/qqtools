@@ -140,7 +140,7 @@ def test_maintenance_service_uses_only_narrow_full_audit_interfaces() -> None:
     }
 
 
-def test_outbox_full_audit_delegates_with_the_service_invocation_ledger(monkeypatch) -> None:
+def test_outbox_full_audit_delegates_with_the_service_invocation_ledger(monkeypatch, tmp_path) -> None:
     from qqtools.plugins.qexp.runtime import maintenance_full_audit, maintenance_service
 
     descriptor = {
@@ -172,7 +172,7 @@ def test_outbox_full_audit_delegates_with_the_service_invocation_ledger(monkeypa
     monkeypatch.setattr(maintenance_service, "update_work", lambda *_args, **_kwargs: None)
 
     result = maintenance_service.advance_maintenance_work(
-        SimpleNamespace(),
+        SimpleNamespace(shared_root=tmp_path),
         reservation_runtime_root=None,
     )
 

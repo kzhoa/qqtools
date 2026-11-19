@@ -507,8 +507,9 @@ def test_human_follow_up_commands_use_parseable_project_locator(
         assert parsed.project == str(project)
 
 
+@pytest.mark.parametrize("abort", [False, True])
 def test_process_death_after_provisional_group_publication_hides_group_and_allows_same_key_recovery(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], abort: bool
 ) -> None:
     from qqtools.plugins.qexp.commands.task import batch_submit
     from qqtools.plugins.qexp.observer import list_groups
@@ -542,6 +543,10 @@ def test_process_death_after_provisional_group_publication_hides_group_and_allow
     with pytest.raises(GroupNotPublished, match=operation_id):
         read_group(cfg.shared_root, "interrupted")
     assert all(item["name"] != "interrupted" for item in list_groups(cfg))
+    from qqtools.plugins.qexp.observer import list_groups_page
+
+    for history in (False, True):
+        assert list_groups_page(cfg, all_groups=history)["items"] == []
 
     assert (
         main(
@@ -563,6 +568,11 @@ def test_process_death_after_provisional_group_publication_hides_group_and_allow
     assert "not published" in preview["error"]["message"]
 
     monkeypatch.setattr(submission_runtime, "save_task", original_save)
+    if abort:
+        assert submission_runtime.reconcile_submission(cfg, operation_id, abort_incomplete=True) == "aborted"
+        for history in (False, True):
+            assert list_groups_page(cfg, all_groups=history)["items"] == []
+        return
     recovered = batch_submit(cfg, manifest, idempotency_key="recover")
     assert recovered.operation_id == operation_id
     assert read_group(cfg.shared_root, "interrupted")["group"]["name"] == "interrupted"
@@ -594,6 +604,11 @@ def test_committed_group_is_visible_even_when_finalization_is_interrupted(
     operation = read_json(submission_path(cfg.shared_root, raw_group["creation_operation_id"]))["submission"]
     assert operation["state"] == "committed"
     assert read_group(cfg.shared_root, "committed")["group"]["name"] == "committed"
+
+    from qqtools.plugins.qexp.observer import list_groups_page
+
+    for history in (False, True):
+        assert [item["group"]["name"] for item in list_groups_page(cfg, all_groups=history)["items"]] == ["committed"]
 
     monkeypatch.setattr(submission_runtime, "finalize_submission_group", original_finalize)
     recovered = batch_submit(cfg, manifest, idempotency_key="finish")

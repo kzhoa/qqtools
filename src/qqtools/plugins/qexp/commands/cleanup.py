@@ -178,12 +178,15 @@ def _start_cleanup_operation(cfg: RootConfig, task: TaskRecord) -> dict[str, Any
         # QQTOOLS-COMPAT-0017: the maintenance locator precedes cleanup's first
         # durable operation or Task-side ownership effect.
         publish_group_locator_for_transition(cfg, task.group_name, "maintenance", "metadata_cleanup")
-    write_active_operation(cfg, "cleanup", task.task_id, operation)
-    task.control["cleanup_operation_id"] = operation["cleanup"]["operation_id"]
-    task.control["cleanup_state"] = "preparing"
-    task.meta["revision"] += 1
-    task.meta["updated_at"] = now
-    save_task(cfg, task)
+    from ..runtime.group_activity import record_group_task_activity
+
+    with record_group_task_activity(cfg, task, cleanup_id=operation["cleanup"]["operation_id"], cleanup_start=True):
+        write_active_operation(cfg, "cleanup", task.task_id, operation)
+        task.control["cleanup_operation_id"] = operation["cleanup"]["operation_id"]
+        task.control["cleanup_state"] = "preparing"
+        task.meta["revision"] += 1
+        task.meta["updated_at"] = now
+        save_task(cfg, task)
     retire_current_ready_generation(cfg, task)
     write_event(
         cfg,

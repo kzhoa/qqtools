@@ -107,7 +107,7 @@ def test_group_control_rejects_before_group_truth_mutation(cfg, gate):
     before = path.read_bytes()
     install_gate(cfg, gate)
     with pytest.raises(RuntimeError, match="capabilit"):
-        group_control(cfg, "experiment", "seal")
+        group_control(cfg, "experiment", "pause")
     assert path.read_bytes() == before
 
 

@@ -28,6 +28,7 @@ from .contracts import (
     UpgradeStorage,
 )
 from .group_service import GroupServiceMigration
+from .group_working_set import GroupWorkingSetMigration
 from .production import UpgradeJournalMigration
 from .registration_v3 import RegistrationV3Migration
 from .task_dependencies_v2 import TaskDependenciesV2Migration
@@ -112,7 +113,13 @@ class MigrationRegistry:
 
 
 DEFAULT_MIGRATIONS = MigrationRegistry(
-    [UpgradeJournalMigration(), GroupServiceMigration(), RegistrationV3Migration(), TaskDependenciesV2Migration()]
+    [
+        UpgradeJournalMigration(),
+        GroupServiceMigration(),
+        GroupWorkingSetMigration(),
+        RegistrationV3Migration(),
+        TaskDependenciesV2Migration(),
+    ]
 )
 
 
@@ -475,6 +482,21 @@ class UpgradeCoordinator:
                     if (protocol in plugin.spec.compatible_readers or protocol == plugin.spec.source_protocol)
                     and _is_applicable(plugin, self.cfg, for_status=True)
                 ]
+            # The coordinated cutover must be visible to read-only machine
+            # status before its first advance, including on roots with an
+            # already completed journal for earlier protocols.
+            if not status["pending"]:
+                known = {item["name"] for item in status["migrations"]}
+                for plugin in self.registry.values():
+                    if not isinstance(plugin, GroupWorkingSetMigration) or plugin.spec.name in known:
+                        continue
+                    if _is_applicable(plugin, self.cfg, for_status=True):
+                        status.update(
+                            state="waiting",
+                            phase=plugin.spec.phases[0],
+                            pending=True,
+                            target_protocol=plugin.spec.target_protocol,
+                        )
             return status
         except OSError as exc:
             # A registered root can be temporarily unavailable. Preserve that distinction so

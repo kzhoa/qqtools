@@ -22,7 +22,6 @@ def populate_settled_group_history(cfg: Any, count: int) -> None:
     for index in range(count):
         name = f"retained-{index:06d}"
         record = new_group(name, cfg.machine_name)
-        record["group"]["admission_state"] = "sealed" if index % 2 else "open"
         record["group"]["dispatch_state"] = "paused" if index % 3 == 0 else "active"
         path = directory / f"{name}.json"
         payload = (json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n").encode()

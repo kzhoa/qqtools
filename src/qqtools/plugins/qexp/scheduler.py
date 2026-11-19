@@ -3771,4 +3771,20 @@ def reconcile_running_tasks(
                 reservation_runtime_root=reservation_runtime_root,
             ):
                 reconciled.append(task.task_id)
+    # Persist a Group termination acknowledgement at reconciliation time so
+    # a later Group observer can report it without driving the operation.
+    acknowledged_groups = set()
+    for task_id in set(reconciled):
+        task = load_task(cfg, task_id)
+        if (
+            task.group_name
+            and task.control.get("cancellation_operation_id")
+            and task.state["projection"] == "cancelled"
+        ):
+            acknowledged_groups.add(task.group_name)
+    if acknowledged_groups:
+        from .commands.group import reconcile_group_cancel_operations
+
+        for name in sorted(acknowledged_groups):
+            reconcile_group_cancel_operations(cfg, name, reservation_runtime_root=reservation_runtime_root)
     return reconciled

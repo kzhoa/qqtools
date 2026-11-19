@@ -335,17 +335,17 @@ def test_group_human_outputs_project_summary_and_operation_context(tmp_path: Pat
     assert listing.splitlines()[0].startswith("Group")
     assert "Group, demo" not in listing
     assert "demo" in listing
-    assert "open" in listing
+    assert "Admission" not in listing
 
     assert main([*_base_args(cfg), "group", "show", "demo"]) == 0
     show = capsys.readouterr().out
     assert "Workers: gpu-1=active" in show
     assert "added_by_operation" not in show
 
-    assert main([*_base_args(cfg), "group", "seal", "demo"]) == 0
-    seal = capsys.readouterr().out
-    assert "Action: seal" in seal
-    assert "Group: demo" in seal
+    assert main([*_base_args(cfg), "group", "pause", "demo"]) == 0
+    pause = capsys.readouterr().out
+    assert "Action: pause" in pause
+    assert "Group: demo" in pause
 
 
 def test_group_json_remains_raw_workflow_result(tmp_path: Path, capsys):

@@ -113,6 +113,8 @@ def _group_page_output(
     next_cursor = page.get("next_cursor")
     if args.format == "human" and next_cursor is not None:
         command = ["qexp", "--project", str(cfg.shared_root), "group", "list"]
+        if args.all_groups:
+            command.append("--all")
         if args.dispatch is not None:
             command.extend(("--dispatch", args.dispatch))
         if args.worker_state is not None:
@@ -534,16 +536,22 @@ def dispatch_project(
                     cfg,
                     page_size=page_size,
                     cursor=args.cursor,
+                    all_groups=args.all_groups,
                     dispatch=args.dispatch,
                     worker_state=args.worker_state,
                     attention=args.attention,
                 )
-            except ValueError as exc:
+            except observer.GroupPageArgumentError as exc:
                 raise ObservationError("invalid_argument", str(exc), 2) from exc
+            except (OSError, RuntimeError, ValueError) as exc:
+                raise ObservationError("index_unavailable", str(exc)) from exc
             return CommandOutcome(0, _group_page_output(cfg, args, result, page_size))
         elif handler == "group_show":
             result = group_commands.show_group(cfg, args.name)
             kind = OutputKind.GROUP_SHOW
+        elif handler == "group_wake":
+            result = {"action": "wake", "outcome": "completed", **group_commands.wake_group(cfg, args.name)}
+            kind = OutputKind.GROUP_STATE_CHANGE
         elif handler == "group_retry":
             ensure_local_agent_active(cfg, reason="group-retry", **get_lifecycle_kwargs())
             result = group_commands.group_retry_failed(cfg, args.name)
