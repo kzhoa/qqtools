@@ -921,7 +921,8 @@ qexp group retry <group>
 Default Group cancellation cancels current queued Tasks and allows running Attempts to
 finish. The operation targets the Group membership snapshot captured when cancellation
 starts. It does not cancel Tasks appended later and does not permanently change Group
-dispatch state. Pause the Group to hold subsequent Tasks in the queue.
+dispatch state. Group cancellation and Worker removal require the full spelling
+`--all` to request termination of running work. Pause the Group to hold subsequent Tasks in the queue.
 
 Pause and cancellation must linearize against process launch through one shared-state
 transition. For a pre-launch Attempt in `claimed`, exactly one outcome wins:
@@ -2396,11 +2397,15 @@ support `--page-size N` (1–1000, default 50). A live page contains `items`,
 `exhausted` and a null cursor. A full intermediate page returns `page_full`.
 A scan that reaches its candidate budget before filling the page returns
 `budget_exhausted`, including when it found zero matches. Both cursors continue
-after the last examined Group and bind the selected view and filters.
+after the last examined Group and bind the selected view and filters. The human
+continuation command preserves explicit machine assertions and runtime roots.
 
 `qexp group wake NAME` restores an existing Group and restarts its inactivity
 interval. It preserves dispatch state and creates no Task. Unknown names fail.
-`group show NAME` resolves historical Groups directly.
+`group show NAME` resolves historical Groups directly. Both commands report
+`group_not_found` for a missing Group in JSON output and exit with status 1. An invalid Group name
+returns `invalid_argument` (exit 2). An unreadable or undecodable Group record
+returns `operational_failure` (exit 1).
 
 Compatibility decision (2026-10-05): the default human result changes from an
 unbounded table to the first bounded page, and the default JSON result changes

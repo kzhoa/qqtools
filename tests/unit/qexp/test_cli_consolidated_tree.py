@@ -439,3 +439,14 @@ def test_main_dispatches_leaf_execution_from_command_spec_handler() -> None:
         "admin_action",
     ):
         assert f"args.{argparse_destination}" not in source
+
+
+@pytest.mark.parametrize("args", [["group", "cancel", "g"], ["group", "worker", "remove", "g", "m"]])
+def test_termination_requires_complete_all_flag(args):
+    parser = build_parser()
+    assert parser.parse_args(args).all is False
+    assert parser.parse_args([*args, "--all"]).all is True
+    for abbreviation in ("--a", "--al"):
+        with pytest.raises(SystemExit) as exc:
+            parser.parse_args([*args, abbreviation])
+        assert exc.value.code == 2

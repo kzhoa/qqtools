@@ -21,6 +21,10 @@ _IDENTITY_FILE = ".authority-identity"
 _internal_provisional_read = ContextVar("qexp_internal_provisional_group_read", default=False)
 
 
+class GroupRecordNotFound(FileNotFoundError):
+    """The selected Group directory exists but has no record for this name."""
+
+
 class GroupNotPublished(RuntimeError):
     """A provisional Group is present but its Submission is not committed."""
 
@@ -134,18 +138,29 @@ def group_directory(root: Path, *, storage: Any | None = None) -> Path:
     raise RuntimeError("Group authority directory is missing or changed")
 
 
+def _read_group_record(directory: Path, name: str) -> dict[str, Any]:
+    try:
+        return read_json(directory / f"{name}.json")
+    except ValueError as exc:
+        raise GroupPublicationUnavailable(f"Group {name!r} has an unreadable record: {exc}") from exc
+    except FileNotFoundError as exc:
+        if directory.is_dir():
+            raise GroupRecordNotFound(exc.errno, exc.strerror, exc.filename) from exc
+        raise
+
+
 def read_group_raw(root: Path, name: str) -> dict[str, Any]:
     """Read one Group without applying Submission publication filtering."""
     directory = group_directory(root)
     try:
-        value = read_json(directory / f"{name}.json")
+        value = _read_group_record(directory, name)
     except FileNotFoundError:
         current = group_directory(root)
         if current == directory:
             raise
-        return read_json(current / f"{name}.json")
+        return _read_group_record(current, name)
     current = group_directory(root)
-    return value if current == directory else read_json(current / f"{name}.json")
+    return value if current == directory else _read_group_record(current, name)
 
 
 def _submission_state(root: Path, operation_id: str) -> str:

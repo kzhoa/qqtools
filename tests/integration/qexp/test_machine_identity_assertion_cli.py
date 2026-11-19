@@ -56,6 +56,7 @@ def test_machine_assertion_mismatch_fails_before_gpu_policy_mutation(tmp_path, c
     [
         ("--machine", "gpu-1", "--expect-machine", "gpu-2"),
         ("--expect-machine", "gpu-1", "--machine", "gpu-2"),
+        ("--expect-mach", "gpu-2", "--machine", "gpu-1"),
     ],
 )
 def test_conflicting_machine_aliases_fail_before_dispatch(tmp_path, capsys, assertions) -> None:

@@ -29,14 +29,7 @@ from .local_handlers import LOCAL_HANDLERS, dispatch_local
 from .notification_handlers import dispatch_config_notifications, dispatch_notifications
 from .outcome import CommandOutcome, validate_command_outcome
 from .output import CliOutput, OutputKind, render
-from .parser import (
-    _is_json_argv,
-    _JsonParseError,
-    _PaginationParseError,
-    _set_parse_modes,
-    _SubmissionParseError,
-    build_parser,
-)
+from .parser import _JsonParseError, _set_parse_modes, _SubmissionParseError, _wait_arguments, build_parser
 from .project_handlers import _validate_continuous_options, dispatch_project
 from .project_presentation import ProjectPresentationState, format_project_line
 from .submission import (
@@ -48,9 +41,6 @@ from .submission import (
     dispatch_submission,
 )
 
-_PAGINATION_JSON_PARSE_MODE = False
-_SUBMISSION_JSON_PARSE_MODE = False
-_JSON_PARSE_MODE = False
 _ACTIVE_COMMAND_SPEC: contextvars.ContextVar[CommandSpec | None] = contextvars.ContextVar(
     "qexp_active_command_spec", default=None
 )
@@ -80,11 +70,6 @@ def _emit_user_error(error: CliUsageError | CliOperationalError, output_format: 
     return classified.exit_code
 
 
-def _is_wait_json_argv(argv: list[str]) -> bool:
-    """Return whether raw argv selects JSON ``task wait`` diagnostics."""
-    return any(argv[index : index + 2] == ["task", "wait"] for index in range(len(argv) - 1)) and _is_json_argv(argv)
-
-
 def _raw_wait_task_id(argv: list[str]) -> str | None:
     """Recover the wait Task ID for parser errors without running argparse again."""
     option_values = {
@@ -96,24 +81,21 @@ def _raw_wait_task_id(argv: list[str]) -> str | None:
         "--format",
         "--timeout",
     }
-    for index in range(len(argv) - 1):
-        if argv[index : index + 2] != ["task", "wait"]:
+    cursor = 0
+    while cursor < len(argv):
+        token = argv[cursor]
+        if token == "--":
+            return None
+        if token in option_values:
+            cursor += 2
             continue
-        cursor = index + 2
-        while cursor < len(argv):
-            token = argv[cursor]
-            if token == "--":
-                return None
-            if token in option_values:
-                cursor += 2
-                continue
-            if any(token.startswith(f"{option}=") for option in option_values):
-                cursor += 1
-                continue
-            if token.startswith("-"):
-                cursor += 1
-                continue
-            return token
+        if any(token.startswith(f"{option}=") for option in option_values):
+            cursor += 1
+            continue
+        if token.startswith("-"):
+            cursor += 1
+            continue
+        return token
     return None
 
 
@@ -378,18 +360,16 @@ def main(argv: list[str] | None = None) -> int:
     _set_parse_modes(raw_argv)
     try:
         args = build_parser().parse_args(raw_argv)
-    except _PaginationParseError as exc:
-        print(json.dumps({"error": {"code": "invalid_argument", "message": str(exc)}}))
-        return 2
     except _SubmissionParseError as exc:
         payload = _submission_parse_failure_payload(raw_argv, str(exc))
         print(json.dumps(payload))
         print(f"qexp: {exc}", file=sys.stderr)
         return 2
     except _JsonParseError as exc:
-        if _is_wait_json_argv(raw_argv):
+        wait_args = _wait_arguments(raw_argv)
+        if wait_args is not None:
             return _emit_wait_error(
-                task_id=_raw_wait_task_id(raw_argv),
+                task_id=_raw_wait_task_id(wait_args),
                 project=None,
                 outcome="invalid_input",
                 reason="invalid_input",

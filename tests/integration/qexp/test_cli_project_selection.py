@@ -221,3 +221,24 @@ def test_task_wait_json_input_errors_keep_fixed_schema(argv: list[str], capsys) 
     }
     assert result["outcome"] == "invalid_input"
     assert result["error"]["code"] == "invalid_input"
+
+
+@pytest.mark.parametrize(
+    ("args", "is_wait"),
+    [
+        (["group", "show", "task", "wait"], False),
+        (["--project", "task", "group", "show", "wait"], False),
+        (["task", "show", "task", "wait"], False),
+        (["task", "wait", "task-1"], True),
+        (["task", "--project", "task", "wait", "task-1"], True),
+    ],
+)
+def test_wait_parse_errors_follow_selected_command(args, is_wait, capsys):
+    assert main([*args, "--unknown", "--format=json"]) == 2
+    result = json.loads(capsys.readouterr().out)
+    if is_wait:
+        assert result["task_id"] == "task-1"
+        assert result["error"]["code"] == "invalid_input"
+    else:
+        assert set(result) == {"error"}
+        assert result["error"]["code"] == "invalid_argument"

@@ -31,6 +31,7 @@ from ..runtime.submission_plan import SubmissionTargetInvalid, semantic_digest
 from ..submission_contracts import ProjectSelection, SubmissionRequest, submission_result_payload
 from .outcome import CommandOutcome
 from .output import CliOutput, OutputKind
+from .parser import _root_command_index, _submission_raw_prefix
 
 
 class SubmissionCommandError(Exception):
@@ -264,19 +265,6 @@ def _command(argv: list[str]) -> list[str]:
     return argv
 
 
-def _submission_raw_prefix(raw_argv: list[str]) -> list[str]:
-    """Return submit options before the literal command separator."""
-    try:
-        submit_index = raw_argv.index("submit")
-    except ValueError:
-        return []
-    prefix = raw_argv[submit_index + 1 :]
-    try:
-        return prefix[: prefix.index("--")]
-    except ValueError:
-        return prefix
-
-
 def _submission_option_supplied(raw_argv: list[str], *names: str) -> bool:
     prefix = _submission_raw_prefix(raw_argv)
     return any(item in names or any(item.startswith(f"{name}=") for name in names) for item in prefix)
@@ -295,11 +283,7 @@ def _submission_raw_option(raw_argv: list[str], name: str) -> str | None:
 def _submission_parse_failure_payload(raw_argv: list[str], message: str) -> dict[str, Any]:
     """Build the complete result schema when argparse cannot create a Namespace."""
     has_file = _submission_option_supplied(raw_argv, "--file", "-f")
-    try:
-        tail = raw_argv[raw_argv.index("submit") + 1 :]
-    except ValueError:
-        tail = []
-    has_command_separator = "--" in tail
+    has_command_separator = "--" in raw_argv[_root_command_index(raw_argv) + 1 :]
     mode = (
         "file"
         if has_file and not has_command_separator

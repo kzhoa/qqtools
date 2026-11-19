@@ -11,10 +11,10 @@ from ..agent.diagnostics import parse_log_size
 from ..commands import configuration as configuration_commands
 from ..commands import context as context_commands
 from ..launch_policy import validate_launch_handoff_timeout_seconds
+from ..runtime.records import validate_group_name
 from .command_spec import CommandAudience, ContextKind, OutputMode, bind_command
 from .output import OutputKind
 
-_PAGINATION_JSON_PARSE_MODE = False
 _SUBMISSION_JSON_PARSE_MODE = False
 _JSON_PARSE_MODE = False
 _MACHINE_ASSERTION_OPTIONS = frozenset({"--expect-machine", "--machine"})
@@ -33,8 +33,19 @@ _SETUP_HANDLERS = frozenset(
 )
 
 
-class _PaginationParseError(RuntimeError):
-    """An argparse error that belongs to paginated JSON output."""
+class _StoreMachineAssertion(argparse.Action):
+    """Retain the canonical option argparse matched, including for abbreviations."""
+
+    def __call__(
+        self,
+        parser: argparse.ArgumentParser,
+        namespace: argparse.Namespace,
+        values: str,
+        option_string: str | None = None,
+    ) -> None:
+        setattr(namespace, self.dest, values)
+        if option_string == "--expect-machine":
+            namespace._expect_machine_explicit = True
 
 
 class _SubmissionParseError(RuntimeError):
@@ -46,11 +57,9 @@ class _JsonParseError(RuntimeError):
 
 
 class _QexpArgumentParser(argparse.ArgumentParser):
-    """Use structured parse errors only for the narrowly scoped page mode."""
+    """Route parse errors to the selected JSON command contract."""
 
     def error(self, message: str) -> None:
-        if _PAGINATION_JSON_PARSE_MODE:
-            raise _PaginationParseError(message)
         if _SUBMISSION_JSON_PARSE_MODE:
             raise _SubmissionParseError(message)
         if _JSON_PARSE_MODE:
@@ -65,10 +74,9 @@ class _QexpArgumentParser(argparse.ArgumentParser):
         if conflict is not None:
             self.error(conflict)
         parsed = super().parse_args(raw, namespace)
-        setup_error = _setup_machine_assertion_error(parsed, raw)
+        setup_error = _setup_machine_assertion_error(parsed)
         if setup_error is not None:
             self.error(setup_error)
-        parsed._expect_machine_explicit = _raw_option_present(raw, "--expect-machine")
         return _normalize_machine_assertion(parsed)
 
 
@@ -85,24 +93,39 @@ def _normalized_common_value(name: str, value: str) -> str:
     return value
 
 
+def _root_command_index(argv: list[str], start: int = 0) -> int:
+    """Locate the next command token after common options at a command level."""
+    index = start
+    while index < len(argv):
+        option, equals, _ = argv[index].partition("=")
+        if not option.startswith("--") or option == "--":
+            break
+        matches = [name for name in _COMMON_OPTIONS if name.startswith(option)]
+        if option not in _COMMON_OPTIONS and len(matches) != 1:
+            break
+        index += 1 if equals else 2
+    return index
+
+
+def _cli_arguments(argv: list[str]) -> list[str]:
+    """Exclude the submitted application's argv from qexp option handling."""
+    index = _root_command_index(argv)
+    if argv[index : index + 1] == ["submit"] and "--" in argv[index + 1 :]:
+        return argv[: argv.index("--", index + 1)]
+    return argv
+
+
 def _common_option_conflict(argv: list[str]) -> str | None:
     """Reject conflicting duplicate common options before argparse dispatches."""
     values: dict[str, str] = {}
+    argv = _cli_arguments(argv)
     stop = len(argv)
-    try:
-        submit_index = argv.index("submit")
-    except ValueError:
-        submit_index = -1
-    if submit_index >= 0:
-        try:
-            separator = argv.index("--", submit_index + 1)
-        except ValueError:
-            separator = len(argv)
-        stop = separator
     index = 0
     while index < stop:
         token = argv[index]
         name = token.split("=", 1)[0]
+        if name.startswith("--") and len(name) > 2 and "--expect-machine".startswith(name):
+            name = "--expect-machine"
         if name not in _COMMON_OPTIONS:
             index += 1
             continue
@@ -124,20 +147,9 @@ def _common_option_conflict(argv: list[str]) -> str | None:
     return None
 
 
-def _raw_option_present(argv: list[str], option: str) -> bool:
-    """Return whether an option occurs before a submit payload separator."""
-    stop = len(argv)
-    try:
-        submit_index = argv.index("submit")
-        stop = argv.index("--", submit_index + 1)
-    except ValueError:
-        pass
-    return any(token == option or token.startswith(f"{option}=") for token in argv[:stop])
-
-
-def _setup_machine_assertion_error(args: argparse.Namespace, raw: list[str]) -> str | None:
+def _setup_machine_assertion_error(args: argparse.Namespace) -> str | None:
     """Reject the ordinary assertion spelling on setup-only commands."""
-    if not _raw_option_present(raw, "--expect-machine"):
+    if not args._expect_machine_explicit:
         return None
     command_spec = getattr(args, "command_spec", None)
     handler = getattr(command_spec, "handler", None)
@@ -172,72 +184,43 @@ def _normalize_machine_assertion(args: argparse.Namespace) -> argparse.Namespace
     return args
 
 
-def _is_paginated_json_argv(argv: list[str]) -> bool:
-    """Return whether raw arguments select JSON task-list pagination."""
-    task_index = next(
-        (index for index in range(len(argv) - 1) if argv[index : index + 2] == ["task", "list"]),
-        None,
-    )
-    if task_index is None:
-        return False
-    has_pagination_flag = any(
-        item == "--page-size" or item.startswith("--page-size=") or item == "--cursor" or item.startswith("--cursor=")
-        for item in argv[task_index + 2 :]
-    )
-    if not has_pagination_flag:
-        return False
+def _wait_arguments(argv: list[str]) -> list[str] | None:
+    resource = _root_command_index(argv)
+    if argv[resource : resource + 1] != ["task"]:
+        return None
+    action = _root_command_index(argv, resource + 1)
+    if argv[action : action + 1] == ["wait"]:
+        return argv[action + 1 :]
+    return None
+
+
+def _submission_raw_prefix(argv: list[str]) -> list[str]:
+    """Return submit options before the literal command separator."""
+    index = _root_command_index(argv)
+    if argv[index : index + 1] != ["submit"]:
+        return []
+    return _cli_arguments(argv)[index + 1 :]
+
+
+def _is_json_argv(argv: list[str]) -> bool:
+    """Return whether a pre-payload option requests JSON diagnostics."""
+    argv = _cli_arguments(argv)
     return any(
         item == "--format=json" or (item == "--format" and index + 1 < len(argv) and argv[index + 1] == "json")
         for index, item in enumerate(argv)
     )
 
 
-def _submission_raw_prefix(argv: list[str]) -> list[str]:
-    """Return submit options before the literal command separator."""
-    try:
-        submit_index = argv.index("submit")
-    except ValueError:
-        return []
-    prefix = argv[submit_index + 1 :]
-    try:
-        return prefix[: prefix.index("--")]
-    except ValueError:
-        return prefix
-
-
-def _is_submission_json_argv(argv: list[str]) -> bool:
-    prefix = _submission_raw_prefix(argv)
-    return bool(prefix) and any(
-        item == "--format=json" or (item == "--format" and index + 1 < len(prefix) and prefix[index + 1] == "json")
-        for index, item in enumerate(prefix)
-    )
-
-
-def _is_json_argv(argv: list[str]) -> bool:
-    """Return whether a pre-payload option requests JSON diagnostics."""
-    stop = len(argv)
-    try:
-        submit_index = argv.index("submit")
-        stop = argv.index("--", submit_index + 1)
-    except (ValueError, IndexError):
-        pass
-    return any(
-        item == "--format=json" or (item == "--format" and index + 1 < stop and argv[index + 1] == "json")
-        for index, item in enumerate(argv[:stop])
-    )
-
-
 def _set_parse_modes(argv: list[str] | None) -> None:
     """Install or reset raw-argv parse diagnostics for one invocation."""
-    global _PAGINATION_JSON_PARSE_MODE, _SUBMISSION_JSON_PARSE_MODE, _JSON_PARSE_MODE
+    global _SUBMISSION_JSON_PARSE_MODE, _JSON_PARSE_MODE
     if argv is None:
-        _PAGINATION_JSON_PARSE_MODE = False
         _SUBMISSION_JSON_PARSE_MODE = False
         _JSON_PARSE_MODE = False
         return
-    _PAGINATION_JSON_PARSE_MODE = _is_paginated_json_argv(argv)
-    _SUBMISSION_JSON_PARSE_MODE = _is_submission_json_argv(argv)
+    index = _root_command_index(argv)
     _JSON_PARSE_MODE = _is_json_argv(argv)
+    _SUBMISSION_JSON_PARSE_MODE = argv[index : index + 1] == ["submit"] and _JSON_PARSE_MODE
 
 
 def _add_output_format(parser: argparse.ArgumentParser) -> None:
@@ -270,6 +253,7 @@ def _add_common_options(parser: argparse.ArgumentParser, *, include_format: bool
             "--expect-machine",
             "--machine",
             dest="expect_machine",
+            action=_StoreMachineAssertion,
             metavar="NAME",
             default=argparse.SUPPRESS,
             help="Assert the selected local machine identity (--machine is a compatibility alias).",
@@ -300,6 +284,14 @@ def _idle_job_gpu_ids(value: str) -> tuple[int, ...]:
         raise argparse.ArgumentTypeError("--gpu-ids must be a comma-separated list of signed integers.") from exc
 
 
+def _group_name(value: str) -> str:
+    try:
+        validate_group_name(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+    return value
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Build the canonical qexp resource/action command tree."""
     parser = _QexpArgumentParser(
@@ -315,9 +307,11 @@ def build_parser() -> argparse.ArgumentParser:
             "qexp use only saves local CLI fallback context."
         ),
     )
+    parser.set_defaults(_expect_machine_explicit=False)
     parser.add_argument("--project", help="Project directory or its .qexp control directory.")
     parser.add_argument(
         "--expect-machine",
+        action=_StoreMachineAssertion,
         metavar="NAME",
         help="Identity assertion for ordinary commands; checks the selected local machine.",
     )
@@ -751,7 +745,7 @@ def build_parser() -> argparse.ArgumentParser:
         output_kinds=OutputKind.GROUP_LIST,
     )
     show_group = group_sub.add_parser("show", help="Show one Group and its Worker Set.")
-    show_group.add_argument("name")
+    show_group.add_argument("name", type=_group_name)
     _add_output_format(show_group)
     bind_command(
         show_group,
@@ -792,8 +786,8 @@ def build_parser() -> argparse.ArgumentParser:
         help_text = (
             "Return a Group to the working set." if name == "wake" else f"{name.capitalize()} Group control state."
         )
-        action = group_sub.add_parser(name, help=help_text)
-        action.add_argument("name")
+        action = group_sub.add_parser(name, help=help_text, allow_abbrev=name != "cancel")
+        action.add_argument("name", type=_group_name if name == "wake" else str)
         if name == "cancel":
             action.add_argument("--all", action="store_true", help="Include launch-authorized and running Tasks.")
         _add_output_format(action)
@@ -813,7 +807,7 @@ def build_parser() -> argparse.ArgumentParser:
     worker = group_sub.add_parser("worker", help="Manage Group Worker Set membership and lifecycle.")
     worker_sub = worker.add_subparsers(dest="worker_action", required=True)
     for name in ("list", "add", "set", "drain", "resume", "remove"):
-        action = worker_sub.add_parser(name, help=f"{name.capitalize()} a Group worker.")
+        action = worker_sub.add_parser(name, help=f"{name.capitalize()} a Group worker.", allow_abbrev=name != "remove")
         action.add_argument("group_name")
         if name != "list":
             action.add_argument("worker_machine")

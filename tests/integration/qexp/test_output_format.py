@@ -675,6 +675,9 @@ def test_group_and_machine_human_output_do_not_query_task_history_for_presentati
         (["task", "list", "--page-size", "10", "--format=json", "--unknown"], "invalid_argument", False),
         (["status", "--format=json", "--unknown"], "invalid_argument", False),
         (["submit", "--format=json", "--unknown"], "invalid_input", True),
+        (["--format=json", "submit", "--unknown"], "invalid_input", True),
+        (["group", "show", "submit", "--format=json", "--unknown"], "invalid_argument", False),
+        (["--project", "submit", "group", "show", "g", "--format=json", "--unknown"], "invalid_argument", False),
     ],
 )
 def test_raw_argv_parse_failures_retain_their_structured_routing(

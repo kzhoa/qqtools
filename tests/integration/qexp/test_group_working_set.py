@@ -1,5 +1,6 @@
 """Published history, daily visibility and bounded due-work contracts."""
 
+import json
 import shlex
 import time
 
@@ -10,6 +11,7 @@ from qqtools.plugins.qexp.cli.entrypoint import main
 from qqtools.plugins.qexp.commands.group import create_group, group_control, show_group, wake_group
 from qqtools.plugins.qexp.runtime import group_working_set as index
 from qqtools.plugins.qexp.runtime.group_working_set_expiry import expire_due_groups
+from qqtools.plugins.qexp.runtime.paths import group_path
 from tests.integration.qexp.test_output_format import _base_args
 
 pytestmark = [pytest.mark.integration, pytest.mark.qexp_fast_io]
@@ -87,13 +89,13 @@ def test_stale_expiry_and_refresh_in_both_orders(cfg, retire_first):
         assert tuple(index.group_candidates(root, None, all_groups=all_groups, limit=2).keys) == ("g",)
 
 
-def test_empty_filtered_slice_prints_executable_continuation(cfg, capsys):
-    import json
-
+@pytest.mark.parametrize("assertion", ["--expect-machine", "--expect-mach"])
+def test_empty_filtered_slice_prints_executable_continuation(cfg, capsys, assertion):
     for i in range(51):
         create_group(cfg, f"g-{i:02}")
     group_control(cfg, "g-50", "pause")
     args = _base_args(cfg)
+    args[args.index("--machine")] = assertion
     request = ["group", "list", "--all", "--attention", "--page-size", "1"]
     assert main([*args, *request, "--format=json"]) == 0
     first = json.loads(capsys.readouterr().out)
@@ -107,16 +109,79 @@ def test_empty_filtered_slice_prints_executable_continuation(cfg, capsys):
     assert "match" in human.lower()
     command = shlex.split("qexp " + human.split("qexp ", 1)[1].strip())
     assert command[1:3] == ["--project", str(cfg.shared_root)]
-    assert main([*args, *command[3:], "--format=json"]) == 0
+    assert command[command.index("--expect-machine") + 1] == cfg.machine_name
+    for option in ("--runtime-root", "--machine-runtime-root"):
+        assert command[command.index(option) + 1] == args[args.index(option) + 1]
+    assert main([*command[1:], "--format=json"]) == 0
     last = json.loads(capsys.readouterr().out)
     assert [item["group"]["name"] for item in last["items"]] == ["g-50"]
     assert last["next_cursor"] is None and last["stop_reason"] == "exhausted"
 
 
+@pytest.mark.parametrize("prefix", [[], ["group"], ["group", "list"]])
+def test_abbreviated_identity_assertion_requires_binding(cfg, tmp_path, capsys, prefix):
+    command = ["group", "list"]
+    args = [*prefix, "--expect-mach=g1", *command[len(prefix) :]]
+    assert (
+        main(
+            [
+                "--project",
+                str(cfg.shared_root),
+                "--machine-runtime-root",
+                str(tmp_path / "unbound"),
+                *args,
+                "--format=json",
+            ]
+        )
+        == 2
+    )
+    error = json.loads(capsys.readouterr().out)["error"]
+    assert error["code"] == "invalid_argument"
+    assert "without a local binding" in error["message"]
+
+
+@pytest.mark.parametrize("action", ["show", "wake"])
+def test_invalid_group_name_returns_usage_error(action, capsys):
+    assert main(["group", action, "bad name", "--format=json"]) == 2
+    error = json.loads(capsys.readouterr().out)["error"]
+    assert error["code"] == "invalid_argument"
+    assert "identifier" in error["message"]
+
+
+@pytest.mark.parametrize("action", ["show", "wake"])
+@pytest.mark.parametrize("content", [b"{", b"[]", b"\xff"])
+def test_invalid_group_record_returns_storage_error(cfg, capsys, action, content):
+    create_group(cfg, "broken")
+    path = group_path(cfg.shared_root, "broken")
+    path.write_bytes(content)
+    assert main([*_base_args(cfg), "group", action, "broken", "--format=json"]) == 1
+    error = json.loads(capsys.readouterr().out)["error"]
+    assert error["code"] == "operational_failure"
+    assert "broken" in error["message"]
+    assert path.read_bytes() == content
+
+
+@pytest.mark.parametrize("action", ["show", "wake"])
+def test_unknown_group_has_public_cli_error(cfg, capsys, action):
+    args = [*_base_args(cfg), "group", action, "missing"]
+    assert main([*args, "--format=json"]) == 1
+    assert json.loads(capsys.readouterr().out)["error"] == {
+        "code": "group_not_found",
+        "message": "Group 'missing' was not found.",
+    }
+    assert main(args) == 1
+    assert "Group 'missing' was not found." in capsys.readouterr().err
+
+
+def test_unreadable_group_record_is_an_operational_failure(cfg, capsys):
+    args = _base_args(cfg)
+    group_path(cfg.shared_root, "broken").mkdir()
+    assert main([*args, "group", "show", "broken", "--format=json"]) == 1
+    assert json.loads(capsys.readouterr().out)["error"]["code"] == "operational_failure"
+
+
 @pytest.mark.parametrize("view", [[], ["--all"]])
 def test_interrupted_index_returns_operational_cli_error(cfg, capsys, view):
-    import json
-
     (cfg.shared_root / "indexes/group-working-set/redo.json").write_text("{}")
     assert main([*_base_args(cfg), "group", "list", *view, "--format=json"]) != 0
     captured = capsys.readouterr()

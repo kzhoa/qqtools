@@ -26,6 +26,7 @@ from ..config_types import RootConfig
 from ..doctor import repair_metadata, resolve_verify_exit_code, verify_integrity
 from ..progress_policy import validate_interval_seconds
 from ..runtime import group_observation_policy
+from ..runtime.group_namespace import GroupNotPublished, GroupPublicationUnavailable, GroupRecordNotFound
 from ..runtime.observation.api import ObservationError
 from .errors import CliOperationalError, CliUsageError
 from .outcome import CommandOutcome
@@ -112,7 +113,17 @@ def _group_page_output(
     presentation: dict[str, object] = {}
     next_cursor = page.get("next_cursor")
     if args.format == "human" and next_cursor is not None:
-        command = ["qexp", "--project", str(cfg.shared_root), "group", "list"]
+        command = ["qexp", "--project", str(cfg.shared_root)]
+        if args.expect_machine is not None:
+            option = "--expect-machine" if args._expect_machine_explicit else "--machine"
+            command.extend((option, args.expect_machine))
+        for option, path in (
+            ("--runtime-root", args.runtime_root),
+            ("--machine-runtime-root", args.machine_runtime_root),
+        ):
+            if path is not None:
+                command.extend((option, str(Path(path).expanduser().resolve())))
+        command.extend(("group", "list"))
         if args.all_groups:
             command.append("--all")
         if args.dispatch is not None:
@@ -546,12 +557,18 @@ def dispatch_project(
             except (OSError, RuntimeError, ValueError) as exc:
                 raise ObservationError("index_unavailable", str(exc)) from exc
             return CommandOutcome(0, _group_page_output(cfg, args, result, page_size))
-        elif handler == "group_show":
-            result = group_commands.show_group(cfg, args.name)
-            kind = OutputKind.GROUP_SHOW
-        elif handler == "group_wake":
-            result = {"action": "wake", "outcome": "completed", **group_commands.wake_group(cfg, args.name)}
-            kind = OutputKind.GROUP_STATE_CHANGE
+        elif handler in {"group_show", "group_wake"}:
+            try:
+                if handler == "group_show":
+                    result = group_commands.show_group(cfg, args.name)
+                    kind = OutputKind.GROUP_SHOW
+                else:
+                    result = {"action": "wake", "outcome": "completed", **group_commands.wake_group(cfg, args.name)}
+                    kind = OutputKind.GROUP_STATE_CHANGE
+            except GroupRecordNotFound as exc:
+                raise CliOperationalError(f"Group {args.name!r} was not found.", code="group_not_found") from exc
+            except (OSError, GroupNotPublished, GroupPublicationUnavailable) as exc:
+                raise CliOperationalError(str(exc)) from exc
         elif handler == "group_retry":
             ensure_local_agent_active(cfg, reason="group-retry", **get_lifecycle_kwargs())
             result = group_commands.group_retry_failed(cfg, args.name)
