@@ -1536,7 +1536,12 @@ class ProjectIOExecutor:
                 self.start(request_id)
             return False
         if result.status == "retryable_error":
-            return False
+            # A pre-write failure can be retried only under its original registry
+            # revision. Release the obsolete slot so the new binding can validate
+            # and publish from the retained process registration.
+            registry_revision, _ = self.runtime.load_registry_snapshot()
+            if registry_revision <= stored.registry_revision:
+                return False
         return self._resolve_stale_request(request_id, current_request)
 
     def reset_ambiguous_authority_termination_commit_for_retry(

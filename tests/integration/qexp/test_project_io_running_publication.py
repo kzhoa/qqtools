@@ -127,6 +127,37 @@ def test_controller_publishes_running_registration_without_local_effects(tmp_pat
         executor.shutdown()
 
 
+def test_registry_change_releases_fenced_running_publication_before_revalidation(tmp_path: Path) -> None:
+    runtime, _cfg, bindings, revision, parameters, path, registration = _case(tmp_path)
+    binding = bindings[0]
+    executor = ProjectIOExecutor(runtime)
+    executor.begin_epoch()
+    controller = ProjectIOController(runtime, executor)
+    try:
+        _until(lambda: controller.advance_binding_validation(bindings, revision), bool)
+        request = executor.prepare_authority_running_publish(binding, revision, **parameters)
+        runtime.set_enabled(binding.project_id, False)
+        new_revision, draining = runtime.load_registry()
+        assert new_revision > revision
+        executor.start(request.request_id)
+        assert _result(executor, request).status == "retryable_error"
+        assert AttemptRecord.from_dict(read_json(path)).phase == "starting"
+        original_registration = registration.read_bytes()
+
+        _until(lambda: controller.advance_binding_validation(draining, new_revision), bool)
+        assert request not in executor.unresolved_requests()
+        result = _until(
+            lambda: controller.advance_authority_running_publications(
+                draining, new_revision, {binding.project_id: parameters}
+            ),
+            lambda completions: binding.project_id in completions,
+        )
+        assert result[binding.project_id]["transitioned_to_running"]
+        assert registration.read_bytes() == original_registration
+    finally:
+        executor.shutdown()
+
+
 def test_running_publication_conflict_does_not_grant_current_authority(tmp_path: Path) -> None:
     runtime, cfg, bindings, revision, parameters, path, _registration = _case(tmp_path)
     stored = AttemptRecord.from_dict(read_json(path))
