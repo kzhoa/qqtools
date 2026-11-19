@@ -307,12 +307,123 @@ def test_project_status_groups_state_actions_and_scheduler_diagnostics() -> None
 
     output = _human(OutputKind.STATUS, payload)
 
-    assert "Project\n  Outcome: complete\n  Path: /work/project" in output
-    assert "Current state\n  Participation: registered" in output
+    assert output.startswith("Project: /work/project")
+    assert "Local enrollment\n  Status: registered" in output
     assert "Task observation reason: projection missing" in output
-    assert output.count("  Run: qexp") == 2
+    assert "Inspect Task observation: qexp task list --project /work/project" in output
+    assert "Inspect scheduling diagnostics: qexp agent diagnostics active" in output
     assert "Scheduling diagnostics\n  State: available\n  Coverage: incomplete" in output
     assert "Reason: probe data unavailable" in output
+
+
+def test_project_status_clean_active_observation_suppresses_actions() -> None:
+    payload = {
+        "status": "complete",
+        "project": {"path": "/work/project", "project_id": "project-1", "selection_source": "explicit"},
+        "local_participation": {"state": "registered"},
+        "local_agent": {"state": "active", "configured_mode": "daemon", "observed_mode": "daemon"},
+        "task_observation": {"state": "active", "reason": None},
+        "next_actions": ["qexp task list --project /work/project"],
+        "warnings": [],
+        "scheduler_diagnostics": {
+            "status": "available",
+            "coverage": "complete",
+            "observed_at": "2026-10-05T00:00:00Z",
+            "active_count": 0,
+            "active_findings": [],
+        },
+    }
+
+    output = _human(OutputKind.STATUS, payload)
+
+    assert output.startswith("Project: /work/project")
+    assert "Local enrollment\n  Status: registered" in output
+    assert "Task observation: active" in output
+    assert "Next actions" not in output
+    assert "running Tasks" not in output
+
+
+def test_project_status_dirty_active_observation_keeps_task_action() -> None:
+    payload = {
+        "status": "partial",
+        "project": {"path": "/work/project", "project_id": "project-1", "selection_source": "explicit"},
+        "local_participation": {"state": "registered"},
+        "local_agent": {"state": "active", "configured_mode": "daemon", "observed_mode": "daemon"},
+        "task_observation": {"state": "active", "reason": "projection_dirty"},
+        "next_actions": ["qexp task list --project /work/project"],
+        "warnings": [],
+        "scheduler_diagnostics": {"status": "available", "coverage": "complete", "active_count": 0},
+    }
+
+    output = _human(OutputKind.STATUS, payload)
+
+    assert "Inspect Task observation: qexp task list --project /work/project" in output
+
+
+def test_project_status_unregistered_action_is_qualified_and_path_is_preserved() -> None:
+    payload = {
+        "status": "partial",
+        "project": {
+            "path": "/work/project with spaces",
+            "project_id": "project-1",
+            "selection_source": "environment",
+        },
+        "local_participation": {"state": "unregistered", "reason": "no_local_binding_or_inventory"},
+        "local_agent": {"state": "unavailable"},
+        "task_observation": {"state": "active"},
+        "next_actions": ["qexp project register /work/project with spaces"],
+        "warnings": ["local agent status unavailable (record_missing)."],
+    }
+
+    output = _human(OutputKind.STATUS, payload)
+
+    assert "Project: /work/project with spaces" in output
+    assert "Selection source: environment" in output
+    assert "Local enrollment\n  Status: not registered with the Project" in output
+    assert "To run Tasks on this machine" in output
+    assert "qexp project register /work/project with spaces" in output
+
+
+def test_project_status_renders_bounded_finding_scope_counts_and_command() -> None:
+    payload = {
+        "status": "partial",
+        "project": {"path": "/work/project", "project_id": "project-1", "selection_source": "explicit"},
+        "local_participation": {"state": "registered"},
+        "local_agent": {"state": "active", "configured_mode": "daemon", "observed_mode": "daemon"},
+        "task_observation": {"state": "active"},
+        "next_actions": [],
+        "warnings": [],
+        "scheduler_diagnostics": {
+            "status": "available",
+            "coverage": "complete",
+            "observed_at": "2026-10-05T00:00:00Z",
+            "active_count": 3,
+            "active_findings": [
+                {
+                    "identity": {
+                        "reason_code": "termination_process_identity_present",
+                        "project_id": "project-1",
+                        "attempt_id": "attempt-7",
+                    },
+                    "severity": "fault",
+                    "last_observed_at": "2026-10-05T00:00:00Z",
+                }
+            ],
+            "truncated": True,
+        },
+    }
+
+    output = _human(OutputKind.STATUS, payload)
+
+    assert "Active findings: 3" in output
+    assert "Displayed findings: 1" in output
+    assert "termination process identity present" in output
+    assert "project-1" in output
+    assert "attempt-7" in output
+    assert "2026-10-05T00:00:00Z" in output
+    assert "qexp agent diagnostics active" in output
+    assert "Next actions" in output
+    assert json.loads(render(CliOutput(OutputKind.STATUS, payload), "json")) == payload
 
 
 def test_agent_status_counts_write_eligible_projects_without_false_blockers() -> None:

@@ -1770,6 +1770,16 @@ and omits a duplicate Selection source row. JSON status retains the structured s
 receives the ordinary Project notice on stderr. If status fails after selection but before rendering,
 the selected Project line is emitted on stderr before the error.
 
+The default human `status` presentation starts with the selected Project path and local enrollment,
+then presents local agent and Task-observation evidence. An active Task observation is an index
+condition and does not assert a running-Task count. A registered Project with a clean active
+observation, complete diagnostic coverage, no warnings, and no active findings omits the action
+section. Material enrollment, observation, agent, mode, warning, diagnostic-coverage, and finding
+conditions retain bounded next actions, with the highest-priority action first. Scheduler findings
+show only the bounded samples returned by the Project summary, their stable reason, available
+Project or Attempt scope, observation time, aggregate and displayed counts, and a finite diagnostic
+command mapping. These presentation rules do not change the JSON status contract or read budget.
+
 Initiating Group cancellation, worker removal, and Task cleanup results include an opaque versioned
 `operation_reference` plus the internal operation ID. The reference binds Project identity,
 operation kind, exact storage key, and operation ID without granting authority. `admin operation
