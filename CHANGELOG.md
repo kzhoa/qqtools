@@ -23,6 +23,7 @@
   safeguards and error reporting.
 - feat: simplify human-readable qexp status output and show guidance based on the
   observed evidence and runtime.
+- fix: preserve the recovery journal when a qexp Group control record has a malformed payload.
 - refactor: separate qexp runtime responsibilities while preserving recovery behavior.
 
 ## v1.3.29
