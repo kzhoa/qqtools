@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v1.3.30
+
 - breaking: remove the deprecated `v1`, `v2`, and `v3` strategies and the
   `sample_order` argument from both balanced samplers. Use an LPT tier for
   sampling. Dataset ordering continues to support all three V strategies.
@@ -10,6 +12,18 @@
   in-flight recovery and historical readers through the final 1.3.x migration.
 - fix: honor the installed Group-service fence when activation metadata is lost
   and discard historical discovery candidates after locator activation.
+- breaking: qexp Groups accept later submissions. Remove uses of `group seal`,
+  `group reopen`, and `admission_state`. The default Group listing shows the
+  working set. For a full inventory, use `group list --all` and follow every cursor.
+- upgrade: coordinate the 1.3.30 switch across qexp clients, agents, and workers.
+  Pause Group mutations during the switch and keep launched training and its runner
+  alive. Finish Project conversion on 1.3.30 before installing 1.4.0.
+  See the [qexp upgrade guide](docs/spec/qexp_upgrade_guide.md).
+- fix: preserve pagination context in qexp Group commands and improve their
+  safeguards and error reporting.
+- feat: simplify human-readable qexp status output and show guidance based on the
+  observed evidence and runtime.
+- refactor: separate qexp runtime responsibilities while preserving recovery behavior.
 
 ## v1.3.29
 
