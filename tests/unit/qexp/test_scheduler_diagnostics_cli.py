@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import shlex
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 
@@ -36,12 +38,13 @@ def _finding_identity(project_id: str) -> dict[str, object]:
 
 
 def _publish_finding(runtime: MachineRuntime, project_id: str) -> None:
-    SchedulerDiagnosticStore(runtime).observe_finding(
-        identity=_finding_identity(project_id),
-        severity="fault",
-        source_revision={"registry_revision": 1},
-        observed_at="2026-09-28T00:00:00Z",
-    )
+    with patch("qqtools.plugins.qexp.agent.scheduler_diagnostics.time", SimpleNamespace(monotonic_ns=lambda: 0)):
+        SchedulerDiagnosticStore(runtime).observe_finding(
+            identity=_finding_identity(project_id),
+            severity="fault",
+            source_revision={"registry_revision": 1},
+            observed_at="2026-09-28T00:00:00Z",
+        )
 
 
 def test_parser_exposes_finite_machine_local_diagnostic_commands() -> None:

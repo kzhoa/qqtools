@@ -204,7 +204,7 @@ def test_new_subscriber_starts_at_tail_while_certified_backlog_is_reclaimed(tmp_
         close(owner)
 
 
-@pytest.mark.parametrize("damage", ["malformed", "no_discovery", "wrong_authority"])
+@pytest.mark.parametrize("damage", ["malformed", "list_payload", "no_discovery", "wrong_authority"])
 def test_uncertain_subscriber_keeps_journal(tmp_path, advancing_clock, damage):
     cfg = isolated_group(tmp_path)
     journal, _ = journal_with_events(cfg)
@@ -212,6 +212,8 @@ def test_uncertain_subscriber_keeps_journal(tmp_path, advancing_clock, damage):
     value = subscriber(cfg, position, cursor=3)
     if damage == "malformed":
         value = {"group_control": None}
+    elif damage == "list_payload":
+        value = {"group_control": []}
     elif damage == "no_discovery":
         value["group_control"].pop("discovery")
     else:
