@@ -105,6 +105,7 @@ from .helpers import (
     _read_pid,
 )
 from .idle_job import IdleJobSupervisor, idle_job_status
+from .idle_job_diagnostics import display_demand_detail
 from .idle_job_integration import advance_machine_idle_job
 from .inventory import exact_binding_for_entry, load_inventory, reconcile_live_bindings_locked
 from .project_admin import _stop_verified_legacy_agent, migrate_project
@@ -289,6 +290,10 @@ def get_machine_agent_status(
         idle_job["state"] = "stopping" if idle_job.get("state") == "stopping" else "blocked"
         idle_job["reason"] = "agent_unavailable"
         idle_job["supervision_active"] = False
+    idle_job["demand_detail"] = display_demand_detail(
+        idle_job.get("demand_detail"),
+        agent_instance_id=identity[1] if running and identity is not None else None,
+    )
     result = {
         "machine_runtime_root": str(machine_runtime.root),
         "runtime_id": machine_runtime.instance_id,

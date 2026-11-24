@@ -1,7 +1,7 @@
 ---
 doc_type: spec
 status: active
-updated_at: 2026-11-19
+updated_at: 2026-11-24
 archived_at:
 ---
 
@@ -1786,6 +1786,27 @@ the selected registry and inventory paths with `ls -ld`. An unavailable, truncat
 scheduler summary offers a bounded Project-filtered diagnostics read. Sampled findings
 also filter by stable reason. These follow-ups require no additional reads during status.
 
+Project JSON includes `upgrade` with `state`, `migration`, `phase`,
+`admission_blocked`, and `reason`. The overview reads the selected root's canonical
+upgrade journal once within the same total budget. It validates journal version,
+Project identity, shared root, and all migration entries. The first recorded
+`repair_required` migration in journal order supplies all migration fields, even
+if an earlier migration is waiting. Additional repairs add an
+`additional_repairs` count and a notice in the same warning. A recorded boolean
+admission flag describes only that migration's effect on new training; absent or
+invalid flags produce null and an unknown-effect statement. A stopped agent or
+old journal timestamp never clears a recorded repair.
+
+A valid journal without repair reports `no_repair_recorded` and null
+migration-specific fields, without an upgrade warning. An absent optional journal
+reports `unknown` / `journal_missing` quietly. Unreadable, oversized, unsupported,
+malformed, mismatched, or over-budget evidence reports `unknown`, a short reason,
+and the ordinary partial-result warning. A matching local registration permits
+one runtime-scoped, shell-quoted `admin upgrade status --project ID` action at the
+front of `next_actions`; human output renders that same action. Other Projects
+retain enrollment guidance. This diagnostic does not establish overall Project
+admission readiness and never advances or repairs migrations.
+
 Initiating Group cancellation, worker removal, and Task cleanup results include an opaque versioned
 `operation_reference` plus the internal operation ID. The reference binds Project identity,
 operation kind, exact storage key, and operation ID without granting authority. `admin operation
@@ -2785,6 +2806,23 @@ and a separate log path. Readiness means supervision is initialized when enabled
 it does not wait for the idle delay or guarantee a successful command launch.
 Unexpected exits back off exponentially up to 60 seconds, normal exits also
 wait before relaunch, and every retry rechecks training demand.
+
+For `unknown_demand`, optional `idle_job.demand_detail` explains the first
+returning unknown check without changing its decision or short-circuit order.
+Upgrade discovery, upgrade blockers, and unready scheduling authority remain
+distinct. Blocker sets supply a total count and at most three sampled Projects;
+unknown attribution is a null count and empty sample. Repair wording requires
+matching cached binding and migration evidence. More specific supervisor outcomes
+supersede this diagnostic. `idle_delay` explicitly means confirmed idle training
+while the configured start delay runs.
+
+A demand observation is live only for the verified current agent instance and an
+age of zero through 60 seconds. Retained old, future-dated, stopped-agent, or
+unverified observations display as last observed without a duration. The optional
+`since` interval is reset by changed blockers, intervening known demand, and
+restart, and is null when scope continuity cannot be established cheaply.
+Malformed optional evidence leaves base status readable. Status and heartbeat
+reads never refresh demand observations or write diagnostic state.
 
 See [Idle Job operation](../qexp-idle-job.md) for configuration examples,
 interpreter/environment rules, shutdown, and troubleshooting.

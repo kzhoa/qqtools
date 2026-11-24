@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- feat: show recorded Project upgrade repairs in qexp status and explain the
+  observed checks that keep a machine Idle Job waiting, with bounded diagnostics
+  and agent-instance freshness.
+
 - fix: resume qexp dependency projection migration within high-degree Tasks during
   backfill and both audits, preserving the per-slice metadata budget.
 - perf: amortize qexp daemon upgrade worker startup across bounded windows of

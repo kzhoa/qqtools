@@ -160,13 +160,88 @@ def _render_agent_operation(result: Mapping[str, Any], _presentation: Mapping[st
     return rendered
 
 
+_IDLE_JOB_WAIT_MESSAGES = {
+    "dispatch_cycle_incomplete": "Waiting for the dispatch cycle to complete.",
+    "enablement_unready": "Waiting for Project enablement to converge.",
+    "bindings_unknown": "Waiting for valid Project registrations.",
+    "launch_handoff_pending": "Waiting for pending training launches to finish handing off.",
+    "upgrade_evidence_unknown": "Waiting for project upgrade information before checking for training.",
+    "recovery_enrollment_pending": "Waiting for Project recovery enrollment to complete.",
+    "maintenance_retry_pending": "Waiting for pending Project maintenance to retry.",
+    "partition_unknown": "Waiting for the unregistered Project partition scan.",
+    "recovery_unknown": "Waiting for Project recovery evidence.",
+    "authority_unready": "Waiting for project scheduling to become ready before checking for training.",
+    "demand_census_unknown": "Waiting for the training-demand census.",
+    "executor_unready": "Waiting for the Project I/O executor to become ready.",
+    "gpu_policy_unknown": "Waiting for current GPU policy and visibility information.",
+    "cpu_policy_unknown": "Waiting for current CPU policy information.",
+    "observation_failed": "Waiting after a training-demand observation failed.",
+}
+
+
+def _render_idle_job_status(status: Mapping[str, Any]) -> str:
+    fields = {key: value for key, value in status.items() if key != "demand_detail"}
+    rendered = _status_section("Idle Job", _status_mapping_fields(fields))
+    if status.get("reason") == "idle_delay":
+        return f"{rendered}\n  Training is idle. Waiting for the configured start delay."
+    detail = status.get("demand_detail")
+    if not isinstance(detail, Mapping):
+        return rendered
+    raw_projects = detail.get("projects")
+    projects = (
+        [
+            project
+            for project in raw_projects
+            if isinstance(project, Mapping) and isinstance(project.get("project_id"), str)
+        ]
+        if isinstance(raw_projects, list)
+        else []
+    )
+    names = [project["project_id"] for project in projects]
+    live = detail.get("live") is True
+    code = detail.get("code")
+    count = detail.get("project_count")
+    lines = []
+    if code == "upgrade_blocks_idle":
+        repairs = [
+            project["project_id"]
+            for project in projects
+            if project.get("state") == "repair_required" and project.get("migration") and project.get("phase")
+        ]
+        if count == 1 and repairs:
+            message = f"qexp cannot confirm training is idle while the {repairs[0]} upgrade needs repair."
+        else:
+            message = "qexp cannot confirm training is idle while Project upgrades are blocking the check."
+        if live:
+            action = "Stopping" if status.get("state") == "stopping" else "Waiting"
+            message = f"{action}. {message}"
+        if repairs and count != 1:
+            lines.append(f"Upgrades needing repair: {', '.join(repairs)}")
+    else:
+        message = _IDLE_JOB_WAIT_MESSAGES.get(code, "Waiting to confirm whether training is idle.")
+    if names and (code != "upgrade_blocks_idle" or count != 1 or not repairs):
+        if type(count) is int and count > len(names):
+            lines.append(f"Blocking Projects ({len(names)} of {count} shown): {', '.join(names)}")
+        else:
+            lines.append(f"Blocking Projects: {', '.join(names)}")
+    if not live:
+        message = f"Last observed: {message}"
+    elapsed = detail.get("elapsed_seconds")
+    if live and type(elapsed) in {int, float}:
+        lines.append(f"Elapsed wait: {elapsed:.1f} seconds")
+    for project in projects:
+        if command := project.get("detail_command"):
+            lines.append(f"Inspect: {command}")
+    return "\n".join((rendered, *(f"  {line}" for line in (message, *lines))))
+
+
 def _render_agent_status(result: Mapping[str, Any], _presentation: Mapping[str, object]) -> str:
     rendered = _render_agent_operation(result, _presentation)
     if result.get("stop_reason") is not None:
         rendered = f"{rendered}\n\nStop reason: {result.get('stop_reason')}"
     idle_job = result.get("idle_job")
     if isinstance(idle_job, Mapping):
-        idle_job_details = _status_section("Idle Job", _status_mapping_fields(idle_job))
+        idle_job_details = _render_idle_job_status(idle_job)
         if idle_job_details:
             rendered = f"{rendered}\n\n{idle_job_details}" if rendered else idle_job_details
     project_io = result.get("project_io_isolation")

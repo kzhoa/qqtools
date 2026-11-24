@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shlex
 import stat
 from pathlib import Path
@@ -18,6 +19,7 @@ from ..layout import machine_path, project_id
 from ..runtime.observation.projection import _validate_state, observation_path
 from ..runtime.paths import shared_paths
 from ..runtime.records import validate_identifier
+from ..upgrade_diagnostics import summarize_upgrade_journal
 
 STATUS_SCHEMA_VERSION = 1
 MAX_READ_ATTEMPTS = 32
@@ -70,12 +72,15 @@ class _ReadBudget:
             raise _BoundedReadFailure("total_read_budget_exhausted", path)
         try:
             with path.open("rb") as handle:
-                encoded = handle.read(self.max_record_bytes + 1)
+                remaining = self.max_total_bytes - self.bytes_read
+                encoded = handle.read(min(self.max_record_bytes + 1, remaining))
+                self.bytes_read += len(encoded)
+                if len(encoded) == remaining and os.fstat(handle.fileno()).st_size > remaining:
+                    raise _BoundedReadFailure("total_read_budget_exhausted", path)
         except FileNotFoundError:
             return None
         except OSError as exc:
             raise _BoundedReadFailure(f"read_failed:{type(exc).__name__}", path) from exc
-        self.bytes_read += len(encoded)
         if len(encoded) > self.max_record_bytes:
             raise _BoundedReadFailure("record_oversized", path)
         try:
@@ -223,6 +228,43 @@ def _task_observation(
     return {"state": validated["state"], "reason": reason}
 
 
+def _project_upgrade(
+    cfg: RootConfig, selected_project_id: str, reader: _ReadBudget, warnings: list[str]
+) -> dict[str, object]:
+    path = shared_paths(cfg.shared_root)["upgrade_journal"]
+    reason = "journal_missing"
+    try:
+        value = reader.read_json(path)
+    except _BoundedReadFailure as exc:
+        reason = exc.reason
+        value = None
+    except (ValueError, RecursionError):
+        reason = "malformed_json"
+        value = None
+    if value is None:
+        if reason != "journal_missing":
+            warnings.append(f"Upgrade journal unavailable ({reason}).")
+        return {"state": "unknown", "migration": None, "phase": None, "admission_blocked": None, "reason": reason}
+
+    upgrade = summarize_upgrade_journal(value, project_id=selected_project_id, shared_root=cfg.shared_root)
+    if upgrade["state"] == "unknown":
+        warnings.append(f"Upgrade journal unavailable ({upgrade['reason']}).")
+    elif upgrade["state"] == "repair_required":
+        warning = (
+            f"Project {selected_project_id} needs upgrade repair during {upgrade['migration']} {upgrade['phase']}."
+        )
+        if upgrade["admission_blocked"] is True:
+            warning += " This migration blocks new training."
+        elif upgrade["admission_blocked"] is False:
+            warning += " This migration does not block new training."
+        else:
+            warning += " Effect on new training is unknown."
+        if "additional_repairs" in upgrade:
+            warning += " Additional migrations need repair."
+        warnings.append(warning)
+    return upgrade
+
+
 def _follow_up_actions(
     project: Path,
     project_id: str,
@@ -232,6 +274,8 @@ def _follow_up_actions(
     observation: dict[str, object],
     diagnostics: dict[str, Any],
     warnings: list[str],
+    *,
+    upgrade: dict[str, object] | None = None,
 ) -> list[str]:
     prefix = ["qexp", "--machine-runtime-root", str(runtime.root)]
     actions: list[str] = []
@@ -241,7 +285,9 @@ def _follow_up_actions(
         if command not in actions:
             actions.append(command)
 
-    if participation in {"unregistered", "inventory_only"}:
+    if participation == "registered" and upgrade is not None and upgrade.get("state") == "repair_required":
+        suggest("admin", "upgrade", "status", "--project", project_id)
+    elif participation in {"unregistered", "inventory_only"}:
         suggest("project", "register", str(project))
     elif participation == "unavailable":
         # Project list can initialize a missing inventory. Inspect the files directly.
@@ -363,6 +409,7 @@ def project_status(
     if local_agent["state"] == "unavailable" and not any("local agent status" in item for item in warnings):
         warnings.append("local agent status unavailable (record_malformed).")
 
+    upgrade = _project_upgrade(cfg, selected_project_id, reader, warnings)
     scheduler_diagnostics = SchedulerDiagnosticStore(machine_runtime).summary_view(
         project_id=selected_project_id,
         limit=8,
@@ -381,6 +428,7 @@ def project_status(
         "local_agent": local_agent,
         "configured_agent_mode": configured_agent_mode,
         "task_observation": task_observation,
+        "upgrade": upgrade,
         "scheduler_diagnostics": scheduler_diagnostics,
         "totals": {"tasks": None, "machines": None, "reason": "not_available"},
         "next_actions": _follow_up_actions(
@@ -392,6 +440,7 @@ def project_status(
             task_observation,
             scheduler_diagnostics,
             warnings,
+            upgrade=upgrade,
         ),
         "budget": reader.as_dict(),
         "warnings": warnings,

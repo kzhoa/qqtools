@@ -36,7 +36,7 @@ from ..runtime.resources.idle_job import (
     write_idle_job_ownership,
 )
 from ..runtime.resources.reservations import reservation_snapshot
-from ..runtime.store import atomic_replace, iter_json, read_json, read_json_limited
+from ..runtime.store import atomic_replace, iter_json, json_encoded_size, read_json, read_json_limited
 from .config import load_agent_config
 from .idle_job_config import (
     IdleJobConfig,
@@ -45,6 +45,7 @@ from .idle_job_config import (
     resolve_idle_job_gpus,
     validate_idle_job_mode,
 )
+from .idle_job_diagnostics import DEMAND_DETAIL_MEMBER, MAX_STATUS_BYTES, observe_demand_detail, validate_demand_detail
 from .idle_job_process import (
     current_boot_id,
     idle_job_processes_exited,
@@ -314,14 +315,20 @@ def _state_path(root: Path) -> Path:
     return root / "idle-job" / "state.json"
 
 
-def _read_status_payload(root: Path) -> dict[str, Any]:
+def _read_status_payload(root: Path, *, include_demand_detail: bool = False) -> dict[str, Any]:
     path = _status_path(root)
     metadata = path.lstat()
     if not stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
         raise ValueError("Idle Job status must be a regular file")
-    envelope = read_json_limited(path, max_bytes=65_536, record_type="idle_job_status")
-    raw = envelope.get("idle_job_status")
-    return _canonical_status(raw)
+    envelope = read_json_limited(path, max_bytes=MAX_STATUS_BYTES, record_type="idle_job_status")
+    payload = _canonical_status(envelope.get("idle_job_status"))
+    if include_demand_detail:
+        payload["demand_detail"] = validate_demand_detail(envelope.get(DEMAND_DETAIL_MEMBER))
+    return payload
+
+
+def _reports_unknown_demand(payload: Mapping[str, Any]) -> bool:
+    return payload["reason"] == "unknown_demand" and payload["state"] in {"waiting", "stopping"}
 
 
 def _ownership_file_exists(root: Path) -> bool:
@@ -353,7 +360,7 @@ def _default_status(runtime_id: str | None, *, state: str, reason: str) -> dict[
     }
 
 
-def idle_job_status(runtime: Any) -> dict[str, Any]:
+def _idle_job_status(runtime: Any) -> dict[str, Any]:
     """Read the independent machine-local Idle Job status projection.
 
     A malformed status or ownership record is reported as ``blocked``.  The
@@ -371,7 +378,7 @@ def idle_job_status(runtime: Any) -> dict[str, Any]:
         ownership_malformed = False
 
     try:
-        payload = _read_status_payload(root)
+        payload = _read_status_payload(root, include_demand_detail=True)
     except FileNotFoundError:
         payload = _default_status(
             runtime_id,
@@ -446,6 +453,13 @@ def idle_job_status(runtime: Any) -> dict[str, Any]:
     return payload
 
 
+def idle_job_status(runtime: Any) -> dict[str, Any]:
+    """Read Idle Job status and retain detail only for a current unknown-demand outcome."""
+    payload = _idle_job_status(runtime)
+    payload["demand_detail"] = payload.get("demand_detail") if _reports_unknown_demand(payload) else None
+    return payload
+
+
 class IdleJobSupervisor:
     """Coordinate one machine-local Idle Job without owning shared work."""
 
@@ -485,6 +499,8 @@ class IdleJobSupervisor:
         self._config_revision: int | None = None
         self._status_state = "disabled"
         self._status_reason = "disabled"
+        self._pending_demand_detail: dict[str, Any] | None = None
+        self._last_demand_detail: dict[str, Any] | None = None
         self._state_corrupt = False
         self._children = []
         self._supervision_active = True
@@ -565,8 +581,37 @@ class IdleJobSupervisor:
         self._status_state = "waiting" if state == "launching" else state
         self._status_reason = reason
         payload = self._payload(state=state, reason=reason)
-        atomic_replace(_status_path(self.root), {"idle_job_status": payload})
+        envelope = {"idle_job_status": payload}
+        detail, self._pending_demand_detail = self._pending_demand_detail, None
+        self._last_demand_detail = None
+        if detail is not None and _reports_unknown_demand(payload):
+            enriched = {**envelope, DEMAND_DETAIL_MEMBER: detail}
+            try:
+                if json_encoded_size(enriched) <= MAX_STATUS_BYTES:
+                    envelope = enriched
+            except (OverflowError, TypeError, ValueError):
+                pass
+        atomic_replace(_status_path(self.root), envelope)
+        self._last_demand_detail = envelope.get(DEMAND_DETAIL_MEMBER)
         return payload
+
+    def set_demand_observation(
+        self, demand: str, detail: Mapping[str, Any] | None, *, agent_instance_id: str | None
+    ) -> None:
+        """Stage the current observation for the next decision publication."""
+        self._pending_demand_detail = None
+        if demand == "unknown" and isinstance(detail, Mapping) and agent_instance_id is not None:
+            try:
+                self._pending_demand_detail = observe_demand_detail(
+                    detail,
+                    agent_instance_id=agent_instance_id,
+                    observed_at=self._wall_now(),
+                    previous=self._last_demand_detail,
+                )
+            except (OSError, OverflowError, RuntimeError, TypeError, ValueError):
+                pass
+        if self._pending_demand_detail is None:
+            self._last_demand_detail = None
 
     def _blocked(self, reason: str) -> dict[str, Any]:
         self._idle_since = None

@@ -96,6 +96,41 @@ last exit reason, retry time, and the independent log path. A ready agent does
 not imply a running Idle Job. Stop failures must remain visible as stopping or
 blocked, rather than disabled.
 
+When `reason=unknown_demand`, `demand_detail` identifies the first check that
+could not prove idleness. Upgrade discovery, upgrade blockers, scheduling
+authority, recovery, and the training-demand census have distinct explanations.
+With multiple blockers, the earlier check takes precedence; a more specific
+supervisor outcome, such as an ownership failure, supersedes demand diagnostics.
+`idle_delay` means training is confirmed idle and the configured start delay is
+still active.
+
+Upgrade blockers name at most three Projects and report the total count. “Needs
+repair” requires a matching cached migration observation; when only the blocker
+is known, the explanation says the upgrade prevents confirmation of idle demand.
+Missing migration fields are null. Inspection commands select the observed
+MachineRuntime and locally registered Project. For example:
+
+```sh
+qexp --machine-runtime-root /srv/qexp/machine admin upgrade status --project lieformer
+```
+
+`qexp status` independently reports recorded repair for the selected Project,
+including while its agent is stopped, and explains that migration's effect on new
+training. A healthy selected Project can remain quiet while machine status names
+a different blocking Project. See the [upgrade guide](spec/qexp_upgrade_guide.md)
+for repair procedures; status does not perform repairs.
+
+Demand observations carry the publishing agent's per-start identity and UTC
+`observed_at`. They are live only when that identity matches the verified running
+agent and their age is between zero and 60 seconds inclusive. Other valid details
+are labeled last observed, without an elapsed duration. Heartbeats and status
+reads do not refresh demand observations. `since` tracks continuous observations
+of the same check and attributed scope within one agent instance; it resets on a
+changed blocker, intervening known demand, or restart. If continuity cannot be
+established cheaply, it is null. Duration additionally requires
+`since <= observed_at`. Old or malformed optional diagnostics remain null without
+making the base Idle Job state unreadable.
+
 Each instance writes `command.log` under
 `<machine-runtime>/idle-job/instances/<instance-id>/`. Output rotates at 1 MiB,
 retaining one rotated file. Completed instance retention is bounded; unresolved

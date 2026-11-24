@@ -1,7 +1,7 @@
 ---
 doc_type: spec
 status: active
-updated_at: 2026-11-19
+updated_at: 2026-11-24
 archived_at:
 ---
 
@@ -4983,6 +4983,43 @@ Idle Job uses machine-local `idle-job/config.json`, with a versioned `idle_job`
 configuration envelope and revisioned updates under the existing config guard.
 Global agent-mode changes use the same guard and reject on-demand mode while
 Idle Job is enabled. There is no temporary compatibility adapter.
+
+`idle-job/status.json` permanently retains the strict v1 `idle_job_status`
+member. An optional sibling, `idle_job_demand_detail`, is published atomically
+with that member within the existing 65,536-byte limit. It contains `code`,
+`agent_instance_id`, UTC `observed_at`, nullable `since`, nullable `project_count`,
+and `projects` (at most three samples). Each sample has `project_id`, `migration`,
+`phase`, `state`, `last_progress_at`, and `detail_command`; unavailable details are
+null. This is additive, permanent optional diagnostic support, not a temporary
+format adapter. Existing readers select the v1 member; new readers accept
+v1-only envelopes. Invalid or unencodable optional detail cannot invalidate or
+prevent publication of base status.
+
+The returning unknown-demand check supplies the detail using its existing
+same-cycle evidence, preserving short-circuit order. Project counts and samples
+reuse existing blockers; optional migration detail requires current binding-matched
+cached upgrade evidence. A progress timestamp requires evidence of migration
+progress, never a heartbeat, probe, or journal rewrite. Diagnostic collection
+adds no Project-root probes, sibling journal reads, full-set sorts, or additional
+status writes. It does not participate in scheduling, admission, or repair.
+
+Detail accompanies only `unknown_demand` waiting/stopping decisions and clears
+in the same publication as a superseding outcome. The per-start agent identity
+must not be the MachineRuntime identity. `observed_at` is the time of the demand
+observation published through the existing decision path; status reads and
+heartbeats cannot refresh it. Continuity belongs to this process only: changed
+check/scope, a non-unknown decision, or restart resets `since`; truncated scope
+may use null when cheap full-scope continuity is unavailable.
+
+Machine status exposes the optional value as `idle_job.demand_detail`, null for
+old files, malformed detail, or superseding ownership/configuration outcomes.
+Display adds `live` and nullable `elapsed_seconds`. Live requires a verified
+running agent with exactly the recorded instance ID and observation age in
+[0, 60] seconds. Otherwise valid detail is last observed, without duration,
+including stopped/unverified agents, retained files from previous starts, and
+future timestamps. Malformed identity/time fields invalidate optional detail.
+Elapsed duration additionally requires non-null `since <= observed_at`. These
+freshness rules are display-only and never cause writes or affect scheduling.
 
 `idle-job/ownership.json` is an independent versioned ownership envelope. It
 binds runtime ID, boot ID, unique instance ID, phase, config revision, resolved
