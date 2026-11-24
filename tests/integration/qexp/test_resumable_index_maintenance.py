@@ -787,3 +787,229 @@ def test_group_control_converges_despite_slow_outbox_selection(tmp_path, monkeyp
         from qqtools.plugins.qexp.runtime.tasks import load_task
 
         assert all(load_task(cfg, task.task_id).state["projection"] == "cancelled" for task in tasks)
+
+
+@pytest.mark.parametrize("slow_stage", ["selection", "descriptor", "context", "status"])
+def test_audit_first_step_survives_slow_setup(tmp_path, monkeypatch, slow_stage):
+    from types import SimpleNamespace
+
+    from qqtools.plugins.qexp import doctor
+    from qqtools.plugins.qexp.agent import context
+    from qqtools.plugins.qexp.runtime import maintenance_service
+    from qqtools.plugins.qexp.runtime.work_budget import InvocationLedger
+
+    cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")
+    now = [0]
+    monkeypatch.setattr(
+        maintenance_full_audit,
+        "create_invocation_ledger",
+        lambda limit: InvocationLedger(semantic_item_limit=limit, clock_ns=lambda: now[0]),
+    )
+    monkeypatch.setattr(
+        maintenance_runtime, "create_invocation_ledger", maintenance_full_audit.create_invocation_ledger
+    )
+    initial = maintenance_full_audit.advance_full_audit(
+        cfg, reservation_runtime_root=cfg.runtime_root, max_work_items=1
+    )
+    path, before = _maintenance_descriptor(cfg)
+
+    def delay(function):
+        def wrapped(*args, **kwargs):
+            result = function(*args, **kwargs)
+            now[0] += 51_000_000
+            return result
+
+        return wrapped
+
+    if slow_stage == "selection":
+        monkeypatch.setattr(maintenance_service, "select_due_work", delay(maintenance_service.select_due_work))
+    elif slow_stage == "descriptor":
+        monkeypatch.setattr(maintenance_full_audit, "_load_descriptor", delay(maintenance_full_audit._load_descriptor))
+    elif slow_stage == "context":
+        monkeypatch.setattr(
+            context,
+            "resolve_execution_context",
+            delay(lambda _: SimpleNamespace(local_cfg=cfg, reservation_root=cfg.runtime_root)),
+        )
+    else:
+        monkeypatch.setattr(doctor, "inspect_submission_control", delay(doctor.inspect_submission_control))
+
+    for _ in range(3):
+        if slow_stage == "selection":
+            progress = maintenance_service._advance_outbox(cfg, reservation_runtime_root=cfg.runtime_root, max_scan=1)
+        elif slow_stage in {"context", "status"}:
+            progress = repair_metadata(
+                cfg, reservation_runtime_root=None if slow_stage == "context" else cfg.runtime_root, max_work_items=1
+            )
+        else:
+            progress = maintenance_full_audit.advance_full_audit(
+                cfg, reservation_runtime_root=cfg.runtime_root, max_work_items=1
+            )
+        after = read_json(path)
+        assert progress["budget"]["semantic_items_consumed"] == 1
+        assert progress["budget"]["operations_consumed"] <= 256
+        assert progress["budget"]["elapsed_ms"] >= 51
+        assert progress["scope"] == initial["scope"]
+        assert after["progress_revision"] > before["progress_revision"]
+        assert (after["phase"], after["cursor"]) != (before["phase"], before["cursor"])
+        before = after
+
+
+@pytest.mark.parametrize("unavailable", ["deadline", "lock"])
+def test_unexamined_audit_is_not_idle_or_meaningful_progress(tmp_path, monkeypatch, unavailable):
+    from contextlib import contextmanager
+
+    from qqtools.plugins.qexp.runtime import maintenance_service
+    from qqtools.plugins.qexp.runtime.work_budget import InvocationLedger
+
+    cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")
+    now = [0]
+    monkeypatch.setattr(
+        maintenance_full_audit,
+        "create_invocation_ledger",
+        lambda limit: InvocationLedger(semantic_item_limit=limit, clock_ns=lambda: now[0]),
+    )
+    initial = maintenance_full_audit.advance_full_audit(
+        cfg, reservation_runtime_root=cfg.runtime_root, max_work_items=1
+    )
+    generation = initial["scope"]["work_generation"]
+    key = dict(kind="full_audit", target_id="project", work_generation=generation)
+    before = read_work(cfg, **key)
+    if unavailable == "deadline":
+
+        def exhausted(limit):
+            ledger = InvocationLedger(semantic_item_limit=limit, clock_ns=lambda: now[0])
+            now[0] += 51_000_000
+            return ledger
+
+        monkeypatch.setattr(maintenance_full_audit, "create_invocation_ledger", exhausted)
+    else:
+
+        @contextmanager
+        def busy(_cfg):
+            yield False
+
+        monkeypatch.setattr(maintenance_full_audit, "_repair_lock", busy)
+    progress = maintenance_service._advance_outbox(cfg, reservation_runtime_root=cfg.runtime_root, max_scan=1)
+    assert progress["maintenance_state"] not in {"idle", "completed"}
+    assert progress["budget"]["semantic_items_consumed"] == 0
+    assert read_work(cfg, **key) == before
+
+
+@pytest.mark.parametrize("action", ["cancel", "remove"])
+def test_group_coverage_wait_backs_off_and_resumes_with_cleared_failure(tmp_path, monkeypatch, action):
+    from qqtools.plugins.qexp.commands.group import change_worker, group_control
+    from qqtools.plugins.qexp.runtime import maintenance_service
+    from qqtools.plugins.qexp.runtime.operation_store import locate_operation_path
+    from qqtools.plugins.qexp.runtime.work_budget import InvocationLedger
+    from qqtools.plugins.qexp.scheduler import cancel_task
+    from tests.helpers.qexp_discovery import discover_group, isolated_group
+
+    cfg = isolated_group(tmp_path, tail=0)
+    task = submit(cfg, ["true"], group="experiment")
+    if action == "cancel":
+        operation_id = group_control(cfg, "experiment", "cancel")["cancellation_operation"]["operation_id"]
+    else:
+        cancel_task(cfg, task.task_id)
+        operation_id = change_worker(cfg, "experiment", "g1", "remove")["worker_control"]["operation_id"]
+    key = dict(kind="group_cancel", target_id=operation_id, work_generation=operation_id)
+    path = locate_operation_path(cfg, "group_control", operation_id)
+    monkeypatch.setattr(
+        maintenance_full_audit,
+        "create_invocation_ledger",
+        lambda limit: InvocationLedger(semantic_item_limit=limit, clock_ns=lambda: 0),
+    )
+    update_work(
+        cfg,
+        **key,
+        state="waiting",
+        due_at="2000-01-01T00:00:00+00:00",
+        retry_count=9,
+        failure={"code": "maintenance_budget_unavailable"},
+    )
+
+    def advance_selected():
+        for _ in range(32):
+            result = maintenance_service._advance_outbox(cfg, reservation_runtime_root=cfg.runtime_root, max_scan=1)
+            identity = result.get("descriptor_identity", result.get("descriptor", {}).get("identity", {}))
+            if identity.get("target_id") == operation_id:
+                return result
+        pytest.fail("group control was not selected")
+
+    # The first call may adopt a new control state; subsequent unchanged coverage
+    # waits must retain progress evidence and back off instead of running hot.
+    advance_selected()
+    previous = read_work(cfg, **key)
+    control_before = read_json(path)["group_control"]
+    for _ in range(2):
+        update_work(cfg, **key, due_at="2000-01-01T00:00:00+00:00")
+        result = advance_selected()
+        current = read_work(cfg, **key)
+        assert result["maintenance_state"] == "waiting"
+        assert current["retry_count"] == previous["retry_count"] + 1
+        assert current["meaningful_progress_at"] == previous["meaningful_progress_at"]
+        assert current["failure"]["code"] == "membership_coverage_pending"
+        assert read_json(path)["group_control"]["discovery"] == control_before["discovery"]
+        previous = current
+
+    discover_group(cfg)
+    update_work(cfg, **key, due_at="2000-01-01T00:00:00+00:00")
+    result = advance_selected()
+    current = read_work(cfg, **key)
+    assert result["maintenance_state"] in {"running", "completed"}
+    assert current["retry_count"] == 0
+    assert current["failure"] is None
+
+
+@pytest.mark.parametrize("publish_activation", [False, True])
+def test_descriptor_failure_omission_preserves_and_explicit_none_clears(tmp_path, publish_activation):
+    cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")
+    key = dict(kind="group_cancel", target_id="test-operation", work_generation="test-generation")
+    prepare_work(cfg, **key, phase="reconcile")
+    failure = {"code": "maintenance_budget_unavailable", "type": "TransientWait"}
+    update_work(cfg, **key, failure=failure, publish_activation=publish_activation)
+    update_work(cfg, **key, state="running", publish_activation=publish_activation)
+    assert read_work(cfg, **key)["failure"] == failure
+    update_work(cfg, **key, failure=None, publish_activation=publish_activation)
+    assert read_work(cfg, **key)["failure"] is None
+
+
+def test_audit_overrun_does_not_admit_a_second_step(tmp_path, monkeypatch):
+    from qqtools.plugins.qexp.runtime.work_budget import InvocationLedger
+
+    cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")
+    now = [0]
+    monkeypatch.setattr(
+        maintenance_full_audit,
+        "create_invocation_ledger",
+        lambda limit: InvocationLedger(semantic_item_limit=limit, clock_ns=lambda: now[0]),
+    )
+    maintenance_full_audit.advance_full_audit(cfg, reservation_runtime_root=cfg.runtime_root, max_work_items=1)
+    original = maintenance_full_audit._load_descriptor
+
+    def slow_load(*args, **kwargs):
+        result = original(*args, **kwargs)
+        now[0] += 51_000_000
+        return result
+
+    monkeypatch.setattr(maintenance_full_audit, "_load_descriptor", slow_load)
+    progress = maintenance_full_audit.advance_full_audit(
+        cfg, reservation_runtime_root=cfg.runtime_root, max_work_items=4
+    )
+    assert progress["budget"]["semantic_items_consumed"] == 1
+    assert progress["budget"]["semantic_items_remaining"] == 3
+    assert progress["budget"]["exhaustion_reason"] == "deadline"
+
+
+@pytest.mark.parametrize("state", ["completed", "superseded", "intervention"])
+def test_retirement_retains_failure_only_for_intervention(tmp_path, state):
+    cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "rt")
+    key = dict(kind="group_cancel", target_id="test-operation", work_generation="test-generation")
+    prepare_work(cfg, **key, phase="reconcile")
+    failure = {"code": "maintenance_budget_unavailable", "type": "TransientWait"}
+    update_work(cfg, **key, failure=failure, retry_count=9)
+    retire_work(cfg, **key, state=state, proof={"source": "test"})
+    result = read_work(cfg, **key)
+    assert result["state"] == state
+    assert result["failure"] == (failure if state == "intervention" else None)
+    assert result["retry_count"] == (9 if state == "intervention" else 0)

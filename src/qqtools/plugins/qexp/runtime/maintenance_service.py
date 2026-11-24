@@ -141,7 +141,7 @@ def _advance_operation_work(
             return {"state": "completed", "proof": {"operation_id": operation_id, "source": "worker_removal"}}
         if outcome.get("state") == "blocked":
             return {"state": "intervention", "reason": outcome.get("blocked_reason") or "worker_removal_blocked"}
-        return {"state": "running", "reason": "worker_removal_progress", "meaningful_progress": True}
+        return _group_control_progress(section, outcome, "worker_removal")
     if operation_type != "cancel":
         return {"state": "intervention", "reason": "legacy_worker_removal_requires_scoped_reconstruction"}
     if state not in {"preparing", "converging", "waiting_ack"}:
@@ -156,12 +156,12 @@ def _advance_operation_work(
             current = locate_operation_path(cfg, "group_control", operation_id)
             if not current.exists():
                 return {"state": "intervention", "reason": "group_cancel_operation_missing_after_prepare"}
-            outcome = {"state": "waiting", "reason": "group_cancel_no_progress"}
+            return {"state": "waiting", "reason": "group_cancel_no_progress"}
         if outcome.get("state") in {"completed", "superseded"}:
             return {"state": "completed", "proof": {"operation_id": operation_id, "source": "indexed_cancel"}}
         if outcome.get("state") == "blocked":
             return {"state": "intervention", "reason": outcome.get("blocked_reason") or "group_cancel_blocked"}
-        return {"state": "running", "reason": "group_cancel_progress", "meaningful_progress": True}
+        return _group_control_progress(section, outcome, "group_cancel")
     from ..commands.group import advance_legacy_cancel_step
 
     outcome = advance_legacy_cancel_step(
@@ -180,6 +180,24 @@ def _advance_operation_work(
         "state": "running",
         "cursor": next_cursor,
         "meaningful_progress": next_cursor != cursor,
+    }
+
+
+def _group_control_progress(previous: dict[str, Any], current: dict[str, Any], kind: str) -> dict[str, Any]:
+    """Separate durable domain progress from an unchanged dependency wait."""
+
+    def evidence(control: dict[str, Any]) -> dict[str, Any]:
+        value = {key: item for key, item in control.items() if key not in {"updated_at", "blocked_reason"}}
+        discovery = value.get("discovery")
+        if isinstance(discovery, dict):
+            value["discovery"] = {key: item for key, item in discovery.items() if key != "next_lane"}
+        return value
+
+    has_progress = evidence(previous) != evidence(current)
+    return {
+        "state": "running" if has_progress else "waiting",
+        "reason": f"{kind}_progress" if has_progress else current.get("blocked_reason") or f"{kind}_no_progress",
+        "meaningful_progress": has_progress,
     }
 
 
@@ -483,9 +501,7 @@ def _advance_outbox(
     ledger.charge_operations(operations=32)
     # Admit one bounded descriptor step before queue I/O can exhaust the soft
     # deadline. Selection and its checkpoint belong to the same admitted step.
-    reservation = ledger.reserve_operations(
-        maximum_operations=max(128, *maintenance_full_audit.PHASE_OPERATION_RESERVATIONS.values())
-    )
+    reservation = ledger.reserve_operations(maximum_operations=maintenance_full_audit.FULL_AUDIT_OPERATION_RESERVATION)
     maintenance_full_audit.ensure_full_audit_outbox(cfg)
     selection = select_due_work(cfg, max_scan=max_scan)
     descriptor = selection["descriptor"]
@@ -530,13 +546,12 @@ def _advance_outbox(
             }
 
     if kind == "full_audit":
-        if reservation is not None:
-            reservation.release()
         progress = maintenance_full_audit.advance_full_audit(
             cfg,
             reservation_runtime_root=reservation_runtime_root,
             max_work_items=1,
             ledger=ledger,
+            admission=reservation,
             create_if_missing=False,
             create_successor=False,
             create_successor_on_change=True,
@@ -559,32 +574,8 @@ def _advance_outbox(
                 state="intervention",
                 proof={"failure": progress.get("failure") or progress.get("intervention")},
             )
-        else:
-            phase = progress.get("phase") or descriptor["phase"]
-            cursor = {"phase": phase, "cursor": progress.get("cursor", {})}
-            if target_state == "waiting":
-                due_at = progress.get("next_due_at") or descriptor["due_at"]
-                update_work(
-                    cfg,
-                    kind=kind,
-                    target_id=identity["target_id"],
-                    work_generation=identity["work_generation"],
-                    state="waiting",
-                    phase=phase,
-                    cursor=cursor,
-                    due_at=due_at,
-                )
-            else:
-                update_work(
-                    cfg,
-                    kind=kind,
-                    target_id=identity["target_id"],
-                    work_generation=identity["work_generation"],
-                    state="running",
-                    phase=phase,
-                    cursor=cursor,
-                    meaningful_progress=True,
-                )
+        # The audit owns its durable checkpoints and outbox synchronization.
+        # A yielded invocation must not manufacture another progress revision.
         return progress
 
     reservation_cost = maintenance_full_audit.PHASE_OPERATION_RESERVATIONS.get(kind, 128)

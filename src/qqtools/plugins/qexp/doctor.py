@@ -573,9 +573,15 @@ def repair_metadata(
 ) -> dict[str, Any]:
     if type(max_work_items) is not int or not 1 <= max_work_items <= GROUP_MEMBER_PAGE_SIZE:
         raise ValueError(f"max_work_items must be between 1 and {GROUP_MEMBER_PAGE_SIZE}.")
-    from .runtime.maintenance import CONTEXT_RESOLUTION_OPERATIONS, advance_full_audit, create_invocation_ledger
+    from .runtime.maintenance import (
+        CONTEXT_RESOLUTION_OPERATIONS,
+        FULL_AUDIT_OPERATION_RESERVATION,
+        advance_full_audit,
+        create_invocation_ledger,
+    )
 
     ledger = create_invocation_ledger(max_work_items)
+    admission = ledger.reserve_operations(maximum_operations=FULL_AUDIT_OPERATION_RESERVATION)
     if reservation_runtime_root is None:
         from .agent.context import resolve_execution_context
 
@@ -599,6 +605,7 @@ def repair_metadata(
         reservation_runtime_root=reservation_runtime_root,
         max_work_items=max_work_items,
         ledger=ledger,
+        admission=admission,
         retry_intervention=retry_intervention,
     )
     repaired = list(progress["repaired"])

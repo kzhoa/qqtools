@@ -23,7 +23,7 @@ from ..runtime.paths import shared_paths, task_path
 from ..runtime.records import AttemptRecord, TaskRecord, new_id, utc_now, validate_identifier
 from ..runtime.store import atomic_replace, read_json_limited, require_json_size
 from ..runtime.submission_control import inspect_submission_control
-from ..runtime.work_budget import InvocationLedger
+from ..runtime.work_budget import InvocationLedger, OperationReservation
 from . import maintenance_steps
 
 PHASES = (
@@ -67,6 +67,10 @@ PHASE_OPERATION_RESERVATIONS = {
     "submission_control": 112,
     "final_verification": 24,
 }
+FULL_AUDIT_OPERATION_RESERVATION = (
+    _SETUP_OPERATIONS + _EXIT_RESERVATION_OPERATIONS + max(PHASE_OPERATION_RESERVATIONS.values())
+)
+
 
 _IDENTITY_FIELDS = frozenset({"project_id", "kind", "target_id", "work_generation"})
 _STAGE1_RECORD_FIELDS = frozenset(
@@ -380,8 +384,13 @@ def _migrate_stage1_descriptor(value: dict[str, Any], *, cfg: RootConfig, identi
     return record
 
 
-def _initialize_descriptor(cfg: RootConfig, record: dict[str, Any], ledger: InvocationLedger) -> bool:
-    reservation = ledger.reserve_operations(
+def _initialize_descriptor(
+    cfg: RootConfig,
+    record: dict[str, Any],
+    ledger: InvocationLedger,
+    reservation: OperationReservation | None = None,
+) -> bool:
+    reservation = reservation or ledger.reserve_operations(
         maximum_operations=PHASE_OPERATION_RESERVATIONS["descriptor_initialization"]
     )
     if reservation is None:
@@ -1224,6 +1233,7 @@ def advance_full_audit(
     reservation_runtime_root: Path | None,
     max_work_items: int,
     ledger: InvocationLedger | None = None,
+    admission: OperationReservation | None = None,
     create_if_missing: bool = True,
     create_successor: bool = True,
     create_successor_on_change: bool = False,
@@ -1235,7 +1245,14 @@ def advance_full_audit(
     ledger = ledger or create_invocation_ledger(max_work_items)
     if ledger.semantic_item_limit != max_work_items:
         raise ValueError("invocation ledger semantic-item limit does not match max_work_items.")
-    exit_reservation = ledger.reserve_operations(maximum_operations=_EXIT_RESERVATION_OPERATIONS)
+    admission = admission or ledger.reserve_operations(maximum_operations=FULL_AUDIT_OPERATION_RESERVATION)
+    first_reservation = admission
+    exit_reservation = None
+    if admission is not None:
+        setup_reservation = ledger.split_reservation(admission, operations=_SETUP_OPERATIONS)
+        setup_reservation.commit(actual_operations=_SETUP_OPERATIONS)
+        exit_reservation = ledger.split_reservation(admission, operations=_EXIT_RESERVATION_OPERATIONS)
+    is_scope_absent = False
     record: dict[str, Any] | None = None
     repaired: list[str] = []
     blocked: list[str] = []
@@ -1246,7 +1263,6 @@ def advance_full_audit(
     try:
         if exit_reservation is not None:
             try:
-                ledger.charge_operations(operations=_SETUP_OPERATIONS)
                 with _repair_lock(cfg) as acquired:
                     if not acquired:
                         busy = True
@@ -1258,9 +1274,13 @@ def advance_full_audit(
                             raise ValueError("maintenance descriptor root is not a directory.")
                         pointer = _read_pointer(cfg)
                         if pointer is None:
+                            is_scope_absent = True
                             if create_if_missing:
                                 pending = _new_descriptor(cfg)
-                                record = pending if _initialize_descriptor(cfg, pending, ledger) else None
+                                record = (
+                                    pending if _initialize_descriptor(cfg, pending, ledger, first_reservation) else None
+                                )
+                                first_reservation = None
                         else:
                             try:
                                 record = _load_descriptor(cfg, pointer)
@@ -1283,11 +1303,19 @@ def advance_full_audit(
                                 and (create_successor or source_changed)
                             ):
                                 successor = _new_descriptor(cfg)
-                                record = successor if _initialize_descriptor(cfg, successor, ledger) else None
+                                record = (
+                                    successor
+                                    if _initialize_descriptor(cfg, successor, ledger, first_reservation)
+                                    else None
+                                )
+                                first_reservation = None
 
                         if record is not None and record["state"] == "intervention" and retry_intervention:
                             successor = _new_descriptor(cfg)
-                            record = successor if _initialize_descriptor(cfg, successor, ledger) else None
+                            record = (
+                                successor if _initialize_descriptor(cfg, successor, ledger, first_reservation) else None
+                            )
+                            first_reservation = None
 
                         if record is not None and record["state"] == "intervention":
                             intervention = record["failure"]
@@ -1311,7 +1339,10 @@ def advance_full_audit(
                                         busy = True
                                         break
                                 reservation_cost = PHASE_OPERATION_RESERVATIONS[record["phase"]]
-                                reservation = ledger.reserve_operations(maximum_operations=reservation_cost)
+                                reservation = first_reservation or ledger.reserve_operations(
+                                    maximum_operations=reservation_cost
+                                )
+                                first_reservation = None
                                 if reservation is None:
                                     break
                                 try:
@@ -1448,7 +1479,8 @@ def advance_full_audit(
     finally:
         # Keep the bounded exit reservation live through status collection and
         # rendering below; it is committed only after those reads finish.
-        pass
+        if first_reservation is not None and first_reservation._active:
+            first_reservation.release()
     if intervention is not None and record is not None and record.get("failure") is None:
         record["failure"] = intervention
         record["state"] = "intervention"
@@ -1470,7 +1502,7 @@ def advance_full_audit(
         if exit_reservation is not None and exit_reservation._active:
             exit_reservation.commit(actual_operations=_EXIT_RESERVATION_OPERATIONS)
     progress["budget"] = ledger.report()
-    if not create_if_missing and record is None and intervention is None:
+    if not create_if_missing and is_scope_absent and record is None and intervention is None:
         progress["maintenance_state"] = "idle"
         progress["next_due_at"] = None
     return progress
@@ -1478,6 +1510,7 @@ def advance_full_audit(
 
 __all__ = [
     "CONTEXT_RESOLUTION_OPERATIONS",
+    "FULL_AUDIT_OPERATION_RESERVATION",
     "PHASES",
     "PHASE_OPERATION_RESERVATIONS",
     "advance_full_audit",

@@ -52,11 +52,15 @@ resolution, bounded descriptor loading, lock handling, one admitted checkpoint
 commit, and bounded rendering cost no semantic items, but still consume the
 operation and elapsed-time budgets.
 
-Before a semantic step starts, it reserves the maximum operations required for
-its safe checkpoint. Unused reservations are released. After the deadline, no
-new semantic step starts; an admitted step may finish its reserved commit and
-report an overrun. This is not a hard syscall timeout. Indefinitely blocked I/O
-requires separate execution isolation.
+Before descriptor or execution-context resolution, the caller admits the first
+semantic step by reserving its worst-case operations together with setup and
+status costs. Outbox service transfers that same reservation to full audit;
+subdivision transfers existing allowance without resetting the deadline or
+increasing the operation limit. Each later semantic step independently reserves
+the maximum operations required for its safe checkpoint. Unused reservations are
+released. After the deadline, no new semantic step is admitted; the already
+admitted first step may finish its work and reserved commit and report an overrun. This is not a hard syscall
+timeout. Indefinitely blocked I/O requires separate execution isolation.
 
 An N=1 invocation can advance every phase over repeated calls. It may initialize
 one descriptor, examine one source record and checkpoint its cursor, advance one
@@ -160,21 +164,32 @@ Routine resident service gives maintenance a turn independently of free CPU or
 GPU capacity. It rotates due Projects, then due descriptors within each Project;
 new arrivals and retries join the tail and cannot overtake already due work. One
 turn advances at most one descriptor with the same ledger primitive used by the
-CLI. Routine non-audit service reserves the largest bounded descriptor-step cost
-before queue selection. Selection, prepared-truth verification, and the selected
-domain step form one admitted unit: slow queue I/O may overrun the soft deadline
+CLI. Routine service reserves a bounded descriptor-step cost, including audit
+setup and status costs, before queue selection. Selection, prepared-truth
+verification, and the selected domain step form one admitted unit: slow queue I/O may overrun the soft deadline
 but cannot repeatedly prevent the selected obligation from making progress. The
 256-operation hard limit still includes setup and the reserved step. Empty or
-uncommitted selections release the reservation. Full-audit selections release
-it and retain the audit's own per-step admission checks on the same ledger. A
-complete pass over active descriptors with none due returns the persisted
-earliest `next_due_at` instead of keeping the Project hot.
+uncommitted selections release the reservation. Full-audit selections transfer
+it to the audit, which keeps per-step admission checks for subsequent steps on
+the same ledger. An invocation that could not examine the audit because of a
+budget boundary or lock contention is pending work, not evidence of idleness.
+Only a successfully checked absent audit scope can return idle. Full audit owns
+its outbox checkpoint updates; a yielded invocation does not create a second
+synthetic progress revision. A complete pass over active descriptors with none
+due returns the persisted earliest `next_due_at` instead of keeping the Project
+hot.
 
 Transient failure k uses a capped exponential base
 `min(60 seconds, 1 second * 2^k)` and persists one jittered due time in
 `[0.8 * base, base]`. Restart does not redraw an already persisted retry.
-Meaningful committed progress resets k. Malformed authority, incompatible
-schema, ambiguous ownership, and unrecoverable storage evidence enter
+Meaningful committed progress resets k and clears the current failure. Group
+control steps waiting for unchanged membership coverage or acknowledgment
+report a dependency wait; timestamp updates and lane rotation alone do not count
+as progress. An omitted failure update preserves existing evidence, while an
+explicit null clears it. Successful completion or supersession clears retry and
+failure state; intervention retains its diagnostic evidence. Malformed
+authority, incompatible schema, ambiguous ownership, and unrecoverable storage
+evidence enter
 intervention instead of retrying forever.
 
 An ordinary rerun attaches to the same intervention descriptor and remains

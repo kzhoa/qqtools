@@ -270,6 +270,15 @@ class InvocationLedger:
         self.operations_reserved += maximum_operations
         return OperationReservation(self, maximum_operations)
 
+    def split_reservation(self, reservation: OperationReservation, *, operations: int) -> OperationReservation:
+        """Transfer already admitted operations without granting any new budget."""
+        self._validate_reservation(reservation)
+        self._validate_count(operations, "operations", positive=True)
+        if operations >= reservation.operations:
+            raise ValueError("split must leave operations in the original reservation.")
+        reservation.operations -= operations
+        return OperationReservation(self, operations)
+
     def consume_semantic_item(self) -> None:
         """Charge one source examination or standalone durable transition."""
         if self.semantic_items_remaining <= 0:

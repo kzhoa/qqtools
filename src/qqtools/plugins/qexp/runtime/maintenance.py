@@ -2,6 +2,7 @@
 
 from .maintenance_full_audit import (
     CONTEXT_RESOLUTION_OPERATIONS,
+    FULL_AUDIT_OPERATION_RESERVATION,
     PHASE_OPERATION_RESERVATIONS,
     PHASES,
     advance_full_audit,
@@ -11,6 +12,7 @@ from .maintenance_service import advance_maintenance_work
 
 __all__ = [
     "CONTEXT_RESOLUTION_OPERATIONS",
+    "FULL_AUDIT_OPERATION_RESERVATION",
     "PHASES",
     "PHASE_OPERATION_RESERVATIONS",
     "advance_full_audit",

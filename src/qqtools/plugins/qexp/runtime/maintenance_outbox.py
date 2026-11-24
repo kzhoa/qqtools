@@ -7,6 +7,7 @@ import json
 import os
 import sqlite3
 from datetime import datetime, timezone
+from enum import Enum
 from pathlib import Path
 from typing import Any
 
@@ -16,6 +17,11 @@ from .locks import exclusive
 from .project_activation import project_activation_transaction
 from .records import new_id, utc_now, validate_identifier
 from .store import atomic_replace, check_mutation_fence, read_json_limited, require_json_size
+
+
+class _Unchanged(Enum):
+    VALUE = "unchanged"
+
 
 DESCRIPTOR_SCHEMA_VERSION = 1
 DESCRIPTOR_MAX_BYTES = 64 * 1024
@@ -830,7 +836,7 @@ def _change_work(
     cursor: dict[str, Any] | None = None,
     due_at: str | None = None,
     retry_count: int | None = None,
-    failure: dict[str, Any] | None = None,
+    failure: dict[str, Any] | None | _Unchanged = _Unchanged.VALUE,
     retirement_proof: dict[str, Any] | None = None,
     meaningful_progress: bool = False,
 ) -> dict[str, Any]:
@@ -847,8 +853,8 @@ def _change_work(
         record["due_at"] = due_at
     if retry_count is not None:
         record["retry_count"] = retry_count
-    if failure is not None:
-        record["failure"] = dict(failure)
+    if failure is not _Unchanged.VALUE:
+        record["failure"] = dict(failure) if failure is not None else None
     if retirement_proof is not None:
         record["retirement_proof"] = dict(retirement_proof)
     now = utc_now()
@@ -962,7 +968,7 @@ def update_work(
     cursor: dict[str, Any] | None = None,
     due_at: str | None = None,
     retry_count: int | None = None,
-    failure: dict[str, Any] | None = None,
+    failure: dict[str, Any] | None | _Unchanged = _Unchanged.VALUE,
     retirement_proof: dict[str, Any] | None = None,
     meaningful_progress: bool = False,
     publish_activation: bool = True,
@@ -1262,6 +1268,8 @@ def retire_work(
         work_generation=work_generation,
         state=state,
         retirement_proof=proof,
+        retry_count=0 if state != "intervention" else None,
+        failure=None if state != "intervention" else _Unchanged.VALUE,
         meaningful_progress=True,
         publish_activation=False,
     )

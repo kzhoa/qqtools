@@ -100,6 +100,7 @@ def test_maintenance_facade_exposes_the_distinct_orchestration_owners() -> None:
     assert maintenance.advance_maintenance_work is maintenance_service.advance_maintenance_work
     assert set(maintenance.__all__) == {
         "CONTEXT_RESOLUTION_OPERATIONS",
+        "FULL_AUDIT_OPERATION_RESERVATION",
         "PHASES",
         "PHASE_OPERATION_RESERVATIONS",
         "advance_full_audit",
@@ -133,6 +134,7 @@ def test_maintenance_service_uses_only_narrow_full_audit_interfaces() -> None:
     }
 
     assert referenced == {
+        "FULL_AUDIT_OPERATION_RESERVATION",
         "PHASE_OPERATION_RESERVATIONS",
         "advance_full_audit",
         "create_invocation_ledger",
@@ -166,7 +168,9 @@ def test_outbox_full_audit_delegates_with_the_service_invocation_ledger(monkeypa
 
     def advance(_cfg, **kwargs):
         captured.update(kwargs)
-        assert kwargs["ledger"].operations_reserved == 0
+        assert kwargs["admission"].ledger is kwargs["ledger"]
+        assert kwargs["ledger"].operations_reserved == maintenance_full_audit.FULL_AUDIT_OPERATION_RESERVATION
+        kwargs["admission"].release()
         return {"maintenance_state": "running", "phase": "cleanup", "cursor": {"offset": 1}}
 
     monkeypatch.setattr(maintenance_full_audit, "advance_full_audit", advance)
@@ -183,6 +187,7 @@ def test_outbox_full_audit_delegates_with_the_service_invocation_ledger(monkeypa
         "reservation_runtime_root": None,
         "max_work_items": 1,
         "ledger": ledger,
+        "admission": captured["admission"],
         "create_if_missing": False,
         "create_successor": False,
         "create_successor_on_change": True,
@@ -453,3 +458,21 @@ def test_outbox_releases_unused_admission_without_running_uncommitted_work(monke
     assert result["budget"]["semantic_items_consumed"] == 0
     assert result["budget"]["operations_remaining"] == 224
     assert ledger.operations_reserved == 0
+
+
+def test_group_control_poll_rotation_does_not_count_as_progress():
+    from qqtools.plugins.qexp.runtime import maintenance_service
+
+    previous = {"state": "converging", "updated_at": "before", "discovery": {"member_cursor": 3, "next_lane": 0}}
+    current = {
+        **previous,
+        "updated_at": "after",
+        "blocked_reason": "membership_coverage_pending",
+        "discovery": {"member_cursor": 3, "next_lane": 1},
+    }
+    result = maintenance_service._group_control_progress(previous, current, "worker_removal")
+    assert result == {"state": "waiting", "reason": "membership_coverage_pending", "meaningful_progress": False}
+    current["discovery"]["member_cursor"] = 4
+    result = maintenance_service._group_control_progress(previous, current, "worker_removal")
+    assert result["state"] == "running"
+    assert result["meaningful_progress"] is True

@@ -194,3 +194,35 @@ def test_invocation_ledger_stops_new_work_after_deadline_and_reports_overrun() -
     report = ledger.report()
     assert report["exhaustion_reason"] == "deadline"
     assert report["deadline_overrun_ms"] == 2
+
+
+def test_split_admission_keeps_hard_limit_and_finishes_after_deadline():
+    clock = _Clock()
+    ledger = InvocationLedger(semantic_item_limit=2, operation_limit=8, deadline_ms=1, clock_ns=clock)
+    first = ledger.reserve_operations(maximum_operations=8)
+    clock.advance(2_000_000)
+    exit_cost = ledger.split_reservation(first, operations=2)
+    assert ledger.operations_reserved == 8
+    assert ledger.operations_remaining == 0
+    assert ledger.reserve_operations(maximum_operations=1) is None
+    ledger.consume_semantic_item()
+    first.commit(actual_operations=5)
+    exit_cost.commit(actual_operations=2)
+    assert ledger.operations_reserved == 0
+    assert ledger.operations_consumed == 7
+    assert ledger.reserve_operations(maximum_operations=1) is None
+    with pytest.raises(ValueError, match="no longer active"):
+        ledger.split_reservation(first, operations=1)
+
+
+@pytest.mark.parametrize("operations", [0, -1, True, 4, 5])
+def test_split_admission_rejects_invalid_transfer_without_changing_budget(operations):
+    ledger = InvocationLedger(semantic_item_limit=1, operation_limit=4)
+    reservation = ledger.reserve_operations(maximum_operations=4)
+    with pytest.raises(ValueError):
+        ledger.split_reservation(reservation, operations=operations)
+    assert reservation.operations == 4
+    assert ledger.operations_reserved == 4
+    other = InvocationLedger(semantic_item_limit=1)
+    with pytest.raises(ValueError, match="another ledger"):
+        other.split_reservation(reservation, operations=1)
