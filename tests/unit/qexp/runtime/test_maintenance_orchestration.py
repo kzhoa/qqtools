@@ -166,6 +166,7 @@ def test_outbox_full_audit_delegates_with_the_service_invocation_ledger(monkeypa
 
     def advance(_cfg, **kwargs):
         captured.update(kwargs)
+        assert kwargs["ledger"].operations_reserved == 0
         return {"maintenance_state": "running", "phase": "cleanup", "cursor": {"offset": 1}}
 
     monkeypatch.setattr(maintenance_full_audit, "advance_full_audit", advance)
@@ -362,3 +363,93 @@ def test_maintenance_domain_owners_do_not_import_command_or_repair_orchestration
     assert not imports & facade_forbidden, (
         f"maintenance.py reverses into repair/cleanup orchestration: {sorted(imports & facade_forbidden)}"
     )
+
+
+@pytest.mark.parametrize("delay_stage", ["setup", "selection", "handoff"])
+@pytest.mark.parametrize("operation_limit", [256, 32])
+def test_outbox_admits_one_step_before_slow_selection(monkeypatch, delay_stage, operation_limit):
+    from qqtools.plugins.qexp.runtime import maintenance_full_audit, maintenance_service
+    from qqtools.plugins.qexp.runtime.work_budget import InvocationLedger
+
+    now = [0]
+    ledger = InvocationLedger(semantic_item_limit=1, operation_limit=operation_limit, clock_ns=lambda: now[0])
+    descriptor = {
+        "identity": {"kind": "group_cancel", "target_id": "operation", "work_generation": "operation"},
+        "state": "prepared" if delay_stage == "handoff" else "running",
+        "phase": "reconcile",
+        "cursor": {},
+        "retry_count": 191,
+    }
+    updates = []
+    advances = []
+
+    def delay(stage):
+        if stage == delay_stage:
+            now[0] += 51_000_000
+
+    def select(_cfg, *, max_scan):
+        delay("selection")
+        return {"descriptor": descriptor}
+
+    def committed(*_args):
+        delay("handoff")
+        return True
+
+    def advance(*_args, **_kwargs):
+        advances.append(True)
+        return {"state": "running", "meaningful_progress": True}
+
+    monkeypatch.setattr(maintenance_full_audit, "create_invocation_ledger", lambda _: ledger)
+    monkeypatch.setattr(maintenance_full_audit, "ensure_full_audit_outbox", lambda _: delay("setup"))
+    monkeypatch.setattr(maintenance_service, "select_due_work", select)
+    monkeypatch.setattr(maintenance_service, "_prepared_truth_committed", committed)
+    monkeypatch.setattr(maintenance_service, "activate_work", lambda *args, **kwargs: descriptor)
+    monkeypatch.setattr(maintenance_service, "_advance_operation_work", advance)
+    monkeypatch.setattr(maintenance_service, "read_work", lambda *args, **kwargs: descriptor)
+    monkeypatch.setattr(maintenance_service, "update_work", lambda *args, **kwargs: updates.append(kwargs))
+
+    result = maintenance_service._advance_outbox(None, reservation_runtime_root=None, max_scan=1)
+
+    if operation_limit == 256:
+        assert advances == [True]
+        assert result["maintenance_state"] == "running"
+        assert result["budget"]["semantic_items_consumed"] == 1
+        assert result["budget"]["operations_consumed"] == 144
+        assert result["budget"]["deadline_overrun_ms"] == 1
+        assert updates[-1]["retry_count"] == 0
+        assert updates[-1]["failure"] is None
+    else:
+        assert advances == []
+        assert result["maintenance_state"] == "waiting"
+        assert result["budget"]["exhaustion_reason"] == "operations"
+        assert updates[-1]["failure"]["code"] == "maintenance_budget_unavailable"
+    assert ledger.operations_reserved == 0
+
+
+@pytest.mark.parametrize("has_descriptor", [False, True])
+def test_outbox_releases_unused_admission_without_running_uncommitted_work(monkeypatch, has_descriptor):
+    from qqtools.plugins.qexp.runtime import maintenance_full_audit, maintenance_service
+    from qqtools.plugins.qexp.runtime.work_budget import InvocationLedger
+
+    ledger = InvocationLedger(semantic_item_limit=1)
+    descriptor = {
+        "identity": {"kind": "group_cancel", "target_id": "operation", "work_generation": "operation"},
+        "state": "prepared",
+    }
+    monkeypatch.setattr(maintenance_full_audit, "create_invocation_ledger", lambda _: ledger)
+    monkeypatch.setattr(maintenance_full_audit, "ensure_full_audit_outbox", lambda _: None)
+    monkeypatch.setattr(
+        maintenance_service,
+        "select_due_work",
+        lambda *args, **kwargs: {"descriptor": descriptor if has_descriptor else None},
+    )
+    monkeypatch.setattr(maintenance_service, "_prepared_truth_committed", lambda *args: False)
+    monkeypatch.setattr(maintenance_service, "update_work", lambda *args, **kwargs: None)
+
+    result = maintenance_service._advance_outbox(None, reservation_runtime_root=None, max_scan=1)
+
+    assert result["maintenance_state"] == ("waiting" if has_descriptor else "idle")
+    assert result["idle_blocking"] is False
+    assert result["budget"]["semantic_items_consumed"] == 0
+    assert result["budget"]["operations_remaining"] == 224
+    assert ledger.operations_reserved == 0

@@ -481,10 +481,17 @@ def _advance_outbox(
 ) -> dict[str, Any]:
     ledger = maintenance_full_audit.create_invocation_ledger(1)
     ledger.charge_operations(operations=32)
+    # Admit one bounded descriptor step before queue I/O can exhaust the soft
+    # deadline. Selection and its checkpoint belong to the same admitted step.
+    reservation = ledger.reserve_operations(
+        maximum_operations=max(128, *maintenance_full_audit.PHASE_OPERATION_RESERVATIONS.values())
+    )
     maintenance_full_audit.ensure_full_audit_outbox(cfg)
     selection = select_due_work(cfg, max_scan=max_scan)
     descriptor = selection["descriptor"]
     if descriptor is None:
+        if reservation is not None:
+            reservation.release()
         state = "pending" if selection.get("more") else "waiting" if selection.get("next_due_at") else "idle"
         return {
             "maintenance_state": state,
@@ -513,6 +520,8 @@ def _advance_outbox(
                 failure={"code": "producer_handoff_pending", "type": "TransientWait"},
                 publish_activation=False,
             )
+            if reservation is not None:
+                reservation.release()
             return {
                 "maintenance_state": "waiting",
                 "next_due_at": due_at,
@@ -521,6 +530,8 @@ def _advance_outbox(
             }
 
     if kind == "full_audit":
+        if reservation is not None:
+            reservation.release()
         progress = maintenance_full_audit.advance_full_audit(
             cfg,
             reservation_runtime_root=reservation_runtime_root,
@@ -577,7 +588,6 @@ def _advance_outbox(
         return progress
 
     reservation_cost = maintenance_full_audit.PHASE_OPERATION_RESERVATIONS.get(kind, 128)
-    reservation = ledger.reserve_operations(maximum_operations=reservation_cost)
     if reservation is None:
         due_at, retry_count, failure = _next_descriptor_retry(descriptor, "maintenance_budget_unavailable")
         update_work(

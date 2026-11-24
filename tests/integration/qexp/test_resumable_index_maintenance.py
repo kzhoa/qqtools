@@ -738,3 +738,52 @@ def test_ready_repair_recovers_reset_before_descriptor_activation(tmp_path: Path
 
 def _ready_build_archive(cfg, build_id: str) -> Path:
     return cfg.shared_root / "indexes" / "ready" / "builds" / build_id / "replaced-projection"
+
+
+@pytest.mark.parametrize("action", ["cancel", "remove"])
+def test_group_control_converges_despite_slow_outbox_selection(tmp_path, monkeypatch, action):
+    from qqtools.plugins.qexp.commands.group import change_worker, group_control
+    from qqtools.plugins.qexp.runtime import maintenance_service
+    from qqtools.plugins.qexp.runtime.operation_store import locate_operation_path
+    from qqtools.plugins.qexp.runtime.work_budget import InvocationLedger
+    from qqtools.plugins.qexp.scheduler import cancel_task
+    from tests.helpers.qexp_discovery import discover_group, isolated_group
+
+    cfg = isolated_group(tmp_path, tail=0)
+    tasks = [submit(cfg, ["true"], group="experiment") for _ in range(2)]
+    if action == "cancel":
+        operation_id = group_control(cfg, "experiment", "cancel")["cancellation_operation"]["operation_id"]
+    else:
+        for task in tasks:
+            cancel_task(cfg, task.task_id)
+        operation_id = change_worker(cfg, "experiment", "g1", "remove")["worker_control"]["operation_id"]
+    discover_group(cfg)
+    now = [0]
+    original_select = maintenance_service.select_due_work
+
+    def select(*args, **kwargs):
+        result = original_select(*args, **kwargs)
+        now[0] += 51_000_000
+        return result
+
+    monkeypatch.setattr(maintenance_service, "select_due_work", select)
+    monkeypatch.setattr(
+        maintenance_full_audit,
+        "create_invocation_ledger",
+        lambda limit: InvocationLedger(semantic_item_limit=limit, clock_ns=lambda: now[0]),
+    )
+    for _ in range(64):
+        progress = advance_maintenance_work(cfg, reservation_runtime_root=cfg.runtime_root)
+        record = read_json(locate_operation_path(cfg, "group_control", operation_id))["group_control"]
+        if record["state"] == "completed":
+            break
+    else:
+        pytest.fail(f"Group control did not converge: {record}; last progress: {progress}")
+    descriptor = read_work(cfg, kind="group_cancel", target_id=operation_id, work_generation=operation_id)
+    assert descriptor["state"] == "completed"
+    assert descriptor["retry_count"] == 0
+    assert record["completed_at"] is not None
+    if action == "cancel":
+        from qqtools.plugins.qexp.runtime.tasks import load_task
+
+        assert all(load_task(cfg, task.task_id).state["projection"] == "cancelled" for task in tasks)

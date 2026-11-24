@@ -160,7 +160,14 @@ Routine resident service gives maintenance a turn independently of free CPU or
 GPU capacity. It rotates due Projects, then due descriptors within each Project;
 new arrivals and retries join the tail and cannot overtake already due work. One
 turn advances at most one descriptor with the same ledger primitive used by the
-CLI. A complete pass over active descriptors with none due returns the persisted
+CLI. Routine non-audit service reserves the largest bounded descriptor-step cost
+before queue selection. Selection, prepared-truth verification, and the selected
+domain step form one admitted unit: slow queue I/O may overrun the soft deadline
+but cannot repeatedly prevent the selected obligation from making progress. The
+256-operation hard limit still includes setup and the reserved step. Empty or
+uncommitted selections release the reservation. Full-audit selections release
+it and retain the audit's own per-step admission checks on the same ledger. A
+complete pass over active descriptors with none due returns the persisted
 earliest `next_due_at` instead of keeping the Project hot.
 
 Transient failure k uses a capped exponential base
