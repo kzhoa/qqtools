@@ -1082,3 +1082,23 @@ def test_due_snapshots_preserve_finite_renewal_and_claim_bursts(free_slots):
     assert any(intent.operation_kind == "scheduler_claim" for intent in executed)
     assert any(intent.operation_kind == "scheduler_observe" for intent in executed)
     assert any(intent.operation_kind == "observation_service" for intent in executed)
+
+
+def test_idle_guard_yields_last_worker_slot_to_waiting_training():
+    admission = ProjectIOAdmission()
+    guard = _intent("guard").owner
+    occupied = [guard, *(_intent(name).owner for name in ("one", "two", "three"))]
+    training = _intent("training")
+    admission.begin([*occupied, training.owner], blocked=occupied, free_slots=0)
+    assert admission.has_idle_guard_capacity(already_occupied=True)
+    executed = []
+    _offer_all(admission, [training], executed)
+    assert not admission.has_idle_guard_capacity(already_occupied=True)
+    admission.finish()
+    assert not executed
+
+    admission.begin([*occupied, training.owner], blocked=occupied[1:], free_slots=1)
+    _offer_all(admission, [training], executed)
+    assert not admission.has_idle_guard_capacity(already_occupied=False)
+    admission.finish()
+    assert executed == [training]

@@ -7,13 +7,15 @@ import json
 import os
 import re
 import signal
+import socket
 import stat
 import subprocess
 import sys
 import time
 import uuid
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from dataclasses import replace
+from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Mapping, TypeVar
@@ -30,6 +32,7 @@ from ..runtime.resources.reservations import (
 from ..runtime.store import atomic_replace, read_json_bytes_limited, read_json_limited, require_json_size
 from .group_service_transport import GroupServiceRequestSpec
 from .project_io_protocol import (
+    IDLE_DECISION_GUARD_PROJECT_ID,
     PROJECT_IO_CAPACITY,
     PROJECT_IO_MAX_RECORD_BYTES,
     PROJECT_IO_MAX_RESOLVED_BYTES,
@@ -108,6 +111,7 @@ _RETRYABLE_ON_WORKER_EXIT = frozenset(
         "scheduler_primary_probe",
         "scheduler_quiescence_probe",
         "idle_job_probe",
+        "idle_decision_guard",
         "scheduler_reservation_reconcile",
         "activation_observe",
         "authority_service",
@@ -169,6 +173,8 @@ class ProjectIOExecutor:
         self.runtime_id = runtime_id or _resolve_runtime_id(self.root)
         self._children: dict[str, subprocess.Popen[bytes]] = {}
         self._reconciliation_unknown = False
+        self._idle_guard_response: tuple[str, float] | None = None
+        self._published_guard_response: tuple[str, float] | None = None
 
     def _ensure_layout(self) -> None:
         ensure_layout = getattr(self.runtime, "ensure_layout", None)
@@ -500,6 +506,10 @@ class ProjectIOExecutor:
             },
             source_revisions=None,
         )
+
+    def prepare_idle_decision_guard(self, registry_revision: int) -> ProjectIORequest:
+        """Persist a machine-scoped guard session for one exact registry revision."""
+        return self._prepare_request(None, registry_revision, "idle_decision_guard", {}, source_revisions=None)
 
     def prepare_scheduler_primary_probe(
         self,
@@ -1626,6 +1636,12 @@ class ProjectIOExecutor:
             raise ValueError("stale resolution requires idle_job_probe.")
         return self._resolve_stale_request(request_id, current_request)
 
+    def resolve_stale_idle_decision_guard(self, request_id: str, current_request: ProjectIORequest) -> bool:
+        """Archive the exact guard session after its worker has exited."""
+        if current_request.operation_kind != "idle_decision_guard":
+            raise ValueError("stale resolution requires idle_decision_guard.")
+        return self._resolve_stale_request(request_id, current_request, blocking=False)
+
     def _validate_project_event_source(self, project_id: str, bucket: str, filename: str, sha256: str) -> None:
         """Validate the exact source path and digest without following local links."""
         path = machine_project_paths(self.root, project_id)["events"] / bucket / filename
@@ -1962,7 +1978,7 @@ class ProjectIOExecutor:
 
     def _prepare_request(
         self,
-        binding: object,
+        binding: object | None,
         registry_revision: int,
         operation_kind: str,
         parameters: Mapping[str, Any],
@@ -1971,9 +1987,14 @@ class ProjectIOExecutor:
         request_id: str | None = None,
         provisional_offer_id: str | None = None,
     ) -> ProjectIORequest:
-        project_id = getattr(binding, "project_id", None)
-        shared_root = getattr(binding, "shared_root", None)
-        registration_generation = getattr(binding, "registration_generation", None)
+        if operation_kind == "idle_decision_guard":
+            project_id = IDLE_DECISION_GUARD_PROJECT_ID
+            shared_root = self.root
+            registration_generation = self.runtime_id
+        else:
+            project_id = getattr(binding, "project_id", None)
+            shared_root = getattr(binding, "shared_root", None)
+            registration_generation = getattr(binding, "registration_generation", None)
         if registration_generation is None:
             raise ValueError(f"{operation_kind} requires a registration_generation.")
         if type(registry_revision) is not int or registry_revision < 0:
@@ -2035,6 +2056,7 @@ class ProjectIOExecutor:
         reconcile_authority_orphan_recovery: bool = False,
         reconcile_authority_termination_commit: bool = False,
         reconcile_authority_terminal_publish: bool = False,
+        idle_guard_socket: socket.socket | None = None,
     ) -> ProjectIOProcess | None:
         """Start one fresh interpreter for a prepared typed request without waiting."""
         child: subprocess.Popen[bytes] | None = None
@@ -2047,6 +2069,13 @@ class ProjectIOExecutor:
             request = requests.get(request_id)
             if request is None:
                 raise ProjectIOProtocolError("prepared request does not exist.")
+            if idle_guard_socket is not None and (
+                request.operation_kind != "idle_decision_guard"
+                or idle_guard_socket.family != socket.AF_UNIX
+                or idle_guard_socket.type != socket.SOCK_SEQPACKET
+                or idle_guard_socket.fileno() < 0
+            ):
+                raise ProjectIOProtocolError("a live Unix seqpacket socket requires idle_decision_guard.")
             is_fenced_claim_reconciliation = reconcile_fenced_claim and request.operation_kind == "scheduler_claim"
             is_authority_renewal_reconciliation = (
                 reconcile_authority_renewal and request.operation_kind == "authority_renewal"
@@ -2117,12 +2146,18 @@ class ProjectIOExecutor:
                 command.append("--reconcile-authority-termination-commit")
             if is_authority_terminal_reconciliation:
                 command.append("--reconcile-authority-terminal-publish")
+            pass_fds = ()
+            if idle_guard_socket is not None:
+                guard_fd = idle_guard_socket.fileno()
+                command.extend(("--idle-guard-fd", str(guard_fd)))
+                pass_fds = (guard_fd,)
             child = subprocess.Popen(
                 command,
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 start_new_session=True,
+                pass_fds=pass_fds,
             )
             # Retain the child before any later identity or record operation can
             # fail. A retry may then observe this exact process instead of
@@ -2164,6 +2199,68 @@ class ProjectIOExecutor:
             self._reconciliation_unknown = True
             return self._unknown_status()
         return self.status_view()
+
+    def note_idle_guard_response(self, request_id: str) -> None:
+        """Refresh this controller's health baseline after an exact verified guard response."""
+        if not _RECORD_ID.fullmatch(request_id):
+            raise ValueError("request_id must be a lowercase 32-character hexadecimal ID.")
+        self._idle_guard_response = (request_id, time.time())
+
+    def publish_idle_guard_response(self, request: ProjectIORequest) -> None:
+        """Publish verified session progress during dispatch for independent status readers."""
+        response = self._idle_guard_response
+        if response is None or response[0] != request.request_id:
+            return
+        previous = self._published_guard_response
+        if previous and previous[0] == response[0] and response[1] - previous[1] < 1:
+            return
+        self._write_record(
+            self.paths["project_io_root"] / "idle-guard-response.json",
+            {"request_id": request.request_id, "executor_epoch": request.executor_epoch, "observed_at": response[1]},
+            "idle_guard_response",
+        )
+        self._published_guard_response = response
+
+    def read_idle_evidence_locked(self) -> tuple[dict[str, Any], tuple[ProjectIORequest, ...]]:
+        """Read without changing transport. The observer owns the cancellable lock lease."""
+        epoch = self._load_epoch()
+        if not epoch.active or self._reconciliation_unknown:
+            return self._unknown_status(), ()
+        requests, processes, results = self._scan_records()
+        if any(request.executor_epoch != epoch.executor_epoch for request in requests.values()):
+            return self._unknown_status(), ()
+        status = self._status_from_records(epoch, requests, processes, results, require_reconciled=True)
+        return status, tuple(sorted(requests.values(), key=lambda request: request.request_id))
+
+    def admission_snapshot(self, *, replay_archives: bool) -> tuple[dict[str, Any], tuple[ProjectIORequest, ...]]:
+        """Reconcile and read exact admission evidence under one nonblocking lock."""
+        try:
+            with exclusive(self.paths["project_io_lock"], blocking=False) as acquired:
+                if not acquired:
+                    return self._unknown_status(), ()
+                epoch = self._load_epoch()
+                if not epoch.active:
+                    return self._unknown_status(), ()
+
+                requests = self._reconcile_locked(replay_archives=replay_archives)
+                self._reconciliation_unknown = False
+                status = self.status_view()
+                status_epoch = status["executor_epoch"]
+                if status_epoch is None:
+                    self._reconciliation_unknown = True
+                    return self._unknown_status(), ()
+
+                current_epoch = self._load_epoch()
+                if (
+                    not current_epoch.active
+                    or current_epoch.executor_epoch != epoch.executor_epoch
+                    or status_epoch != epoch.executor_epoch
+                ):
+                    return self._unknown_status(), ()
+                return status, tuple(sorted(requests.values(), key=lambda request: request.request_id))
+        except (OSError, RuntimeError, ValueError, KeyError, TypeError):
+            self._reconciliation_unknown = True
+            return self._unknown_status(), ()
 
     def unresolved_requests(self) -> tuple[ProjectIORequest, ...]:
         """Return exact unresolved requests without resolving or consuming them."""
@@ -2497,10 +2594,14 @@ class ProjectIOExecutor:
         """Archive an exact stale request after the private process-absence checks."""
         return self._resolve_stale_request(request_id, current_request)
 
-    def _resolve_stale_request(self, request_id: str, current_request: ProjectIORequest) -> bool:
+    def _resolve_stale_request(
+        self, request_id: str, current_request: ProjectIORequest, *, blocking: bool = True
+    ) -> bool:
         if not isinstance(current_request, ProjectIORequest) or current_request.request_id != request_id:
             raise ValueError("stale resolution requires the exact request identity.")
-        with exclusive(self.paths["project_io_lock"]):
+        with exclusive(self.paths["project_io_lock"], blocking=blocking) as acquired:
+            if not acquired:
+                return False
             try:
                 stored = self._load_request(request_id)
             except FileNotFoundError:
@@ -2744,60 +2845,126 @@ class ProjectIOExecutor:
 
     def status_view(self) -> dict[str, Any]:
         """Return a read-only, bounded status projection without touching Project roots."""
-        now = time.time()
         if self._reconciliation_unknown:
             return self._unknown_status()
         try:
             epoch = self._load_epoch()
-            requests, processes, results = self._scan_records()
             if epoch is None:
                 return self._unknown_status()
-            active_count = 0
-            overdue_requests: list[ProjectIORequest] = []
-            exit_unverified_count = 0
-            unreaped_count = 0
-            blocking_project_ids: list[str] = []
-            unknown = False
-            for request_id, request in requests.items():
-                abnormal = False
-                if request_id not in results and now - _timestamp_seconds(request.prepared_at) > (
-                    PROJECT_IO_OVERDUE_SECONDS
-                ):
-                    overdue_requests.append(request)
-                    abnormal = True
-                process = processes.get(request_id)
-                if process is not None:
-                    state = inspect_process_identity(process.pid, process.start_time_ticks)
-                    if state == _PROCESS_LIVE:
-                        active_count += 1
-                        if process.state == "stop_targeted":
-                            unreaped_count += 1
-                            abnormal = True
-                    elif state == _PROCESS_UNVERIFIED:
-                        exit_unverified_count += 1
-                        unknown = True
-                        abnormal = True
-                        if process.state == "stop_targeted":
-                            unreaped_count += 1
-                    elif state != _PROCESS_ABSENT:
-                        raise ProjectIOProtocolError("executor process identity is unverifiable.")
-                if not epoch.active:
-                    abnormal = True
-                if abnormal and request.project_id not in blocking_project_ids:
-                    if len(blocking_project_ids) >= PROJECT_IO_CAPACITY:
-                        continue
-                    blocking_project_ids.append(request.project_id)
-            overdue_count = len(overdue_requests)
-            if unknown:
-                envelope = "unknown"
-            elif overdue_count > PROJECT_IO_SUPPORTED_HANG_LIMIT:
-                envelope = "exceeded"
-            elif not epoch.active or overdue_count > 0 or unreaped_count > 0:
-                envelope = "degraded"
-            else:
-                envelope = "healthy"
+            return self._status_from_records(epoch, *self._scan_records())
         except (OSError, RuntimeError, ValueError, KeyError, TypeError, ProjectIOProtocolError):
             return self._unknown_status()
+
+    def _has_idle_guard_child_exited(self, request_id: str) -> bool:
+        # A zombie retains matching /proc start ticks. Leave reaping to reconciliation.
+        child = self._children.get(request_id)
+        if child is None:
+            return False
+        try:
+            return os.waitid(os.P_PID, child.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is not None
+        except ChildProcessError:
+            return True
+
+    def _overdue_since(self, request: ProjectIORequest, now: float, *, has_live_process: bool) -> str | None:
+        response = self._idle_guard_response
+        if (
+            has_live_process
+            and request.operation_kind == "idle_decision_guard"
+            and (response is None or response[0] != request.request_id)
+        ):
+            try:
+                record = self._read_record(
+                    self.paths["project_io_root"] / "idle-guard-response.json", "idle_guard_response"
+                )
+            except (OSError, ValueError, ProjectIOProtocolError):
+                record = {}
+            observed_at = record.get("observed_at")
+            if (
+                record.get("request_id") == request.request_id
+                and record.get("executor_epoch") == request.executor_epoch
+                and type(observed_at) in (int, float)
+                and _timestamp_seconds(request.prepared_at) <= observed_at <= now
+            ):
+                response = (request.request_id, observed_at)
+        if (
+            has_live_process
+            and request.operation_kind == "idle_decision_guard"
+            and response is not None
+            and response[0] == request.request_id
+        ):
+            if now - response[1] <= PROJECT_IO_OVERDUE_SECONDS:
+                return None
+            return datetime.fromtimestamp(response[1], timezone.utc).isoformat().replace("+00:00", "Z")
+        prepared_at = _timestamp_seconds(request.prepared_at)
+        return request.prepared_at if now - prepared_at > PROJECT_IO_OVERDUE_SECONDS else None
+
+    def _status_from_records(
+        self,
+        epoch: ProjectIOEpoch,
+        requests: dict[str, ProjectIORequest],
+        processes: dict[str, ProjectIOProcess],
+        results: dict[str, ProjectIOResult],
+        *,
+        require_reconciled: bool = False,
+    ) -> dict[str, Any]:
+        now = time.time()
+        active_count = 0
+        overdue_times: list[str] = []
+        exit_unverified_count = 0
+        unreaped_count = 0
+        blocking_project_ids: list[str] = []
+        unknown = False
+        for request_id, request in requests.items():
+            abnormal = False
+            has_live_process = False
+            process = processes.get(request_id)
+            if process is not None:
+                state = inspect_process_identity(process.pid, process.start_time_ticks)
+                if (
+                    state == _PROCESS_LIVE
+                    and request.operation_kind == "idle_decision_guard"
+                    and self._has_idle_guard_child_exited(request_id)
+                ):
+                    state = _PROCESS_ABSENT
+                if state == _PROCESS_LIVE:
+                    active_count += 1
+                    has_live_process = (
+                        process.state == "running" and epoch.active and request.executor_epoch == epoch.executor_epoch
+                    )
+                    if process.state == "stop_targeted":
+                        unreaped_count += 1
+                        abnormal = True
+                elif state == _PROCESS_UNVERIFIED:
+                    exit_unverified_count += 1
+                    unknown = True
+                    abnormal = True
+                    if process.state == "stop_targeted":
+                        unreaped_count += 1
+                elif state != _PROCESS_ABSENT:
+                    raise ProjectIOProtocolError("executor process identity is unverifiable.")
+                elif require_reconciled and request_id not in results:
+                    unknown = True
+                    abnormal = True
+            if request_id not in results:
+                overdue_since = self._overdue_since(request, now, has_live_process=has_live_process)
+                if overdue_since is not None:
+                    overdue_times.append(overdue_since)
+                    abnormal = True
+            if not epoch.active:
+                abnormal = True
+            if abnormal and request.project_id not in blocking_project_ids:
+                if len(blocking_project_ids) >= PROJECT_IO_CAPACITY:
+                    continue
+                blocking_project_ids.append(request.project_id)
+        overdue_count = len(overdue_times)
+        if unknown:
+            envelope = "unknown"
+        elif overdue_count > PROJECT_IO_SUPPORTED_HANG_LIMIT:
+            envelope = "exceeded"
+        elif not epoch.active or overdue_count > 0 or unreaped_count > 0:
+            envelope = "degraded"
+        else:
+            envelope = "healthy"
         return {
             "protocol_version": PROJECT_IO_PROTOCOL_VERSION,
             "executor_epoch": epoch.executor_epoch,
@@ -2809,7 +2976,7 @@ class ProjectIOExecutor:
             "free_slot_count": max(0, PROJECT_IO_CAPACITY - len(requests)),
             "supported_hang_limit": PROJECT_IO_SUPPORTED_HANG_LIMIT,
             "envelope": envelope,
-            "oldest_overdue_at": min((request.prepared_at for request in overdue_requests), default=None),
+            "oldest_overdue_at": min(overdue_times, key=_timestamp_seconds, default=None),
             "blocking_project_ids": blocking_project_ids[:PROJECT_IO_CAPACITY],
         }
 
@@ -2949,8 +3116,6 @@ class ProjectIOExecutor:
 
 
 def _timestamp_seconds(value: str) -> float:
-    from datetime import datetime
-
     return datetime.fromisoformat(value[:-1] + "+00:00" if value.endswith("Z") else value).timestamp()
 
 

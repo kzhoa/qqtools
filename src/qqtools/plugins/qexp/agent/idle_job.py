@@ -18,6 +18,8 @@ import stat
 import time
 import uuid
 from collections.abc import Callable, Mapping
+from contextlib import AbstractContextManager, ExitStack, nullcontext
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -27,6 +29,7 @@ from ..infrastructure.process import process_start_time_ticks
 from ..runtime.locks import exclusive
 from ..runtime.paths import machine_runtime_paths
 from ..runtime.records import utc_now
+from ..runtime.resources.cpu_lane import get_cpu_lane_policy
 from ..runtime.resources.idle_job import (
     clear_idle_job_ownership,
     idle_job_guard,
@@ -37,6 +40,7 @@ from ..runtime.resources.idle_job import (
 )
 from ..runtime.resources.reservations import reservation_snapshot
 from ..runtime.store import atomic_replace, iter_json, json_encoded_size, read_json, read_json_limited
+from .bindings import ProjectBinding
 from .config import load_agent_config
 from .idle_job_config import (
     IdleJobConfig,
@@ -45,7 +49,16 @@ from .idle_job_config import (
     resolve_idle_job_gpus,
     validate_idle_job_mode,
 )
-from .idle_job_diagnostics import DEMAND_DETAIL_MEMBER, MAX_STATUS_BYTES, observe_demand_detail, validate_demand_detail
+from .idle_job_diagnostics import (
+    DEMAND_DETAIL_MEMBER,
+    INTERVAL_DETAIL_MEMBER,
+    MAX_STATUS_BYTES,
+    build_demand_observation,
+    demand_check,
+    observe_demand_detail,
+    validate_demand_detail,
+    validate_interval_detail,
+)
 from .idle_job_process import (
     current_boot_id,
     idle_job_processes_exited,
@@ -53,6 +66,7 @@ from .idle_job_process import (
     request_idle_job_stop,
     spawn_idle_job,
 )
+from .launch_handoff_state import LaunchHandoffState
 
 IDLE_JOB_STATUS_VERSION = 1
 IDLE_JOB_STATE_VERSION = 1
@@ -120,6 +134,33 @@ class _SupervisorBlocked(RuntimeError):
 
 class _GpuReserved(_SupervisorBlocked):
     """The selected GPU is currently occupied by another local reservation."""
+
+
+class _IdleDecisionRejected(RuntimeError):
+    """A covered fence could not authorize the current Idle Job decision."""
+
+
+@dataclass(frozen=True, slots=True)
+class IdleDecisionEvidence:
+    """Versioned evidence that must match to preserve continuous idleness."""
+
+    registry_revision: int
+    bindings: tuple[ProjectBinding, ...]
+    gpu_policy_revision: int
+    visible_gpu_ids: tuple[int, ...]
+    cpu_policy_revision: int
+    cpu_capacity: int
+    executor_epoch: str
+    checkpoint_digest: str
+
+    def matches_gpu_policy(self, policy: Mapping[str, Any]) -> bool:
+        """Check the observed persisted revision and usable inventory."""
+        visible = policy.get("visible_gpu_ids")
+        return (
+            policy.get("revision") == self.gpu_policy_revision
+            and isinstance(visible, (list, tuple))
+            and tuple(visible) == self.visible_gpu_ids
+        )
 
 
 class _ConfigObservation:
@@ -315,20 +356,50 @@ def _state_path(root: Path) -> Path:
     return root / "idle-job" / "state.json"
 
 
-def _read_status_payload(root: Path, *, include_demand_detail: bool = False) -> dict[str, Any]:
+def _read_status_payload(root: Path, *, include_diagnostics: bool = False) -> dict[str, Any]:
     path = _status_path(root)
     metadata = path.lstat()
     if not stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
         raise ValueError("Idle Job status must be a regular file")
     envelope = read_json_limited(path, max_bytes=MAX_STATUS_BYTES, record_type="idle_job_status")
     payload = _canonical_status(envelope.get("idle_job_status"))
-    if include_demand_detail:
+    if include_diagnostics:
         payload["demand_detail"] = validate_demand_detail(envelope.get(DEMAND_DETAIL_MEMBER))
+        payload["interval_detail"] = validate_interval_detail(envelope.get(INTERVAL_DETAIL_MEMBER))
     return payload
 
 
 def _reports_unknown_demand(payload: Mapping[str, Any]) -> bool:
     return payload["reason"] == "unknown_demand" and payload["state"] in {"waiting", "stopping"}
+
+
+def _observation_reset_check(previous: str | None, current: str) -> str:
+    if previous is None:
+        return "observation_changed"
+    try:
+        before, after = json.loads(previous), json.loads(current)
+        if (
+            not isinstance(before, dict)
+            or before.keys() != after.keys()
+            or before["demand"] != "idle"
+            or any(
+                type(before[field]) is not int or before[field] < 0 for field in ("demand_revision", "config_revision")
+            )
+        ):
+            return "observation_changed"
+        previous_policy = json.loads(before["policy"])
+        if not isinstance(previous_policy, dict) or "resolved_gpu_ids" not in previous_policy:
+            return "observation_changed"
+    except (TypeError, ValueError, RecursionError):
+        return "observation_changed"
+    for field, check in (
+        ("demand_revision", "demand_revision_changed"),
+        ("config_revision", "config_revision_changed"),
+        ("policy", "gpu_policy_changed"),
+    ):
+        if before[field] != after[field]:
+            return check
+    return "observation_changed"
 
 
 def _ownership_file_exists(root: Path) -> bool:
@@ -378,7 +449,7 @@ def _idle_job_status(runtime: Any) -> dict[str, Any]:
         ownership_malformed = False
 
     try:
-        payload = _read_status_payload(root, include_demand_detail=True)
+        payload = _read_status_payload(root, include_diagnostics=True)
     except FileNotFoundError:
         payload = _default_status(
             runtime_id,
@@ -454,9 +525,10 @@ def _idle_job_status(runtime: Any) -> dict[str, Any]:
 
 
 def idle_job_status(runtime: Any) -> dict[str, Any]:
-    """Read Idle Job status and retain detail only for a current unknown-demand outcome."""
+    """Read Idle Job status and its last observed interval without refreshing evidence."""
     payload = _idle_job_status(runtime)
     payload["demand_detail"] = payload.get("demand_detail") if _reports_unknown_demand(payload) else None
+    payload.setdefault("interval_detail", None)
     return payload
 
 
@@ -486,6 +558,9 @@ class IdleJobSupervisor:
         self._sleep = sleep or (lambda seconds: time.sleep(seconds))
         self._agent_mode_override = agent_mode
         self._observation_key: str | None = None
+        self._last_handoff_revision: int | None = None
+        self._last_decision_evidence: IdleDecisionEvidence | None = None
+        # Restart interrupts proof of continuous idleness.
         self._idle_since: float | None = None
         self._retry_at: float | None = None
         self._failure_count = 0
@@ -499,14 +574,18 @@ class IdleJobSupervisor:
         self._config_revision: int | None = None
         self._status_state = "disabled"
         self._status_reason = "disabled"
+        self._pending_demand_check: str | None = None
         self._pending_demand_detail: dict[str, Any] | None = None
+        self._pending_agent_instance_id: str | None = None
         self._last_demand_detail: dict[str, Any] | None = None
+        self._interval_observed = False
+        self._last_interval_reset: dict[str, Any] | None = None
+        self._last_stop: dict[str, Any] | None = None
+        self._last_stop_instance_id: str | None = None
         self._state_corrupt = False
         self._children = []
         self._supervision_active = True
         self._load_state()
-        # Restart interrupts proof of continuous idleness.
-        self._idle_since = None
 
     def _now(self) -> float:
         value = float(self._monotonic())
@@ -534,7 +613,6 @@ class IdleJobSupervisor:
             self._state_corrupt = True
             return
         self._observation_key = state["observation_key"]
-        self._idle_since = float(state["idle_since"]) if state["idle_since"] is not None else None
         self._retry_at = float(state["retry_at"]) if state["retry_at"] is not None else None
         self._failure_count = state["failure_count"]
         self._last_exit = _copy_json(state["last_exit"]) if state["last_exit"] is not None else None
@@ -581,40 +659,67 @@ class IdleJobSupervisor:
         self._status_state = "waiting" if state == "launching" else state
         self._status_reason = reason
         payload = self._payload(state=state, reason=reason)
-        envelope = {"idle_job_status": payload}
+        # Only a completed decision establishes an interval for reset reporting.
+        # A timer can start and clear within one tick while validating reservations.
+        self._interval_observed = self._idle_since is not None
+        base = {"idle_job_status": payload}
         detail, self._pending_demand_detail = self._pending_demand_detail, None
+        self._pending_demand_check = None
+        self._pending_agent_instance_id = None
         self._last_demand_detail = None
-        if detail is not None and _reports_unknown_demand(payload):
-            enriched = {**envelope, DEMAND_DETAIL_MEMBER: detail}
+        if not _reports_unknown_demand(payload):
+            detail = None
+        try:
+            interval = self._interval_detail()
+        except Exception:
+            interval = None
+        enriched = base
+        for member, value in ((DEMAND_DETAIL_MEMBER, detail), (INTERVAL_DETAIL_MEMBER, interval)):
+            if value is None:
+                continue
             try:
-                if json_encoded_size(enriched) <= MAX_STATUS_BYTES:
-                    envelope = enriched
-            except (OverflowError, TypeError, ValueError):
+                candidate = {**enriched, member: value}
+                if json_encoded_size(candidate) <= MAX_STATUS_BYTES:
+                    enriched = candidate
+            except Exception:
                 pass
-        atomic_replace(_status_path(self.root), envelope)
-        self._last_demand_detail = envelope.get(DEMAND_DETAIL_MEMBER)
+        path = _status_path(self.root)
+        if enriched is not base:
+            try:
+                atomic_replace(path, enriched)
+            except Exception:
+                # Optional status must not interrupt supervision if the enriched write fails.
+                pass
+            else:
+                self._last_demand_detail = enriched.get(DEMAND_DETAIL_MEMBER)
+                return payload
+        atomic_replace(path, base)
         return payload
 
     def set_demand_observation(
         self, demand: str, detail: Mapping[str, Any] | None, *, agent_instance_id: str | None
     ) -> None:
         """Stage the current observation for the next decision publication."""
+        self._pending_agent_instance_id = agent_instance_id
+        self._pending_demand_check = None
         self._pending_demand_detail = None
-        if demand == "unknown" and isinstance(detail, Mapping) and agent_instance_id is not None:
+        if demand == "unknown" and isinstance(detail, Mapping):
             try:
-                self._pending_demand_detail = observe_demand_detail(
-                    detail,
-                    agent_instance_id=agent_instance_id,
-                    observed_at=self._wall_now(),
-                    previous=self._last_demand_detail,
-                )
-            except (OSError, OverflowError, RuntimeError, TypeError, ValueError):
+                self._pending_demand_check = demand_check(detail.get("code"))
+                if agent_instance_id is not None:
+                    self._pending_demand_detail = observe_demand_detail(
+                        detail,
+                        agent_instance_id=agent_instance_id,
+                        observed_at=self._wall_now(),
+                        previous=self._last_demand_detail,
+                    )
+            except Exception:
                 pass
-        if self._pending_demand_detail is None:
+        if demand == "unknown" and self._pending_demand_detail is None:
             self._last_demand_detail = None
 
     def _blocked(self, reason: str) -> dict[str, Any]:
-        self._idle_since = None
+        self._clear_idle_interval(reason)
         self._status_state = "blocked"
         self._status_reason = reason
         try:
@@ -657,9 +762,11 @@ class IdleJobSupervisor:
         return value, gpu_policy
 
     def _resolve_gpus(
-        self, config: IdleJobConfig, gpu_policy: Any
+        self, config: IdleJobConfig, gpu_policy: Any, *, decision_evidence: IdleDecisionEvidence | None = None
     ) -> tuple[tuple[int, ...], Mapping[str, Any], GpuReservationPolicy | None]:
         policy, reservation_policy = self._policy_mapping(gpu_policy)
+        if decision_evidence is not None and not decision_evidence.matches_gpu_policy(policy):
+            raise _IdleDecisionRejected("demand_census_unknown")
         visible = policy.get("visible_gpu_ids")
         if visible is None and "gpu_ids" in policy:
             visible = policy["gpu_ids"]
@@ -710,8 +817,10 @@ class IdleJobSupervisor:
     def _reset_observation_if_changed(self, key: str, now_wall: float) -> bool:
         changed = key != self._observation_key
         if changed:
+            interval_start = self._now()
+            self._record_interval_reset("observation_changed", replacement_key=key, now=interval_start)
             self._observation_key = key
-            self._idle_since = self._now()
+            self._idle_since = interval_start
             self._retry_at = None
             self._failure_count = 0
             self._persist_state()
@@ -719,6 +828,62 @@ class IdleJobSupervisor:
             self._idle_since = self._now()
             self._persist_state()
         return changed
+
+    def _diagnostic_timestamp(self) -> str:
+        return datetime.fromtimestamp(self._wall_now(), timezone.utc).isoformat().replace("+00:00", "Z")
+
+    def _record_interval_reset(
+        self, check: str, *, replacement_key: str | None = None, now: float | None = None
+    ) -> None:
+        if self._idle_since is None or not self._interval_observed:
+            return
+        self._interval_observed = False
+        self._last_interval_reset = None
+        try:
+            if replacement_key is not None:
+                check = _observation_reset_check(self._observation_key, replacement_key)
+            elif check == "unknown_demand":
+                check = self._pending_demand_check or check
+            observed = self._now() if now is None else now
+            elapsed = max(0.0, observed - self._idle_since)
+            if math.isfinite(elapsed):
+                self._last_interval_reset = {
+                    "check": check,
+                    "elapsed_seconds": elapsed,
+                    "reset_at": self._diagnostic_timestamp(),
+                }
+        except Exception:
+            # Optional evidence cannot interrupt interval invalidation.
+            pass
+
+    def _clear_idle_interval(self, check: str, *, replacement_key: str | None = None) -> None:
+        self._record_interval_reset(check, replacement_key=replacement_key)
+        self._idle_since = None
+        self._last_decision_evidence = None
+
+    def _record_stop_request(self, instance_id: str, reason: str) -> None:
+        if self._last_stop_instance_id == instance_id:
+            return
+        self._last_stop_instance_id = instance_id
+        self._last_stop = None
+        try:
+            check = self._pending_demand_check if reason == "unknown_demand" else None
+            self._last_stop = {
+                "check": check or reason,
+                "instance_id": instance_id,
+                "stopped_at": self._diagnostic_timestamp(),
+            }
+        except Exception:
+            # The persisted stop request remains authoritative.
+            pass
+
+    def _interval_detail(self) -> dict[str, Any] | None:
+        if self._idle_since is None and self._last_interval_reset is None and self._last_stop is None:
+            return None
+        elapsed = max(0.0, self._now() - self._idle_since) if self._idle_since is not None else 0.0
+        return validate_interval_detail(
+            {"idle_elapsed_seconds": elapsed, "last_reset": self._last_interval_reset, "last_stop": self._last_stop}
+        )
 
     def _idle_elapsed(self, now_wall: float) -> float:
         if self._idle_since is None:
@@ -866,7 +1031,7 @@ class IdleJobSupervisor:
     def _stop_locked(
         self, reason: str, owner: dict[str, Any] | None = None
     ) -> tuple[dict[str, Any] | None, str | None]:
-        self._idle_since = None
+        self._clear_idle_interval(reason)
         self._observation_key = None
         current = owner
         if current is None:
@@ -879,12 +1044,22 @@ class IdleJobSupervisor:
         if current["runtime_id"] != self.runtime_id:
             self._set_owner_fields(current, None)
             return current, "foreign_ownership"
-        if (
-            current["phase"] != "stopping"
-            or _read_stop_reason(idle_job_instance_path(self.root, current["instance_id"])) is None
-        ):
+        instance_dir = idle_job_instance_path(self.root, current["instance_id"])
+        already_stopping = current["phase"] == "stopping"
+        if not already_stopping or _read_stop_reason(instance_dir) is None:
+            first_request = False
+            if not already_stopping:
+                try:
+                    (instance_dir / "stop.json").lstat()
+                except FileNotFoundError:
+                    first_request = True
+                except Exception:
+                    # An unreadable marker cannot prove who initiated the stop.
+                    pass
             try:
-                request_idle_job_stop(idle_job_instance_path(self.root, current["instance_id"]), reason)
+                request_idle_job_stop(instance_dir, reason)
+                if first_request:
+                    self._record_stop_request(current["instance_id"], reason)
                 stopping = dict(current)
                 stopping["phase"] = "stopping"
                 write_idle_job_ownership(self.root, stopping)
@@ -1118,10 +1293,54 @@ class IdleJobSupervisor:
         self._instance_id = None
         return self._publish(state=state, reason=reason)
 
-    def tick(self, demand: str = "idle", gpu_policy: Any = None, *, launch_allowed: bool = True) -> dict[str, Any]:
+    def _stop_for_demand_locked(
+        self, config: IdleJobConfig, owner: dict[str, Any] | None, reason: str
+    ) -> dict[str, Any]:
+        owner, error = self._stop_locked(reason, owner)
+        if error is not None:
+            return self._blocked(error)
+        self._last_handoff_revision = None
+        if owner is not None:
+            return self._publish(state="stopping", reason=reason)
+        self._resolved_gpu_ids = None
+        return self._status_after_no_owner(config, state="waiting", reason=reason)
+
+    def _reject_idle_decision(self, boot_id: str, config: IdleJobConfig, check: str) -> dict[str, Any]:
+        self.set_demand_observation(
+            "unknown", build_demand_observation(check), agent_instance_id=self._pending_agent_instance_id
+        )
+        try:
+            with idle_job_guard(self.root, blocking=False) as acquired:
+                if not acquired:
+                    # Invalidate immediately. The next owned turn must stop any
+                    # surviving instance before it can accept fresh idle evidence.
+                    self._clear_idle_interval("unknown_demand")
+                    self._observation_key = None
+                    if self._instance_id is not None:
+                        return self._blocked("ownership_reconciliation_failed")
+                    return self._publish(state="waiting", reason="unknown_demand")
+                owner, error = self._reconcile_locked(boot_id)
+                if error is not None:
+                    return self._blocked(error)
+                return self._stop_for_demand_locked(config, owner, "unknown_demand")
+        except (OSError, RuntimeError, TypeError, ValueError, KeyError):
+            return self._blocked("supervision_failed")
+
+    def tick(
+        self,
+        demand: str = "idle",
+        gpu_policy: Any = None,
+        *,
+        launch_allowed: bool = True,
+        expected_handoff_revision: int | None = None,
+        decision_evidence: IdleDecisionEvidence | None = None,
+        decision_guard: AbstractContextManager[bool] | None = None,
+        decision_deadline: float | None = None,
+    ) -> dict[str, Any]:
         """Advance supervision once and return the flat status payload."""
         self._children = [child for child in self._children if child.poll() is None]
         observed_demand = demand if demand in {"idle", "busy", "unknown"} else "unknown"
+        guarded = decision_evidence is not None and observed_demand == "idle"
         try:
             boot_id = current_boot_id()
             now_wall = self._wall_now()
@@ -1130,13 +1349,14 @@ class IdleJobSupervisor:
         if self._state_corrupt:
             return self._blocked("malformed_state")
 
-        try:
-            with idle_job_guard(self.root):
-                owner, reconciliation_error = self._reconcile_locked(boot_id)
-                if reconciliation_error is not None:
-                    return self._blocked(reconciliation_error)
-        except (OSError, RuntimeError, TypeError, ValueError, KeyError):
-            return self._blocked("ownership_reconciliation_failed")
+        if not guarded:
+            try:
+                with idle_job_guard(self.root):
+                    owner, reconciliation_error = self._reconcile_locked(boot_id)
+                    if reconciliation_error is not None:
+                        return self._blocked(reconciliation_error)
+            except (OSError, RuntimeError, TypeError, ValueError, KeyError):
+                return self._blocked("ownership_reconciliation_failed")
 
         try:
             observation = self._load_config()
@@ -1175,17 +1395,17 @@ class IdleJobSupervisor:
                 owner, error = self._reconcile_locked(boot_id)
                 if error is not None:
                     return self._blocked(error)
-                owner, error = self._stop_locked(stop_reason, owner)
-                if error is not None:
-                    return self._blocked(error)
-                if owner is not None:
-                    return self._publish(state="stopping", reason=stop_reason)
-                self._resolved_gpu_ids = None
-                return self._status_after_no_owner(config, state="waiting", reason=stop_reason)
+                return self._stop_for_demand_locked(config, owner, stop_reason)
 
         try:
-            resolved, policy, reservation_policy = self._resolve_gpus(config, gpu_policy)
+            resolved, policy, reservation_policy = (
+                self._resolve_gpus(config, gpu_policy, decision_evidence=decision_evidence)
+                if guarded
+                else self._resolve_gpus(config, gpu_policy)
+            )
             policy_key = self._policy_key(policy, resolved)
+        except _IdleDecisionRejected as exc:
+            return self._reject_idle_decision(boot_id, config, str(exc))
         except _GpuReserved:
             with idle_job_guard(self.root):
                 owner, error = self._reconcile_locked(boot_id)
@@ -1221,7 +1441,25 @@ class IdleJobSupervisor:
             return self._blocked("gpu_policy_unavailable")
 
         try:
-            with idle_job_guard(self.root):
+            handoffs = (
+                getattr(self.runtime, "pending_launch_handoffs", None)
+                if expected_handoff_revision is not None
+                else None
+            )
+            has_handoff_fence = isinstance(handoffs, LaunchHandoffState)
+            handoff_guard = handoffs.read_guard(blocking=not guarded) if has_handoff_fence else nullcontext(True)
+            with ExitStack() as stack:
+                if guarded and (
+                    decision_guard is None or decision_deadline is None or not stack.enter_context(decision_guard)
+                ):
+                    raise _IdleDecisionRejected("demand_census_unknown")
+                if not stack.enter_context(handoff_guard):
+                    raise _IdleDecisionRejected("launch_handoff_pending")
+                if guarded:
+                    if not stack.enter_context(idle_job_guard(self.root, blocking=False)):
+                        raise _IdleDecisionRejected("demand_census_unknown")
+                else:
+                    stack.enter_context(idle_job_guard(self.root))
                 current_owner, error = self._reconcile_locked(boot_id)
                 if error is not None:
                     return self._blocked(error)
@@ -1230,8 +1468,33 @@ class IdleJobSupervisor:
                     current_demand_revision = read_idle_job_demand(self.root)
                 except (OSError, RuntimeError, TypeError, ValueError, KeyError):
                     return self._blocked("config_changed")
-                if current_observation.config != config or current_observation.agent_mode != observation.agent_mode:
+                key = self._observation_key_for(
+                    observed_demand, current_demand_revision, current_observation.config, policy_key
+                )
+                config_changed = (
+                    current_observation.config != config or current_observation.agent_mode != observation.agent_mode
+                )
+                if config_changed or (current_owner is not None and current_owner["phase"] == "stopping"):
+                    self._clear_idle_interval(
+                        "config_changed" if config_changed else "stopping",
+                        replacement_key=key if key != self._observation_key else None,
+                    )
+                if config_changed:
                     return self._publish(state="waiting", reason="config_changed")
+                if decision_evidence is not None and (current_owner is None or current_owner["phase"] != "stopping"):
+                    current_policy, _ = self._policy_mapping(gpu_policy)
+                    cpu_policy = get_cpu_lane_policy(self.root, blocking=False)
+                    if (
+                        time.monotonic() >= decision_deadline
+                        or not decision_evidence.matches_gpu_policy(current_policy)
+                        or cpu_policy.revision != decision_evidence.cpu_policy_revision
+                        or cpu_policy.capacity != decision_evidence.cpu_capacity
+                        or (
+                            (self._idle_since is not None or current_owner is not None)
+                            and self._last_decision_evidence != decision_evidence
+                        )
+                    ):
+                        raise _IdleDecisionRejected("demand_census_unknown")
                 if current_owner is not None and current_owner["config_revision"] != config.revision:
                     current_owner, stop_error = self._stop_locked("config_changed", current_owner)
                     if stop_error is not None:
@@ -1244,23 +1507,41 @@ class IdleJobSupervisor:
                         return self._blocked(stop_error)
                     if current_owner is not None:
                         return self._publish(state="stopping", reason="gpu_changed")
+                if current_owner is not None and current_owner["phase"] == "stopping":
+                    return self._publish(state="stopping", reason="stopping")
+                if expected_handoff_revision is not None:
+                    revision, has_pending = handoffs.snapshot() if has_handoff_fence else (None, False)
+                    if (
+                        has_pending
+                        or revision != expected_handoff_revision
+                        or self._last_handoff_revision not in (None, revision)
+                    ):
+                        raise _IdleDecisionRejected("launch_handoff_pending")
+                    self._last_handoff_revision = revision
                 if current_owner is not None:
                     return self._publish(state=current_owner["phase"], reason=current_owner["phase"])
 
-                key = self._observation_key_for(observed_demand, current_demand_revision, config, policy_key)
                 if not launch_allowed and key != self._observation_key:
+                    self._clear_idle_interval("observation_changed", replacement_key=key)
                     self._observation_key = key
-                    self._idle_since = None
                 elif launch_allowed:
                     self._reset_observation_if_changed(key, now_wall)
                 try:
-                    snapshot = reservation_snapshot(self.root)
+                    snapshot = (
+                        reservation_snapshot(self.root, blocking=False) if guarded else reservation_snapshot(self.root)
+                    )
                 except (OSError, RuntimeError, TypeError, ValueError, KeyError):
+                    if guarded:
+                        raise _IdleDecisionRejected("demand_census_unknown") from None
                     return self._blocked("reservation_observation_unavailable")
                 if snapshot.active or snapshot.provisional:
-                    self._idle_since = None
+                    self._clear_idle_interval("gpu_reserved")
                     self._resolved_gpu_ids = list(resolved)
                     return self._publish(state="waiting", reason="gpu_reserved")
+                if decision_evidence is not None:
+                    if time.monotonic() >= decision_deadline:
+                        raise _IdleDecisionRejected("demand_census_unknown")
+                    self._last_decision_evidence = decision_evidence
                 if not launch_allowed:
                     return self._publish(state="waiting", reason="partition_scan_pending")
                 elapsed = self._idle_elapsed(now_wall)
@@ -1272,13 +1553,15 @@ class IdleJobSupervisor:
                     return self._publish(state="backoff", reason="backoff")
 
                 paths = machine_runtime_paths(self.root)
-                with exclusive(paths["reservation_lock"]):
+                with exclusive(paths["reservation_lock"], blocking=not guarded) as acquired:
+                    if not acquired:
+                        raise _IdleDecisionRejected("demand_census_unknown")
                     try:
                         current_reserved = self._reserved_gpu_ids_locked()
                     except _SupervisorBlocked:
                         return self._blocked("reservation_observation_unavailable")
                     if snapshot.active or snapshot.provisional or current_reserved:
-                        self._idle_since = None
+                        self._clear_idle_interval("gpu_reserved")
                         self._resolved_gpu_ids = list(resolved)
                         return self._publish(state="waiting", reason="gpu_reserved")
                     if reservation_policy is not None:
@@ -1286,8 +1569,14 @@ class IdleJobSupervisor:
                             validate_gpu_reservation(self.root, list(resolved), reservation_policy)
                         except (OSError, RuntimeError, TypeError, ValueError, KeyError):
                             return self._blocked("gpu_policy_unavailable")
+                    if guarded and time.monotonic() >= decision_deadline:
+                        raise _IdleDecisionRejected("demand_census_unknown")
                     return self._launch_locked(config, resolved, boot_id)
+        except _IdleDecisionRejected as exc:
+            return self._reject_idle_decision(boot_id, config, str(exc))
         except (OSError, RuntimeError, TypeError, ValueError, KeyError):
+            if decision_evidence is not None:
+                return self._reject_idle_decision(boot_id, config, "demand_census_unknown")
             return self._blocked("supervision_failed")
 
     def shutdown(self, timeout: float | None = None, *, timeout_seconds: float | None = None) -> bool:

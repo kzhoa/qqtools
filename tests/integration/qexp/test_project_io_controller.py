@@ -6,6 +6,7 @@ import io
 import os
 import threading
 import time
+from contextlib import ExitStack
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -44,6 +45,7 @@ from qqtools.plugins.qexp.runtime import project_activation as project_activatio
 from qqtools.plugins.qexp.runtime.availability import offer_deadlines as offer_deadline_module
 from qqtools.plugins.qexp.runtime.availability import sync_deadline_index
 from qqtools.plugins.qexp.runtime.availability import transitions as availability_transitions_module
+from qqtools.plugins.qexp.runtime.locks import exclusive
 from qqtools.plugins.qexp.runtime.paths import attempt_path, local_paths, ready_state_path, shared_paths, task_path
 from qqtools.plugins.qexp.runtime.process_evidence import ProcessEvidence
 from qqtools.plugins.qexp.runtime.project_activation import publish_project_activation
@@ -2452,10 +2454,10 @@ def test_unknown_executor_poll_preserves_backoff_until_identity_change_is_observ
             executor.fence_epoch()
             executor.begin_epoch()
         with monkeypatch.context() as patch:
-            patch.setattr(executor, "poll", executor._unknown_status)
+            patch.setattr(executor, "admission_snapshot", lambda **_: (executor._unknown_status(), ()))
             assert controller.advance_recovery_admission([binding], revision, {binding.project_id: {}}) == {}
             assert not executor.unresolved_requests()
-            assert controller._service_backoff == ({} if invalidation == "registry" else retained)
+            assert controller._service_backoff == retained
         with controller.admission_turn():
             controller._poll_admission_executor()
         if invalidation == "none":
@@ -4113,12 +4115,20 @@ def test_admission_replays_archives_at_boundaries_and_rechecks_live_capacity(tmp
     executor = ProjectIOExecutor(runtime)
     executor.begin_epoch()
     controller = ProjectIOController(runtime, executor)
-    original_poll, original_status = executor.poll, executor.status_view
-    polls = []
+    original_reconcile, original_status = executor._reconcile_locked, executor.status_view
+    original_snapshot = executor.admission_snapshot
+    snapshot_calls = []
+    replays = []
 
-    def poll():
-        polls.append(None)
-        return original_poll()
+    def observed_snapshot(*, replay_archives):
+        before = len(replays)
+        result = original_snapshot(replay_archives=replay_archives)
+        snapshot_calls.append(replays[before:])
+        return result
+
+    def reconcile(*, replay_archives=True):
+        replays.append(replay_archives)
+        return original_reconcile(replay_archives=replay_archives)
 
     def changed_status():
         value = original_status()
@@ -4126,7 +4136,8 @@ def test_admission_replays_archives_at_boundaries_and_rechecks_live_capacity(tmp
         value["overdue_worker_count"] = 3 if envelope == "exceeded" else 0
         return value
 
-    monkeypatch.setattr(executor, "poll", poll)
+    monkeypatch.setattr(executor, "_reconcile_locked", reconcile)
+    monkeypatch.setattr(executor, "admission_snapshot", observed_snapshot)
     monkeypatch.setattr(executor, "start", lambda _request_id: None)
     try:
         with controller.admission_turn():
@@ -4137,8 +4148,8 @@ def test_admission_replays_archives_at_boundaries_and_rechecks_live_capacity(tmp
             assert observed["overdue_worker_count"] == (3 if envelope == "exceeded" else 0)
             for _ in range(5):
                 controller.advance_registration_renewals(bindings, revision, renewal_horizon_seconds=10)
-            assert len(polls) == 1
-        assert len(polls) == 2
+            assert replays == [True] + [False] * 6
+        assert snapshot_calls == [[True]] + [[False]] * 6 + [[True]]
         requests = executor.unresolved_requests()
         if envelope == "healthy":
             assert len(requests) == 1
@@ -4207,10 +4218,10 @@ def test_invalid_public_service_input_never_enters_executor_reconciliation(
     executor.begin_epoch()
     controller = ProjectIOController(runtime, executor)
 
-    def reject_mutation():
+    def reject_mutation(**kwargs):
         raise AssertionError("invalid input reached mutating executor reconciliation")
 
-    monkeypatch.setattr(executor, "poll", reject_mutation)
+    monkeypatch.setattr(executor, "_reconcile_locked", reject_mutation)
     monkeypatch.setattr(executor, "unresolved_requests", reject_mutation)
     with pytest.raises(ValueError):
         getattr(controller, method_name)([], **{"registry_revision": 0, **kwargs})
@@ -4545,7 +4556,7 @@ def test_unknown_executor_state_hides_cached_validation(
     _advance_until_validated(controller, bindings, revision, binding.project_id)
     unknown = executor.status_view()
     unknown["envelope"] = "unknown"
-    monkeypatch.setattr(executor, "poll", lambda: unknown)
+    monkeypatch.setattr(executor, "status_view", lambda: unknown)
 
     current = controller.advance_binding_validation(bindings, revision)
 
@@ -4739,13 +4750,63 @@ def test_due_validation_retry_reuses_its_existing_slot_at_supported_hang_limit(
     now[0] += 5.0
     status = executor.status_view()
     status.update(overdue_worker_count=2, free_slot_count=2, envelope="degraded")
-    monkeypatch.setattr(executor, "poll", lambda: status)
+    monkeypatch.setattr(executor, "status_view", lambda: status)
 
     controller.advance_binding_validation(bindings, revision)
 
     assert calls == 2
     assert executor.unresolved_requests() == (prepared,)
     executor.shutdown()
+
+
+def test_admission_retries_opening_replay_and_requires_evidence_of_completion(tmp_path, monkeypatch):
+    runtime = MachineRuntime(tmp_path / "machine")
+    initialize_machine(runtime, "gpu-1")
+    _cfg, binding, revision, _bindings = _registered(tmp_path, "project-a", runtime)
+    executor = ProjectIOExecutor(runtime)
+    executor.begin_epoch()
+    controller = ProjectIOController(runtime, executor)
+    request = executor.prepare_validate_binding(binding, revision)
+    reconciliations = []
+    reconcile = executor._reconcile_locked
+
+    def observe_reconcile(*, replay_archives):
+        reconciliations.append(replay_archives)
+        return reconcile(replay_archives=replay_archives)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(executor, "_reconcile_locked", observe_reconcile)
+        with ExitStack() as exit_lock, controller.admission_turn():
+            with exclusive(executor.paths["project_io_lock"]):
+                missed, _ = controller._poll_admission_executor()
+            assert missed["envelope"] == "unknown"
+            assert controller._poll_admission_executor()[1] == (request,)
+            assert reconciliations == [True]
+            exit_lock.enter_context(exclusive(executor.paths["project_io_lock"]))
+    assert not controller.has_pending_admission
+    assert executor.unresolved_requests() == (request,)
+    executor.shutdown()
+
+
+def test_admission_snapshot_reports_lock_contention_without_losing_pending_request(tmp_path):
+    runtime = MachineRuntime(tmp_path / "machine")
+    initialize_machine(runtime, "gpu-1")
+    _cfg, binding, revision, _bindings = _registered(tmp_path, "project-a", runtime)
+    executor = ProjectIOExecutor(runtime)
+    epoch = executor.begin_epoch()
+    request = executor.prepare_validate_binding(binding, revision)
+    try:
+        with exclusive(executor.paths["project_io_lock"]):
+            status, requests = executor.admission_snapshot(replay_archives=True)
+            assert status["envelope"] == "unknown"
+            assert status["free_slot_count"] == 0
+            assert requests == ()
+        status, requests = executor.admission_snapshot(replay_archives=True)
+        assert status["executor_epoch"] == epoch
+        assert status["free_slot_count"] == status["capacity"] - 1
+        assert requests == (request,)
+    finally:
+        executor.shutdown()
 
 
 def test_unresolved_requests_are_sorted_and_do_not_consume_results(tmp_path: Path) -> None:
@@ -4780,7 +4841,7 @@ def test_validation_uses_both_free_slots_when_supported_hang_limit_is_reached(
         executor.prepare_activation_observe(binding, revision)
     status = executor.status_view()
     status.update(overdue_worker_count=2, free_slot_count=2, envelope="degraded")
-    monkeypatch.setattr(executor, "poll", lambda: status)
+    monkeypatch.setattr(executor, "status_view", lambda: status)
     controller = ProjectIOController(runtime, executor)
 
     assert controller.advance_binding_validation(bindings, revision) == {}
@@ -4815,7 +4876,7 @@ def test_running_validation_does_not_reserve_the_other_healthy_slot(
     executor.start(running.request_id)
     status = executor.status_view()
     status.update(overdue_worker_count=2, free_slot_count=1, envelope="degraded")
-    monkeypatch.setattr(executor, "poll", lambda: status)
+    monkeypatch.setattr(executor, "status_view", lambda: status)
     controller = ProjectIOController(runtime, executor)
 
     try:
@@ -5663,7 +5724,7 @@ def test_scheduler_observation_can_use_reserved_peer_slot_at_two_overdue(
     _prime_current_activation(runtime, bindings, revision)
     status = executor.status_view()
     status.update(overdue_worker_count=2, free_slot_count=2, envelope="degraded")
-    monkeypatch.setattr(executor, "poll", lambda: status)
+    monkeypatch.setattr(executor, "status_view", lambda: status)
 
     controller.advance_scheduler_observations(
         bindings,
@@ -8207,7 +8268,45 @@ def test_deferred_snapshot_keeps_original_admission_deadline_and_then_publishes(
     assert read_json(machine_state_path(cfg, "agent.json"))["agent"]["instance_id"] == "agent-1"
 
 
-def test_idle_job_census_is_activation_scoped_and_does_not_retire_scheduler(tmp_path):
+@pytest.mark.parametrize("fault", ["exit_lock", "exit_epoch", "initial_degraded", "exit_degraded"])
+def test_idle_demand_requires_same_healthy_executor_at_both_turn_boundaries(tmp_path, monkeypatch, fault):
+    runtime = MachineRuntime(tmp_path / "machine")
+    initialize_machine(runtime, "gpu-1")
+    executor = ProjectIOExecutor(runtime)
+    executor.begin_epoch()
+    controller = ProjectIOController(runtime, executor)
+    snapshot = executor.admission_snapshot
+    reads = 0
+
+    def inject(*, replay_archives):
+        nonlocal reads
+        reads += 1
+        if reads == 2 and fault == "exit_lock":
+            with exclusive(executor.paths["project_io_lock"]):
+                return snapshot(replay_archives=replay_archives)
+        if reads == 2 and fault == "exit_epoch":
+            executor.begin_epoch()
+        status, unresolved = snapshot(replay_archives=replay_archives)
+        if (reads == 1 and fault == "initial_degraded") or (reads == 2 and fault == "exit_degraded"):
+            status = {**status, "envelope": "degraded"}
+        return status, unresolved
+
+    def demand():
+        return controller.advance_idle_job_demand([], 0, gpu_capacity=1, cpu_capacity=1, capacity_key="test")
+
+    try:
+        assert demand() == "idle"
+        with monkeypatch.context() as patch:
+            patch.setattr(executor, "admission_snapshot", inject)
+            assert demand() == "unknown"
+        assert demand() == "idle"
+        with controller.admission_turn():
+            assert demand() == "unknown"
+    finally:
+        executor.shutdown()
+
+
+def test_idle_job_census_is_activation_scoped_and_does_not_retire_scheduler(tmp_path, monkeypatch):
     runtime = MachineRuntime(tmp_path / "machine")
     initialize_machine(runtime, "gpu-1")
     cfg, binding, revision, bindings = _registered(tmp_path, "project", runtime)
@@ -8243,6 +8342,12 @@ def test_idle_job_census_is_activation_scoped_and_does_not_retire_scheduler(tmp_
         )
         advance_until("idle")
         advance_until("busy", capacity=2)
+        status_view = executor.status_view
+        monkeypatch.setattr(executor, "status_view", lambda: {**status_view(), "envelope": "degraded"})
+        assert (
+            controller.advance_idle_job_demand(bindings, revision, gpu_capacity=2, cpu_capacity=1, capacity_key="2")
+            == "busy"
+        )
         assert "scheduler" not in state.acknowledged_lanes
     finally:
         executor.shutdown()

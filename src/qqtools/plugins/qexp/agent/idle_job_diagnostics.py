@@ -1,7 +1,8 @@
-"""Bounded observations of the checks that prevent Idle Job demand proof."""
+"""Bounded observations of Idle Job demand and continuous idle proof."""
 
 from __future__ import annotations
 
+import math
 import re
 import shlex
 import time
@@ -17,6 +18,7 @@ from ..upgrade_progress import validate_progress_evidence
 from .bindings import ProjectBinding
 
 DEMAND_DETAIL_MEMBER = "idle_job_demand_detail"
+INTERVAL_DETAIL_MEMBER = "idle_job_interval_detail"
 MAX_STATUS_BYTES = 65_536
 _MAX_PROJECTS = 3
 _MAX_LIVE_AGE_SECONDS = 60
@@ -44,6 +46,9 @@ _CODES = frozenset(
 )
 _DETAIL_FIELDS = frozenset({"code", "agent_instance_id", "observed_at", "since", "project_count", "projects"})
 _PROJECT_FIELDS = frozenset({"project_id", "migration", "phase", "state", "last_progress_at", "detail_command"})
+_INTERVAL_FIELDS = frozenset({"idle_elapsed_seconds", "last_reset", "last_stop"})
+_RESET_FIELDS = frozenset({"check", "elapsed_seconds", "reset_at"})
+_STOP_FIELDS = frozenset({"check", "instance_id", "stopped_at"})
 
 
 def _safe_token(value: object) -> bool:
@@ -61,6 +66,48 @@ def _utc_timestamp(value: object) -> datetime | None:
         return datetime.fromisoformat(value)
     except ValueError:
         return None
+
+
+def _nonnegative_finite(value: object) -> bool:
+    if type(value) not in {int, float} or value < 0:
+        return False
+    try:
+        return math.isfinite(value)
+    except OverflowError:
+        return False
+
+
+def validate_interval_detail(value: object) -> dict[str, Any] | None:
+    """Copy a bounded observation of the active interval and its most recent reset."""
+    if not isinstance(value, dict) or set(value) != _INTERVAL_FIELDS:
+        return None
+    elapsed = value["idle_elapsed_seconds"]
+    if not _nonnegative_finite(elapsed):
+        return None
+    reset = value["last_reset"]
+    if reset is not None:
+        if not isinstance(reset, dict) or set(reset) != _RESET_FIELDS:
+            return None
+        if not _safe_token(reset["check"]) or not _nonnegative_finite(reset["elapsed_seconds"]):
+            return None
+        if _utc_timestamp(reset["reset_at"]) is None:
+            return None
+        reset = dict(reset)
+    stop = value["last_stop"]
+    if stop is not None:
+        if not isinstance(stop, dict) or set(stop) != _STOP_FIELDS:
+            return None
+        if not _safe_token(stop["check"]) or not _safe_token(stop["instance_id"]):
+            return None
+        if _utc_timestamp(stop["stopped_at"]) is None:
+            return None
+        stop = dict(stop)
+    return {"idle_elapsed_seconds": elapsed, "last_reset": reset, "last_stop": stop}
+
+
+def demand_check(value: object) -> str | None:
+    """Recognize a staged decisive check independently of its sampled details."""
+    return value if isinstance(value, str) and value in _CODES else None
 
 
 def _validate_project(value: object) -> dict[str, Any] | None:
@@ -85,7 +132,7 @@ def validate_demand_detail(value: object) -> dict[str, Any] | None:
     """Copy valid optional detail independently of the required status member."""
     if not isinstance(value, dict) or set(value) != _DETAIL_FIELDS:
         return None
-    if not isinstance(value["code"], str) or value["code"] not in _CODES:
+    if demand_check(value["code"]) is None:
         return None
     if not _safe_token(value["agent_instance_id"]) or _utc_timestamp(value["observed_at"]) is None:
         return None

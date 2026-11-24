@@ -47,6 +47,7 @@ PROJECT_IO_MAX_RESOLVED_RECORDS = 256
 PROJECT_IO_MAX_RESOLVED_BYTES = 8 * 1024 * 1024
 PROJECT_IO_OVERDUE_SECONDS = 10.0
 PROJECT_IO_STOP_GRACE_SECONDS = 2.0
+IDLE_DECISION_GUARD_PROJECT_ID = "@idle-decision"
 
 PROJECT_IO_OPERATIONS = frozenset(
     {
@@ -68,6 +69,7 @@ PROJECT_IO_OPERATIONS = frozenset(
         "scheduler_primary_probe",
         "scheduler_quiescence_probe",
         "idle_job_probe",
+        "idle_decision_guard",
         "scheduler_claim",
         "scheduler_cursor_commit",
         "scheduler_launch_authorize",
@@ -784,7 +786,9 @@ def _validate_timeout_retirement(value: object, parameters: Mapping[str, Any]) -
 
 def _request_parameters(operation_kind: str, value: object) -> dict[str, Any]:
     parameters = dict(_require_mapping(value, f"{operation_kind} parameters"))
-    if operation_kind == "validate_binding":
+    if operation_kind == "idle_decision_guard":
+        _require_exact_keys(parameters, frozenset(), "idle_decision_guard parameters")
+    elif operation_kind == "validate_binding":
         _require_exact_keys(parameters, frozenset({"machine_name"}), "validate_binding parameters")
         parameters["machine_name"] = _require_identifier(parameters["machine_name"], "machine_name")
     elif operation_kind == "registration_renew":
@@ -1454,7 +1458,12 @@ def _request_fields(value: object) -> dict[str, Any]:
     operation_kind = payload["operation_kind"]
     if operation_kind not in PROJECT_IO_OPERATIONS:
         raise ValueError("operation_kind is not supported by this protocol version.")
-    project_id = _require_identifier(payload["project_id"], "project_id")
+    if operation_kind == "idle_decision_guard":
+        if payload["project_id"] != IDLE_DECISION_GUARD_PROJECT_ID:
+            raise ValueError("idle_decision_guard requires the reserved machine-scoped identity.")
+        project_id = IDLE_DECISION_GUARD_PROJECT_ID
+    else:
+        project_id = _require_identifier(payload["project_id"], "project_id")
     canonical_root = _require_text(payload["canonical_shared_root"], "canonical_shared_root", maximum=4096)
     root_path = Path(canonical_root)
     # This parser runs in the controller for poll/status/replay. Canonicality
@@ -1564,6 +1573,10 @@ def _request_fields(value: object) -> dict[str, Any]:
         _require_exact_keys(revisions, frozenset(), "idle_job_probe source_revisions")
         if offer_id is not None:
             raise ValueError("idle job probe cannot name a provisional offer.")
+    if operation_kind == "idle_decision_guard":
+        _require_exact_keys(revisions, frozenset(), "idle_decision_guard source_revisions")
+        if registration_generation != runtime_id or offer_id is not None:
+            raise ValueError("idle_decision_guard has an invalid machine-scoped identity.")
     if operation_kind in {"group_service_probe", "group_service_advance"}:
         _require_exact_keys(revisions, frozenset(), f"{operation_kind} source_revisions")
         if offer_id is not None:
@@ -1777,6 +1790,7 @@ class ProjectIOResult:
             "project_io_recovery_capture_transition_failed",
             "project_io_scheduler_observation_failed",
             "project_io_idle_job_probe_failed",
+            "project_io_idle_decision_guard_unavailable",
             "project_io_scheduler_claim_failed_before_commit",
             "project_io_scheduler_cursor_commit_failed",
             "project_io_scheduler_launch_authorize_failed",
@@ -2034,6 +2048,10 @@ def _validate_evidence(request: ProjectIORequest, status: str, value: Mapping[st
                     )
             elif next_due_at is not None:
                 raise ValueError("maintenance_descriptor_advance next_due_at must be null outside waiting state.")
+        elif request.operation_kind == "idle_decision_guard":
+            _require_exact_keys(evidence, frozenset({"closed"}), "idle_decision_guard evidence")
+            if evidence["closed"] is not True:
+                raise ValueError("idle_decision_guard durable evidence only describes session closure.")
         elif request.operation_kind in {"scheduler_quiescence_probe", "idle_job_probe"}:
             _require_exact_keys(evidence, frozenset({"state", "probe_state"}), "scheduler quiescence evidence")
             if evidence["state"] not in {"quiescent", "active", "pending"}:

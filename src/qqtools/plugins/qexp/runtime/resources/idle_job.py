@@ -199,11 +199,11 @@ def _demand_envelope(revision: int) -> dict[str, Any]:
 
 
 @contextmanager
-def idle_job_guard(root: Path | Any) -> Iterator[None]:
+def idle_job_guard(root: Path | Any, *, blocking: bool = True) -> Iterator[bool]:
     """Hold the machine-wide fence for Idle Job and training admission."""
     paths = local_paths(_runtime_root(root))
-    with exclusive(paths["locks"] / "idle-job-admission.lock"):
-        yield
+    with exclusive(paths["locks"] / "idle-job-admission.lock", blocking=blocking) as acquired:
+        yield acquired
 
 
 def idle_job_instance_path(root: Path | Any, instance_id: str) -> Path:

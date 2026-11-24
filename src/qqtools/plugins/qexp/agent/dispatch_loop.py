@@ -71,6 +71,7 @@ from .helpers import (
     _recover_starting_reservations,
     _working_directory_reason,
 )
+from .idle_job_demand import idle_job_capacity_key
 from .inventory import InventoryReconciliation, exact_binding_for_entry
 from .launch_handoff import _LaunchHandoffBatch
 from .launch_handoff import _PendingLaunchHandoff as _PendingLaunchHandoff
@@ -540,6 +541,7 @@ def _observe_gpu_policy(
         )
     except (OSError, RuntimeError, ValueError, TypeError):
         diagnostic_increment("gpu_policy.observation_unavailable")
+    runtime.cycle_gpu_observation = (reservation_policy, policy_view)
     return reservation_policy, policy_view
 
 
@@ -1114,6 +1116,7 @@ def _dispatch_isolated_machine_cycle(
     *,
     controller: ProjectIOController,
     bindings: list[ProjectBinding],
+    registered_bindings: Sequence[ProjectBinding],
     validated_configs: dict[str, RootConfig],
     registry_revision: int,
     launch_batch: _LaunchHandoffBatch,
@@ -1153,7 +1156,7 @@ def _dispatch_isolated_machine_cycle(
     if not isinstance(ready_generations, dict):
         ready_generations = {}
         runtime.authority_ready_generations = ready_generations
-    current_generations = {binding.project_id: binding.registration_generation for binding in bindings}
+    current_generations = {binding.project_id: binding.registration_generation for binding in registered_bindings}
     for project_id, generation in tuple(ready_generations.items()):
         if current_generations.get(project_id) != generation:
             ready_generations.pop(project_id, None)
@@ -1222,7 +1225,11 @@ def _dispatch_isolated_machine_cycle(
     except (OSError, RuntimeError, ValueError, KeyError, TypeError, AttributeError):
         runtime.last_cycle_had_demand = True
 
+    idle_capacity_inputs: tuple[int, tuple[int, ...], int, int] | None = None
+
     def local_capacity() -> tuple[list[int], int, int, int]:
+        nonlocal idle_capacity_inputs
+        idle_capacity_inputs = None
         snapshot = reservation_snapshot(runtime.root)
         _gpu_policy, policy_view = _observe_gpu_policy(
             runtime,
@@ -1233,6 +1240,12 @@ def _dispatch_isolated_machine_cycle(
         visible = list(policy_view.visible_gpu_ids or ())
         free_gpu_ids = [gpu_id for gpu_id in visible if gpu_id not in snapshot.reserved_gpu_ids]
         cpu_policy, cpu_reservations = cpu_reservation_snapshot(runtime.root)
+        if policy_view.visible_gpu_ids is not None and policy_view.visible_status not in {
+            "pending",
+            "unavailable",
+            "invalid",
+        }:
+            idle_capacity_inputs = (policy_view.revision, tuple(visible), cpu_policy.revision, cpu_policy.capacity)
         reserved_cpu_slots = 0
         cpu_valid = True
         for record in cpu_reservations:
@@ -1584,6 +1597,27 @@ def _dispatch_isolated_machine_cycle(
         runtime.last_cycle_had_demand = True
     if getattr(runtime, "pending_launch_handoffs", {}):
         runtime.last_cycle_had_demand = True
+    idle_capacity = None
+    if (
+        idle_capacity_inputs is not None
+        and final_snapshot is not None
+        and not final_snapshot.active
+        and not final_snapshot.provisional
+        and not runtime.pending_launch_identities()
+    ):
+        gpu_revision, visible_gpu_ids, cpu_revision, cpu_capacity = idle_capacity_inputs
+        idle_capacity = (
+            len(visible_gpu_ids),
+            cpu_capacity,
+            idle_job_capacity_key(gpu_revision, visible_gpu_ids, cpu_revision=cpu_revision, cpu_capacity=cpu_capacity),
+        )
+    try:
+        controller.service_queued_idle_job_demand(registered_bindings, registry_revision, capacity=idle_capacity)
+    except (OSError, RuntimeError, ValueError, KeyError, TypeError, AttributeError):
+        diagnostic_increment("scheduler.isolated.idle_job_census_failed")
+    controller.register_idle_job_guard_service(
+        tuple(registered_bindings), registry_revision, can_start=idle_capacity is not None
+    )
     runtime.last_cycle_validated_project_ids = frozenset(validated_configs)
     diagnostic_probes: list[dict[str, object]] = []
     if runtime.last_enablement_reconciliation_probe is not None:
@@ -1615,6 +1649,7 @@ def _dispatch_machine_cycle_locked(
     executor = executor or Executor()
     launch_batch = _LaunchHandoffBatch(executor, runtime)
     runtime.last_scheduler_diagnostic_probes = ()
+    runtime.cycle_gpu_observation = None
     runtime.last_cycle_had_demand = False
     runtime.last_cycle_consumed_binding = False
     runtime.last_cycle_validated_project_ids = frozenset()
@@ -1679,6 +1714,7 @@ def _dispatch_machine_cycle_locked(
             runtime,
             controller=project_io_controller,
             bindings=supervised,
+            registered_bindings=registered,
             validated_configs=validated_configs,
             registry_revision=registry_revision,
             launch_batch=launch_batch,

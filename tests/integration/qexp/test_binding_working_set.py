@@ -959,3 +959,23 @@ def test_shared_ack_failure_keeps_binding_resident(tmp_path: Path) -> None:
     assert results[-1] is False
     assert working_set.resident_bindings([binding]) == [binding]
     assert working_set.snapshot()["unknown_bindings"] == 1
+
+
+def test_dormant_binding_retains_only_its_current_completed_turn(tmp_path):
+    runtime, pairs = _bindings(tmp_path, 1)
+    binding = pairs[0][1]
+    revision, bindings = runtime.load_registry_snapshot()
+    working_set = runtime.working_set
+    working_set.reconcile(bindings, revision=revision)
+    try:
+        _drive_activation(working_set, lambda: _state(working_set, binding).activation_observed)
+        turn = working_set.begin_turn(binding, "scheduler")
+        assert not working_set.retains_dormant_turn(turn)
+        _retire(working_set, binding)
+        assert not working_set.resident_bindings()
+        assert working_set.retains_dormant_turn(turn)
+        working_set.begin_turn(binding, "scheduler")
+        assert not working_set.retains_dormant_turn(turn)
+    finally:
+        if getattr(runtime, "project_io_executor", None) is not None:
+            runtime.project_io_executor.shutdown()

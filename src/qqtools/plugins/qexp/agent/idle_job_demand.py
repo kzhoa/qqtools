@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import time
 from collections.abc import Callable, Collection, Hashable, Mapping, Sequence
 from dataclasses import dataclass
@@ -21,6 +22,25 @@ _MAX_SELECTION_WINDOW = 64
 _ACTIVE_RETRY_SECONDS = 1.0
 
 
+def idle_job_capacity_key(
+    gpu_revision: object,
+    allowed_gpu_ids: Sequence[int],
+    *,
+    cpu_revision: int,
+    cpu_capacity: int,
+) -> str:
+    return json.dumps(
+        {
+            "gpu_policy_revision": gpu_revision,
+            "allowed_gpu_ids": list(allowed_gpu_ids),
+            "cpu_policy_revision": cpu_revision,
+            "cpu_capacity": cpu_capacity,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
 def _json_copy(value: Any) -> Any:
     """Copy protocol-shaped state before retaining it across a controller turn."""
     if isinstance(value, Mapping):
@@ -28,6 +48,17 @@ def _json_copy(value: Any) -> Any:
     if isinstance(value, Sequence) and not isinstance(value, str | bytes):
         return [_json_copy(item) for item in value]
     return value
+
+
+@dataclass(frozen=True, slots=True)
+class IdleJobCensus:
+    """Latest immutable dispatch input for the Idle Job demand producer."""
+
+    bindings: tuple[ProjectBinding, ...]
+    registry_revision: int
+    gpu_capacity: int
+    cpu_capacity: int
+    capacity_key: str
 
 
 @dataclass(slots=True)
@@ -67,7 +98,7 @@ class _DemandController(Protocol):
 
     def _request_identity(self, request: ProjectIORequest) -> Hashable: ...
 
-    def validated_config(self, binding: ProjectBinding, registry_revision: int) -> Any | None: ...
+    def _binding_identity_is_validated(self, identity: Hashable) -> bool: ...
 
     def _offer_new_request(
         self,
@@ -87,7 +118,7 @@ class _DemandController(Protocol):
         service_key: tuple[Hashable, str, str, str],
     ) -> None: ...
 
-    def scheduler_is_quiescent(self, binding: ProjectBinding, registry_revision: int) -> bool: ...
+    def _scheduler_quiescence_is_current(self, identity: Hashable, *, blocking: bool = True) -> bool: ...
 
 
 class IdleJobDemandCoordinator:
@@ -117,7 +148,7 @@ class IdleJobDemandCoordinator:
         capacity_key: str,
     ) -> str:
         """Advance demand proofs and return ``idle``, ``busy``, or ``unknown``."""
-        self._validate_inputs(
+        self.validate_inputs(
             bindings,
             registry_revision,
             gpu_capacity=gpu_capacity,
@@ -129,6 +160,7 @@ class IdleJobDemandCoordinator:
         if status is None:
             return "unknown"
         executor_epoch = status["executor_epoch"]
+        clear_demand = "idle" if status["envelope"] == "healthy" else "unknown"
         try:
             controller._observed_executor_epoch = executor_epoch
         except (AttributeError, TypeError):
@@ -171,7 +203,7 @@ class IdleJobDemandCoordinator:
         if not current:
             if validation_blocked or remaining_unresolved:
                 return "unknown"
-            return "idle"
+            return clear_demand
 
         self._offer_probes(
             controller,
@@ -183,28 +215,83 @@ class IdleJobDemandCoordinator:
             status,
         )
 
-        has_active = False
-        complete = True
-        for cache_identity, (base_identity, binding) in current.items():
-            round_state = self._rounds.get(cache_identity)
-            if self._scheduler_proof_is_current(controller, binding, registry_revision):
+        demand = self._classify_current(controller, current, validation_blocked, has_capacity_match=True)
+        return clear_demand if demand == "idle" else demand
+
+    def cached_demand(
+        self,
+        controller: _DemandController,
+        census: IdleJobCensus,
+        executor_epoch: str,
+        unresolved: tuple[ProjectIORequest, ...],
+    ) -> str:
+        """Inspect exact current proofs without advancing Project I/O or turns."""
+        current, validation_blocked = self._current_bindings(
+            controller, census.bindings, census.registry_revision, executor_epoch, census.capacity_key
+        )
+        if not current and unresolved:
+            return "unknown"
+        return self._classify_current(
+            controller,
+            current,
+            validation_blocked,
+            has_capacity_match=self._capacity_matches(census),
+            blocking=False,
+        )
+
+    def needs_probe_service(self, controller: _DemandController, census: IdleJobCensus, executor_epoch: str) -> bool:
+        """Check whether a matching census has any eligible probe work."""
+        current, _validation_blocked = self._current_bindings(
+            controller, census.bindings, census.registry_revision, executor_epoch, census.capacity_key
+        )
+        has_capacity_match = self._capacity_matches(census)
+        started_requests = self._started_requests(controller)
+        active_request_identities = {
+            association.identity for request_id, association in self._requests.items() if request_id in started_requests
+        }
+        for cache_identity, (base_identity, _binding) in current.items():
+            if controller._scheduler_quiescence_is_current(base_identity):
                 continue
-            if round_state is None or not self._turn_is_current(controller, round_state.turn):
+            if has_capacity_match and cache_identity in active_request_identities:
+                continue
+            round_state = self._rounds.get(cache_identity) if has_capacity_match else None
+            if round_state is not None and self._turn_is_current(controller, round_state.turn):
+                if round_state.state == "quiescent" or round_state.retry_at > self._monotonic():
+                    continue
+            if self._retry_due(controller, self._service_key(base_identity, census.capacity_key)):
+                return True
+        return False
+
+    def _capacity_matches(self, census: IdleJobCensus) -> bool:
+        return self._capacity_key == census.capacity_key and self._capacity_values == (
+            census.gpu_capacity,
+            census.cpu_capacity,
+        )
+
+    def _classify_current(
+        self,
+        controller: _DemandController,
+        current: Mapping[tuple[Hashable, str], tuple[Hashable, ProjectBinding]],
+        validation_blocked: bool,
+        *,
+        has_capacity_match: bool,
+        blocking: bool = True,
+    ) -> str:
+        complete = not validation_blocked
+        for cache_identity, (base_identity, _binding) in current.items():
+            if controller._scheduler_quiescence_is_current(base_identity, blocking=blocking):
+                continue
+            round_state = self._rounds.get(cache_identity) if has_capacity_match else None
+            if round_state is None or not self._turn_is_current(controller, round_state.turn, blocking=blocking):
                 complete = False
-                continue
-            if round_state.state == "active":
-                has_active = True
+            elif round_state.state == "active":
+                return "busy"
             elif round_state.state != "quiescent":
                 complete = False
-
-        if has_active:
-            return "busy"
-        if complete and not validation_blocked:
-            return "idle"
-        return "unknown"
+        return "idle" if complete else "unknown"
 
     @staticmethod
-    def _validate_inputs(
+    def validate_inputs(
         bindings: Sequence[ProjectBinding],
         registry_revision: int,
         *,
@@ -214,8 +301,8 @@ class IdleJobDemandCoordinator:
     ) -> None:
         if not isinstance(bindings, Sequence) or isinstance(bindings, str | bytes | bytearray):
             raise ValueError("bindings must be a sequence.")
-        if any(not isinstance(binding, ProjectBinding) for binding in bindings):
-            raise ValueError("bindings must contain ProjectBinding values.")
+        if any(not isinstance(binding, ProjectBinding) or type(binding.enabled) is not bool for binding in bindings):
+            raise ValueError("bindings must contain ProjectBinding values with boolean enablement.")
         if type(registry_revision) is not int or registry_revision < 0:
             raise ValueError("registry_revision must be a nonnegative integer.")
         for value, label in ((gpu_capacity, "gpu_capacity"), (cpu_capacity, "cpu_capacity")):
@@ -267,17 +354,10 @@ class IdleJobDemandCoordinator:
             if binding.enabled is not True:
                 continue
             try:
-                config = controller.validated_config(binding, registry_revision)
-            except (OSError, RuntimeError, ValueError, KeyError, TypeError):
-                config = None
-            if config is None:
-                validation_blocked = True
-                continue
-            try:
                 base_identity = controller._binding_identity(binding, registry_revision, executor_epoch)
             except (OSError, RuntimeError, ValueError, KeyError, TypeError):
                 base_identity = None
-            if base_identity is None:
+            if base_identity is None or not controller._binding_identity_is_validated(base_identity):
                 validation_blocked = True
                 continue
             cache_identity = (base_identity, capacity_key)
@@ -403,7 +483,7 @@ class IdleJobDemandCoordinator:
         for cache_identity, (base_identity, binding) in window:
             if offered >= offer_limit:
                 break
-            if self._scheduler_proof_is_current(controller, binding, registry_revision):
+            if controller._scheduler_quiescence_is_current(base_identity):
                 continue
             round_state = self._rounds.get(cache_identity)
             if round_state is not None:
@@ -494,9 +574,9 @@ class IdleJobDemandCoordinator:
         return identity, "idle_job_probe", capacity_key, "demand"
 
     @staticmethod
-    def _turn_is_current(controller: _DemandController, turn: BindingTurn) -> bool:
+    def _turn_is_current(controller: _DemandController, turn: BindingTurn, *, blocking: bool = True) -> bool:
         try:
-            return bool(controller.runtime.working_set.is_current_turn(turn))
+            return bool(controller.runtime.working_set.is_current_turn(turn, blocking=blocking))
         except (OSError, RuntimeError, ValueError, KeyError, TypeError, AttributeError):
             return False
 
@@ -504,20 +584,6 @@ class IdleJobDemandCoordinator:
     def _turn_observation_pending(controller: _DemandController, turn: BindingTurn) -> bool:
         try:
             return bool(controller.runtime.working_set.is_turn_observation_pending(turn))
-        except (OSError, RuntimeError, ValueError, KeyError, TypeError, AttributeError):
-            return False
-
-    @staticmethod
-    def _scheduler_proof_is_current(
-        controller: _DemandController,
-        binding: ProjectBinding,
-        registry_revision: int,
-    ) -> bool:
-        checker = getattr(controller, "scheduler_is_quiescent", None)
-        if not callable(checker):
-            return False
-        try:
-            return bool(checker(binding, registry_revision))
         except (OSError, RuntimeError, ValueError, KeyError, TypeError, AttributeError):
             return False
 
@@ -577,4 +643,4 @@ class IdleJobDemandCoordinator:
             started.discard(request_id)
 
 
-__all__ = ["IdleJobDemandCoordinator"]
+__all__ = ["IdleJobCensus", "IdleJobDemandCoordinator", "idle_job_capacity_key"]

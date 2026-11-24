@@ -1750,6 +1750,17 @@ process-table inspection, resource-offer allocation, result consumption, diagnos
 lifecycle remain in the controller. Launch retains its asynchronous handoff; any shared Project
 validation before launch is isolated.
 
+The read-only `idle_decision_guard` operation covers the enabled roster at one exact
+machine registry revision. Its synthetic `@idle-decision` identity binds to the
+runtime and executor epoch. It occupies one of the same four worker slots and
+yields to training. Only a current live session can supply final admission evidence.
+A stored result records closure and cannot authorize a later decision. The
+worker exits on disconnect or after 15 seconds without a check. Independent
+status readers may use the last verified response timestamp for that exact
+request and active epoch to assess the existing 10-second overdue threshold.
+A missing diagnostic sample grants no additional time and has no effect on
+the live decision.
+
 Each request runs in a new subprocess started through a fresh interpreter. The agent never forks
 its multithreaded controller and does not use a thread pool for this boundary. The controller:
 
@@ -5021,6 +5032,22 @@ future timestamps. Malformed identity/time fields invalidate optional detail.
 Elapsed duration additionally requires non-null `since <= observed_at`. These
 freshness rules are display-only and never cause writes or affect scheduling.
 
+An optional sibling `idle_job_interval_detail` in the same v1 status envelope
+records `idle_elapsed_seconds` at publication and nullable `last_reset` and
+`last_stop`. A supervisor-issued stop records its check, instance ID, and UTC
+request time, including when a restarted supervisor adopts a running instance.
+An established interval's clear or replacement captures one bounded check name,
+nonnegative monotonic `elapsed_seconds`, and UTC `reset_at` before replacing
+its start time. When training has already requested a stop, observing the
+stopping owner ends the interval even if the demand census still reports idle.
+Elapsed time is sampled when supervision observes the invalidation. The external
+request does not create a supervisor-issued `last_stop` record.
+Repeated unknown observations with no active interval preserve
+that record. A supervisor restart starts a fresh history. Status exposes
+`idle_job.interval_detail` as last observed, or null when absent or malformed.
+The existing envelope size bound applies. If enriched publication fails, the
+supervisor retries the base status and retains its reset record in memory.
+
 `idle-job/ownership.json` is an independent versioned ownership envelope. It
 binds runtime ID, boot ID, unique instance ID, phase, config revision, resolved
 GPU IDs, parent PID/start ticks, and creation time. Per-instance `intent.json`
@@ -5044,10 +5071,32 @@ A dedicated read-only Project I/O `idle_job_probe` performs bounded, resumable
 ready-route censuses using current GPU/CPU capacity. It scans past known
 ineligible candidates so they cannot hide feasible peers. Its coordinator binds
 proofs to runtime/Project generation, executor epoch, registry revision, capacity,
-and activation turn. Unknown or incomplete proofs cannot establish idleness.
+and activation turn. Both the demand census and the closing admission snapshot
+must report a healthy executor in the same epoch before the controller can
+return an idle result. Unknown or incomplete proofs cannot establish idleness.
 These probes neither acknowledge nor retire the scheduler activation lane, and
 do not change protected on-demand exit semantics. Existing current full
-quiescence proofs may be reused.
+quiescence proofs may be reused. An omitted resident scheduling turn preserves
+exact generation-bound startup evidence within its registry revision and
+executor epoch. A dormant Project retains its completed scheduler proof only
+while its turn is current and all lanes acknowledge the same checkpoint.
+
+A positive census requires a fresh final check for both launch and continuation.
+The guard orders this decision with shared writers by taking each enabled Project's
+schema, registration and activation locks in canonical root order. It transfers each acquired
+lock to the controller over its local socket before reading further shared state.
+With all locks held, the worker verifies identities, pending activation and the
+activation checkpoints. The shared registration must match the runtime and
+generation and remain eligible through the decision deadline. The controller compares the roster and checkpoint digest
+to the census and retains matching locks through the local decision. An empty
+roster needs only the local fences. Changes to the roster, checkpoints, policy,
+executor epoch or launch handoff membership invalidate the continuous interval.
+
+The controller gives the required executor observations and final guard exchange
+one 50 ms monotonic deadline per idle decision. Short executor lock contention
+can resolve within the same turn. A timeout releases received locks, rejects
+late results and ends the interval. The single outstanding local read performs
+no reconciliation. Probe scheduling runs after training admission in dispatch.
 
 On Linux a supervisor and a separate process-group guardian use parent-death
 signals and pidfds. The guardian persists its identity before a GO handshake,

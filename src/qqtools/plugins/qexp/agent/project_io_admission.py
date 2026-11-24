@@ -194,6 +194,24 @@ class ProjectIOAdmission:
         """Whether the last completed pass left eligible work to rediscover."""
         return self._has_deferred_work
 
+    def has_idle_guard_capacity(self, *, already_occupied: bool) -> bool:
+        """Leave the guard slot available to waiting training producers."""
+        spare = self._free_slots if already_occupied else self._free_slots - 1
+        if spare < 0:
+            return False
+        training_owners = set()
+        for owner, service_class, (kind, _family) in self._seen_families:
+            if owner in self._blocked or kind in {"idle_job_probe", "idle_decision_guard"}:
+                continue
+            if service_class in {"authority", "primary"} or kind in {
+                "scheduler_due_offer",
+                "scheduler_ready_index_build",
+            }:
+                training_owners.add(owner)
+                if len(training_owners) > spare:
+                    return False
+        return True
+
     def candidate_priority(self, owner: BindingOwner, service_class: ServiceClass) -> int | None:
         """Return this turn's roster rank for one known owner and class.
 

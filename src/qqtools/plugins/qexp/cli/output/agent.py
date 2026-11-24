@@ -180,8 +180,17 @@ _IDLE_JOB_WAIT_MESSAGES = {
 
 
 def _render_idle_job_status(status: Mapping[str, Any]) -> str:
-    fields = {key: value for key, value in status.items() if key != "demand_detail"}
+    fields = {key: value for key, value in status.items() if key not in {"demand_detail", "interval_detail"}}
     rendered = _status_section("Idle Job", _status_mapping_fields(fields))
+    interval = status.get("interval_detail")
+    if isinstance(interval, Mapping):
+        rendered += f"\n  Idle elapsed when last observed: {interval['idle_elapsed_seconds']:.1f} seconds"
+        if (reset := interval.get("last_reset")) is not None:
+            rendered += f"\n  Last idle reset: {reset['check']} after {reset['elapsed_seconds']:.1f} seconds at {reset['reset_at']}"
+        if (stop := interval.get("last_stop")) is not None:
+            rendered += (
+                f"\n  Last stop request: {stop['check']} at {stop['stopped_at']} (instance {stop['instance_id']})"
+            )
     if status.get("reason") == "idle_delay":
         return f"{rendered}\n  Training is idle. Waiting for the configured start delay."
     detail = status.get("demand_detail")

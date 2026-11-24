@@ -334,3 +334,31 @@ def test_invalid_migration_semantics_cannot_produce_repair_warning(supervised, f
     result = module.idle_job_status(runtime)
     assert result["reason"] == "unknown_demand"
     assert result["demand_detail"] is None
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    [
+        {"idle_elapsed_seconds": True},
+        {"idle_elapsed_seconds": -1},
+        {"last_reset": {"check": ["invalid"], "elapsed_seconds": 59, "reset_at": STAMP}},
+        {"last_reset": {"check": "busy", "elapsed_seconds": -1, "reset_at": STAMP}},
+        {"last_reset": {"check": "busy", "elapsed_seconds": 59, "reset_at": "yesterday"}},
+    ],
+)
+def test_invalid_interval_detail_preserves_current_check(supervised, corruption):
+    runtime, supervisor, _ = supervised
+    _observe(supervisor)
+    supervisor._publish(state="waiting", reason="unknown_demand")
+    envelope = _envelope(runtime)
+    envelope["idle_job_interval_detail"] = {
+        "idle_elapsed_seconds": 0,
+        "last_reset": None,
+        "last_stop": None,
+        **corruption,
+    }
+    atomic_replace(runtime.root / "idle-job/status.json", envelope)
+    result = module.idle_job_status(runtime)
+    assert result["reason"] == "unknown_demand"
+    assert result["demand_detail"]["code"] == "upgrade_blocks_idle"
+    assert result["interval_detail"] is None

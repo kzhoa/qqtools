@@ -536,10 +536,8 @@ class _MachineControlPlane:
             self._finish_authority_sample(sample, started, self._loop_interval)
             return self._loop_interval
         sample["project_count"] = len(bindings)
-        current_generations = {binding.project_id: binding.registration_generation for binding in bindings}
-        for project_id, generation in tuple(self._runtime.authority_ready_generations.items()):
-            if current_generations.get(project_id) != generation:
-                self._runtime.authority_ready_generations.pop(project_id, None)
+        # Isolated dispatch prunes readiness against the actual registry.
+        # This diagnostic sample contains only the resident rotation.
         for binding in bindings[:_INITIAL_CONTROL_PLANE_BINDINGS]:
             sample["projects"].append(
                 {

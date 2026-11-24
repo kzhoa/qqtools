@@ -792,6 +792,7 @@ def run_machine_agent_loop(
                             registry_revision=registry_revision,
                             enablement_converged=enablement_view_converged,
                             partition_observation=partition_observation,
+                            use_dispatch_gpu_observation=True,
                         )
                     machine_only_ready = bool(
                         not enabled_project_ids
@@ -973,6 +974,13 @@ def run_machine_agent_loop(
                     controller.progress.close()
 
             run_cleanup_step("progress_observation_close", close_progress_observation)
+
+            def close_idle_job_observation() -> None:
+                controller = getattr(machine_runtime, "project_io_controller", None)
+                if isinstance(controller, ProjectIOController):
+                    controller.close_idle_job_observation()
+
+            run_cleanup_step("idle_job_observation_close", close_idle_job_observation)
 
             def close_machine_only_partition_scan() -> None:
                 previous_scan = getattr(machine_runtime, "_machine_only_partition_scan", None)

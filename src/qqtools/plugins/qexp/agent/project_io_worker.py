@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import re
+import socket
 import stat
 import sys
 import time
@@ -372,9 +373,21 @@ def _authority_renewal_task_commit_matches_request(request: ProjectIORequest, cf
     )
 
 
-def _read_worker_registry(runtime_root: Path) -> tuple[int, tuple[ProjectBinding, ...]]:
-    path = machine_runtime_paths(runtime_root)["registry"]
-    if not stat.S_ISREG(path.lstat().st_mode):
+def _read_worker_registry(
+    runtime_root: Path, *, allow_uninitialized_empty: bool = False
+) -> tuple[int, tuple[ProjectBinding, ...]]:
+    paths = machine_runtime_paths(runtime_root)
+    path = paths["registry"]
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        if allow_uninitialized_empty:
+            try:
+                paths["inventory"].lstat()
+            except FileNotFoundError:
+                return 0, ()
+        raise
+    if not stat.S_ISREG(metadata.st_mode):
         raise RuntimeError("machine registry must be a regular non-symlink file.")
     return decode_registry(read_json_limited(path, max_bytes=_MAX_SHARED_RECORD_BYTES, record_type="machine_registry"))
 
@@ -2672,6 +2685,50 @@ def _publish_result(
         return atomic_replace(result_path, record) is not None
 
 
+def _run_idle_decision_guard(
+    root: Path,
+    paths: dict[str, Path],
+    request: ProjectIORequest,
+    process: ProjectIOProcess,
+    descriptor: int | None,
+) -> int:
+    from .idle_guard_worker import serve_idle_decision_guard
+
+    def is_worker_current() -> bool:
+        current = _matching_handshake(
+            paths, request.request_id, request.runtime_id, process.pid, process.start_time_ticks
+        )
+        return bool(
+            current
+            and current[0] == request
+            and current[2].active
+            and current[2].executor_epoch == request.executor_epoch
+        )
+
+    try:
+        if descriptor is None:
+            raise ValueError("Idle Job guard requires its live channel.")
+        with socket.socket(fileno=descriptor) as channel:
+            if channel.family != socket.AF_UNIX or channel.type != socket.SOCK_SEQPACKET:
+                raise ValueError("Idle Job guard requires a Unix seqpacket socket.")
+            if request.canonical_shared_root != str(root):
+                raise ValueError("Idle Job guard request identifies a different machine runtime root.")
+            serve_idle_decision_guard(
+                channel,
+                request,
+                root,
+                read_registry=lambda: _read_worker_registry(root, allow_uninitialized_empty=True),
+                is_worker_current=is_worker_current,
+            )
+    except (OSError, RuntimeError, ValueError, KeyError, TypeError):
+        published = _publish_result(
+            root, paths, request, process, "retryable_error", "project_io_idle_decision_guard_unavailable", {}
+        )
+    else:
+        published = _publish_result(root, paths, request, process, "completed", None, {"closed": True})
+    return 0 if published else 1
+
+
 def _run(
     root: Path,
     request_id: str,
@@ -2681,6 +2738,7 @@ def _run(
     reconcile_authority_orphan_recovery: bool = False,
     reconcile_authority_termination_commit: bool = False,
     reconcile_authority_terminal_publish: bool = False,
+    idle_guard_fd: int | None = None,
 ) -> int:
     paths = machine_runtime_paths(root)
     runtime_id = _resolve_runtime_id(root)
@@ -2696,6 +2754,8 @@ def _run(
     if handshake is None:
         return 1
     request, process, epoch = handshake
+    if idle_guard_fd is not None and request.operation_kind != "idle_decision_guard":
+        return 1
     if reconcile_authority_renewal and (
         request.operation_kind != "authority_renewal" or not epoch.active or epoch.runtime_id != request.runtime_id
     ):
@@ -2795,6 +2855,8 @@ def _run(
             )
             else 1
         )
+    if request.operation_kind == "idle_decision_guard":
+        return _run_idle_decision_guard(root, paths, request, process, idle_guard_fd)
     fenced = False
     cursor_write_possible = [False]
     claim_cursor_commit_started = [False]
@@ -3602,6 +3664,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--reconcile-authority-orphan-recovery", action="store_true")
     parser.add_argument("--reconcile-authority-termination-commit", action="store_true")
     parser.add_argument("--reconcile-authority-terminal-publish", action="store_true")
+    parser.add_argument("--idle-guard-fd", type=int)
     args = parser.parse_args(argv)
     if not _REQUEST_ID.fullmatch(args.request_id):
         return 2
@@ -3617,6 +3680,7 @@ def main(argv: list[str] | None = None) -> int:
             reconcile_authority_orphan_recovery=args.reconcile_authority_orphan_recovery,
             reconcile_authority_termination_commit=args.reconcile_authority_termination_commit,
             reconcile_authority_terminal_publish=args.reconcile_authority_terminal_publish,
+            idle_guard_fd=args.idle_guard_fd,
         )
     except (OSError, RuntimeError, ValueError, KeyError, TypeError, ProjectIOProtocolError):
         return 1

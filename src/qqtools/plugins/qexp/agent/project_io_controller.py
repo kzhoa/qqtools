@@ -17,6 +17,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from functools import partial, wraps
 from typing import Any, Iterator
+from weakref import finalize
 
 from ..config_types import RootConfig
 from ..runtime.authority_scan import validate_evidence_path
@@ -41,13 +42,21 @@ from .bindings import ProjectBinding
 from .context import MachineRuntime
 from .dispatch_probe import PrimaryProbeSession
 from .group_service_coordinator import GroupServiceCoordinator, GroupServiceOffer
-from .idle_job_demand import IdleJobDemandCoordinator
+from .idle_executor_observation import IdleExecutorObservation
+from .idle_guard_client import IdleGuardClient
+from .idle_job_config import load_idle_job_config
+from .idle_job_demand import IdleJobCensus, IdleJobDemandCoordinator
 from .primary_probe_transport import encode_probe_session
 from .process_reservation_recovery import registration_reservation
 from .progress_coordinator import ProgressObservationCoordinator
 from .project_io_admission import ProjectIOAdmission, ServiceIntent
 from .project_io_executor import ProjectIOExecutor, ProjectIOProtocolError
-from .project_io_protocol import PROJECT_IO_OPERATIONS, ProjectIORequest
+from .project_io_protocol import (
+    IDLE_DECISION_GUARD_PROJECT_ID,
+    PROJECT_IO_OPERATIONS,
+    PROJECT_IO_OVERDUE_SECONDS,
+    ProjectIORequest,
+)
 from .ready_cursor_validation import validate_ready_cursor_transition
 from .snapshot_publication_health import SNAPSHOT_HEALTH_ITEM_LIMIT, SnapshotPublicationHealth
 from .working_set import BindingTurn
@@ -111,6 +120,7 @@ _VALIDATION_INDEPENDENT_RECONCILIATION_OPERATION_KINDS = frozenset(
         "scheduler_primary_probe",
         "scheduler_quiescence_probe",
         "idle_job_probe",
+        "idle_decision_guard",
         "scheduler_claim",
         "scheduler_cursor_commit",
         "scheduler_reservation_reconcile",
@@ -198,6 +208,7 @@ _SERVICE_CLASS_BY_OPERATION_KIND = {
     "scheduler_due_offer": "background",
     "scheduler_quiescence_probe": "primary",
     "idle_job_probe": "primary",
+    "idle_decision_guard": "background",
     "scheduler_ready_index_build": "background",
     "maintenance_descriptor_advance": "background",
     "maintenance_flush_event": "background",
@@ -313,6 +324,7 @@ class ProjectIOController:
         self.executor = executor
         self._admission = ProjectIOAdmission(monotonic=monotonic)
         self._admission_scope_active = False
+        self._final_healthy_executor_epoch: str | None = None
         self._initial_request_ids: set[str] = set()
         self._needs_successor_turn = False
         self._monotonic = monotonic
@@ -345,6 +357,11 @@ class ProjectIOController:
         self._scheduler_quiescence_rounds: dict[_ValidationIdentity, _SchedulerQuiescenceRound] = {}
         self._scheduler_quiescence_requests: dict[str, _SchedulerQuiescenceRound] = {}
         self._idle_job_demand = IdleJobDemandCoordinator(monotonic=monotonic)
+        self._idle_job_guard = IdleGuardClient(executor)
+        self._idle_guard_request: tuple[int, tuple[ProjectBinding, ...]] | None = None
+        self._idle_guard_dispatch: tuple[int, tuple[ProjectBinding, ...], bool] | None = None
+        self._idle_job_census_input: IdleJobCensus | None = None
+        self._idle_executor_observation: IdleExecutorObservation | None = None
         self._group_service = GroupServiceCoordinator(monotonic=monotonic)
         self._borrow_grants: dict[str, BorrowAdmissionGrant] = {}
         self._pending_claim_offers: dict[str, _PendingClaimOffer] = {}
@@ -528,11 +545,21 @@ class ProjectIOController:
         if self.executor.has_ready_result():
             return min(default, 0.1)
         status = self.executor.status_view()
-        if status["active_worker_count"] > status["overdue_worker_count"] + status["exit_unverified_worker_count"] or (
-            status["free_slot_count"] < status["capacity"] and status["overdue_worker_count"] == 0
-        ):
+        request = self._idle_guard_request
+        epoch = status.get("executor_epoch")
+        ready_guard = (
+            request is not None
+            and isinstance(epoch, str)
+            and status.get("envelope") == "healthy"
+            and self._idle_job_guard.ready(request[0], epoch)
+        )
+        responsive = (
+            status["active_worker_count"] - status["overdue_worker_count"] - status["exit_unverified_worker_count"]
+        )
+        free_slots = status["free_slot_count"] + ready_guard
+        if responsive > ready_guard or (free_slots < status["capacity"] and status["overdue_worker_count"] == 0):
             return min(default, 0.1)
-        return default
+        return min(default, PROJECT_IO_OVERDUE_SECONDS / 2) if ready_guard else default
 
     @contextmanager
     def admission_turn(self) -> Iterator[None]:
@@ -542,16 +569,24 @@ class ProjectIOController:
             return
 
         self._admission_scope_active = True
+        self._final_healthy_executor_epoch = None
         self._needs_successor_turn = False
+        final_healthy_epoch = None
         try:
             try:
                 yield
                 if self._admission.active:
                     # The last producer may have consumed a result after its
                     # snapshot. Grant against final occupancy, not call order.
-                    _, unresolved = self._poll_admission_executor(force_poll=True)
-                    current_request_ids = {request.request_id for request in unresolved}
-                    self._needs_successor_turn = bool(self._initial_request_ids - current_request_ids)
+                    status, unresolved = self._poll_admission_executor(force_poll=True)
+                    if self._idle_guard_dispatch is not None:
+                        self._service_idle_job_guard(status, unresolved)
+                    epoch = status["executor_epoch"]
+                    if epoch is not None:
+                        current_request_ids = {request.request_id for request in unresolved}
+                        self._needs_successor_turn = bool(self._initial_request_ids - current_request_ids)
+                    if isinstance(epoch, str) and epoch and status["envelope"] == "healthy":
+                        final_healthy_epoch = epoch
             except BaseException:
                 if self._admission.active:
                     self._admission.finish(failed=True)
@@ -559,6 +594,7 @@ class ProjectIOController:
             else:
                 if self._admission.active:
                     self._admission.finish()
+                    self._final_healthy_executor_epoch = final_healthy_epoch
         finally:
             # A capability not selected by this turn's arbiter must expire.
             # Keep discovery progress, but require a fresh verification pass
@@ -569,27 +605,23 @@ class ProjectIOController:
                     round_state.verified.clear()
             self._borrow_grants.clear()
             self._admission_scope_active = False
+            self._idle_guard_dispatch = None
             self._initial_request_ids.clear()
 
     def _poll_admission_executor(
         self, *, force_poll: bool = False
     ) -> tuple[dict[str, Any], tuple[ProjectIORequest, ...]]:
         """Reconcile live ownership per producer, replaying archives at turn boundaries."""
-        if self._admission.active and not force_poll:
-            # This read already reaps/reconciles workers under the executor lock.
-            # Replaying durable archives again for every producer duplicates the
-            # bounded census. Status remains fresh; no epoch or capacity is cached.
-            unresolved = self.executor.unresolved_requests()
-            status = self.executor.status_view()
-        else:
-            status = self.executor.poll()
-            unresolved = self.executor.unresolved_requests()
+        status, unresolved = self.executor.admission_snapshot(replay_archives=force_poll or not self._admission.active)
         blocked = {(request.runtime_id, request.project_id, request.registration_generation) for request in unresolved}
         free_slots = max(0, status["capacity"] - len(unresolved))
         if status["envelope"] == "unknown" or status["overdue_worker_count"] > status["supported_hang_limit"]:
             free_slots = 0
         if self._admission.active:
             self._admission.refresh_capacity(blocked=blocked, free_slots=free_slots)
+            return status, unresolved
+        if status["executor_epoch"] is None:
+            # A later producer still needs to perform the opening archive replay.
             return status, unresolved
         _registry_revision, bindings = self.runtime.load_registry_snapshot()
         retained_request_identities = {self._request_identity(request) for request in unresolved}
@@ -615,6 +647,8 @@ class ProjectIOController:
         owners.extend(
             (request.runtime_id, request.project_id, request.registration_generation) for request in unresolved
         )
+        if self._idle_guard_request is not None and self._idle_guard_request[0] == _registry_revision:
+            owners.append((self.executor.runtime_id, IDLE_DECISION_GUARD_PROJECT_ID, self.executor.runtime_id))
         owners.extend(
             (self.executor.runtime_id, binding.project_id, binding.registration_generation)
             for binding in self.runtime.activation_consumer_retirements.select_pending(bindings, limit=64)
@@ -684,7 +718,17 @@ class ProjectIOController:
             current_bindings[identity] = binding
             ordered_bindings.append((identity, binding))
 
-        unresolved = self._idle_job_demand.advance_pending_probes(self, unresolved, current_bindings.keys())
+        # A resident rotation can omit a validated binding without changing its
+        # registry revision or executor epoch. Never schedule validation work
+        # for that omission, but keep its proof for the full idle census.
+        self._validated = {
+            identity
+            for identity in self._validated
+            if identity.registry_revision == registry_revision and identity.executor_epoch == executor_epoch
+        }
+        unresolved = self._idle_job_demand.advance_pending_probes(
+            self, unresolved, self._validated | current_bindings.keys()
+        )
         unresolved_request_ids = {request.request_id for request in unresolved}
         self._started_requests.intersection_update(unresolved_request_ids)
         self._advance_prevalidation_requests(
@@ -725,7 +769,6 @@ class ProjectIOController:
                 self._record_failure(identity)
 
         current_identities = set(current_bindings)
-        self._validated.intersection_update(current_identities)
         self._backoff = {identity: state for identity, state in self._backoff.items() if identity in current_identities}
 
         overdue_count = executor_status["overdue_worker_count"]
@@ -1327,13 +1370,15 @@ class ProjectIOController:
             raise ValueError("binding must be a ProjectBinding value.")
         if type(registry_revision) is not int or registry_revision < 0:
             raise ValueError("registry_revision must be a nonnegative integer.")
-        epoch = self._observed_executor_epoch
-        identity = None if epoch is None else self._binding_identity(binding, registry_revision, epoch)
+        identity = self._binding_identity(binding, registry_revision, self._observed_executor_epoch)
+        return self._scheduler_quiescence_is_current(identity)
+
+    def _scheduler_quiescence_is_current(self, identity: _ValidationIdentity | None, *, blocking: bool = True) -> bool:
         round_state = self._scheduler_quiescence_rounds.get(identity)
         return bool(
             round_state is not None
             and round_state.is_quiescent
-            and self.runtime.working_set.is_current_turn(round_state.turn)
+            and self.runtime.working_set.is_current_turn(round_state.turn, blocking=blocking)
         )
 
     def group_service_is_quiescent(self, binding: ProjectBinding, registry_revision: int) -> bool:
@@ -1461,7 +1506,85 @@ class ProjectIOController:
             return
         self._start_observation_request(request, key)
 
-    @_admission_operation
+    def observe_idle_job_demand(
+        self,
+        bindings: Sequence[ProjectBinding],
+        registry_revision: int,
+        *,
+        gpu_capacity: int,
+        cpu_capacity: int,
+        capacity_key: str,
+        deadline: float,
+    ) -> tuple[str, str | None]:
+        """Queue the current census and decide from local evidence within the deadline."""
+        self._idle_job_demand.validate_inputs(
+            bindings, registry_revision, gpu_capacity=gpu_capacity, cpu_capacity=cpu_capacity, capacity_key=capacity_key
+        )
+        census = IdleJobCensus(tuple(bindings), registry_revision, gpu_capacity, cpu_capacity, capacity_key)
+        self._idle_job_census_input = census
+        if time.monotonic() >= deadline:
+            return "unknown", None
+        observer = self._idle_executor_observation
+        if observer is None:
+            observer = IdleExecutorObservation()
+            self._idle_executor_observation = observer
+            finalize(self, observer.close)
+        evidence = observer.observe(self.executor, deadline=deadline)
+        if evidence is None or self._observed_executor_epoch not in {None, evidence.epoch}:
+            return "unknown", None
+        demand = self._idle_job_demand.cached_demand(self, census, evidence.epoch, evidence.unresolved)
+        if time.monotonic() >= deadline:
+            return "unknown", None
+        if demand == "busy":
+            return demand, None
+        if evidence.envelope != "healthy":
+            return "unknown", None
+        return demand, evidence.epoch
+
+    @contextmanager
+    def idle_executor_guard(self, expected_epoch: str, *, deadline: float) -> Iterator[bool]:
+        observer = self._idle_executor_observation
+        if observer is None:
+            yield False
+            return
+        with observer.guard(self.executor, deadline=deadline) as evidence:
+            yield evidence is not None and evidence.epoch == expected_epoch and evidence.envelope == "healthy"
+
+    def close_idle_job_observation(self) -> None:
+        """Release Idle Job observation resources during agent shutdown."""
+        self.disarm_idle_job_guard()
+        if self._idle_executor_observation is not None:
+            self._idle_executor_observation.close()
+
+    def service_queued_idle_job_demand(
+        self,
+        bindings: Sequence[ProjectBinding],
+        registry_revision: int,
+        *,
+        capacity: tuple[int, int, str] | None,
+    ) -> None:
+        """Service one current census in the ordinary dispatch admission turn."""
+        census = self._idle_job_census_input
+        self._idle_job_census_input = None
+        epoch = self._observed_executor_epoch
+        if (
+            census is None
+            or not census.bindings
+            or epoch is None
+            or census.registry_revision != registry_revision
+            or capacity != (census.gpu_capacity, census.cpu_capacity, census.capacity_key)
+            or frozenset(census.bindings) != frozenset(binding for binding in bindings if binding.enabled)
+            or not self._idle_job_demand.needs_probe_service(self, census, epoch)
+        ):
+            return
+        self.advance_idle_job_demand(
+            census.bindings,
+            census.registry_revision,
+            gpu_capacity=census.gpu_capacity,
+            cpu_capacity=census.cpu_capacity,
+            capacity_key=census.capacity_key,
+        )
+
     def advance_idle_job_demand(
         self,
         bindings: Sequence[ProjectBinding],
@@ -1472,14 +1595,107 @@ class ProjectIOController:
         capacity_key: str,
     ) -> str:
         """Return the fail-closed machine demand state for an Idle Job census."""
-        return self._idle_job_demand.advance(
-            self,
-            bindings,
-            registry_revision,
-            gpu_capacity=gpu_capacity,
-            cpu_capacity=cpu_capacity,
-            capacity_key=capacity_key,
+        with self.admission_turn():
+            demand = self._idle_job_demand.advance(
+                self,
+                bindings,
+                registry_revision,
+                gpu_capacity=gpu_capacity,
+                cpu_capacity=cpu_capacity,
+                capacity_key=capacity_key,
+            )
+            demand_epoch = self._observed_executor_epoch
+
+        # A nested census returns before the outer turn can confirm its epoch.
+        if demand == "idle" and (demand_epoch is None or demand_epoch != self._final_healthy_executor_epoch):
+            return "unknown"
+        return demand
+
+    def request_idle_job_guard(self, bindings: tuple[ProjectBinding, ...], registry_revision: int) -> None:
+        """Retain the latest enabled census roster for the next dispatch admission."""
+        self._idle_guard_request = (registry_revision, bindings) if bindings else None
+
+    def disarm_idle_job_guard(self, *, clear_census: bool = True) -> None:
+        """Drop the pending guard service and close the live worker channel."""
+        self._idle_guard_request = None
+        if clear_census:
+            self._idle_job_census_input = None
+        self._idle_job_guard.close()
+
+    def register_idle_job_guard_service(
+        self, bindings: tuple[ProjectBinding, ...], registry_revision: int, *, can_start: bool
+    ) -> None:
+        """Offer guard service after training and only using the closing admission snapshot."""
+        self._idle_guard_dispatch = (registry_revision, bindings, can_start)
+
+    def _service_idle_job_guard(self, status: Mapping[str, Any], unresolved: tuple[ProjectIORequest, ...]) -> None:
+        dispatch = self._idle_guard_dispatch
+        if dispatch is None:
+            return
+        revision, bindings, can_start = dispatch
+        request = self._idle_guard_request
+        try:
+            enabled = (
+                can_start
+                and request is not None
+                and request == (revision, tuple(binding for binding in bindings if binding.enabled))
+                and load_idle_job_config(self.runtime).enabled
+            )
+        except (OSError, RuntimeError, TypeError, ValueError, KeyError):
+            enabled = False
+        epoch = status.get("executor_epoch")
+        guard = self._idle_job_guard
+        occupied = isinstance(epoch, str) and guard.live(revision, epoch)
+        has_capacity = self._admission.has_idle_guard_capacity(already_occupied=occupied)
+        if not enabled or not has_capacity:
+            guard.close()
+        try:
+            guard.service(revision, epoch, unresolved)
+        except (OSError, RuntimeError, TypeError, ValueError, KeyError):
+            guard.close()
+            return
+        if not enabled or not has_capacity or status.get("envelope") != "healthy" or not guard.needs_start:
+            return
+        if not isinstance(epoch, str):
+            return
+        owner = self.executor.runtime_id
+        root = str(self.runtime.root)
+        self._offer_new_request(
+            _ValidationIdentity(
+                owner,
+                epoch,
+                IDLE_DECISION_GUARD_PROJECT_ID,
+                root,
+                IDLE_DECISION_GUARD_PROJECT_ID,
+                owner,
+                root,
+                revision,
+            ),
+            "idle_decision_guard",
+            partial(self._start_idle_job_guard, request, revision),
         )
+
+    def _start_idle_job_guard(self, request: tuple[int, tuple[ProjectBinding, ...]] | None, revision: int) -> None:
+        try:
+            if (
+                request is not None
+                and request == self._idle_guard_request
+                and load_idle_job_config(self.runtime).enabled
+            ):
+                self._idle_job_guard.start(revision)
+        except (OSError, RuntimeError, TypeError, ValueError, KeyError):
+            self._idle_job_guard.close()
+
+    @contextmanager
+    def authorize_idle_job_guard(
+        self, revision: int, epoch: str, digest: str, project_count: int, deadline: float
+    ) -> Iterator[bool]:
+        """Retain the shared Project evidence through one affirmative machine decision."""
+        if project_count == 0:
+            yield True
+            return
+        with self._idle_job_guard.authorize(revision, epoch, digest, project_count, deadline) as granted:
+            yield granted
 
     @_admission_operation
     def advance_scheduler_quiescence(self, bindings: Sequence[ProjectBinding], registry_revision: int) -> None:
@@ -1514,6 +1730,11 @@ class ProjectIOController:
             and (
                 self.runtime.working_set.is_current_turn(round_state.turn)
                 or self.runtime.working_set.is_turn_observation_pending(round_state.turn)
+            )
+            or (
+                identity in self._validated
+                and round_state.is_quiescent
+                and self.runtime.working_set.retains_dormant_turn(round_state.turn)
             )
         }
 
@@ -5758,9 +5979,12 @@ class ProjectIOController:
         if type(registry_revision) is not int or registry_revision < 0:
             return None
         identity = self._binding_identity(binding, registry_revision, self._observed_executor_epoch)
-        if identity is None or identity not in self._validated:
+        if identity is None or not self._binding_identity_is_validated(identity):
             return None
         return self._root_config(binding)
+
+    def _binding_identity_is_validated(self, identity: _ValidationIdentity) -> bool:
+        return identity in self._validated
 
     def _binding_identity(
         self,
@@ -5789,7 +6013,9 @@ class ProjectIOController:
             request.executor_epoch,
             request.project_id,
             request.canonical_shared_root,
-            request.parameters["machine_name"],
+            request.project_id
+            if request.operation_kind == "idle_decision_guard"
+            else request.parameters["machine_name"],
             request.registration_generation,
             str(self.runtime.root),
             request.registry_revision,

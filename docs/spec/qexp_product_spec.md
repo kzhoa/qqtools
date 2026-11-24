@@ -2816,6 +2816,10 @@ matching cached binding and migration evidence. More specific supervisor outcome
 supersede this diagnostic. `idle_delay` explicitly means confirmed idle training
 while the configured start delay runs.
 
+Machine status also shows the last observed idle interval and its most recent
+reset. The check, elapsed seconds before reset, and UTC reset time remain
+available after recovery to `idle_delay` for the lifetime of that supervisor.
+
 A demand observation is live only for the verified current agent instance and an
 age of zero through 60 seconds. Retained old, future-dated, stopped-agent, or
 unverified observations display as last observed without a duration. The optional

@@ -20,7 +20,7 @@ class Supervisor:
     def set_demand_observation(self, demand, detail, *, agent_instance_id):
         self.observations.append((demand, detail, agent_instance_id))
 
-    def tick(self, demand="idle", gpu_policy=None, *, launch_allowed=True):
+    def tick(self, demand="idle", gpu_policy=None, *, launch_allowed=True, expected_handoff_revision=None, **kwargs):
         self.ticks.append((demand, launch_allowed))
         return {"state": "waiting", "reason": "unknown_demand" if demand == "unknown" else demand}
 
@@ -43,9 +43,9 @@ def demand_context(tmp_path, monkeypatch):
             self.calls = 0
             self.demand = "idle"
 
-        def advance_idle_job_demand(self, *args, **kwargs):
+        def observe_idle_job_demand(self, *args, **kwargs):
             self.calls += 1
-            return self.demand
+            return self.demand, "current-epoch"
 
     monkeypatch.setattr(integration, "ProjectIOController", Controller)
     controller = Controller()

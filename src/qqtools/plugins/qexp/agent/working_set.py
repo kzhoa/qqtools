@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Any
 from ..runtime.records import utc_now
 from ..runtime.store import atomic_replace
 from .bindings import ProjectBinding
+from .idle_guard_digest import IdleGuardCheckpoint, idle_guard_digest
 
 if TYPE_CHECKING:
     from .context import MachineRuntime
@@ -631,9 +632,11 @@ class BindingWorkingSet:
                 self._wake_generations.get(identity, 0),
             )
 
-    def is_current_turn(self, turn: BindingTurn) -> bool:
+    def is_current_turn(self, turn: BindingTurn, *, blocking: bool = True) -> bool:
         """Check local proof identity without waking a binding or advancing a lane."""
-        with self._lock:
+        if not self._lock.acquire(blocking=blocking):
+            return False
+        try:
             state = self._states.get(turn.identity)
             return bool(
                 state is not None
@@ -645,6 +648,8 @@ class BindingWorkingSet:
                 and not state.unknown
                 and state.consumer_registered
             )
+        finally:
+            self._lock.release()
 
     def has_current_activation(self, binding: ProjectBinding) -> bool:
         """Return whether service turns can bind to a fully observed activation."""
@@ -657,6 +662,45 @@ class BindingWorkingSet:
                 and state.consumer_registered
                 and state.activation_observed
             )
+
+    def retains_dormant_turn(self, turn: BindingTurn) -> bool:
+        """Check whether a completed service proof belongs to a settled, omitted binding."""
+        with self._lock:
+            state = self._states.get(turn.identity)
+            return bool(
+                state
+                and state.state == "dormant"
+                and self.is_current_turn(turn)
+                and state.activation_observed
+                and self._all_lanes_acknowledged(state)
+            )
+
+    def idle_guard_checkpoint_digest(self, bindings: Sequence[ProjectBinding]) -> str | None:
+        """Capture the exact roster's observed checkpoints without waiting or accessing storage."""
+        if not self._lock.acquire(blocking=False):
+            return None
+        try:
+            checkpoints: list[IdleGuardCheckpoint] = []
+            runtime_id = self._runtime_id
+            for binding in bindings:
+                if runtime_id is None:
+                    return None
+                state = self._states.get((runtime_id, binding.project_id, binding.registration_generation))
+                if (
+                    state is None
+                    or state.binding != binding
+                    or state.unknown
+                    or not state.consumer_registered
+                    or not state.activation_observed
+                ):
+                    return None
+                epoch, sequence = state.checkpoint if state.checkpoint is not None else (None, None)
+                checkpoints.append(
+                    (binding.project_id, binding.registration_generation, str(binding.shared_root), epoch, sequence)
+                )
+        finally:
+            self._lock.release()
+        return idle_guard_digest(checkpoints)
 
     def is_lane_quiescent(self, binding: ProjectBinding, lane: str) -> bool:
         """Recognize a settled lane without certifying final activation replay."""

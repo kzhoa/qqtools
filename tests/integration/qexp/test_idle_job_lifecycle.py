@@ -4,11 +4,12 @@ import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
 
 import pytest
 
 from qqtools.plugins.qexp.agent.context import MachineRuntime
-from qqtools.plugins.qexp.agent.idle_job import IdleJobSupervisor
+from qqtools.plugins.qexp.agent.idle_job import IdleJobSupervisor, idle_job_status
 from qqtools.plugins.qexp.agent.idle_job_config import set_idle_job_config
 from qqtools.plugins.qexp.agent.idle_job_process import idle_job_processes_exited
 from qqtools.plugins.qexp.agent.setup import initialize_machine
@@ -82,7 +83,68 @@ def test_eligible_admission_waits_for_process_cleanup(tmp_path, lane):
             admit()
         assert not reservation_snapshot(runtime.root).reservations
         _until(supervisor, lambda value: read_idle_job_ownership(runtime.root) is None, demand="busy")
+        # The training participant issued this stop before the supervisor saw busy demand.
+        assert idle_job_status(runtime)["interval_detail"]["last_stop"] is None
         assert admit()["reservation"]["task_id"] == "training"
+    finally:
+        assert supervisor.shutdown()
+
+
+@pytest.mark.parametrize(
+    ("config_changes", "cleanup_between_reads"),
+    [(False, False), (True, False), (True, True)],
+    ids=["stable_config", "concurrent_config_edit", "concurrent_config_edit_and_exit"],
+)
+def test_training_stop_invalidates_interval_even_when_census_returns_idle(
+    tmp_path, monkeypatch, config_changes, cleanup_between_reads
+):
+    from qqtools.plugins.qexp.agent import idle_job
+
+    runtime = _runtime(tmp_path)
+    set_idle_job_config(runtime, idle_delay_seconds=60)
+    clock = [0]
+    supervisor = IdleJobSupervisor(runtime, monotonic=lambda: clock[0])
+    try:
+        assert supervisor.tick(gpu_policy=POLICY)["reason"] == "idle_delay"
+        clock[0] = 60
+        _until(supervisor, lambda value: value["state"] == "running")
+        with pytest.raises(IdleJobAdmissionBlocked):
+            reserve(runtime.root, "training", [0])
+        with monkeypatch.context() as patch:
+            # Keep the first ownership observation in stopping until the chosen interleaving.
+            patch.setattr(idle_job, "idle_job_processes_exited", lambda directory: False)
+            clock[0] = 75
+            with monkeypatch.context() as config_patch:
+                if config_changes:
+                    resolve_gpus = supervisor._resolve_gpus
+
+                    def resolve_after_edit(config, policy):
+                        set_idle_job_config(runtime, idle_delay_seconds=61)
+                        if cleanup_between_reads:
+                            owner = read_idle_job_ownership(runtime.root)
+                            directory = idle_job_instance_path(runtime.root, owner["instance_id"])
+                            deadline = time.monotonic() + 5
+                            while not idle_job_processes_exited(directory):
+                                assert time.monotonic() < deadline
+                                time.sleep(0.01)
+                            patch.setattr(idle_job, "idle_job_processes_exited", idle_job_processes_exited)
+                        return resolve_gpus(config, policy)
+
+                    config_patch.setattr(supervisor, "_resolve_gpus", resolve_after_edit)
+                status = supervisor.tick("idle", gpu_policy=POLICY)
+            assert status["reason"] == ("config_changed" if config_changes else "stopping")
+            detail = idle_job_status(runtime)["interval_detail"]
+            assert detail["idle_elapsed_seconds"] == 0
+            assert detail["last_reset"]["check"] == "demand_revision_changed"
+            assert detail["last_reset"]["elapsed_seconds"] == 75
+            assert detail["last_stop"] is None
+            clock[0] += 15
+            status = supervisor.tick("idle", gpu_policy=POLICY)
+            if cleanup_between_reads:
+                assert status["reason"] == "idle_delay"
+            else:
+                assert status["state"] == "stopping"
+            assert idle_job_status(runtime)["interval_detail"] == detail
     finally:
         assert supervisor.shutdown()
 
@@ -201,6 +263,34 @@ def test_recreated_supervisor_adopts_only_one_instance(tmp_path):
     finally:
         if second is not None:
             assert second.shutdown()
+        assert first.shutdown()
+
+
+def test_adopted_instance_records_stop_even_without_an_idle_interval(tmp_path):
+    from qqtools.plugins.qexp.agent.idle_job_diagnostics import build_demand_observation
+
+    runtime = _runtime(tmp_path)
+    first = IdleJobSupervisor(runtime)
+    try:
+        _until(first, lambda value: value["state"] == "running")
+        owner = read_idle_job_ownership(runtime.root)
+        adopted = IdleJobSupervisor(runtime)
+        assert adopted.tick(gpu_policy=POLICY)["state"] == "running"
+        adopted.set_demand_observation(
+            "unknown", build_demand_observation("authority_unready"), agent_instance_id="agent-b"
+        )
+        before = time.time()
+        assert adopted.tick("unknown", gpu_policy=POLICY)["state"] == "stopping"
+        after = time.time()
+        detail = idle_job_status(runtime)["interval_detail"]
+        assert detail["last_reset"] is None
+        stop = detail["last_stop"]
+        assert stop["check"] == "authority_unready"
+        assert stop["instance_id"] == owner["instance_id"]
+        assert before <= datetime.fromisoformat(stop["stopped_at"]).timestamp() <= after
+        _until(adopted, lambda value: value["state"] == "waiting", demand="unknown")
+        assert idle_job_status(runtime)["interval_detail"]["last_stop"] == stop
+    finally:
         assert first.shutdown()
 
 
@@ -385,3 +475,128 @@ def test_agent_stop_reclaims_idle_ownership_without_live_agent(tmp_path):
         assert read_idle_job_ownership(runtime.root) is None
     finally:
         assert supervisor.shutdown()
+
+
+def test_reservation_pulse_is_visible_after_countdown_restarts(tmp_path):
+    import os
+    import subprocess
+
+    from qqtools.plugins.qexp.agent.helpers import _pid_start_time_ticks, _publish_process_status
+    from qqtools.plugins.qexp.runtime.resources.reservations import release
+
+    runtime = _runtime(tmp_path)
+    set_idle_job_config(runtime, idle_delay_seconds=60)
+    clock = [0]
+    supervisor = IdleJobSupervisor(runtime, monotonic=lambda: clock[0])
+    assert supervisor.tick(gpu_policy=POLICY)["reason"] == "idle_delay"
+    assert idle_job_status(runtime)["interval_detail"]["last_reset"] is None
+    clock[0] = 59
+    reservation = reserve(runtime.root, "training", [0])["reservation"]
+    release(runtime.root, reservation["reservation_id"])
+    before = time.time()
+    assert supervisor.tick(gpu_policy=POLICY)["reason"] == "idle_delay"
+    after = time.time()
+    detail = idle_job_status(runtime)["interval_detail"]
+    assert detail["idle_elapsed_seconds"] == 0
+    reset = detail["last_reset"]
+    assert reset["check"] == "demand_revision_changed"
+    assert reset["elapsed_seconds"] == 59
+    assert before <= datetime.fromisoformat(reset["reset_at"]).timestamp() <= after
+
+    clock[0] += 1
+    assert supervisor.tick(gpu_policy=POLICY)["reason"] == "idle_delay"
+    assert idle_job_status(runtime)["interval_detail"]["idle_elapsed_seconds"] == 1
+    # The process driving the supervisor publishes its real identity so the CLI
+    # can distinguish a live idle_delay decision from a stopped agent snapshot.
+    pid = os.getpid()
+    runtime.paths["pid"].write_text(str(pid), encoding="utf-8")
+    _publish_process_status(
+        runtime,
+        instance_id="interval-test",
+        pid=pid,
+        start_ticks=_pid_start_time_ticks(pid),
+        waiting_for_first_registration=True,
+    )
+    output = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from qqtools.plugins.qexp.cli.entrypoint import main; raise SystemExit(main())",
+            "agent",
+            "status",
+            "--machine-runtime-root",
+            str(runtime.root),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=15,
+    ).stdout
+    for value in ("idle_delay", "demand_revision_changed", "59", reset["reset_at"]):
+        assert value in output
+
+
+@pytest.mark.parametrize("running", [False, True], ids=["countdown", "running"])
+def test_decisive_check_survives_optional_write_failure_and_recovery(tmp_path, monkeypatch, running):
+    from qqtools.plugins.qexp.agent import idle_job as module
+    from qqtools.plugins.qexp.agent.idle_job_diagnostics import build_demand_observation
+
+    runtime = _runtime(tmp_path)
+    set_idle_job_config(runtime, idle_delay_seconds=60)
+    clock = [0]
+    supervisor = IdleJobSupervisor(runtime, monotonic=lambda: clock[0])
+    try:
+        supervisor.tick(gpu_policy=POLICY)
+        clock[0] = 60 if running else 59
+        if running:
+            _until(supervisor, lambda status: status["state"] == "running")
+        supervisor.set_demand_observation(
+            "unknown", build_demand_observation("launch_handoff_pending"), agent_instance_id="agent-a"
+        )
+        write = module.atomic_replace
+        with monkeypatch.context() as patch:
+
+            def fail_enriched(path, record, **kwargs):
+                if "idle_job_interval_detail" in record:
+                    raise OSError("optional status unavailable")
+                return write(path, record, **kwargs)
+
+            patch.setattr(module, "atomic_replace", fail_enriched)
+            status = supervisor.tick(demand="unknown", gpu_policy=POLICY)
+            assert status["state"] == ("stopping" if running else "waiting")
+            assert status["reason"] == "unknown_demand"
+            assert module.idle_job_status(runtime)["interval_detail"] is None
+        clock[0] += 10
+        supervisor.tick(demand="unknown", gpu_policy=POLICY)
+        reset = module.idle_job_status(runtime)["interval_detail"]["last_reset"]
+        assert reset["check"] == "launch_handoff_pending"
+        assert reset["elapsed_seconds"] == (60 if running else 59)
+        _until(supervisor, lambda status: status["reason"] == "idle_delay")
+        assert module.idle_job_status(runtime)["interval_detail"]["last_reset"] == reset
+        restarted = IdleJobSupervisor(runtime, monotonic=lambda: clock[0])
+        assert restarted.tick(gpu_policy=POLICY)["reason"] == "idle_delay"
+        assert module.idle_job_status(runtime)["interval_detail"]["last_reset"] is None
+    finally:
+        assert supervisor.shutdown()
+
+
+@pytest.mark.parametrize("established", [False, True])
+def test_held_reservation_cannot_create_repeated_interval_resets(tmp_path, established):
+    runtime = _runtime(tmp_path)
+    set_idle_job_config(runtime, idle_delay_seconds=60)
+    clock = [0]
+    supervisor = IdleJobSupervisor(runtime, monotonic=lambda: clock[0], wall_clock=lambda: 1700000000 + clock[0])
+    if established:
+        assert supervisor.tick(gpu_policy=POLICY)["reason"] == "idle_delay"
+    clock[0] = 59
+    reserve(runtime.root, "training", [0])
+    assert supervisor.tick(gpu_policy=POLICY)["reason"] == "gpu_reserved"
+    detail = idle_job_status(runtime)["interval_detail"] or {}
+    if established:
+        assert detail["last_reset"]["elapsed_seconds"] == 59
+        assert detail["last_reset"]["check"] == "demand_revision_changed"
+    else:
+        assert detail.get("last_reset") is None
+    clock[0] += 2
+    assert supervisor.tick(gpu_policy=POLICY)["reason"] == "gpu_reserved"
+    assert (idle_job_status(runtime)["interval_detail"] or {}) == detail

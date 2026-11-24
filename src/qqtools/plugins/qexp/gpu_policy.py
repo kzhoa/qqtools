@@ -22,6 +22,7 @@ from typing import Any, Mapping
 from .runtime.locks import exclusive
 from .runtime.paths import machine_runtime_paths
 from .runtime.records import utc_now
+from .runtime.resources.idle_job import idle_job_guard
 from .runtime.store import atomic_replace, iter_json, read_json
 from .runtime.work_budget import diagnostic_increment
 
@@ -748,7 +749,7 @@ def _mutate_gpu_policy(
     discovery, env_ids, env_status, running = _mutation_context(root)
     paths = machine_runtime_paths(root)
     paths["locks"].mkdir(parents=True, exist_ok=True)
-    with exclusive(paths["reservation_lock"]):
+    with idle_job_guard(root), exclusive(paths["reservation_lock"]):
         previous = _read_policy_record(root)
         if expected_revision is not None and previous.revision != expected_revision:
             raise ValueError(

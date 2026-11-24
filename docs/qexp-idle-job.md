@@ -104,6 +104,14 @@ supervisor outcome, such as an ownership failure, supersedes demand diagnostics.
 `idle_delay` means training is confirmed idle and the configured start delay is
 still active.
 
+Ordinary `qexp agent status` shows the idle time observed at publication.
+After an established interval restarts, the display keeps the latest reset's
+check, elapsed seconds, and UTC time alongside the current reason. For example,
+a training reservation acquired and released between ticks can leave the agent
+waiting in `idle_delay` with `demand_revision_changed` as the last reset.
+Reading status does not advance the displayed interval. A new supervisor starts
+with a fresh interval and reset history.
+
 Upgrade blockers name at most three Projects and report the total count. “Needs
 repair” requires a matching cached migration observation; when only the blocker
 is known, the explanation says the upgrade prevents confirmation of idle demand.

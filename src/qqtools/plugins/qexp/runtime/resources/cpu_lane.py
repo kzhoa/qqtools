@@ -130,10 +130,12 @@ def _policy(paths: dict[str, Path]) -> CpuLanePolicy:
     return CpuLanePolicy(value["capacity"], value["revision"])
 
 
-def get_cpu_lane_policy(runtime_root: Path | Any) -> CpuLanePolicy:
+def get_cpu_lane_policy(runtime_root: Path | Any, *, blocking: bool = True) -> CpuLanePolicy:
     """Return the current machine-global CPU-only lane policy."""
     paths = local_paths(_runtime_root(runtime_root))
-    with exclusive(paths["locks"] / "cpu-lane.lock"):
+    with exclusive(paths["locks"] / "cpu-lane.lock", blocking=blocking) as acquired:
+        if not acquired:
+            raise BlockingIOError("CPU lane policy is being updated.")
         return _policy(paths)
 
 
@@ -155,11 +157,12 @@ def set_cpu_lane_capacity(runtime_root: Path | Any, *, capacity: int) -> CpuLane
     """
     if type(capacity) is not int or capacity < 0:
         raise ValueError("CPU lane capacity must be a non-negative integer.")
-    paths = local_paths(_runtime_root(runtime_root))
+    root = _runtime_root(runtime_root)
+    paths = local_paths(root)
     paths["cpu_policy"].parent.mkdir(parents=True, exist_ok=True)
     for name in ("cpu_provisional", "cpu_active", "cpu_released", "locks"):
         paths[name].mkdir(parents=True, exist_ok=True)
-    with exclusive(paths["locks"] / "cpu-lane.lock"):
+    with idle_job_guard(root), exclusive(paths["locks"] / "cpu-lane.lock"):
         _release_expired(paths)
         current = _policy(paths)
         reserved = sum(item.get("cpu_slots", 0) for item in _reservations(paths))
@@ -176,11 +179,12 @@ def initialize_cpu_lane_capacity(runtime_root: Path | Any, *, capacity: int) -> 
     """Set an initial CPU capacity, rejecting a conflicting shared policy."""
     if type(capacity) is not int or capacity < 0:
         raise ValueError("CPU lane capacity must be a non-negative integer.")
-    paths = local_paths(_runtime_root(runtime_root))
+    root = _runtime_root(runtime_root)
+    paths = local_paths(root)
     paths["cpu_policy"].parent.mkdir(parents=True, exist_ok=True)
     for name in ("cpu_provisional", "cpu_active", "cpu_released", "locks"):
         paths[name].mkdir(parents=True, exist_ok=True)
-    with exclusive(paths["locks"] / "cpu-lane.lock"):
+    with idle_job_guard(root), exclusive(paths["locks"] / "cpu-lane.lock"):
         _release_expired(paths)
         if paths["cpu_policy"].exists():
             current = _policy(paths)
@@ -195,10 +199,14 @@ def initialize_cpu_lane_capacity(runtime_root: Path | Any, *, capacity: int) -> 
         return policy
 
 
-def cpu_reservation_snapshot(runtime_root: Path) -> tuple[CpuLanePolicy, tuple[dict[str, Any], ...]]:
+def cpu_reservation_snapshot(
+    runtime_root: Path, *, blocking: bool = True
+) -> tuple[CpuLanePolicy, tuple[dict[str, Any], ...]]:
     """Return a lock-consistent CPU policy and usage-bearing reservations."""
     paths = local_paths(runtime_root)
-    with exclusive(paths["locks"] / "cpu-lane.lock"):
+    with exclusive(paths["locks"] / "cpu-lane.lock", blocking=blocking) as acquired:
+        if not acquired:
+            raise BlockingIOError("CPU reservations are being updated.")
         _release_expired(paths)
         return _policy(paths), tuple(_reservations(paths))
 

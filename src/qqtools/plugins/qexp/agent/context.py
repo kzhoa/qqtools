@@ -35,6 +35,7 @@ from .activation_wake import ActivationWakeFence
 from .bindings import ProjectBinding
 from .dispatch_probe import PrimaryProbeSession
 from .identity import MachineRuntimeUninitializedError, load_identity_record, require_fresh_runtime
+from .launch_handoff_state import LaunchHandoffState
 from .registration import (
     RECOVERY_REGISTRATION_PROTOCOL,
     RECOVERY_REGISTRATION_VERSION,
@@ -164,6 +165,7 @@ class MachineRuntime:
         self.ready_batch_sizers: dict[str, AdaptiveBatchSizer] = {}
         self.primary_probe = PrimaryProbeSession()
         # Set by the most recent bounded dispatch cycle for on-demand idle exit.
+        self.cycle_gpu_observation = None
         self.last_cycle_had_demand = True
         # Set when the current process validates and consumes a current binding.
         self.last_cycle_consumed_binding = False
@@ -199,7 +201,7 @@ class MachineRuntime:
         # the machine reservation remains authoritative.  The dispatch layer
         # owns the record shape; this map deliberately stores opaque values so
         # context.py does not depend on the executor implementation.
-        self.pending_launch_handoffs: dict[tuple[str, str], Any] = {}
+        self.pending_launch_handoffs = LaunchHandoffState()
         self.group_source_owner = GroupSourceOwner()
         self.activation_consumer_retirements = ActivationConsumerRetirements(self.root)
         self.registration = MachineRegistration(
