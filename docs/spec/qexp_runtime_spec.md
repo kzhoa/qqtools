@@ -5092,11 +5092,18 @@ to the census and retains matching locks through the local decision. An empty
 roster needs only the local fences. Changes to the roster, checkpoints, policy,
 executor epoch or launch handoff membership invalidate the continuous interval.
 
-The controller gives the required executor observations and final guard exchange
-one 50 ms monotonic deadline per idle decision. Short executor lock contention
+The executor observations, final guard exchange, and physical registry check
+share one 50 ms monotonic deadline per idle decision. The controller fences
+registry writers while its local observer checks the full revision and roster,
+then verifies the executor epoch under the executor lock. A stalled registry
+read leaves the executor lock available to training. Short executor lock contention
 can resolve within the same turn. A timeout releases received locks, rejects
 late results and ends the interval. The single outstanding local read performs
-no reconciliation. Probe scheduling runs after training admission in dispatch.
+no reconciliation. The supervisor loads configuration outside the machine
+admission lock and attempts the lock without waiting when reconciling a stop.
+If it is occupied, the supervisor invalidates the interval immediately. On the
+next available turn it reconciles ownership before accepting fresh idle evidence.
+Probe scheduling runs after training admission in dispatch.
 
 On Linux a supervisor and a separate process-group guardian use parent-death
 signals and pidfds. The guardian persists its identity before a GO handshake,

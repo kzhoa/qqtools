@@ -20,14 +20,14 @@ pytestmark = [pytest.mark.integration, pytest.mark.qexp_fast_io]
 
 
 @contextmanager
-def held_briefly(lock):
+def held_briefly(lock, *, timeout=1.0):
     acquired = threading.Event()
     release = threading.Event()
 
     def hold():
         with lock:
             acquired.set()
-            release.wait(1)
+            release.wait(timeout)
 
     thread = threading.Thread(target=hold)
     thread.start()
@@ -471,3 +471,154 @@ def test_resident_omission_preserves_exact_startup_proof(decision, monkeypatch):
     assert runtime.authority_ready_generations.get(binding.project_id) == binding.registration_generation
     assert controller.validated_config(binding, revision) is not None
     assert controller.validated_config(binding, revision + 1) is None
+
+
+@pytest.mark.parametrize("running", [False, True])
+def test_executor_timeout_cannot_block_again_on_machine_guard(decision, running):
+    from qqtools.plugins.qexp.agent.idle_job import idle_job_status
+    from qqtools.plugins.qexp.runtime.locks import exclusive
+    from qqtools.plugins.qexp.runtime.resources.idle_job import idle_job_guard
+
+    runtime, executor, supervisor, now, tick = decision
+    now[0] = 60
+    if running:
+        end = time.monotonic() + 5
+        while tick()["state"] != "running":
+            assert time.monotonic() < end
+            time.sleep(0.01)
+
+    with (
+        held_briefly(exclusive(executor.paths["project_io_lock"]), timeout=0.32),
+        held_briefly(idle_job_guard(runtime.root), timeout=0.32),
+    ):
+        start = time.monotonic()
+        status = tick()
+        assert time.monotonic() - start < 0.15
+        assert supervisor._idle_since is None
+        if running:
+            assert status["state"] == "blocked"
+        else:
+            assert status["reason"] == "unknown_demand"
+    assert idle_job_status(runtime)["interval_detail"]["last_reset"]["check"] == "executor_unready"
+    if running:
+        assert tick()["state"] == "stopping"
+    else:
+        assert tick()["reason"] == "idle_delay"
+
+
+def test_stalled_final_registry_read_releases_decision_without_locking_executor(decision, monkeypatch):
+    from qqtools.plugins.qexp.runtime.locks import exclusive
+
+    runtime, executor, supervisor, now, tick = decision
+    now[0] = 60
+    read_started = threading.Event()
+    release = threading.Event()
+    returned = threading.Event()
+    available = []
+    original = runtime.load_registry_uncached
+
+    def read_registry():
+        with exclusive(executor.paths["project_io_lock"], blocking=False) as acquired:
+            available.append(acquired)
+        read_started.set()
+        release.wait(0.27)
+        try:
+            return original()
+        finally:
+            returned.set()
+
+    try:
+        with monkeypatch.context() as delayed:
+            delayed.setattr(runtime, "load_registry_uncached", read_registry)
+            start = time.monotonic()
+            status = tick()
+            elapsed = time.monotonic() - start
+            assert read_started.is_set()
+            assert available == [True]
+            assert elapsed < 0.15
+            assert not returned.is_set()
+            assert status["reason"] == "unknown_demand"
+            assert supervisor._idle_since is None
+            with runtime.registry_guard(blocking=False) as registry_available:
+                assert registry_available
+            assert tick()["reason"] == "unknown_demand"
+            assert available == [True]
+    finally:
+        release.set()
+    assert returned.wait(1)
+    end = time.monotonic() + 2
+    while tick()["reason"] != "idle_delay":
+        assert time.monotonic() < end
+        time.sleep(0.01)
+
+
+@pytest.mark.parametrize("changed", ["registry", "executor"])
+def test_final_local_reads_reject_changed_identity(decision, monkeypatch, changed):
+    from qqtools.plugins.qexp.runtime.locks import exclusive
+
+    runtime, executor, supervisor, now, tick = decision
+    now[0] = 60
+    original = runtime.load_registry_uncached
+    observed = threading.Event()
+    monkeypatch.setattr(idle_job_integration, "IDLE_DECISION_SECONDS", 3)
+
+    def change_during_read():
+        revision, bindings = original()
+        if changed == "registry":
+            observed.set()
+            return revision + 1, bindings
+        with exclusive(executor.paths["project_io_lock"], blocking=False) as available:
+            if not available:
+                return revision, bindings
+        executor.fence_epoch()
+        executor.begin_epoch()
+        observed.set()
+        return revision, bindings
+
+    monkeypatch.setattr(runtime, "load_registry_uncached", change_during_read)
+    status = tick()
+    assert observed.is_set()
+    assert status["reason"] == "unknown_demand"
+    assert supervisor._idle_since is None
+
+
+def test_unknown_config_read_keeps_machine_guard_available_to_training(decision, monkeypatch):
+    from qqtools.plugins.qexp.runtime.resources.idle_job import idle_job_guard
+
+    runtime, _, supervisor, _, _ = decision
+    reader = supervisor._load_config
+    availability = []
+
+    def check_machine_guard():
+        with idle_job_guard(runtime.root, blocking=False) as acquired:
+            availability.append(acquired)
+        return reader()
+
+    monkeypatch.setattr(supervisor, "_load_config", check_machine_guard)
+    assert supervisor.tick(demand="unknown")["reason"] == "unknown_demand"
+    assert availability == [True]
+
+
+def test_unavailable_gpu_stop_does_not_wait_for_machine_guard(decision):
+    from qqtools.plugins.qexp.runtime.resources.idle_job import idle_job_guard
+
+    runtime, _, supervisor, _, tick = decision
+    set_idle_job_config(runtime, gpu_ids=(1,))
+    with held_briefly(idle_job_guard(runtime.root), timeout=0.32):
+        start = time.monotonic()
+        assert tick()["state"] == "blocked"
+        assert time.monotonic() - start < 0.15
+        assert supervisor._idle_since is None
+    assert tick()["reason"] == "gpu_policy_unavailable"
+
+
+def test_unowned_deferred_disable_does_not_override_current_unknown(decision):
+    from qqtools.plugins.qexp.runtime.resources.idle_job import idle_job_guard
+
+    runtime, _, supervisor, _, _ = decision
+    set_idle_job_config(runtime, enabled=False)
+    with held_briefly(idle_job_guard(runtime.root), timeout=0.32):
+        assert supervisor.tick(demand="unknown")["state"] == "blocked"
+    set_idle_job_config(runtime, enabled=True)
+    status = supervisor.tick(demand="unknown")
+    assert (status["state"], status["reason"]) == ("waiting", "unknown_demand")

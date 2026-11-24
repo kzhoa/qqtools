@@ -1542,12 +1542,19 @@ class ProjectIOController:
         return demand, evidence.epoch
 
     @contextmanager
-    def idle_executor_guard(self, expected_epoch: str, *, deadline: float) -> Iterator[bool]:
+    def idle_executor_guard(
+        self,
+        expected_epoch: str,
+        *,
+        deadline: float,
+        pre_executor_check: Callable[[], bool] | None = None,
+    ) -> Iterator[bool]:
+        """Fence the expected executor after the observer's optional read-only check."""
         observer = self._idle_executor_observation
         if observer is None:
             yield False
             return
-        with observer.guard(self.executor, deadline=deadline) as evidence:
+        with observer.guard(self.executor, deadline=deadline, pre_executor_check=pre_executor_check) as evidence:
             yield evidence is not None and evidence.epoch == expected_epoch and evidence.envelope == "healthy"
 
     def close_idle_job_observation(self) -> None:

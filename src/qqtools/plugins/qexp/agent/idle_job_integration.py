@@ -185,6 +185,11 @@ def _authorize_idle_decision(
     deadline: float,
 ) -> Iterator[bool]:
     """Acquire shared proof before taking the machine-local decision fences."""
+
+    def registry_matches() -> bool:
+        revision, bindings = runtime.load_registry_uncached()
+        return (revision, tuple(bindings)) == (evidence.registry_revision, evidence.bindings)
+
     with ExitStack() as stack:
         if not stack.enter_context(
             controller.authorize_idle_job_guard(
@@ -193,19 +198,18 @@ def _authorize_idle_decision(
         ):
             yield False
             return
-        if time.monotonic() >= deadline or not stack.enter_context(
-            controller.idle_executor_guard(evidence.executor_epoch, deadline=deadline)
-        ):
-            yield False
-            return
+        # The controller owns the registry guard; the observer only reads under it.
         if time.monotonic() >= deadline or not stack.enter_context(runtime.registry_guard(blocking=False)):
             yield False
             return
-        revision, bindings = runtime.load_registry_uncached()
-        if (revision, tuple(bindings)) != (evidence.registry_revision, evidence.bindings):
+        if time.monotonic() >= deadline or not stack.enter_context(
+            controller.idle_executor_guard(
+                evidence.executor_epoch, deadline=deadline, pre_executor_check=registry_matches
+            )
+        ):
             yield False
             return
-        enabled = tuple(binding for binding in bindings if binding.enabled)
+        enabled = tuple(binding for binding in evidence.bindings if binding.enabled)
         if enabled and runtime.working_set.idle_guard_checkpoint_digest(enabled) != evidence.checkpoint_digest:
             yield False
             return

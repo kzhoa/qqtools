@@ -560,6 +560,7 @@ class IdleJobSupervisor:
         self._observation_key: str | None = None
         self._last_handoff_revision: int | None = None
         self._last_decision_evidence: IdleDecisionEvidence | None = None
+        self._deferred_stop: tuple[str, str | None] | None = None
         # Restart interrupts proof of continuous idleness.
         self._idle_since: float | None = None
         self._retry_at: float | None = None
@@ -1040,6 +1041,7 @@ class IdleJobSupervisor:
             except (OSError, RuntimeError, TypeError, ValueError, KeyError):
                 return None, "malformed_ownership"
         if current is None:
+            self._deferred_stop = None
             return None, None
         if current["runtime_id"] != self.runtime_id:
             self._set_owner_fields(current, None)
@@ -1068,6 +1070,7 @@ class IdleJobSupervisor:
                 self._set_owner_fields(current, None)
                 return current, "stop_request_failed"
         self._set_owner_fields(current, self._process)
+        self._deferred_stop = None
         return current, None
 
     def _reserved_gpu_ids_locked(self) -> set[int]:
@@ -1293,38 +1296,60 @@ class IdleJobSupervisor:
         self._instance_id = None
         return self._publish(state=state, reason=reason)
 
-    def _stop_for_demand_locked(
-        self, config: IdleJobConfig, owner: dict[str, Any] | None, reason: str
-    ) -> dict[str, Any]:
-        owner, error = self._stop_locked(reason, owner)
-        if error is not None:
-            return self._blocked(error)
-        self._last_handoff_revision = None
-        if owner is not None:
-            return self._publish(state="stopping", reason=reason)
-        self._resolved_gpu_ids = None
-        return self._status_after_no_owner(config, state="waiting", reason=reason)
+    def _defer_stop(self, reason: str) -> dict[str, Any]:
+        if self._deferred_stop is None:
+            self._deferred_stop = (reason, self._pending_demand_check)
+        self._clear_idle_interval(reason)
+        self._observation_key = None
+        if self._instance_id is None and reason == "unknown_demand":
+            return self._publish(state="waiting", reason=reason)
+        return self._blocked("ownership_reconciliation_failed")
+
+    def _settle_stop(
+        self, boot_id: str, config: IdleJobConfig | None, reason: str, *, resume_if_unowned: bool = False
+    ) -> dict[str, Any] | None:
+        """Stop under the ownership fence, deferring an unverified owner to a later tick."""
+        try:
+            with idle_job_guard(self.root, blocking=False) as acquired:
+                if not acquired:
+                    return self._defer_stop(reason)
+                owner, error = self._reconcile_locked(boot_id)
+                if error is not None:
+                    return self._blocked(error)
+                if resume_if_unowned and owner is None:
+                    self._deferred_stop = None
+                    return None
+
+                owner, error = self._stop_locked(reason, owner)
+                if error is not None:
+                    return self._blocked(error)
+                if reason in {"unknown_demand", "busy"}:
+                    self._last_handoff_revision = None
+                if reason == "config_invalid":
+                    if config is None and owner is None:
+                        self._configured_gpu_ids = None
+                        self._config_revision = None
+                    return self._blocked(reason)
+                if owner is not None:
+                    return self._publish(state="stopping", reason=reason)
+                assert config is not None
+                if reason == "gpu_policy_unavailable":
+                    return self._blocked(reason)
+                if reason != "gpu_reserved":
+                    self._resolved_gpu_ids = None
+                return self._status_after_no_owner(
+                    config, state="disabled" if reason == "disabled" else "waiting", reason=reason
+                )
+        except (OSError, RuntimeError, TypeError, ValueError, KeyError):
+            return self._blocked("supervision_failed")
 
     def _reject_idle_decision(self, boot_id: str, config: IdleJobConfig, check: str) -> dict[str, Any]:
         self.set_demand_observation(
             "unknown", build_demand_observation(check), agent_instance_id=self._pending_agent_instance_id
         )
-        try:
-            with idle_job_guard(self.root, blocking=False) as acquired:
-                if not acquired:
-                    # Invalidate immediately. The next owned turn must stop any
-                    # surviving instance before it can accept fresh idle evidence.
-                    self._clear_idle_interval("unknown_demand")
-                    self._observation_key = None
-                    if self._instance_id is not None:
-                        return self._blocked("ownership_reconciliation_failed")
-                    return self._publish(state="waiting", reason="unknown_demand")
-                owner, error = self._reconcile_locked(boot_id)
-                if error is not None:
-                    return self._blocked(error)
-                return self._stop_for_demand_locked(config, owner, "unknown_demand")
-        except (OSError, RuntimeError, TypeError, ValueError, KeyError):
-            return self._blocked("supervision_failed")
+        status = self._settle_stop(boot_id, config, "unknown_demand")
+        assert status is not None
+        return status
 
     def tick(
         self,
@@ -1349,53 +1374,45 @@ class IdleJobSupervisor:
         if self._state_corrupt:
             return self._blocked("malformed_state")
 
-        if not guarded:
-            try:
-                with idle_job_guard(self.root):
-                    owner, reconciliation_error = self._reconcile_locked(boot_id)
-                    if reconciliation_error is not None:
-                        return self._blocked(reconciliation_error)
-            except (OSError, RuntimeError, TypeError, ValueError, KeyError):
-                return self._blocked("ownership_reconciliation_failed")
-
         try:
             observation = self._load_config()
             config = observation.config
         except (OSError, RuntimeError, TypeError, ValueError, KeyError):
-            with idle_job_guard(self.root):
-                owner, error = self._reconcile_locked(boot_id)
-                if error is not None:
-                    return self._blocked(error)
-                owner, error = self._stop_locked("config_invalid", owner)
-                if error is not None:
-                    return self._blocked(error)
-                if owner is not None:
-                    return self._blocked("config_invalid")
-            self._configured_gpu_ids = None
-            self._config_revision = None
-            return self._blocked("config_invalid")
-        self._set_config_fields(config)
+            config = None
+        else:
+            self._set_config_fields(config)
 
-        if not config.enabled:
-            with idle_job_guard(self.root):
-                owner, error = self._reconcile_locked(boot_id)
-                if error is not None:
-                    return self._blocked(error)
-                owner, error = self._stop_locked("disabled", owner)
-                if error is not None:
-                    return self._blocked(error)
-                if owner is not None:
-                    return self._publish(state="stopping", reason="disabled")
-                self._resolved_gpu_ids = None
-                return self._status_after_no_owner(config, state="disabled", reason="disabled")
+        resume_if_unowned = False
+        if config is None:
+            stop_reason = "config_invalid"
+        elif not config.enabled:
+            stop_reason = "disabled"
+        elif observed_demand == "busy":
+            stop_reason = "busy"
+        elif observed_demand == "unknown":
+            stop_reason = "unknown_demand"
+        elif self._deferred_stop is not None:
+            stop_reason, self._pending_demand_check = self._deferred_stop
+            resume_if_unowned = True
+        else:
+            stop_reason = None
 
-        if observed_demand != "idle":
-            stop_reason = "busy" if observed_demand == "busy" else "unknown_demand"
-            with idle_job_guard(self.root):
-                owner, error = self._reconcile_locked(boot_id)
-                if error is not None:
-                    return self._blocked(error)
-                return self._stop_for_demand_locked(config, owner, stop_reason)
+        if stop_reason is not None:
+            status = self._settle_stop(boot_id, config, stop_reason, resume_if_unowned=resume_if_unowned)
+            if status is not None:
+                return status
+        assert config is not None
+
+        if not guarded:
+            try:
+                with idle_job_guard(self.root, blocking=False) as acquired:
+                    if not acquired:
+                        return self._defer_stop("unknown_demand")
+                    _, error = self._reconcile_locked(boot_id)
+                    if error is not None:
+                        return self._blocked(error)
+            except (OSError, RuntimeError, TypeError, ValueError, KeyError):
+                return self._blocked("ownership_reconciliation_failed")
 
         try:
             resolved, policy, reservation_policy = (
@@ -1406,39 +1423,11 @@ class IdleJobSupervisor:
             policy_key = self._policy_key(policy, resolved)
         except _IdleDecisionRejected as exc:
             return self._reject_idle_decision(boot_id, config, str(exc))
-        except _GpuReserved:
-            with idle_job_guard(self.root):
-                owner, error = self._reconcile_locked(boot_id)
-                if error is not None:
-                    return self._blocked(error)
-                owner, error = self._stop_locked("gpu_reserved", owner)
-                if error is not None:
-                    return self._blocked(error)
-                if owner is not None:
-                    return self._publish(state="stopping", reason="gpu_reserved")
-            return self._status_after_no_owner(config, state="waiting", reason="gpu_reserved")
-        except _SupervisorBlocked:
-            with idle_job_guard(self.root):
-                owner, error = self._reconcile_locked(boot_id)
-                if error is not None:
-                    return self._blocked(error)
-                owner, error = self._stop_locked("gpu_policy_unavailable", owner)
-                if error is not None:
-                    return self._blocked(error)
-                if owner is not None:
-                    return self._publish(state="stopping", reason="gpu_policy_unavailable")
-            return self._blocked("gpu_policy_unavailable")
-        except (OSError, RuntimeError, TypeError, ValueError, KeyError):
-            with idle_job_guard(self.root):
-                owner, error = self._reconcile_locked(boot_id)
-                if error is not None:
-                    return self._blocked(error)
-                owner, error = self._stop_locked("gpu_policy_unavailable", owner)
-                if error is not None:
-                    return self._blocked(error)
-                if owner is not None:
-                    return self._publish(state="stopping", reason="gpu_policy_unavailable")
-            return self._blocked("gpu_policy_unavailable")
+        except (OSError, RuntimeError, TypeError, ValueError, KeyError) as exc:
+            reason = "gpu_reserved" if isinstance(exc, _GpuReserved) else "gpu_policy_unavailable"
+            status = self._settle_stop(boot_id, config, reason)
+            assert status is not None
+            return status
 
         try:
             handoffs = (
@@ -1455,11 +1444,8 @@ class IdleJobSupervisor:
                     raise _IdleDecisionRejected("demand_census_unknown")
                 if not stack.enter_context(handoff_guard):
                     raise _IdleDecisionRejected("launch_handoff_pending")
-                if guarded:
-                    if not stack.enter_context(idle_job_guard(self.root, blocking=False)):
-                        raise _IdleDecisionRejected("demand_census_unknown")
-                else:
-                    stack.enter_context(idle_job_guard(self.root))
+                if not stack.enter_context(idle_job_guard(self.root, blocking=False)):
+                    raise _IdleDecisionRejected("demand_census_unknown")
                 current_owner, error = self._reconcile_locked(boot_id)
                 if error is not None:
                     return self._blocked(error)

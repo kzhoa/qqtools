@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field
 from threading import Condition, Event, Thread
@@ -26,6 +26,7 @@ class IdleExecutorEvidence:
 class _ObservationRequest:
     executor: ProjectIOExecutor
     deadline: float
+    pre_executor_check: Callable[[], bool] | None
     done: Event = field(default_factory=Event)
     cancelled: bool = False
     lease: ExitStack | None = None
@@ -42,8 +43,15 @@ class IdleExecutorObservation:
         Thread(target=self._run, name="qexp-idle-executor-observation", daemon=True).start()
 
     @contextmanager
-    def guard(self, executor: ProjectIOExecutor, *, deadline: float) -> Iterator[IdleExecutorEvidence | None]:
-        request = _ObservationRequest(executor, deadline)
+    def guard(
+        self,
+        executor: ProjectIOExecutor,
+        *,
+        deadline: float,
+        pre_executor_check: Callable[[], bool] | None = None,
+    ) -> Iterator[IdleExecutorEvidence | None]:
+        """Run an optional read-only check in the observer before acquiring the executor lock."""
+        request = _ObservationRequest(executor, deadline, pre_executor_check)
         with self._condition:
             accepted = not self._closed and self._request is None and time.monotonic() < deadline
             if accepted:
@@ -54,7 +62,9 @@ class IdleExecutorObservation:
             return
         try:
             ready = request.done.wait(max(0, deadline - time.monotonic()))
-            yield request.evidence if ready and time.monotonic() < deadline else None
+            with self._condition:
+                evidence = request.evidence if ready and self._is_active_locked(request) else None
+            yield evidence
         finally:
             with self._condition:
                 request.cancelled = True
@@ -85,19 +95,36 @@ class IdleExecutorObservation:
             except (AttributeError, OSError, RuntimeError, TypeError, ValueError, KeyError):
                 evidence = None
             with self._condition:
-                if not request.cancelled:
+                if self._is_active_locked(request):
                     request.evidence = evidence
                 self._request = None
                 request.done.set()
             del request
 
+    def _is_active_locked(self, request: _ObservationRequest) -> bool:
+        return not request.cancelled and not self._closed and time.monotonic() < request.deadline
+
     def _read(self, request: _ObservationRequest) -> IdleExecutorEvidence | None:
-        while time.monotonic() < request.deadline:
+        if request.pre_executor_check is not None:
+            with self._condition:
+                if not self._is_active_locked(request):
+                    return None
+            try:
+                if not request.pre_executor_check():
+                    return None
+            except Exception:
+                return None
+
+        # A stalled check can return after the caller released its registry guard.
+        while True:
+            with self._condition:
+                if not self._is_active_locked(request):
+                    return None
             with ExitStack() as lock:
                 acquired = lock.enter_context(exclusive(request.executor.paths["project_io_lock"], blocking=False))
                 if acquired:
                     with self._condition:
-                        if request.cancelled or self._closed or time.monotonic() >= request.deadline:
+                        if not self._is_active_locked(request):
                             return None
                         # No read or reconciliation may mutate transport after a timeout.
                         # The control thread releases this exact lock, even if I/O is still pending.
@@ -108,4 +135,3 @@ class IdleExecutorObservation:
                         return IdleExecutorEvidence(epoch, envelope, unresolved)
                     return None
             time.sleep(max(0, min(_CONTENTION_RETRY_SECONDS, request.deadline - time.monotonic())))
-        return None
