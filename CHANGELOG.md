@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- fix: resume qexp dependency projection migration within high-degree Tasks during
+  backfill and both audits, preserving the per-slice metadata budget.
+
 ## v1.3.30
 
 - breaking: remove the deprecated `v1`, `v2`, and `v3` strategies and the

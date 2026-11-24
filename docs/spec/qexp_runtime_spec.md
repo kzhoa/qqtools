@@ -940,6 +940,12 @@ indexes/task-dependencies/
   generations/<generation>/records/<prerequisite-task-id>.json
 ```
 
+Rebuild capture and both audit phases checkpoint bounded edge windows within each Task or
+reverse record. A partial cursor stores the directory offset, Task ID, and next edge offset;
+legacy directory-only cursors start at the first edge. The directory cursor advances only after
+all edges for that record complete. Replaying an interrupted window is idempotent, and canonical
+mutations still invalidate the building generation under the dependency fence.
+
 The state binds Project identity, protocol version, active or building generation, phase, cursor,
 revision, and `active | building | degraded` status. An active generation contains one record for
 every live Task, including Tasks with no dependents. Each record names its prerequisite Task ID and

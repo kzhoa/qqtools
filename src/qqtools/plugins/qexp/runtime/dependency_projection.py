@@ -33,6 +33,8 @@ PROJECTION_PROTOCOL = "task-dependencies-v2"
 PROJECTION_STATUS = frozenset({"active", "building", "degraded"})
 PROJECTION_PHASES = frozenset({"complete", "capture", "forward_audit", "reverse_audit", "select"})
 MAX_FAILURE_REASON = 512
+# QQTOOLS-COMPAT-0023: bound edge work within each migration record.
+_REBUILD_EDGES_PER_ITEM = 16
 
 
 class ProjectionUnavailable(RuntimeError):
@@ -555,10 +557,47 @@ def _load_task(cfg: Any, task_id: str, *, storage: Any | None = None) -> TaskRec
     return TaskRecord.from_dict(_storage_read(storage, task_path(cfg.shared_root, task_id), max_bytes=256 * 1024))
 
 
-def _validate_forward_edges(cfg: Any, task: TaskRecord, *, storage: Any | None = None) -> None:
+def _edge_window(edge_offset: int, count: int) -> tuple[int, int | None]:
+    if type(edge_offset) is not int or not 0 <= edge_offset <= count:
+        raise ProjectionUnavailable("task dependency projection edge cursor is invalid")
+    end = min(edge_offset + _REBUILD_EDGES_PER_ITEM, count)
+    return end, end if end < count else None
+
+
+def _capture_task(
+    cfg: Any, generation: str, task: TaskRecord, *, edge_offset: int, storage: Any | None = None
+) -> int | None:
+    """Merge a bounded window of outgoing edges into a build generation."""
+    end, next_edge = _edge_window(edge_offset, len(task.depends_on_task_ids))
+    if edge_offset == 0:
+        try:
+            own_record = _read_record(cfg, generation, task.task_id, storage=storage)
+            own_dependents = own_record["dependent_task_ids"]
+        except ProjectionUnavailable:
+            own_dependents = []
+        _write_record(cfg, generation, task.task_id, own_dependents, storage=storage)
+    for prerequisite_id in task.depends_on_task_ids[edge_offset:end]:
+        try:
+            record = _read_record(cfg, generation, prerequisite_id, storage=storage)
+            dependents = set(record["dependent_task_ids"])
+        except ProjectionUnavailable:
+            dependents = set()
+        dependents.add(task.task_id)
+        _write_record(cfg, generation, prerequisite_id, dependents, storage=storage)
+    return next_edge
+
+
+def _audit_forward_record(
+    cfg: Any, generation: str, task: TaskRecord, *, edge_offset: int, storage: Any | None = None
+) -> int | None:
+    end, next_edge = _edge_window(edge_offset, len(task.depends_on_task_ids))
     if task.task_id in task.depends_on_task_ids:
         raise ProjectionUnavailable(f"Task {task.task_id!r} contains a self dependency")
-    for prerequisite_id in task.depends_on_task_ids:
+    try:
+        _read_record(cfg, generation, task.task_id, storage=storage)
+    except ProjectionUnavailable as exc:
+        raise ProjectionUnavailable(f"task dependency reverse record is missing for Task {task.task_id!r}") from exc
+    for prerequisite_id in task.depends_on_task_ids[edge_offset:end]:
         try:
             prerequisite = _load_task(cfg, prerequisite_id, storage=storage)
         except FileNotFoundError as exc:
@@ -567,41 +606,17 @@ def _validate_forward_edges(cfg: Any, task: TaskRecord, *, storage: Any | None =
             ) from exc
         if not prerequisite.submission_operation_id:
             raise ProjectionUnavailable(f"Task {task.task_id!r} references an uncommitted prerequisite")
-
-
-def _capture_task(cfg: Any, generation: str, task: TaskRecord, *, storage: Any | None = None) -> None:
-    """Merge one Task's authoritative outgoing edges into a build generation."""
-    try:
-        own_record = _read_record(cfg, generation, task.task_id, storage=storage)
-        own_dependents = own_record["dependent_task_ids"]
-    except ProjectionUnavailable:
-        own_dependents = []
-    _write_record(cfg, generation, task.task_id, own_dependents, storage=storage)
-    for prerequisite_id in task.depends_on_task_ids:
-        try:
-            record = _read_record(cfg, generation, prerequisite_id, storage=storage)
-            dependents = set(record["dependent_task_ids"])
-        except ProjectionUnavailable:
-            dependents = set()
-        dependents.add(task.task_id)
-        _write_record(cfg, generation, prerequisite_id, dependents, storage=storage)
-
-
-def _audit_forward_record(cfg: Any, generation: str, task: TaskRecord, *, storage: Any | None = None) -> None:
-    _validate_forward_edges(cfg, task, storage=storage)
-    try:
-        _read_record(cfg, generation, task.task_id, storage=storage)
-    except ProjectionUnavailable as exc:
-        raise ProjectionUnavailable(f"task dependency reverse record is missing for Task {task.task_id!r}") from exc
-    for prerequisite_id in task.depends_on_task_ids:
         record = _read_record(cfg, generation, prerequisite_id, storage=storage)
         if task.task_id not in record["dependent_task_ids"]:
             raise ProjectionUnavailable(
                 f"task dependency reverse record omits {task.task_id!r} from {prerequisite_id!r}"
             )
+    return next_edge
 
 
-def _audit_reverse_record(cfg: Any, generation: str, prerequisite_id: str, *, storage: Any | None = None) -> None:
+def _audit_reverse_record(
+    cfg: Any, generation: str, prerequisite_id: str, *, edge_offset: int, storage: Any | None = None
+) -> int | None:
     try:
         _load_task(cfg, prerequisite_id, storage=storage)
     except FileNotFoundError as exc:
@@ -609,7 +624,8 @@ def _audit_reverse_record(cfg: Any, generation: str, prerequisite_id: str, *, st
             f"task dependency reverse record has no canonical Task {prerequisite_id!r}"
         ) from exc
     record = _read_record(cfg, generation, prerequisite_id, storage=storage)
-    for dependent_id in record["dependent_task_ids"]:
+    end, next_edge = _edge_window(edge_offset, len(record["dependent_task_ids"]))
+    for dependent_id in record["dependent_task_ids"][edge_offset:end]:
         try:
             dependent = _load_task(cfg, dependent_id, storage=storage)
         except FileNotFoundError as exc:
@@ -618,6 +634,23 @@ def _audit_reverse_record(cfg: Any, generation: str, prerequisite_id: str, *, st
             raise ProjectionUnavailable(
                 f"task dependency reverse record disagrees with canonical Task {dependent_id!r} truth"
             )
+    return next_edge
+
+
+def _rebuild_cursor(cursor: dict, task_id: str, next_offset: int, next_edge: int | None) -> dict:
+    if next_edge is None:
+        return {"offset": next_offset}
+    return {"offset": cursor["offset"], "task_id": task_id, "edge_offset": next_edge}
+
+
+def _cursor_edge_offset(cursor: dict, task_id: str | None) -> int:
+    if "edge_offset" not in cursor:
+        if set(cursor) != {"offset"}:
+            raise ProjectionUnavailable("task dependency projection rebuild cursor is invalid")
+        return 0
+    if task_id is None or set(cursor) != {"offset", "task_id", "edge_offset"} or cursor["task_id"] != task_id:
+        raise ProjectionUnavailable("task dependency projection rebuild cursor does not match Task")
+    return cursor["edge_offset"]
 
 
 def start_rebuild(cfg: Any, *, storage: Any | None = None) -> dict[str, Any]:
@@ -657,7 +690,7 @@ def start_rebuild(cfg: Any, *, storage: Any | None = None) -> dict[str, Any]:
 
 
 def advance_rebuild(cfg: Any, *, storage: Any | None = None, max_items: int = 1) -> dict[str, Any]:
-    """Advance at most ``max_items`` Task/reverse-record rebuild units."""
+    """Advance at most ``max_items`` bounded edge windows or empty records."""
     if type(max_items) is not int or not 1 <= max_items <= 64:
         raise ValueError("max_items must be between 1 and 64")
     state = start_rebuild(cfg, storage=storage)
@@ -673,42 +706,48 @@ def advance_rebuild(cfg: Any, *, storage: Any | None = None, max_items: int = 1)
             raise ProjectionUnavailable("task dependency projection rebuild cursor is invalid")
         if state["phase"] == "capture":
             task_id, next_offset = _task_entry(cfg, offset, storage=storage)
+            edge_offset = _cursor_edge_offset(cursor, task_id)
             if task_id is None:
                 state["phase"] = "forward_audit"
                 state["cursor"] = {"offset": 0}
                 _write_state(cfg, state, storage=storage)
                 continue
-            _capture_task(cfg, generation, _load_task(cfg, task_id, storage=storage), storage=storage)
-            cursor["offset"] = next_offset
-            state["cursor"] = cursor
+            next_edge = _capture_task(
+                cfg, generation, _load_task(cfg, task_id, storage=storage), edge_offset=edge_offset, storage=storage
+            )
+            state["cursor"] = _rebuild_cursor(cursor, task_id, next_offset, next_edge)
             state["updated_at"] = utc_now()
             _write_state(cfg, state, storage=storage)
             work += 1
             continue
         if state["phase"] == "forward_audit":
             task_id, next_offset = _task_entry(cfg, offset, storage=storage)
+            edge_offset = _cursor_edge_offset(cursor, task_id)
             if task_id is None:
                 state["phase"] = "reverse_audit"
                 state["cursor"] = {"offset": 0}
                 _write_state(cfg, state, storage=storage)
                 continue
-            _audit_forward_record(cfg, generation, _load_task(cfg, task_id, storage=storage), storage=storage)
-            cursor["offset"] = next_offset
-            state["cursor"] = cursor
+            next_edge = _audit_forward_record(
+                cfg, generation, _load_task(cfg, task_id, storage=storage), edge_offset=edge_offset, storage=storage
+            )
+            state["cursor"] = _rebuild_cursor(cursor, task_id, next_offset, next_edge)
             state["updated_at"] = utc_now()
             _write_state(cfg, state, storage=storage)
             work += 1
             continue
         if state["phase"] == "reverse_audit":
             prerequisite_id, next_offset = _record_entry(cfg, generation, offset, storage=storage)
+            edge_offset = _cursor_edge_offset(cursor, prerequisite_id)
             if prerequisite_id is None:
                 state["phase"] = "select"
                 state["cursor"] = {"offset": 0}
                 _write_state(cfg, state, storage=storage)
                 continue
-            _audit_reverse_record(cfg, generation, prerequisite_id, storage=storage)
-            cursor["offset"] = next_offset
-            state["cursor"] = cursor
+            next_edge = _audit_reverse_record(
+                cfg, generation, prerequisite_id, edge_offset=edge_offset, storage=storage
+            )
+            state["cursor"] = _rebuild_cursor(cursor, prerequisite_id, next_offset, next_edge)
             state["updated_at"] = utc_now()
             _write_state(cfg, state, storage=storage)
             work += 1

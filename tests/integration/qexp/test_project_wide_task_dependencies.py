@@ -601,3 +601,127 @@ def test_interrupted_edge_projection_stays_degraded_until_bounded_repair(
     else:  # pragma: no cover - bounded failure diagnostic
         pytest.fail("projection repair did not converge")
     assert projected_dependents(cfg, parent.task_id) == [child.task_id]
+
+
+# QQTOOLS-COMPAT-0023: historical projection builds must resume within a record.
+@pytest.mark.parametrize(("direction", "count"), [("forward", 88), ("forward", 300), ("reverse", 300)])
+def test_dependency_migration_resumes_high_degree_records_with_default_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, direction: str, count: int
+) -> None:
+    from dataclasses import replace
+
+    from qqtools.plugins.qexp.runtime import dependency_projection as projection
+    from qqtools.plugins.qexp.runtime.upgrade.contracts import UpgradeContext, UpgradeSliceBudget, UpgradeStorage
+    from qqtools.plugins.qexp.runtime.upgrade.task_dependencies_v2 import TaskDependenciesV2Migration
+
+    cfg = _config(tmp_path)
+    seed = submit(cfg, ["true"], task_id="hub", group=None, working_dir=tmp_path)
+    leaves = [f"leaf-{index:04d}" for index in range(count)]
+    for task_id in leaves:
+        task = replace(seed, task_id=task_id, depends_on_task_ids=["hub"] if direction == "reverse" else [])
+        atomic_replace(cfg.shared_root / "tasks" / f"{task_id}.json", task.to_dict())
+    if direction == "forward":
+        seed = replace(seed, depends_on_task_ids=leaves)
+        atomic_replace(cfg.shared_root / "tasks" / "hub.json", seed.to_dict())
+    with dependency_lock(cfg.shared_root):
+        mark_degraded(cfg, "test historical high-degree graph")
+        initial = start_rebuild(cfg)
+    assert initial["cursor"] == {"offset": 0}
+
+    plugin = TaskDependenciesV2Migration()
+    spec = plugin.spec
+    partial_phases = set()
+    interrupted = False
+    for _ in range(count * 4 + 100):
+        before = read_projection_state(cfg)
+        budget = UpgradeSliceBudget(
+            spec.max_records_per_slice, spec.max_metadata_ops_per_slice, spec.max_io_bytes_per_slice
+        )
+        context = UpgradeContext(
+            cfg=cfg,
+            journal={},
+            work_budget=1,
+            journal_path=tmp_path / "unused-journal.json",
+            slice_budget=budget,
+            storage=UpgradeStorage(budget),
+        )
+        # Lose a checkpoint after writes to prove replay does not duplicate or omit edges.
+        if not interrupted and before["phase"] == "capture" and "edge_offset" in before["cursor"]:
+            with monkeypatch.context() as patch:
+                patch.setattr(projection, "_task_entry", lambda *_args, **_kwargs: (None, 0))
+                with pytest.raises(projection.ProjectionUnavailable, match="cursor does not match"):
+                    advance_rebuild(cfg)
+            assert read_projection_state(cfg)["cursor"] == before["cursor"]
+
+            def fail_checkpoint(*_args, **_kwargs):
+                raise OSError("interrupted checkpoint")
+
+            with monkeypatch.context() as patch:
+                patch.setattr(projection, "_write_state", fail_checkpoint)
+                with pytest.raises(OSError, match="interrupted checkpoint"):
+                    plugin.backfill(context)
+            assert read_projection_state(cfg)["cursor"] == before["cursor"]
+            interrupted = True
+            continue
+        result = plugin.backfill(context)
+        assert result.state in {"progressed", "complete"}
+        assert 0 < result.metadata_ops <= 256
+        assert result.io_bytes <= spec.max_io_bytes_per_slice
+        after = read_projection_state(cfg)
+        if after["cursor"] and "edge_offset" in after["cursor"]:
+            partial_phases.add(after["phase"])
+            assert after["cursor"]["task_id"] == "hub"
+            assert after["cursor"]["edge_offset"] > 0
+        if result.state == "complete":
+            break
+    else:
+        pytest.fail(f"high-degree migration did not converge: {read_projection_state(cfg)}")
+
+    assert read_projection_state(cfg)["state"] == "active"
+    if direction == "forward":
+        assert interrupted
+        assert partial_phases == {"capture", "forward_audit"}
+        assert projected_dependents(cfg, "hub") == []
+        for task_id in leaves:
+            assert projected_dependents(cfg, task_id) == ["hub"]
+    else:
+        assert partial_phases == {"reverse_audit"}
+        assert projected_dependents(cfg, "hub") == leaves
+
+
+@pytest.mark.parametrize("phase", ["forward_audit", "reverse_audit"])
+def test_dependency_rebuild_audits_edges_after_the_first_checkpoint(tmp_path: Path, phase: str) -> None:
+    from dataclasses import replace
+
+    from qqtools.plugins.qexp.runtime.dependency_projection import ProjectionUnavailable
+
+    cfg = _config(tmp_path)
+    hub = submit(cfg, ["true"], task_id="hub", group=None, working_dir=tmp_path)
+    leaves = [f"leaf-{index:04d}" for index in range(20)]
+    for task_id in leaves:
+        task = replace(hub, task_id=task_id, depends_on_task_ids=["hub"] if phase == "reverse_audit" else [])
+        atomic_replace(cfg.shared_root / "tasks" / f"{task_id}.json", task.to_dict())
+    if phase == "forward_audit":
+        hub = replace(hub, depends_on_task_ids=leaves)
+        atomic_replace(cfg.shared_root / "tasks" / "hub.json", hub.to_dict())
+    with dependency_lock(cfg.shared_root):
+        mark_degraded(cfg, "test audit continuation")
+        for _ in range(150):
+            result = advance_rebuild(cfg)
+            if result["phase"] == phase and "edge_offset" in (result["cursor"] or {}):
+                break
+        else:
+            pytest.fail("audit did not checkpoint the hub")
+        checkpoint = read_projection_state(cfg)
+        # Inject damaged truth beyond the completed window without the normal writer fence.
+        path = cfg.shared_root / "tasks" / f"{leaves[-1]}.json"
+        task = load_task(cfg, leaves[-1])
+        if phase == "forward_audit":
+            task.submission_operation_id = None
+        else:
+            task.depends_on_task_ids = []
+        atomic_replace(path, task.to_dict())
+        with pytest.raises(ProjectionUnavailable, match="uncommitted|disagrees"):
+            advance_rebuild(cfg)
+    assert read_projection_state(cfg) == checkpoint
+    assert checkpoint["state"] == "building"
