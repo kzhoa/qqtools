@@ -118,13 +118,17 @@ def _phase_result(context: UpgradeContext, state: str, *, blocker: str | None = 
         max_metadata_ops=TaskDependenciesV2Migration.spec.max_metadata_ops_per_slice,
         max_io_bytes=TaskDependenciesV2Migration.spec.max_io_bytes_per_slice,
     )
+    detail = detail or {}
+    projection = detail.get("projection")
+    projection_work_items = projection.get("work_items") if isinstance(projection, dict) else None
     return PhaseResult(
         state,
         work_items=usage["records"],
         metadata_ops=usage["metadata_ops"],
         io_bytes=usage["io_bytes"],
         blocker=blocker,
-        detail=detail or {},
+        detail=detail,
+        meaningful_progress=type(projection_work_items) is int and projection_work_items > 0,
     )
 
 

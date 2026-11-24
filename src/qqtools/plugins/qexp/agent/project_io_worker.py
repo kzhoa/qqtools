@@ -27,7 +27,7 @@ from ..layout import (
     machine_state_path,
     validate_root_contract,
 )
-from ..lease import load_lease_policy
+from ..lease import load_lease_policy, parse_utc
 from ..machine_config import load_machine_policy
 from ..runtime.authority_lock import authority_locks
 from ..runtime.paths import (
@@ -48,7 +48,14 @@ from ..runtime.ready.traversal import ReadyCursor, compare_and_commit_ready_curs
 from ..runtime.records import AttemptRecord, utc_now
 from ..runtime.registration_authority import RegistrationIdentity, registration_state, registration_write_guard
 from ..runtime.resources.reservations import ReservationIdentity
-from ..runtime.store import atomic_replace, fenced_mutations, read_json, read_json_limited, require_json_size
+from ..runtime.store import (
+    atomic_replace,
+    authorized_migration_json_io,
+    fenced_mutations,
+    read_json,
+    read_json_limited,
+    require_json_size,
+)
 from ..runtime.tasks import load_task
 from ..runtime.work_budget import SliceBudget, WorkBudgetPolicy
 from .bindings import ProjectBinding, decode_registry
@@ -74,6 +81,8 @@ _REQUEST_ID = re.compile(r"^[0-9a-f]{32}$")
 _HANDSHAKE_SECONDS = 2.0
 _HANDSHAKE_POLL_SECONDS = 0.025
 _MAX_SHARED_RECORD_BYTES = 8 * 1024 * 1024
+_UPGRADE_WINDOW_SECONDS = 2.0
+_UPGRADE_WINDOW_MAX_CALLS = 8
 
 
 class _ExecutorEpochFenced(RuntimeError):
@@ -2361,6 +2370,60 @@ def _progress_projection(
     return result
 
 
+def _active_upgrade_migration(status: dict[str, Any]) -> dict[str, Any] | None:
+    return next(
+        (item for item in status.get("migrations", []) if item.get("state") not in {"completed", "idle"}),
+        None,
+    )
+
+
+def _upgrade_deadline_is_due(value: object) -> bool:
+    if not isinstance(value, str):
+        return value is None
+    try:
+        return parse_utc(value) <= datetime.now(timezone.utc)
+    except (TypeError, ValueError):
+        return False
+
+
+def _can_continue_upgrade(status: dict[str, Any], identity: tuple[str, str]) -> bool:
+    invocation = status.get("invocation", {})
+    active = _active_upgrade_migration(status)
+    return (
+        invocation.get("slice_committed") is True
+        and invocation.get("contended_lock") is None
+        and (invocation.get("meaningful_progress") is True or invocation.get("delta") is not None)
+        and (invocation.get("migration"), invocation.get("phase")) == identity
+        and status["state"] == "runnable"
+        and status.get("pending") is True
+        and status.get("can_run") is True
+        and active is not None
+        and (active.get("name"), active.get("phase")) == identity
+        and _upgrade_deadline_is_due(active.get("next_retry_at"))
+        and _upgrade_deadline_is_due(active.get("next_probe_at"))
+        and _upgrade_deadline_is_due(invocation.get("next_probe_at"))
+    )
+
+
+def _upgrade_next_probe(status: dict[str, Any]) -> str | None:
+    """Preserve the latest applicable deadline in the closed worker summary."""
+    active = _active_upgrade_migration(status) or {}
+    deadlines = (
+        status.get("next_probe_at"),
+        status.get("invocation", {}).get("next_probe_at"),
+        active.get("next_retry_at"),
+        active.get("next_probe_at"),
+    )
+    valid = []
+    for value in deadlines:
+        if isinstance(value, str):
+            try:
+                valid.append((parse_utc(value), value))
+            except (TypeError, ValueError):
+                continue
+    return max(valid)[1] if valid else None
+
+
 def _upgrade_service(
     request: ProjectIORequest,
     runtime_root: Path,
@@ -2373,25 +2436,49 @@ def _upgrade_service(
     cfg = load_root_config(Path(request.canonical_shared_root), request.parameters["machine_name"])
 
     def before_shared_mutation() -> None:
-        epoch = _read_epoch(paths)
-        if not epoch.active or epoch.runtime_id != request.runtime_id or epoch.executor_epoch != request.executor_epoch:
-            raise _ExecutorEpochFenced
-        if not _claim_binding_is_current(request, runtime_root, cfg):
-            raise _BindingAuthorityChanged
+        # Authority reads are worker fencing, not migration-owned record I/O.
+        with authorized_migration_json_io():
+            epoch = _read_epoch(paths)
+            if (
+                not epoch.active
+                or epoch.runtime_id != request.runtime_id
+                or epoch.executor_epoch != request.executor_epoch
+            ):
+                raise _ExecutorEpochFenced
+            if not _claim_binding_is_current(request, runtime_root, cfg):
+                raise _BindingAuthorityChanged
         write_possible[0] = True
 
     with fenced_mutations(cfg.shared_root, before_shared_mutation):
         coordinator = UpgradeCoordinator(cfg)
+        started_at = time.monotonic()
         status = coordinator.discover()
-        if status.get("pending") and status.get("can_run"):
+        invocation = status.get("invocation", {})
+        if (
+            status.get("pending")
+            and status.get("can_run")
+            and invocation.get("contended_lock") is None
+            and _upgrade_deadline_is_due(invocation.get("next_probe_at"))
+        ):
             status = coordinator.advance()
+            invocation = status.get("invocation", {})
+            name, phase = invocation.get("migration"), invocation.get("phase")
+            identity = (name, phase) if isinstance(name, str) and isinstance(phase, str) else None
+            for _ in range(1, _UPGRADE_WINDOW_MAX_CALLS):
+                if (
+                    identity is None
+                    or not _can_continue_upgrade(status, identity)
+                    or time.monotonic() - started_at >= _UPGRADE_WINDOW_SECONDS
+                ):
+                    break
+                status = coordinator.advance(continuation=identity)
     return {
         "state": status["state"],
         "pending": bool(status.get("pending")),
         "can_run": bool(status.get("can_run")),
         "admission_blocked": bool(status.get("admission_blocked")) or status["state"] == "inaccessible",
         "idle_blocking": pending_upgrade_requires_completion(status),
-        "next_probe_at": status.get("next_probe_at"),
+        "next_probe_at": _upgrade_next_probe(status),
     }
 
 

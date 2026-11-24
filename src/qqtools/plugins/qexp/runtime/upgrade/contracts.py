@@ -157,6 +157,7 @@ class PhaseResult:
     progress_evidence: dict[str, Any] | None = None
     progress_state: dict[str, Any] | None = None
     progress_before: dict[str, Any] | None = None
+    meaningful_progress: bool = False
 
     def __post_init__(self) -> None:
         if self.state not in {"progressed", "waiting", "complete", "blocked"}:

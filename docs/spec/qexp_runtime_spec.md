@@ -1844,8 +1844,27 @@ reclaimed only after exact worker absence; an overdue or unverified worker
 continues to occupy its slot. Registry and local reservation identity are
 checked again before the single borrow reservation is created.
 
-`upgrade_service` performs shared journal discovery and at most one existing
-migration phase slice through background admission. Its closed result contains
+`upgrade_service` performs shared journal discovery and a bounded window of
+migration phase slices through background admission. The window starts its
+monotonic clock before discovery and permits at most eight `advance()` calls
+and two seconds before starting another slice. An eligible first slice still
+runs when discovery exhausts the window; a slow slice may finish after the
+deadline. Each call independently acquires and releases upgrade exclusion and
+retains the phase's existing locks, resource budgets and journal commit.
+
+Continuation requires this invocation's committed meaningful progress, the same
+migration and phase, runnable state and no future retry or probe deadline.
+After reacquiring upgrade exclusion, the coordinator refreshes the journal and
+rechecks that identity, state, pause intent and both deadlines before phase work.
+Contention, missing progress evidence, failure, pause, waiting, repair or an
+identity change ends the window. Dependency rebuild progress uses positive
+processed rebuild work items (bounded edge windows or empty records); charged
+records, revision changes and progress
+observed from a peer cannot justify continuation. Manual `advance()` retains
+its single-slice behavior without the optional continuation guard. Binding and
+epoch fences remain active for every shared mutation. After a window the slot
+returns to ordinary background admission, whose equal-priority Project rotation
+gives an eligible waiting peer a turn before renewal. Its closed result contains
 only state, pending/runnable flags, admission and idle blockers, and the next
 probe timestamp. MachineRuntime applies those summaries for the exact binding,
 registry revision, and executor epoch; it does not run shared discovery inline
@@ -2383,7 +2402,8 @@ Upgrade and maintenance-descriptor producers offer every currently eligible
 binding's transient intent to this common bounded collector. They do not rotate
 a separate producer cursor or stop after offering an occupied binding. The
 collector, class/binding/family rotation and current executor occupancy decide
-actual grants; each worker still performs only one bounded domain slice.
+actual grants. A maintenance-descriptor worker performs one bounded domain slice;
+an upgrade worker performs the bounded window described above.
 
 Local activation and asynchronous idle shutdown share the existing machine
 lifecycle guard. An activation request publishes a fresh runtime-bound UUID in
@@ -3286,7 +3306,10 @@ journal creation, and rechecks durable state after acquisition. Busy discovery
 remains pending until a later bounded probe can establish applicable work.
 The upgrade-lock loser rereads the journal once and performs no journal save.
 Its separate invocation result contains `slice_committed`, `contended_lock`,
-`next_probe_at`, `observed_progress` and `delta`. A schema miss retains existing
+`next_probe_at`, `observed_progress` and `delta`, plus invocation-local
+`meaningful_progress` and the committed slice's `migration` and `phase`.
+These fields are published only after the journal commit and do not alter the
+closed worker transport or persisted journal format. A schema miss retains existing
 durable waiting behavior. Only matching semantic epochs and source identities can
 establish observed advancement; timestamps and journal revisions alone cannot.
 Invocation waiting never replaces durable intervention or admission-safety state.

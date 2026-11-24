@@ -26,7 +26,7 @@ from .paths import (
     task_path,
 )
 from .records import TaskRecord, utc_now, validate_identifier
-from .store import atomic_replace, read_json
+from .store import atomic_replace, check_mutation_fence, read_json
 
 PROJECTION_VERSION = 1
 PROJECTION_PROTOCOL = "task-dependencies-v2"
@@ -193,8 +193,10 @@ def _new_state(project_id: str, generation: str, *, status: str = "active") -> d
 
 def _ensure_generation(root: Path, generation: str) -> Path:
     generation_path = task_dependency_generation_path(root, generation)
+    check_mutation_fence(generation_path)
     generation_path.mkdir(parents=True, exist_ok=True)
     records = generation_path / "records"
+    check_mutation_fence(records)
     records.mkdir(parents=True, exist_ok=True)
     return records
 

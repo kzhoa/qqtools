@@ -201,6 +201,9 @@ def _invocation_result(
     next_probe_at: str | None = None,
     observed_progress: bool = False,
     delta: dict[str, Any] | None = None,
+    meaningful_progress: bool = False,
+    migration: str | None = None,
+    phase: str | None = None,
 ) -> dict[str, Any]:
     return {
         "slice_committed": slice_committed,
@@ -208,6 +211,9 @@ def _invocation_result(
         "next_probe_at": next_probe_at,
         "observed_progress": observed_progress,
         "delta": delta,
+        "meaningful_progress": meaningful_progress,
+        "migration": migration,
+        "phase": phase,
     }
 
 
@@ -219,6 +225,9 @@ def _with_invocation(
     next_probe_at: str | None = None,
     observed_progress: bool = False,
     delta: dict[str, Any] | None = None,
+    meaningful_progress: bool = False,
+    migration: str | None = None,
+    phase: str | None = None,
 ) -> dict[str, Any]:
     result = dict(status)
     result["invocation"] = _invocation_result(
@@ -227,6 +236,9 @@ def _with_invocation(
         next_probe_at=next_probe_at,
         observed_progress=observed_progress,
         delta=delta,
+        meaningful_progress=meaningful_progress,
+        migration=migration,
+        phase=phase,
     )
     return result
 
@@ -691,8 +703,11 @@ class UpgradeCoordinator:
             _save_journal(self.cfg, current)
         return current
 
-    def advance(self, *, force_retry: bool = False) -> dict[str, Any]:
-        """Run at most one bounded phase slice and return durable project status."""
+    def advance(self, *, force_retry: bool = False, continuation: tuple[str, str] | None = None) -> dict[str, Any]:
+        """Attempt one bounded slice, optionally matching a runnable migration name and phase.
+
+        A continuation requires both deadlines to be due, even with force_retry.
+        """
         try:
             before_status = _status_from_journal(self.cfg, _load_journal(self.cfg))
         except (OSError, KeyError, TypeError, ValueError, UpgradeError) as exc:
@@ -706,13 +721,26 @@ class UpgradeCoordinator:
                 return _with_invocation(self._error_status(exc))
             if journal is None:
                 return _with_invocation(_status_from_journal(self.cfg, None))
+            active = None
             try:
-                status = self._advance_locked(journal, force_retry=force_retry)
+                if continuation is not None:
+                    upgrade = journal["upgrade"]
+                    active = self._next_active(upgrade)
+                    if (
+                        active is None
+                        or (active.get("name"), active.get("phase")) != continuation
+                        or active.get("state") != "runnable"
+                        or (_load_pause_intent(self.cfg) or upgrade["pause"]).get("state") == "requested"
+                        or not _is_due(active.get("next_retry_at"))
+                        or not _is_due(active.get("next_probe_at"))
+                    ):
+                        return _with_invocation(_status_from_journal(self.cfg, journal))
+                status = self._advance_locked(journal, force_retry=force_retry, active=active)
                 if "invocation" not in status:
                     return _with_invocation(status)
                 return status
             except (OSError, RuntimeError, ValueError, KeyError, TypeError) as exc:
-                active = next(
+                active = active or next(
                     (item for item in journal["upgrade"]["migrations"].values() if item.get("state") != "completed"),
                     None,
                 )
@@ -910,10 +938,13 @@ class UpgradeCoordinator:
             _save_journal(self.cfg, journal)
             return _status_from_journal(self.cfg, journal)
 
-    def _advance_locked(self, journal: dict[str, Any], *, force_retry: bool) -> dict[str, Any]:
+    def _advance_locked(
+        self, journal: dict[str, Any], *, force_retry: bool, active: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
         upgrade = journal["upgrade"]
         pause = upgrade["pause"]
-        active = self._next_active(upgrade)
+        if active is None:
+            active = self._next_active(upgrade)
         if active is None:
             return _status_from_journal(self.cfg, journal)
         before_status = _status_from_journal(self.cfg, journal)
@@ -1058,10 +1089,14 @@ class UpgradeCoordinator:
                     active[key] = value
             raise
         after_status = _status_from_journal(self.cfg, journal)
+        delta = semantic_delta(result.progress_before or before_status, after_status) if phase_invoked else None
         return _with_invocation(
             after_status,
             slice_committed=phase_invoked,
-            delta=semantic_delta(result.progress_before or before_status, after_status) if phase_invoked else None,
+            delta=delta,
+            meaningful_progress=phase_invoked and (result.meaningful_progress is True or delta is not None),
+            migration=spec.name if phase_invoked else None,
+            phase=phase if phase_invoked else None,
         )
 
     def _record_failure(

@@ -4,6 +4,8 @@
 
 - fix: resume qexp dependency projection migration within high-degree Tasks during
   backfill and both audits, preserving the per-slice metadata budget.
+- perf: amortize qexp daemon upgrade worker startup across bounded windows of
+  runnable slices, preserving per-slice locks, pause checks and Project fairness.
 
 ## v1.3.30
 
