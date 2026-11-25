@@ -9,7 +9,8 @@
   and agent-instance freshness.
 - fix: recheck training demand before starting a prepared qexp Idle Job and
   prevent execution after writer cutover. Bound the work spent checking demand
-  and explaining rejected launches.
+  and explaining rejected launches. Preserve scheduler acknowledgements while
+  probing for idle capacity across registered Projects.
 - fix: keep qexp maintenance eligible during slow queue selection and report
   progress accurately.
 - fix: resume qexp dependency projection migration within high-degree Tasks during
