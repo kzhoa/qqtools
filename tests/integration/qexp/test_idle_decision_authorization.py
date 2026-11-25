@@ -1053,16 +1053,27 @@ def test_training_arrival_stops_locally_without_a_project_slot(decision, tmp_pat
     import signal
 
     from qqtools.plugins.qexp import submit
+    from qqtools.plugins.qexp.agent.dispatch_loop import dispatch_machine_cycle_locked
+    from qqtools.plugins.qexp.agent.idle_job import idle_job_status
     from qqtools.plugins.qexp.agent.project_io_protocol import PROJECT_IO_OVERDUE_SECONDS
     from qqtools.plugins.qexp.runtime.resources.idle_job import read_idle_job_ownership
     from qqtools.plugins.qexp.runtime.resources.reservations import reserve
 
     runtime, executor, supervisor, now, tick = decision
-    now[0] = 60
-    end = time.monotonic() + 8
-    while tick()["state"] != "running":
-        assert time.monotonic() < end
+    startup_deadline = time.monotonic() + 8
+    while True:
+        # A transient loss of proof can restart the full idle interval during warm-up.
+        now[0] += 60
+        status = tick()
+        if status["state"] == "running":
+            break
+        if time.monotonic() >= startup_deadline:
+            interval = idle_job_status(runtime)["interval_detail"]
+            pytest.fail(f"Idle Job startup timed out at simulated t={now[0]}: status={status!r}, interval={interval!r}")
+        if status["reason"] == "unknown_demand":
+            dispatch_machine_cycle_locked(runtime, available_gpus=[0], supervise=False, publish_snapshots=False)
         time.sleep(0.01)
+    end = time.monotonic() + 8
     revision, bindings = runtime.load_registry()
     ctrl = runtime.project_io_controller
     ctrl.disarm_idle_job_guard(clear_census=False)
