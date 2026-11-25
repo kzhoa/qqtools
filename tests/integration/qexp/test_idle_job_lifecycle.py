@@ -860,3 +860,34 @@ def test_ambiguous_owner_publication_retains_cleanup_until_verified(tmp_path, mo
         assert reserve(runtime.root, "training", [0])["reservation"]["task_id"] == "training"
     finally:
         assert supervisor.shutdown()
+
+
+def test_expired_gpu_provisional_allows_idle_and_late_attach_revokes_it(tmp_path):
+    from qqtools.plugins.qexp.runtime.paths import local_paths
+    from qqtools.plugins.qexp.runtime.resources.idle_job import read_idle_job_demand
+    from qqtools.plugins.qexp.runtime.resources.reservations import attach
+    from qqtools.plugins.qexp.runtime.store import atomic_replace, read_json
+
+    runtime = _runtime(tmp_path)
+    supervisor = IdleJobSupervisor(runtime)
+    record = reserve(runtime.root, "training", [0])["reservation"]
+    reservation_id = record["reservation_id"]
+    path = local_paths(runtime.root)["provisional"] / f"{reservation_id}.json"
+    value = read_json(path)
+    value["reservation"]["expires_at"] = "2000-01-01T00:00:00Z"
+    atomic_replace(path, value)
+    try:
+        _until(supervisor, lambda status: status["state"] == "running")
+        assert path.exists()
+        before = read_idle_job_demand(runtime.root)
+        with pytest.raises(IdleJobAdmissionBlocked):
+            attach(runtime.root, reservation_id, "attempt", 1)
+        assert read_idle_job_demand(runtime.root) == before + 1
+        assert read_idle_job_ownership(runtime.root)["phase"] == "stopping"
+        assert not reservation_snapshot(runtime.root).active
+        assert path.exists()
+        _until(supervisor, lambda status: read_idle_job_ownership(runtime.root) is None, demand="busy")
+        attach(runtime.root, reservation_id, "attempt", 1)
+        assert reservation_snapshot(runtime.root).active[0]["attempt_id"] == "attempt"
+    finally:
+        assert supervisor.shutdown()

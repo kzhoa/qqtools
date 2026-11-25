@@ -560,6 +560,44 @@ def test_stalled_final_registry_read_releases_decision_without_locking_executor(
         time.sleep(0.01)
 
 
+@pytest.mark.parametrize("decision", ["two_projects"], indirect=True)
+def test_registry_lock_open_timeout_releases_projects_before_open_returns(decision, monkeypatch):
+    from pathlib import Path
+
+    runtime, _, supervisor, now, tick = decision
+    configs = [binding.root_config() for binding in runtime.load_registry()[1]]
+    entered = threading.Event()
+    release = threading.Event()
+    resumed = threading.Event()
+    original = Path.open
+
+    def slow_open(path, *args, **kwargs):
+        if path == runtime.paths["registry_lock"] and not entered.is_set():
+            entered.set()
+            release.wait(8)
+            resumed.set()
+        return original(path, *args, **kwargs)
+
+    now[0] = 60
+    writer = multiprocessing.get_context("spawn").Process(target=_submit_during_local_read, args=(configs,))
+    try:
+        monkeypatch.setattr(Path, "open", slow_open)
+        status = tick()
+        assert entered.is_set()
+        assert status["reason"] == "unknown_demand"
+        assert supervisor._idle_since is None
+        writer.start()
+        writer.join(5)
+        assert writer.exitcode == 0
+        assert not resumed.is_set()
+    finally:
+        release.set()
+        if writer.is_alive():
+            writer.kill()
+            writer.join(3)
+    assert resumed.wait(2)
+
+
 @pytest.mark.parametrize("changed", ["registry", "executor"])
 def test_final_local_reads_reject_changed_identity(decision, monkeypatch, changed):
     from qqtools.plugins.qexp.runtime.locks import exclusive
@@ -639,6 +677,77 @@ def _submit_and_cancel_every_project(configs, runtime_root, working_dir):
     for cfg in configs:
         task = submit(cfg, ["true"], requested_gpus=1, working_dir=working_dir)
         cancel(cfg, task.task_id, reservation_runtime_root=runtime_root)
+
+
+def _submit_during_local_read(configs):
+    from qqtools.plugins.qexp import submit
+
+    for cfg in configs:
+        submit(cfg, ["true"], requested_gpus=1, working_dir=cfg.project_root)
+
+
+@pytest.mark.parametrize("decision", ["two_projects"], indirect=True)
+@pytest.mark.parametrize(
+    "read", ["intent", "stop", "ownership", "config", "demand", "reservation", "gpu_policy", "cpu_policy"]
+)
+def test_remote_submit_completes_while_final_local_read_is_stalled(decision, tmp_path, monkeypatch, read):
+    from qqtools.plugins.qexp.agent import idle_job
+
+    runtime, _, supervisor, now, tick = decision
+    configs = [binding.root_config() for binding in runtime.load_registry()[1]]
+    writer = multiprocessing.get_context("spawn").Process(target=_submit_during_local_read, args=(configs,))
+    now[0] = 60
+    deadline = time.monotonic() + 10
+    while supervisor._preparation is None:
+        tick()
+        assert time.monotonic() < deadline
+    observed = []
+
+    def stall():
+        if observed:
+            return
+        observed.append(True)
+        writer.start()
+        try:
+            writer.join(5)
+            assert writer.exitcode == 0, "training commit waited for the local read"
+        finally:
+            if writer.is_alive():
+                writer.kill()
+                writer.join(3)
+
+    target, name = {
+        "intent": (idle_job._PreparedIdleJob, "intent_matches"),
+        "stop": (idle_job, "_read_stop_reason"),
+        "ownership": (idle_job, "read_idle_job_ownership"),
+        "config": (supervisor, "_load_config"),
+        "demand": (idle_job, "read_idle_job_demand"),
+        "reservation": (idle_job, "reservation_snapshot"),
+        "gpu_policy": (supervisor, "_policy_mapping"),
+        "cpu_policy": (idle_job, "get_cpu_lane_policy"),
+    }[read]
+    original = getattr(target, name)
+
+    def delayed(*args, **kwargs):
+        stall()
+        return original(*args, **kwargs)
+
+    if read in {"intent", "stop"}:
+        monkeypatch.setattr(target, name, delayed)
+    else:
+        observe = supervisor._observe_local_idle_locked
+
+        def observe_with_delay(*args, **kwargs):
+            with monkeypatch.context() as inject:
+                inject.setattr(target, name, delayed)
+                return observe(*args, **kwargs)
+
+        monkeypatch.setattr(supervisor, "_observe_local_idle_locked", observe_with_delay)
+    while not observed:
+        status = tick()
+        assert time.monotonic() < deadline, status
+    assert supervisor._idle_since is None
+    assert not (tmp_path / "command-ran").exists()
 
 
 @pytest.mark.parametrize("decision", ["two_projects"], indirect=True)

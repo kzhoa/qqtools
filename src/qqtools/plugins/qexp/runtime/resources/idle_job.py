@@ -266,16 +266,23 @@ def read_idle_job_demand(root: Path | Any) -> int:
     return _validate_demand(value)
 
 
-def require_idle_job_released(root: Path | Any) -> None:
-    """Record training demand and block admission while Idle Job ownership remains."""
+def advance_idle_job_demand(root: Path | Any) -> bool:
+    """Advance training demand if the Idle Job root exists, under idle_job_guard."""
     idle_root = _idle_job_root(root)
     if not _require_directory(idle_root, "Idle Job root"):
-        return
+        return False
     revision = read_idle_job_demand(root)
     atomic_replace(
         idle_root / "demand.json",
         _demand_envelope(revision + 1),
     )
+    return True
+
+
+def require_idle_job_released(root: Path | Any) -> None:
+    """Record training demand and block admission while Idle Job ownership remains."""
+    if not advance_idle_job_demand(root):
+        return
     ownership = read_idle_job_ownership(root)
     if ownership is None:
         return
@@ -290,6 +297,7 @@ def require_idle_job_released(root: Path | Any) -> None:
 __all__ = [
     "IDLE_JOB_RECORD_MAX_BYTES",
     "IdleJobAdmissionBlocked",
+    "advance_idle_job_demand",
     "clear_idle_job_ownership",
     "idle_job_guard",
     "idle_job_instance_path",

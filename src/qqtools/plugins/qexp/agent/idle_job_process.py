@@ -36,6 +36,7 @@ from ..runner import _configure_process_group_guardian
 from ..runtime.resources.idle_job import (
     idle_job_guard,
     idle_job_instance_path,
+    read_idle_job_demand,
     read_idle_job_ownership,
     write_idle_job_ownership,
 )
@@ -995,6 +996,7 @@ def _commit_guardian_go(
     boot_id: str,
     guardian: subprocess.Popen[bytes],
     deadline: float,
+    demand_revision: int,
 ) -> str | None:
     owner = read_idle_job_ownership(root)
     if (
@@ -1008,6 +1010,8 @@ def _commit_guardian_go(
     stop_reason = _supervisor_stop_reason(instance_dir, intent, boot_id)
     if stop_reason is not None:
         return stop_reason
+    if read_idle_job_demand(root) != demand_revision:
+        return "launch_permit_demand_changed"
     if time.monotonic() >= deadline:
         return "launch_permit_expired"
     write_idle_job_ownership(root, {**owner, "phase": "launching"})
@@ -1040,11 +1044,12 @@ def _await_launch_permit(
                     return stop_reason
                 if not selector.select(IDLE_JOB_POLL_SECONDS):
                     continue
-                deadline = poll_idle_launch_permit(endpoint, intent["instance_id"])
-                if deadline is not None:
+                permit = poll_idle_launch_permit(endpoint, intent["instance_id"])
+                if permit is not None:
                     break
             else:
                 return "guardian_start_failed"
+        deadline, demand_revision = permit
         # The controller may still be releasing the local fence after queueing the permit.
         while (remaining := deadline - time.monotonic()) > 0:
             stop_reason = _supervisor_stop_reason(instance_dir, intent, boot_id)
@@ -1052,7 +1057,7 @@ def _await_launch_permit(
                 return stop_reason
             with idle_job_guard(root, blocking=False) as has_lock:
                 if has_lock:
-                    return _commit_guardian_go(root, instance_dir, intent, boot_id, guardian, deadline)
+                    return _commit_guardian_go(root, instance_dir, intent, boot_id, guardian, deadline, demand_revision)
             time.sleep(min(remaining, _IDLE_JOB_PERMIT_GUARD_RETRY_SECONDS))
         return "launch_permit_expired"
     except (OSError, RuntimeError, TypeError, ValueError, KeyError):

@@ -26,6 +26,7 @@ from ..runtime.locks import exclusive
 from ..runtime.paths import local_paths
 from ..runtime.records import utc_now, validate_identifier
 from ..runtime.registration_protocol import assert_name_unreserved, convert_registration
+from ..runtime.resources.idle_job import advance_idle_job_demand, idle_job_guard
 from ..runtime.responsibility_store import DurableIO
 from ..runtime.store import atomic_replace, read_json
 from .context import MachineRuntime, ProjectBinding, default_machine_runtime_root
@@ -269,7 +270,7 @@ def _import_reservation_lane(
                     project_id=binding.project_id, shared_root=str(cfg.shared_root), machine_name=cfg.machine_name
                 )
                 records[runtime.paths[name] / path.name] = path, value
-        with exclusive(runtime.paths["locks"] / lock_name):
+        with idle_job_guard(runtime.root), exclusive(runtime.paths["locks"] / lock_name):
             imported_ids = {path.name for path in records}
             occupied_gpus = set()
             for name in names:
@@ -340,9 +341,12 @@ def _import_reservation_lane(
                     "legacy reservation GPUs conflict during migration; the project remains disabled and no reservation was released."
                 )
             # Validate every conflict before copying or deleting any source in this lane.
-            for destination, value in copies:
-                if not is_path_present(destination):
-                    atomic_replace(destination, value)
+            new_copies = [(destination, value) for destination, value in copies if not is_path_present(destination)]
+            if new_copies:
+                # Imported occupancy belongs to preexisting training. Invalidate Idle Job permits before publishing it.
+                advance_idle_job_demand(runtime.root)
+            for destination, value in new_copies:
+                atomic_replace(destination, value)
             directories = {parent for target in durable_targets for parent in target.resolve().parents}
             for directory in sorted(directories, key=lambda path: len(path.parts), reverse=True):
                 io.sync_directory(directory, "migration_reservation_destination")

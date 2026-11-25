@@ -5126,6 +5126,15 @@ failure between the two. After a failed or uncertain operation, a guard can
 accept only a recovered current checkpoint and a new complete census. An empty
 scan alone cannot reconstruct the previous interval.
 
+The controller reads the local intent, stop record, ownership, demand revision,
+configuration, capacity and reservation state before requesting Project locks.
+It holds the local config, handoff and admission fences through the decision.
+An ordinary provisional becoming active in either lane must pass training
+admission under the same fence. This prevents a late attachment from restoring
+occupancy using an expired idle proof. CPU and GPU reservation locks are
+released before the Project guard exchange. Legacy migration advances demand under the same
+admission fence before importing new occupancy into either local lane.
+
 The controller decides at `T_auth` with those fences held and the original
 continuous interval still valid. A writer takes effect at its authoritative
 business commit. Eligible demand committed before this decision rejects the
@@ -5136,7 +5145,10 @@ worker is available. Writers waiting to commit have no FIFO guarantee.
 Release the shared locks before delivering the permit, spawning helpers,
 publishing status, or cleaning up. The supervisor accepts the permit for the
 exact prepared instance and sends guardian GO under the same local admission
-guard used by training (`T_go`). Expiry applies through GO. Earlier effective
+guard used by training (`T_go`). The permit carries the durable machine demand
+revision observed at authorization. A changed or unreadable revision rejects
+GO, including when training published demand and then failed to write the stop
+record. Expiry applies through GO. Earlier effective
 revocation suppresses execution. After GO, admission waits for confirmed cleanup,
 including when the command has yet to publish process evidence. A guardian
 registration alone proves preparation. A v2 running report additionally
@@ -5145,7 +5157,8 @@ controller cannot recreate launch authority from durable ownership.
 
 The executor observations, final guard exchange, and physical registry check
 share one 50 ms monotonic deadline per idle decision. The controller fences
-registry writers while its local observer checks the full revision and roster,
+registry writers through its deadline-bound local observer, which acquires the
+registry lock and checks the full revision and roster,
 then verifies the executor epoch under the executor lock. A stalled registry
 read leaves the executor lock available to training. Short executor lock contention
 can resolve within the same turn. A timeout releases received locks, rejects

@@ -488,3 +488,29 @@ def test_invalid_unrelated_cpu_occupancy_blocks_import(tmp_path, slots):
     with pytest.raises(RuntimeError, match="invalid slots"):
         migrate_project(runtime, cfg)
     assert source.exists() and not destination.exists() and other.read_bytes() == before
+
+
+@pytest.mark.parametrize("is_cpu", [False, True])
+def test_import_invalidates_idle_permit_before_new_occupancy(tmp_path, monkeypatch, is_cpu):
+    from qqtools.plugins.qexp.runtime.resources.idle_job import idle_job_guard, read_idle_job_demand
+
+    cfg, runtime, source, destination = migration_fixture(tmp_path, is_cpu, True)
+    (runtime.root / "idle-job").mkdir(exist_ok=True)
+    before = read_idle_job_demand(runtime.root)
+    publish = project_admin.atomic_replace
+    seen = []
+
+    def assert_fenced(path, payload):
+        if path == destination:
+            with idle_job_guard(runtime.root, blocking=False) as available:
+                assert not available
+            assert read_idle_job_demand(runtime.root) == before + 1
+            seen.append(path)
+        return publish(path, payload)
+
+    monkeypatch.setattr(project_admin, "atomic_replace", assert_fenced)
+    assert migrate_project(runtime, cfg).enabled
+    assert seen == [destination]
+    assert destination.exists() and not source.exists()
+    assert migrate_project(runtime, cfg).enabled
+    assert read_idle_job_demand(runtime.root) == before + 1

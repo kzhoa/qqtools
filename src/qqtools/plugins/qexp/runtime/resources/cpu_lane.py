@@ -308,7 +308,7 @@ def reserve_cpu(
 def attach_cpu(runtime_root: Path, reservation_id: str, attempt_id: str, fencing_token: int) -> None:
     """Attach a matching, unexpired provisional CPU reservation to an Attempt."""
     paths = local_paths(runtime_root)
-    with exclusive(paths["locks"] / "cpu-lane.lock"):
+    with idle_job_guard(runtime_root), exclusive(paths["locks"] / "cpu-lane.lock"):
         source = paths["cpu_provisional"] / f"{reservation_id}.json"
         if not source.exists():
             if (paths["cpu_active"] / source.name).exists():
@@ -323,6 +323,8 @@ def attach_cpu(runtime_root: Path, reservation_id: str, attempt_id: str, fencing
             raise RuntimeError("executor-owned reservations require exact offer attachment.")
         if reservation.get("attempt_id") != attempt_id or reservation.get("fencing_token") != fencing_token:
             raise RuntimeError("CPU reservation identity does not match Attempt authority.")
+        # Fence materialization even if the wall clock moved since the last occupancy snapshot.
+        require_idle_job_released(runtime_root)
         reservation["state"] = "active"
         atomic_replace(paths["cpu_active"] / source.name, value)
         source.unlink(missing_ok=True)

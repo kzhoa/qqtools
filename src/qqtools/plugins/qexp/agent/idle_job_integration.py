@@ -198,13 +198,12 @@ def _authorize_idle_decision(
         ):
             yield False
             return
-        # The controller owns the registry guard; the observer only reads under it.
-        if time.monotonic() >= deadline or not stack.enter_context(runtime.registry_guard(blocking=False)):
-            yield False
-            return
         if time.monotonic() >= deadline or not stack.enter_context(
             controller.idle_executor_guard(
-                evidence.executor_epoch, deadline=deadline, pre_executor_check=registry_matches
+                evidence.executor_epoch,
+                deadline=deadline,
+                registry_lock_path=runtime.paths["registry_lock"],
+                pre_executor_check=registry_matches,
             )
         ):
             yield False

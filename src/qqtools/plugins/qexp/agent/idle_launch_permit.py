@@ -9,8 +9,10 @@ import time
 
 _READY = b"ready"
 _MAX_DEADLINE_BYTES = 64
-_MAX_PERMIT_BYTES = 1_024 + 1 + _MAX_DEADLINE_BYTES
-_PERMIT_PATTERN = re.compile(rb"([!-~]{1,1024}) ([0-9]+(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?)")
+_MAX_DEMAND_REVISION_BYTES = 64
+_DEMAND_REVISION_LIMIT = 10**_MAX_DEMAND_REVISION_BYTES
+_MAX_PERMIT_BYTES = 1_024 + 1 + _MAX_DEADLINE_BYTES + 1 + _MAX_DEMAND_REVISION_BYTES
+_PERMIT_PATTERN = re.compile(rb"([!-~]{1,1024}) ([0-9]+(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?) (0|[1-9][0-9]*)")
 
 
 def create_idle_launch_permit() -> tuple[socket.socket, socket.socket]:
@@ -62,9 +64,14 @@ def poll_idle_launch_ready(endpoint: socket.socket) -> bool:
     return True
 
 
-def send_idle_launch_permit(endpoint: socket.socket, instance_id: str, deadline: float) -> None:
+def send_idle_launch_permit(endpoint: socket.socket, instance_id: str, deadline: float, demand_revision: int) -> None:
     """Queue the single launch permit while its monotonic deadline is still live."""
-    packet = f"{instance_id} {deadline!r}".encode("ascii")
+    if type(demand_revision) is not int or not 0 <= demand_revision < _DEMAND_REVISION_LIMIT:
+        raise ValueError("invalid idle launch permit demand revision")
+    deadline_text = repr(deadline)
+    if len(deadline_text) > _MAX_DEADLINE_BYTES:
+        raise ValueError("invalid idle launch permit deadline")
+    packet = f"{instance_id} {deadline_text} {demand_revision}".encode("ascii")
     if len(packet) > _MAX_PERMIT_BYTES or _PERMIT_PATTERN.fullmatch(packet) is None:
         raise ValueError("invalid idle launch permit packet")
     if not math.isfinite(deadline) or time.monotonic() >= deadline:
@@ -72,14 +79,20 @@ def send_idle_launch_permit(endpoint: socket.socket, instance_id: str, deadline:
     _send_packet(endpoint, packet)
 
 
-def poll_idle_launch_permit(endpoint: socket.socket, instance_id: str) -> float | None:
+def poll_idle_launch_permit(endpoint: socket.socket, instance_id: str) -> tuple[float, int] | None:
+    """Return the live permit deadline and demand revision, if a packet is ready."""
     packet = _poll_packet(endpoint, _MAX_PERMIT_BYTES)
     if packet is None:
         return None
     fields = _PERMIT_PATTERN.fullmatch(packet)
-    if fields is None or len(fields[2]) > _MAX_DEADLINE_BYTES or fields[1].decode("ascii") != instance_id:
+    if (
+        fields is None
+        or len(fields[2]) > _MAX_DEADLINE_BYTES
+        or len(fields[3]) > _MAX_DEMAND_REVISION_BYTES
+        or fields[1].decode("ascii") != instance_id
+    ):
         raise ValueError("invalid idle launch permit packet")
     deadline = float(fields[2])
     if not math.isfinite(deadline) or time.monotonic() >= deadline:
         raise ValueError("idle launch permit deadline expired")
-    return deadline
+    return deadline, int(fields[3])

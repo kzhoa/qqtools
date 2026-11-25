@@ -444,7 +444,7 @@ def reserve_admitted(
 
 def attach(runtime_root: Path, reservation_id: str, attempt_id: str, fencing_token: int) -> None:
     paths = local_paths(runtime_root)
-    with exclusive(paths["locks"] / "gpu-reservations.lock"):
+    with idle_job_guard(runtime_root), exclusive(paths["locks"] / "gpu-reservations.lock"):
         source = paths["provisional"] / f"{reservation_id}.json"
         if not source.exists():
             if (paths["active"] / source.name).exists():
@@ -453,6 +453,8 @@ def attach(runtime_root: Path, reservation_id: str, attempt_id: str, fencing_tok
         value = read_json(source)
         if "executor_owner" in value.get("reservation", {}):
             raise RuntimeError("executor-owned reservations require exact offer attachment.")
+        # Legacy attachment can make a previously expired provisional occupy the lane again.
+        require_idle_job_released(runtime_root)
         value["reservation"].update({"state": "active", "attempt_id": attempt_id, "fencing_token": fencing_token})
         atomic_replace(paths["active"] / source.name, value)
         source.unlink(missing_ok=True)

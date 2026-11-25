@@ -1463,7 +1463,7 @@ class IdleJobSupervisor:
         resolved: tuple[int, ...],
         reservation_policy: GpuReservationPolicy | None,
         evidence: IdleDecisionEvidence | None,
-    ) -> tuple[dict[str, Any] | None, str, str | None]:
+    ) -> tuple[dict[str, Any] | None, str, int, str | None]:
         """Inspect local fences without publishing state or reconciling ownership."""
         current_owner = read_idle_job_ownership(self.root)
         if not _same_owner(current_owner, owner):
@@ -1473,14 +1473,14 @@ class IdleJobSupervisor:
         demand_revision = read_idle_job_demand(self.root)
         key = self._observation_key_for("idle", demand_revision, current.config, policy_key)
         if current.config != observation.config or current.agent_mode != observation.agent_mode:
-            return owner, key, "config_changed"
+            return owner, key, demand_revision, "config_changed"
         if owner is not None:
             if owner["phase"] == "stopping":
-                return owner, key, "stopping"
+                return owner, key, demand_revision, "stopping"
             if owner["config_revision"] != current.config.revision:
-                return owner, key, "config_changed"
+                return owner, key, demand_revision, "config_changed"
             if tuple(owner["gpu_ids"]) != resolved:
-                return owner, key, "gpu_changed"
+                return owner, key, demand_revision, "gpu_changed"
             if self._idle_since is not None and self._observation_key != key:
                 raise _IdleDecisionRejected("demand_census_unknown")
         if evidence is not None:
@@ -1496,7 +1496,7 @@ class IdleJobSupervisor:
         except (AttributeError, OSError, RuntimeError, TypeError, ValueError, KeyError) as exc:
             raise _IdleDecisionRejected("demand_census_unknown") from exc
         if snapshot.active or snapshot.provisional:
-            return owner, key, "gpu_reserved"
+            return owner, key, demand_revision, "gpu_reserved"
         paths = machine_runtime_paths(self.root)
         with exclusive(paths["reservation_lock"], blocking=False) as acquired:
             if not acquired:
@@ -1510,8 +1510,8 @@ class IdleJobSupervisor:
                 if reservation_policy is not None:
                     validate_gpu_reservation(self.root, list(resolved), reservation_policy)
             except (OSError, RuntimeError, TypeError, ValueError, KeyError):
-                return owner, key, "gpu_policy_unavailable"
-        return owner, key, None
+                return owner, key, demand_revision, "gpu_policy_unavailable"
+        return owner, key, demand_revision, None
 
     def _finish_idle_observation_locked(
         self,
@@ -1679,51 +1679,58 @@ class IdleJobSupervisor:
                 raise _IdleDecisionRejected("demand_census_unknown")
             with ExitStack() as admission:
                 with ExitStack() as local:
-                    with ExitStack() as project:
-                        if guarded and (decision_guard is None or not project.enter_context(decision_guard)):
-                            raise _IdleDecisionRejected("demand_census_unknown")
-                        if not local.enter_context(exclusive(paths["config_lock"], blocking=False)):
-                            raise _IdleDecisionRejected("demand_census_unknown")
-                        if not local.enter_context(handoff_guard):
+                    if not local.enter_context(exclusive(paths["config_lock"], blocking=False)):
+                        raise _IdleDecisionRejected("demand_census_unknown")
+                    if not local.enter_context(handoff_guard):
+                        raise _IdleDecisionRejected("launch_handoff_pending")
+                    if not admission.enter_context(idle_job_guard(self.root, blocking=False)):
+                        raise _IdleDecisionRejected("demand_census_unknown")
+                    if expected_handoff_revision is not None:
+                        revision, pending = handoffs.snapshot() if has_handoff_fence else (None, False)
+                        if (
+                            pending
+                            or revision != expected_handoff_revision
+                            or self._last_handoff_revision not in (None, revision)
+                        ):
                             raise _IdleDecisionRejected("launch_handoff_pending")
-                        if not admission.enter_context(idle_job_guard(self.root, blocking=False)):
+                    owner, key, demand_revision, reason = self._observe_local_idle_locked(
+                        owner, observation, policy_key, resolved, reservation_policy, decision_evidence
+                    )
+                    endpoint = None
+                    ready_until = None
+                    if reason is None and owner is not None and owner["phase"] == "prepared":
+                        if (
+                            preparation is None
+                            or self._idle_since != preparation.idle_since
+                            or key != preparation.observation_key
+                            or not preparation.intent_matches()
+                            or _read_stop_reason(preparation.directory) is not None
+                        ):
                             raise _IdleDecisionRejected("demand_census_unknown")
-                        if expected_handoff_revision is not None:
-                            revision, pending = handoffs.snapshot() if has_handoff_fence else (None, False)
-                            if (
-                                pending
-                                or revision != expected_handoff_revision
-                                or self._last_handoff_revision
-                                not in (
-                                    None,
-                                    revision,
-                                )
-                            ):
-                                raise _IdleDecisionRejected("launch_handoff_pending")
-                        owner, key, reason = self._observe_local_idle_locked(
-                            owner, observation, policy_key, resolved, reservation_policy, decision_evidence
-                        )
-                        endpoint = None
-                        if reason is None and owner is not None and owner["phase"] == "prepared":
-                            if (
-                                preparation is None
-                                or self._idle_since != preparation.idle_since
-                                or key != preparation.observation_key
-                                or not preparation.intent_matches()
-                                or _read_stop_reason(preparation.directory) is not None
+                        if not preparation.permit_sent:
+                            ready_until = preparation.ready_until
+                        if launch_allowed and preparation.ready:
+                            endpoint = preparation.endpoint
+                    if reason is None:
+                        with ExitStack() as project:
+                            if guarded and (
+                                decision_guard is None
+                                or time.monotonic() >= deadline
+                                or not project.enter_context(decision_guard)
                             ):
                                 raise _IdleDecisionRejected("demand_census_unknown")
-                            if not preparation.permit_sent and time.monotonic() >= preparation.ready_until:
+                            authorized_at = time.monotonic()
+                            if ((guarded or endpoint is not None) and authorized_at >= deadline) or (
+                                ready_until is not None and authorized_at >= ready_until
+                            ):
                                 raise _IdleDecisionRejected("demand_census_unknown")
-                            if launch_allowed and preparation.ready:
-                                endpoint = preparation.endpoint
-                        if (guarded or endpoint is not None) and time.monotonic() >= deadline:
-                            raise _IdleDecisionRejected("demand_census_unknown")
                     # The admission and local config/handoff fences still cover
                     # this decision. All Project proof locks have been released.
                     if endpoint is not None and preparation is not None:
                         try:
-                            send_idle_launch_permit(endpoint, preparation.owner["instance_id"], deadline)
+                            send_idle_launch_permit(
+                                endpoint, preparation.owner["instance_id"], deadline, demand_revision
+                            )
                             preparation.permit_sent = True
                         finally:
                             preparation.close_permit()

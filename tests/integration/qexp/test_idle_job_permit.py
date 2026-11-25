@@ -19,6 +19,7 @@ from qqtools.plugins.qexp.runtime.resources.idle_job import (
     IdleJobAdmissionBlocked,
     idle_job_guard,
     idle_job_instance_path,
+    read_idle_job_demand,
     read_idle_job_ownership,
     write_idle_job_ownership,
 )
@@ -92,7 +93,7 @@ def test_delivered_permit_cannot_overtake_effective_stop(tmp_path, prepared, lan
     _, status = os.waitpid(helper.pid, os.WUNTRACED)
     assert os.WIFSTOPPED(status)
     try:
-        channel.send(f"{owner['instance_id']} {time.monotonic() + 10}".encode())
+        channel.send(f"{owner['instance_id']} {time.monotonic() + 10} {read_idle_job_demand(tmp_path)}".encode())
         with pytest.raises(IdleJobAdmissionBlocked):
             if lane == "cpu":
                 reserve_cpu(tmp_path, "training", 1)
@@ -114,7 +115,7 @@ def test_prepared_instance_obeys_exact_permit(tmp_path, prepared, mode):
     else:
         ident = uuid.uuid4().hex if mode == "foreign" else owner["instance_id"]
         expiry = time.monotonic() + (-1 if mode == "expired" else 10)
-        channel.send(f"{ident} {expiry}".encode())
+        channel.send(f"{ident} {expiry} {read_idle_job_demand(tmp_path)}".encode())
     if mode == "allow":
         deadline = time.monotonic() + 5
         while not marker.is_file() and time.monotonic() < deadline:
@@ -139,7 +140,7 @@ def test_go_before_training_with_guardian_paused_before_command(tmp_path, prepar
         while "T" not in Path(f"/proc/{guardian}/status").read_text().split("State:", 1)[1].splitlines()[0]:
             assert time.monotonic() < end
             time.sleep(0.005)
-        channel.send(f"{owner['instance_id']} {end}".encode())
+        channel.send(f"{owner['instance_id']} {end} {read_idle_job_demand(tmp_path)}".encode())
         while read_idle_job_ownership(tmp_path)["phase"] != "launching":
             assert time.monotonic() < end
             time.sleep(0.005)
@@ -152,3 +153,42 @@ def test_go_before_training_with_guardian_paused_before_command(tmp_path, prepar
         os.kill(guardian, signal.SIGCONT)
     helper.wait(timeout=8)
     assert idle_job_processes_exited(directory)
+
+
+@pytest.mark.parametrize("lane", ["cpu", "gpu", "malformed"])
+def test_go_rechecks_durable_demand_before_running(tmp_path, prepared, monkeypatch, lane):
+    from qqtools.plugins.qexp.runtime.resources import idle_job as admission
+
+    channel, owner, helper, directory, marker = prepared
+    revision = read_idle_job_demand(tmp_path)
+    helper.send_signal(signal.SIGSTOP)
+    _, status = os.waitpid(helper.pid, os.WUNTRACED)
+    assert os.WIFSTOPPED(status)
+    try:
+        expiry = time.monotonic() + 10
+        channel.send(f"{owner['instance_id']} {expiry} {revision}".encode())
+        if lane == "malformed":
+            atomic_replace(tmp_path / "idle-job" / "demand.json", {"invalid": True})
+        else:
+
+            def fail_stop(path, value):
+                if path == directory / "stop.json":
+                    raise OSError("stop publication failed")
+                atomic_replace(path, value)
+
+            monkeypatch.setattr(admission, "atomic_replace", fail_stop)
+            with pytest.raises(OSError, match="stop publication failed"):
+                if lane == "cpu":
+                    reserve_cpu(tmp_path, "training", 1)
+                else:
+                    reserve(tmp_path, "training", [0])
+            assert read_idle_job_demand(tmp_path) == revision + 1
+        assert read_idle_job_ownership(tmp_path)["phase"] == "prepared"
+        assert not (directory / "stop.json").exists()
+    finally:
+        helper.send_signal(signal.SIGCONT)
+    helper.wait(timeout=8)
+    assert time.monotonic() < expiry
+    assert idle_job_processes_exited(directory)
+    assert read_idle_job_ownership(tmp_path)["phase"] == "prepared"
+    assert not marker.exists()

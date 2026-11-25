@@ -16,6 +16,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from functools import partial, wraps
+from pathlib import Path
 from typing import Any, Iterator
 from weakref import finalize
 
@@ -1547,14 +1548,20 @@ class ProjectIOController:
         expected_epoch: str,
         *,
         deadline: float,
-        pre_executor_check: Callable[[], bool] | None = None,
+        registry_lock_path: Path,
+        pre_executor_check: Callable[[], bool],
     ) -> Iterator[bool]:
-        """Fence the expected executor after the observer's optional read-only check."""
+        """Fence the registry and the expected executor through the local decision."""
         observer = self._idle_executor_observation
         if observer is None:
             yield False
             return
-        with observer.guard(self.executor, deadline=deadline, pre_executor_check=pre_executor_check) as evidence:
+        with observer.guard(
+            self.executor,
+            deadline=deadline,
+            registry_lock_path=registry_lock_path,
+            pre_executor_check=pre_executor_check,
+        ) as evidence:
             yield evidence is not None and evidence.epoch == expected_epoch and evidence.envelope == "healthy"
 
     def close_idle_job_observation(self) -> None:
