@@ -9,6 +9,7 @@ from operator import itemgetter
 
 IDLE_DECISION_SECONDS = 0.05
 LOCKS_PER_PROJECT = 3
+MAX_REGISTRATION_HORIZON_NS = (1 << 63) - 1
 
 IdleGuardCheckpoint = tuple[str, str | None, str, str | None, int | None]
 

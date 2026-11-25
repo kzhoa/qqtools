@@ -2783,6 +2783,13 @@ selector `[-1]` resolves to the last sorted GPU admitted by current machine poli
 and successful discovery. Multiple selectors are deduplicated; invalid IDs,
 empty inventory, and unavailable discovery fail closed.
 
+A fresh Project requires activation-aware writers. A Project created before
+this capability remains open to training during a rolling upgrade. While such
+a Project is enabled, Idle Job waits. Once the participating writers have
+upgraded, the operator may cut over a single registered Project with
+`qexp admin upgrade advance --project PROJECT_ID --enable-idle-job-activation-writers`.
+The Project then rejects older business writers.
+
 A continuous idle interval (default 60 seconds) requires no qexp training
 reservations and no training eligible for local admission across every enabled
 Project. Known locally ineligible queued work does not suppress the Idle Job.
@@ -2790,6 +2797,14 @@ Unresolved ownership, recovery, or scheduling evidence interrupts idleness.
 Eligible GPU or CPU work stops the entire instance, including when it requests
 other GPUs. Training admission waits for confirmed process cleanup. Idle Job
 occupancy must not hide eligible training from this preemption decision.
+
+The agent first durably prepares a single instance, then rechecks idleness and
+grants one expiring launch permission. During preparation, status shows
+`waiting` with reason `preparing`. Slow local ownership writes leave other
+machines free to submit training to the participating Projects. A training
+admission that revokes the instance before its final GO prevents the command
+from starting. Recovery reconciles the exact owner and requires fresh
+authorization for a new instance.
 
 Changing command or GPU configuration, removing a selected GPU from policy,
 disabling Idle Job, and stopping the agent reclaim the current instance before

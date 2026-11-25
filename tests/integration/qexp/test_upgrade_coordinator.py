@@ -739,6 +739,7 @@ def test_released_manifest_before_ready_bootstrap_is_recognized_exactly(tmp_path
             "task-dependencies-v2",
             "registration-replacement-v1",
             "group-working-set-v1",
+            "idle-job-activation-writers-v1",
         }
     ]
     path = cfg.shared_root / "operations/upgrades/protocol-manifest.json"
@@ -793,6 +794,7 @@ def test_released_false_positive_journal_reconciles_only_proven_terminal_state(t
             "task-dependencies-v2",
             "registration-replacement-v1",
             "group-working-set-v1",
+            "idle-job-activation-writers-v1",
         }
     ]
     manifest["upgrade_protocol_manifest"]["schema_digest"] = production._digest(original)

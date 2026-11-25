@@ -2440,7 +2440,9 @@ quiescence is not binding retirement: final activation observation/acknowledgeme
 still has to settle after all lanes. Producers must not clear a completed lane
 merely because asynchronous binding retirement has not returned yet.
 Registration renewal, activation consumer register/ack, and advisory snapshot
-workers use only shared registration locks. They recheck the captured local
+workers use shared registration locks. Restoring eligibility under a reused
+generation additionally fences the registration write with a Project activation
+transaction. They recheck the captured local
 registry/epoch immediately before each shared mutation, never instantiate a
 MachineRuntime capacity owner, and never hold a local binding or snapshot lock
 across shared I/O. The direct library registration API uses the same shared
@@ -5061,9 +5063,15 @@ Both CPU and GPU reservation admission acquire the outer machine-local
 Idle Job admission guard. Once existing resource/policy checks prove training
 eligible, admission publishes a demand revision and requests an owned Idle Job's
 stop. It must not grant a training reservation until ownership is released.
-Idle launch holds the same guard, rechecks configuration and demand revision,
-observes all GPU and CPU reservations sequentially, and validates current GPU
-policy under the GPU reservation lock before publishing intent and ownership.
+New launches persist a v2 intent and publish v2 ownership in phase
+`prepared` under machine admission exclusion. Successful durable publication
+(`T_owner`) assigns cleanup responsibility to that instance. Admission treats
+every retained phase as occupied. A failed directory sync after replace can
+leave a visible owner. Reconcile using the exact identity and process evidence
+before releasing resources. Helpers may start during preparation but must await
+a private, process-bound, one-shot permit. A prepared instance appears as
+`waiting/preparing` until authorized or stopped. On recovery, v1 launching,
+running and stopping records retain their original interpretation and version.
 GPU and CPU reservation locks are never nested. Idle Job consumes no Task
 reservation IDs, and its occupancy is not subtracted from training eligibility.
 
@@ -5081,7 +5089,8 @@ exact generation-bound startup evidence within its registry revision and
 executor epoch. A dormant Project retains its completed scheduler proof only
 while its turn is current and all lanes acknowledge the same checkpoint.
 
-A positive census requires a fresh final check for both launch and continuation.
+After preparation, a positive census requires a fresh final check for both
+launch and continuation.
 The guard orders this decision with shared writers by taking each enabled Project's
 schema, registration and activation locks in canonical root order. It transfers each acquired
 lock to the controller over its local socket before reading further shared state.
@@ -5091,6 +5100,48 @@ generation and remain eligible through the decision deadline. The controller com
 to the census and retains matching locks through the local decision. An empty
 roster needs only the local fences. Changes to the roster, checkpoints, policy,
 executor epoch or launch handoff membership invalidate the continuous interval.
+
+A nonempty roster requires the `idle-job-activation-writers-v1` Project
+writer capability at every root. Before the explicit cutover, training remains
+available and the new controller treats the Project as unknown for Idle Job.
+The operator selects one registered Project. Under schema exclusion, cutover
+checks its on-disk identity, publishes pending activation, writes the writer
+floor and advances the checkpoint. This invalidates censuses taken while an
+older writer could still commit. Registration renewals additionally require overlapping observed
+safe lease horizons because they can proceed under registration locks alone.
+
+| Authoritative change | Writer exclusion and evidence before visibility | What the next guard requires |
+| --- | --- | --- |
+| Submission commit, including large receipts and resumed commits | Submission protocol locks and a pending `submission_commit` activation around the committed source and receipt publication | Updated checkpoint after commit or unknown while pending |
+| Task retry, newly shared offer, ready generation or queue change | Task authority and ready-route fences, with pending activation around eligible queued Task truth | Current ready-route census at the new checkpoint. A due offer becomes locally shareable at publication of the shared Task, after its eligibility deadline |
+| Dependency release | Task authority with pending activation around authoritative upstream success, including standalone Tasks | Re-evaluate the dependent from committed upstream truth |
+| Group pause or resume | Group writer lock and pending activation around dispatch state replacement | Re-evaluate dispatch state even after a resume/pause pulse |
+| Membership admission, worker role, quota and removal | Submission commit, Group authority and affected primary route transactions | Rescan the affected roster and ready routes when their checkpoints change |
+| Cancellation or failed attempt | Retirement of the old ready generation removes demand. Retry, dependency satisfaction or the next eligible publication must invalidate the earlier proof | In-flight activation requires unknown. An advanced checkpoint on failure starts a new observation without asserting demand |
+| Registration, scope or executor change | Matching machine, generation, canonical root, registry revision and executor epoch. Successive safe lease horizons must overlap | Require a fresh interval after a gap, replacement, enablement change or epoch change |
+| Local capacity, config, handoffs and reservations | Local admission exclusion, versioned policy/config, handoff membership revision and durable training-demand revision | Match all revisions, including a reservation/release or policy ABA, and observe both CPU and GPU lanes |
+
+Checkpoint publication follows the business write. A pending record survives
+failure between the two. After a failed or uncertain operation, a guard can
+accept only a recovered current checkpoint and a new complete census. An empty
+scan alone cannot reconstruct the previous interval.
+
+The controller decides at `T_auth` with those fences held and the original
+continuous interval still valid. A writer takes effect at its authoritative
+business commit. Eligible demand committed before this decision rejects the
+launch. Demand committed later must be addressed by the next due continuation
+check. An incomplete check at that point requires local stop even if no Project
+worker is available. Writers waiting to commit have no FIFO guarantee.
+
+Release the shared locks before delivering the permit, spawning helpers,
+publishing status, or cleaning up. The supervisor accepts the permit for the
+exact prepared instance and sends guardian GO under the same local admission
+guard used by training (`T_go`). Expiry applies through GO. Earlier effective
+revocation suppresses execution. After GO, admission waits for confirmed cleanup,
+including when the command has yet to publish process evidence. A guardian
+registration alone proves preparation. A v2 running report additionally
+requires a command-start witness. Closing the permit channel or restarting the
+controller cannot recreate launch authority from durable ownership.
 
 The executor observations, final guard exchange, and physical registry check
 share one 50 ms monotonic deadline per idle decision. The controller fences
@@ -5123,5 +5174,8 @@ Readiness and Idle Job share one partition scan observation per cycle. A pending
 rescan preserves an already established idle interval but cannot permit launch;
 the next complete clear sweep is required. Initial incomplete discovery cannot
 start the interval. Discovered evidence, scan errors, or changed registry/root
-identity invalidate it. Agent stop includes the configured Idle Job grace and
+identity invalidate it. When an instance exists, a local scan can use up to
+5 ms of additional inspection after its initial 64 entries, capped at 4096
+entries in the turn. It runs before shared guards. An incomplete sweep at a
+required continuation check leads to local stopping. Agent stop includes the configured Idle Job grace and
 bounded cleanup allowance, and reconciles retained ownership after agent exit.

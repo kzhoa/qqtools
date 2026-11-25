@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from contextlib import nullcontext
 from typing import Callable
 
 from .paths import task_path
@@ -29,17 +30,31 @@ def save_task(
     mutation_fence: Callable[[], None] | None = None,
 ) -> None:
     from .observation.projection import publish_task
+    from .project_activation import project_activation_transaction
     from .ready import assert_ready_writer_compatible
+    from .ready.index import task_should_have_ready_marker
 
     assert_ready_writer_compatible(cfg)
     path = task_path(cfg.shared_root, task.task_id)
 
     def write_truth() -> None:
-        atomic_replace(
-            path,
-            task.to_dict(),
-            before_replace=(lambda _stat: mutation_fence()) if mutation_fence is not None else None,
+        reason = None
+        if task.state.get("projection") == "succeeded":
+            reason = "dependency_satisfied"
+        elif task.ready_generation > 0 and task_should_have_ready_marker(task):
+            reason = "task_ready"
+        value = task.to_dict()
+        activation = (
+            project_activation_transaction(cfg, reason, before_write=mutation_fence)
+            if reason is not None
+            else nullcontext()
         )
+        with activation:
+            atomic_replace(
+                path,
+                value,
+                before_replace=(lambda _stat: mutation_fence()) if mutation_fence is not None else None,
+            )
 
     with fenced_mutations(cfg.shared_root, mutation_fence):
         publish_task(cfg, task, write_truth)

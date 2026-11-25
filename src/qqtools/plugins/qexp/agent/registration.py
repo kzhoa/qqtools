@@ -6,7 +6,7 @@ import os
 import stat
 import uuid
 from collections.abc import Callable, Iterator
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, contextmanager, nullcontext
 from copy import deepcopy
 from dataclasses import replace
 from datetime import datetime, timezone
@@ -33,6 +33,7 @@ from ..runtime.paths import (
     machine_runtime_paths,
     shared_paths,
 )
+from ..runtime.project_activation import project_activation_transaction
 from ..runtime.project_activation_consumers import read_consumer_progress
 from ..runtime.records import utc_now
 from ..runtime.registration_authority import (
@@ -702,7 +703,15 @@ class MachineRegistration:
             ),
             "updated_at": now,
         }
-        save_machine_registration(cfg, {"registration": value})
+        previous_generation = registration["generation"] if registration is not None else current_generation
+        is_reactivation = generation == previous_generation and (
+            registration is None or self.registration_state(registration) != "eligible"
+        )
+        activation = (
+            project_activation_transaction(cfg, "registration_reactivation") if is_reactivation else nullcontext()
+        )
+        with activation:
+            save_machine_registration(cfg, {"registration": value})
         return value
 
     def _replace_registration(

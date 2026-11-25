@@ -12,7 +12,7 @@ from collections.abc import Iterator, Sequence
 from contextlib import contextmanager, suppress
 from typing import TYPE_CHECKING
 
-from .idle_guard_digest import LOCKS_PER_PROJECT
+from .idle_guard_digest import LOCKS_PER_PROJECT, MAX_REGISTRATION_HORIZON_NS
 from .project_io_protocol import PROJECT_IO_OVERDUE_SECONDS, ProjectIORequest
 from .project_io_transport_support import ProjectIOProtocolError
 
@@ -23,8 +23,8 @@ _OPERATION = "idle_decision_guard"
 _MAX_DESCRIPTORS_PER_PACKET = 100
 _DESCRIPTOR_SIZE = array("i").itemsize
 _ANCILLARY_SIZE = socket.CMSG_SPACE(_MAX_DESCRIPTORS_PER_PACKET * _DESCRIPTOR_SIZE)
-_RESULT_SIZE = len(b"ok:") + 64
-_RESULT_PATTERN = re.compile(rb"ok:([0-9a-f]{64})")
+_RESULT_SIZE = len(b"ok:") + 64 + 1 + len(str(MAX_REGISTRATION_HORIZON_NS))
+_RESULT_PATTERN = re.compile(rb"ok:([0-9a-f]{64})(?::([1-9][0-9]{0,18}))?")
 
 
 def _close_descriptors(descriptors: list[int]) -> None:
@@ -87,7 +87,7 @@ def _send_check(channel: socket.socket, deadline: float) -> None:
 
 def _receive_check(
     channel: socket.socket, descriptors: list[int], descriptor_limit: int, deadline: float
-) -> bytes | None:
+) -> tuple[str, int | None] | None:
     while True:
         packet, count = _receive_before(channel, descriptors, deadline)
         if packet == b"fds" and count > 0 and len(descriptors) <= descriptor_limit:
@@ -96,7 +96,12 @@ def _receive_check(
             if packet == b"unknown":
                 return None
             if len(descriptors) == descriptor_limit and (matched := _RESULT_PATTERN.fullmatch(packet)):
-                return matched[1]
+                if descriptor_limit == 0 and matched[2] is None:
+                    return matched[1].decode("ascii"), None
+                if descriptor_limit > 0 and matched[2] is not None:
+                    horizon_ns = int(matched[2])
+                    if horizon_ns <= MAX_REGISTRATION_HORIZON_NS:
+                        return matched[1].decode("ascii"), horizon_ns
         raise ProjectIOProtocolError("Idle Job guard returned invalid activation lock evidence.")
 
 
@@ -110,6 +115,7 @@ class IdleGuardClient:
         self._is_ready = False
         self._last_response_at = 0.0
         self._has_orphan = False
+        self._registration_horizon: tuple[tuple[int, str, str], int] | None = None
 
     @property
     def needs_start(self) -> bool:
@@ -233,6 +239,19 @@ class IdleGuardClient:
             elif not is_resolved:
                 self._has_orphan = True
 
+    def _registration_covers_decision(
+        self, scope: tuple[int, str, str], horizon_ns: int | None, deadline: float
+    ) -> bool:
+        if horizon_ns is None:
+            return True
+        if horizon_ns / 1_000_000_000 <= deadline:
+            return False
+        previous = self._registration_horizon
+        # Keep the last verified horizon across worker restarts. A fresh lease
+        # can start a new interval only after the caller sees the gap as unknown.
+        self._registration_horizon = (scope, horizon_ns)
+        return previous is None or previous[0] != scope or time.monotonic_ns() < previous[1]
+
     @contextmanager
     def authorize(self, revision: int, epoch: str, digest: str, project_count: int, deadline: float) -> Iterator[bool]:
         """Grant only fresh matching evidence and hold every lock through the caller's scope."""
@@ -262,7 +281,11 @@ class IdleGuardClient:
                 self._note_response(request)
                 if time.monotonic() >= deadline or self._channel is not channel:
                     raise TimeoutError("Idle Job guard decision expired before it could be granted.")
-                is_authorized = received is not None and received.decode("ascii") == digest
+                is_authorized = (
+                    received is not None
+                    and received[0] == digest
+                    and self._registration_covers_decision((revision, epoch, digest), received[1], deadline)
+                )
             except TimeoutError:
                 # Startup can legitimately take longer than one decision turn.
                 # Once a check has been sent, its late response must never be reused.

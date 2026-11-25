@@ -213,8 +213,7 @@ def _authorize_idle_decision(
         if enabled and runtime.working_set.idle_guard_checkpoint_digest(enabled) != evidence.checkpoint_digest:
             yield False
             return
-        config_current = stack.enter_context(runtime.config_guard(blocking=False))
-        yield config_current and time.monotonic() < deadline
+        yield time.monotonic() < deadline
 
 
 def advance_machine_idle_job(

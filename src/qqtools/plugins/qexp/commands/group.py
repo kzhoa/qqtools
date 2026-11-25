@@ -28,6 +28,7 @@ from ..runtime.operation_store import (
     write_active_operation,
 )
 from ..runtime.paths import attempt_path, group_path, shared_paths, submission_path
+from ..runtime.project_activation import project_activation_transaction
 from ..runtime.ready import (
     primary_projection_routes_for_group,
     primary_route_update_transaction,
@@ -225,7 +226,10 @@ def group_control(
         if action == "cancel":
             atomic_replace(path, data)
         else:
-            with record_group_activity(cfg, data, is_dispatch_change=True):
+            with (
+                project_activation_transaction(cfg, "group_dispatch_change"),
+                record_group_activity(cfg, data, is_dispatch_change=True),
+            ):
                 atomic_replace(path, data)
         result_data = data
     if indexed_cancel:

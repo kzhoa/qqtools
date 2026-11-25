@@ -15,10 +15,12 @@ from .lease import default_lease_policy_document
 from .runtime.group_namespace import group_directory
 from .runtime.locks import exclusive, schema_lock
 from .runtime.paths import local_paths, machine_path, machine_registration_path, shared_log_path, shared_paths
+from .runtime.project_activation import _read_regular_json
 from .runtime.protocol_compatibility import (
     CPU_LANE_CAPABILITY,
     GROUP_READY_MEMBERS_CAPABILITY,
     GROUP_WORKING_SET_CAPABILITY,
+    IDLE_JOB_ACTIVATION_WRITERS_CAPABILITY,
     OBSERVATION_CAPABILITY,
     READY_WRITER_CAPABILITY,
     REGISTRATION_REPLACEMENT_CAPABILITY,
@@ -30,7 +32,7 @@ from .runtime.protocol_compatibility import (
 from .runtime.protocol_compatibility import LOCAL_RECOVERY_CAPABILITY as LOCAL_RECOVERY_CAPABILITY
 from .runtime.records import SCHEMA_VERSION, AttemptRecord, TaskRecord, utc_now
 from .runtime.registration_protocol import REGISTRATION_PROTOCOL, TARGET_REGISTRATION_VERSION
-from .runtime.store import atomic_replace, read_json
+from .runtime.store import atomic_replace, read_json, read_json_limited
 
 
 def _schema_path(cfg: RootConfig) -> Path:
@@ -41,7 +43,10 @@ def read_schema_version(cfg: RootConfig) -> int | None:
     path = _schema_path(cfg)
     if not path.exists():
         return None
-    value = read_json(path)
+    return _schema_version(read_json(path))
+
+
+def _schema_version(value: dict[str, Any]) -> int | None:
     schema = value.get("schema")
     if not isinstance(schema, dict):
         raise RuntimeError("qexp schema/version.json is malformed.")
@@ -159,6 +164,57 @@ def is_submission_group_publication_root(cfg: RootConfig, *, is_required: bool =
     if is_required and SUBMISSION_GROUP_PUBLICATION_CAPABILITY not in capabilities:
         raise RuntimeError(_SUBMISSION_GROUP_REQUIRED_ERROR)
     return SUBMISSION_GROUP_PUBLICATION_CAPABILITY in capabilities
+
+
+def _idle_job_writer_schema(cfg: RootConfig) -> tuple[dict[str, Any], list[str]]:
+    value = _read_regular_json(_schema_path(cfg))
+    if _schema_version(value) != SCHEMA_VERSION:
+        raise RuntimeError(f"Idle Job writer activation requires qexp schema {SCHEMA_VERSION}.")
+    capabilities = value["schema"].get("required_capabilities", [])
+    if (
+        not isinstance(capabilities, list)
+        or not all(isinstance(item, str) for item in capabilities)
+        or len(set(capabilities)) != len(capabilities)
+    ):
+        raise RuntimeError("qexp schema/version.json has malformed required capabilities.")
+    unknown = sorted(set(capabilities) - SUPPORTED_REQUIRED_CAPABILITIES)
+    if unknown:
+        raise RuntimeError(f"qexp root requires unsupported capabilities: {', '.join(unknown)}.")
+    return value, capabilities
+
+
+def is_idle_job_activation_writers_root(cfg: RootConfig) -> bool:
+    """Read the Idle Job writer floor under the caller's schema fence."""
+    try:
+        _, capabilities = _idle_job_writer_schema(cfg)
+    except FileNotFoundError:
+        return False
+    return IDLE_JOB_ACTIVATION_WRITERS_CAPABILITY in capabilities
+
+
+def enable_idle_job_activation_writers(cfg: RootConfig, *, expected_project_id: str) -> None:
+    """Fence earlier writers after the operator confirms the Project cutover."""
+    with schema_lock(cfg.shared_root, blocking=False) as acquired:
+        if not acquired:
+            raise RuntimeError("Project schema is busy. Retry Idle Job writer activation.")
+
+        def verify_identity() -> None:
+            path = shared_paths(cfg.shared_root)["project"] / "identity.json"
+            identity = read_json_limited(path, max_bytes=65536, record_type="project_identity")
+            if identity != {"project": {"project_id": expected_project_id, "shared_root": str(cfg.shared_root)}}:
+                raise RuntimeError("Project identity changed before Idle Job writer cutover.")
+
+        verify_identity()
+        validate_root_contract(cfg)
+        value, capabilities = _idle_job_writer_schema(cfg)
+        if IDLE_JOB_ACTIVATION_WRITERS_CAPABILITY not in capabilities:
+            value["schema"]["required_capabilities"] = [*capabilities, IDLE_JOB_ACTIVATION_WRITERS_CAPABILITY]
+            from .runtime.project_activation import project_activation_transaction
+
+            # Old writers could change eligibility after an idle census cached
+            # its checkpoint. Exclude that entire history at the cutover.
+            with project_activation_transaction(cfg, "idle_job_writer_cutover", before_write=verify_identity):
+                atomic_replace(_schema_path(cfg), value, before_replace=lambda _: verify_identity())
 
 
 def _validate_root_contract(cfg: RootConfig, *, should_require_cpu_lane: bool) -> None:
@@ -279,6 +335,7 @@ def initialize_shared_root(cfg: RootConfig) -> None:
                         SUBMISSION_GROUP_PUBLICATION_CAPABILITY,
                         REGISTRATION_REPLACEMENT_CAPABILITY,
                         GROUP_WORKING_SET_CAPABILITY,
+                        IDLE_JOB_ACTIVATION_WRITERS_CAPABILITY,
                     ],
                     "writer_capabilities": [READY_WRITER_CAPABILITY],
                 }

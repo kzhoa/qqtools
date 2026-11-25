@@ -3112,3 +3112,53 @@ def test_unknown_executor_shutdown_does_not_infer_worker_absence(
 
     assert grace_calls == [2.0]
     assert status["envelope"] == "degraded"
+
+
+def test_inflight_idle_guard_can_be_third_overdue_without_releasing_slot(tmp_path, monkeypatch):
+    import signal
+
+    from qqtools.plugins.qexp.agent.idle_guard_client import IdleGuardClient
+
+    runtime = MachineRuntime(tmp_path / "machine")
+    initialize_machine(runtime, "gpu-1")
+    bindings = [_registered(tmp_path, f"project-{i}", runtime)[1] for i in range(4)]
+    revision, _ = runtime.load_registry()
+    executor = ProjectIOExecutor(runtime)
+    executor.begin_epoch()
+    client = IdleGuardClient(executor)
+    stopped = []
+    try:
+        client.start(revision)
+        guard_id = client._request.request_id
+        # SIGSTOP keeps exact child identities available while making progress
+        # impossible even after the controller closes the private socket.
+        child = executor._children[guard_id]
+        child.send_signal(signal.SIGSTOP)
+        stopped.append(child)
+        for binding in bindings[:2]:
+            request = executor.prepare_validate_binding(binding, revision)
+            executor.start(request.request_id)
+            child = executor._children[request.request_id]
+            child.send_signal(signal.SIGSTOP)
+            stopped.append(child)
+        client.close()
+        with monkeypatch.context() as delayed:
+            future = time.time() + PROJECT_IO_OVERDUE_SECONDS + 1
+            delayed.setattr(project_io_executor_module.time, "time", lambda: future)
+            status = executor.status_view()
+            assert status["envelope"] == "exceeded"
+            assert status["active_worker_count"] == status["overdue_worker_count"] == 3
+            assert status["free_slot_count"] == 1
+            assert guard_id in {req.request_id for req in executor.unresolved_requests()}
+        fourth = executor.prepare_validate_binding(bindings[2], revision)
+        executor.start(fourth.request_id)
+        child = executor._children[fourth.request_id]
+        child.send_signal(signal.SIGSTOP)
+        stopped.append(child)
+        with pytest.raises(RuntimeError, match="capacity|occupied"):
+            executor.prepare_validate_binding(bindings[3], revision)
+    finally:
+        for proc in stopped:
+            proc.send_signal(signal.SIGCONT)
+        client.close()
+        executor.shutdown()

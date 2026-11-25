@@ -16,6 +16,7 @@ import os
 import select
 import selectors
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -32,15 +33,24 @@ from ..infrastructure.process import (
     read_process_presence,
 )
 from ..runner import _configure_process_group_guardian
+from ..runtime.resources.idle_job import (
+    idle_job_guard,
+    idle_job_instance_path,
+    read_idle_job_ownership,
+    write_idle_job_ownership,
+)
 from ..runtime.store import atomic_replace, read_json_limited
+from .idle_launch_permit import poll_idle_launch_permit, send_idle_launch_ready, validate_idle_launch_permit_socket
 
 IDLE_JOB_PROTOCOL_VERSION = 1
+IDLE_JOB_PREPARED_INTENT_VERSION = 2
 MAX_IDLE_JOB_RECORD_BYTES = 65_536
 MAX_IDLE_JOB_STOP_REASON_BYTES = 1_024
 MAX_IDLE_JOB_LOG_BYTES = 1_048_576
 MAX_IDLE_JOB_LOG_CHUNK_BYTES = 65_536
 IDLE_JOB_POLL_SECONDS = 0.05
 IDLE_JOB_REGISTRATION_TIMEOUT_SECONDS = 10.0
+_IDLE_JOB_PERMIT_GUARD_RETRY_SECONDS = 0.001
 _MODULE_NAME = "qqtools.plugins.qexp.agent.idle_job_process"
 
 _PR_SET_PDEATHSIG = 1
@@ -48,9 +58,12 @@ _PR_SET_CHILD_SUBREAPER = 36
 _PROC_ROOT = Path("/proc")
 _BOOT_ID_PATH = _PROC_ROOT / "sys/kernel/random/boot_id"
 _STOP_SENTINEL = object()
+_INSTANCE_IDENTITY_FIELDS = ("runtime_id", "instance_id", "boot_id")
+_PREPARED_OWNER_IDENTITY_FIELDS = (*_INSTANCE_IDENTITY_FIELDS, "parent_pid", "parent_start_ticks")
 
 __all__ = [
     "IDLE_JOB_PROTOCOL_VERSION",
+    "IDLE_JOB_PREPARED_INTENT_VERSION",
     "MAX_IDLE_JOB_LOG_BYTES",
     "MAX_IDLE_JOB_RECORD_BYTES",
     "MAX_IDLE_JOB_STOP_REASON_BYTES",
@@ -181,7 +194,8 @@ def _validate_intent(intent: object) -> dict[str, Any]:
     }
     if set(intent) != required:
         raise ValueError("idle_job_intent has an unsupported or missing field")
-    if type(intent["version"]) is not int or intent["version"] != IDLE_JOB_PROTOCOL_VERSION:
+    version = intent["version"]
+    if type(version) is not int or version not in (IDLE_JOB_PROTOCOL_VERSION, IDLE_JOB_PREPARED_INTENT_VERSION):
         raise ValueError("idle_job_intent version is unsupported")
     runtime_id = _bounded_text(intent["runtime_id"], "runtime_id", max_bytes=1_024)
     instance_id = _bounded_text(intent["instance_id"], "instance_id", max_bytes=1_024)
@@ -198,7 +212,7 @@ def _validate_intent(intent: object) -> dict[str, Any]:
         raise ValueError("intent gpu_ids must be a list")
     gpu_ids = tuple(_nonnegative_int(gpu_id, f"gpu_ids[{index}]") for index, gpu_id in enumerate(gpu_value))
     return {
-        "version": IDLE_JOB_PROTOCOL_VERSION,
+        "version": version,
         "runtime_id": runtime_id,
         "instance_id": instance_id,
         "command": command,
@@ -218,6 +232,24 @@ def _read_intent(instance_dir: Path) -> dict[str, Any]:
         record_type="idle_job_intent",
     )
     return _validate_intent(envelope.get("idle_job_intent"))
+
+
+def idle_job_intent_matches_owner(instance_dir: Path, owner: dict[str, Any]) -> bool:
+    intent = _read_intent(instance_dir)
+    return (
+        intent["version"] == owner["version"]
+        and all(intent[key] == owner[key] for key in _PREPARED_OWNER_IDENTITY_FIELDS)
+        and intent["gpu_ids"] == tuple(owner["gpu_ids"])
+    )
+
+
+def _validate_intent_permit(intent: dict[str, Any], endpoint: socket.socket | None) -> None:
+    if intent["version"] == IDLE_JOB_PREPARED_INTENT_VERSION:
+        if endpoint is None:
+            raise ValueError("idle job intent version 2 requires a launch permit socket")
+        validate_idle_launch_permit_socket(endpoint)
+    elif endpoint is not None:
+        raise ValueError("idle job intent version 1 cannot use a launch permit socket")
 
 
 def _validate_process_record(process: object) -> dict[str, Any]:
@@ -374,17 +406,20 @@ def spawn_idle_job(
     stop_timeout_seconds: float,
     parent_pid: int,
     parent_start_ticks: int,
+    permit_socket: socket.socket | None = None,
 ) -> subprocess.Popen[bytes]:
     """Start a supervisor after validating the caller's persisted intent.
 
     The caller must have atomically written ``intent.json`` before calling this
-    function.  This function never creates or updates that intent.
+    function. This function never creates or updates that intent. Version 2
+    requires the supervisor's permit endpoint, which the caller still owns.
     """
     _require_linux()
     if not isinstance(instance_dir, Path) or not instance_dir.is_dir():
         raise ValueError("instance_dir must be an existing directory")
     expected_boot_id = current_boot_id()
     intent = _read_intent(instance_dir)
+    _validate_intent_permit(intent, permit_socket)
     expected = {
         "runtime_id": _bounded_text(runtime_id, "runtime_id", max_bytes=1_024),
         "instance_id": _bounded_text(instance_id, "instance_id", max_bytes=1_024),
@@ -415,12 +450,18 @@ def spawn_idle_job(
     if not _identity_matches(parent_pid, parent_start_ticks, expected_boot_id):
         raise RuntimeError("idle job launch parent identity is not live")
     command_line = [sys.executable, "-m", _MODULE_NAME, "--supervisor", "--instance-dir", str(instance_dir)]
+    descriptors: tuple[int, ...] = ()
+    if permit_socket is not None:
+        descriptor = permit_socket.fileno()
+        descriptors = (descriptor,)
+        command_line.extend(["--permit-fd", str(descriptor)])
     return subprocess.Popen(
         command_line,
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         start_new_session=True,
+        pass_fds=descriptors,
     )
 
 
@@ -767,7 +808,9 @@ def _run_guardian(instance_dir: Path) -> int:
         raise RuntimeError("idle job intent belongs to another boot")
     supervisor = _read_supervisor_record(instance_dir)
     expected_supervisor_pid = os.getppid()
-    if supervisor["pid"] != expected_supervisor_pid or supervisor["boot_id"] != boot_id:
+    if supervisor["pid"] != expected_supervisor_pid or any(
+        supervisor[key] != intent[key] for key in _INSTANCE_IDENTITY_FIELDS
+    ):
         raise RuntimeError("idle job supervisor identity does not match guardian parent")
     if not _identity_matches(supervisor["pid"], supervisor["start_time_ticks"], boot_id):
         raise RuntimeError("idle job supervisor identity is not live")
@@ -824,6 +867,14 @@ def _run_guardian(instance_dir: Path) -> int:
     termination_deadline: float | None = None
     child_returncode: int | None = None
     try:
+        if intent["version"] == IDLE_JOB_PREPARED_INTENT_VERSION:
+            try:
+                evidence = {**process_record, "command_started": True}
+                atomic_replace(instance_dir / "process.json", {"idle_job_process": evidence})
+            except (OSError, RuntimeError, ValueError):
+                # Keep the guardian in charge of the group until cleanup completes.
+                _guardian_stop_requested = True
+                _guardian_send_group_term()
         while True:
             _guardian_relay_output(child_selector, child.stdout, output_broken)
             if child_returncode is None:
@@ -911,9 +962,7 @@ def _supervisor_stop_reason(instance_dir: Path, intent: dict[str, Any], boot_id:
 
 def _validate_registration(process: dict[str, Any], intent: dict[str, Any], supervisor: dict[str, Any]) -> bool:
     return bool(
-        process["runtime_id"] == intent["runtime_id"]
-        and process["instance_id"] == intent["instance_id"]
-        and process["boot_id"] == intent["boot_id"]
+        all(process[key] == intent[key] == supervisor[key] for key in _INSTANCE_IDENTITY_FIELDS)
         and process["supervisor_pid"] == supervisor["pid"]
         and process["supervisor_start_ticks"] == supervisor["start_time_ticks"]
         and process["process_group_id"] == process["pid"]
@@ -924,22 +973,99 @@ def _acquire_instance_lock(lock: _InstanceLock, intent: dict[str, Any], boot_id:
     return lock.acquire(lambda: _identity_matches(intent["parent_pid"], intent["parent_start_ticks"], boot_id))
 
 
-def _send_guardian_go(guardian: subprocess.Popen[bytes]) -> bool:
+def _send_guardian_go(guardian: subprocess.Popen[bytes], *, deadline: float | None = None) -> str | None:
     if guardian.stdin is None:
-        return False
+        return "guardian_start_failed"
     try:
-        guardian.stdin.write(b"G")
-        guardian.stdin.flush()
-        guardian.stdin.close()
-    except (BrokenPipeError, OSError, ValueError):
-        return False
-    return True
+        descriptor = guardian.stdin.fileno()
+        os.set_blocking(descriptor, False)
+        if deadline is not None and time.monotonic() >= deadline:
+            return "launch_permit_expired"
+        if os.write(descriptor, b"G") == 1:
+            return None
+    except (OSError, ValueError):
+        pass
+    return "guardian_start_failed"
 
 
-def _run_supervisor(instance_dir: Path) -> int:
+def _commit_guardian_go(
+    root: Path,
+    instance_dir: Path,
+    intent: dict[str, Any],
+    boot_id: str,
+    guardian: subprocess.Popen[bytes],
+    deadline: float,
+) -> str | None:
+    owner = read_idle_job_ownership(root)
+    if (
+        owner is None
+        or owner["version"] != 2
+        or owner["phase"] != "prepared"
+        or any(owner[key] != intent[key] for key in _PREPARED_OWNER_IDENTITY_FIELDS)
+        or tuple(owner["gpu_ids"]) != intent["gpu_ids"]
+    ):
+        return "launch_permit_owner_changed"
+    stop_reason = _supervisor_stop_reason(instance_dir, intent, boot_id)
+    if stop_reason is not None:
+        return stop_reason
+    if time.monotonic() >= deadline:
+        return "launch_permit_expired"
+    write_idle_job_ownership(root, {**owner, "phase": "launching"})
+    # The durable write can outlast the permit or overlap a parent exit.
+    stop_reason = _supervisor_stop_reason(instance_dir, intent, boot_id)
+    if stop_reason is not None:
+        return stop_reason
+    return _send_guardian_go(guardian, deadline=deadline)
+
+
+def _await_launch_permit(
+    instance_dir: Path,
+    intent: dict[str, Any],
+    boot_id: str,
+    guardian: subprocess.Popen[bytes],
+    endpoint: socket.socket,
+) -> str | None:
+    try:
+        root = instance_dir.parent.parent.parent.resolve()
+        if instance_dir.resolve() != idle_job_instance_path(root, intent["instance_id"]):
+            return "launch_permit_owner_changed"
+        if os.getppid() != intent["parent_pid"]:
+            return "parent_exit"
+        send_idle_launch_ready(endpoint)
+        with selectors.DefaultSelector() as selector:
+            selector.register(endpoint, selectors.EVENT_READ)
+            while guardian.poll() is None:
+                stop_reason = _supervisor_stop_reason(instance_dir, intent, boot_id)
+                if stop_reason is not None:
+                    return stop_reason
+                if not selector.select(IDLE_JOB_POLL_SECONDS):
+                    continue
+                deadline = poll_idle_launch_permit(endpoint, intent["instance_id"])
+                if deadline is not None:
+                    break
+            else:
+                return "guardian_start_failed"
+        # The controller may still be releasing the local fence after queueing the permit.
+        while (remaining := deadline - time.monotonic()) > 0:
+            stop_reason = _supervisor_stop_reason(instance_dir, intent, boot_id)
+            if stop_reason is not None:
+                return stop_reason
+            with idle_job_guard(root, blocking=False) as has_lock:
+                if has_lock:
+                    return _commit_guardian_go(root, instance_dir, intent, boot_id, guardian, deadline)
+            time.sleep(min(remaining, _IDLE_JOB_PERMIT_GUARD_RETRY_SECONDS))
+        return "launch_permit_expired"
+    except (OSError, RuntimeError, TypeError, ValueError, KeyError):
+        return "launch_permit_rejected"
+    finally:
+        endpoint.close()
+
+
+def _run_supervisor(instance_dir: Path, permit_socket: socket.socket | None = None) -> int:
     global _supervisor_stop_event
     _require_linux()
     intent = _read_intent(instance_dir)
+    _validate_intent_permit(intent, permit_socket)
     boot_id = current_boot_id()
     if intent["boot_id"] != boot_id:
         raise RuntimeError("idle job intent belongs to another boot")
@@ -957,6 +1083,8 @@ def _run_supervisor(instance_dir: Path) -> int:
     stop_reason: str | None = None
     try:
         if not _acquire_instance_lock(lock, intent, boot_id):
+            return 2
+        if (instance_dir / "exit.json").exists():
             return 2
         if not _identity_matches(intent["parent_pid"], intent["parent_start_ticks"], boot_id):
             return 2
@@ -976,7 +1104,7 @@ def _run_supervisor(instance_dir: Path) -> int:
         }
         _validate_supervisor_record(supervisor_record)
         atomic_replace(instance_dir / "supervisor.json", {"idle_job_supervisor": supervisor_record})
-        if _supervisor_stop_reason(instance_dir, intent, boot_id) is not None:
+        if (instance_dir / "exit.json").exists() or _supervisor_stop_reason(instance_dir, intent, boot_id) is not None:
             return 2
         guardian = subprocess.Popen(
             [sys.executable, "-m", _MODULE_NAME, "--guardian", "--instance-dir", str(instance_dir)],
@@ -999,17 +1127,25 @@ def _run_supervisor(instance_dir: Path) -> int:
                 if (instance_dir / "process.json").exists():
                     break
             if candidate is not None:
-                if _validate_registration(candidate, intent, supervisor_record):
+                if candidate["pid"] == guardian.pid and _validate_registration(candidate, intent, supervisor_record):
                     process_record = candidate
                 break
             if _supervisor_stop_reason(instance_dir, intent, boot_id) is not None:
                 break
         guardian_identity = read_process_identity(guardian.pid)
+        if process_record is not None and (
+            guardian_identity.state != "present"
+            or guardian_identity.start_time_ticks != process_record["start_time_ticks"]
+        ):
+            process_record = None
         if process_record is not None:
             stop_reason = _supervisor_stop_reason(instance_dir, intent, boot_id)
-            if stop_reason is None and _identity_matches(intent["parent_pid"], intent["parent_start_ticks"], boot_id):
-                stop_reason = None if _send_guardian_go(guardian) else "guardian_start_failed"
-            elif guardian.stdin is not None:
+            if stop_reason is None:
+                if permit_socket is None:
+                    stop_reason = _send_guardian_go(guardian)
+                else:
+                    stop_reason = _await_launch_permit(instance_dir, intent, boot_id, guardian, permit_socket)
+            if guardian.stdin is not None:
                 try:
                     guardian.stdin.close()
                 except OSError:
@@ -1120,11 +1256,20 @@ def main(argv: list[str] | None = None) -> int:
     mode.add_argument("--supervisor", action="store_true")
     mode.add_argument("--guardian", action="store_true")
     parser.add_argument("--instance-dir", type=Path, required=True)
+    parser.add_argument("--permit-fd", type=int)
     arguments = parser.parse_args(argv)
     try:
-        return (
-            _run_supervisor(arguments.instance_dir) if arguments.supervisor else _run_guardian(arguments.instance_dir)
-        )
+        if arguments.permit_fd is None:
+            return (
+                _run_supervisor(arguments.instance_dir)
+                if arguments.supervisor
+                else _run_guardian(arguments.instance_dir)
+            )
+        if not arguments.supervisor or arguments.permit_fd < 3:
+            return 2
+        with socket.socket(fileno=arguments.permit_fd) as permit_socket:
+            permit_socket.set_inheritable(False)
+            return _run_supervisor(arguments.instance_dir, permit_socket)
     except (OSError, RuntimeError, TypeError, ValueError, KeyError):
         return 2
 

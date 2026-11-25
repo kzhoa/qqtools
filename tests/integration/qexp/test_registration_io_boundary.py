@@ -35,9 +35,13 @@ def test_explicit_reactivation_repairs_invalid_expiry_only_for_current_owner(tmp
         elif ownership == "other_generation":
             record["registration"]["generation"] = "other-generation"
         save_machine_registration(cfg, record)
+        from qqtools.plugins.qexp.runtime.project_activation import read_project_activation
+
         before = load_machine_registration(cfg)
+        checkpoint = read_project_activation(cfg.shared_root)
         assert runtime.reactivate_binding(binding) is (ownership == "current")
         after = load_machine_registration(cfg)
+        assert (read_project_activation(cfg.shared_root) != checkpoint) == (ownership == "current")
         if ownership == "current":
             assert after["registration"]["generation"] == before["registration"]["generation"]
             assert datetime.fromisoformat(

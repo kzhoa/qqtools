@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import stat
+import time
 from contextlib import closing
 from dataclasses import replace
 from pathlib import Path
@@ -152,7 +153,7 @@ def _unregistered_partition_evidence(runtime: MachineRuntime, registered: frozen
                         yield path is not None
 
 
-def _observe_unregistered_partitions(runtime: MachineRuntime, bindings) -> str:
+def _observe_unregistered_partitions(runtime: MachineRuntime, bindings, *, continuation_due: bool = False) -> str:
     registered = frozenset(binding.project_id for binding in bindings)
     previous = getattr(runtime, "_machine_only_partition_scan", None)
     try:
@@ -179,7 +180,12 @@ def _observe_unregistered_partitions(runtime: MachineRuntime, bindings) -> str:
         return "blocked"
     scan = previous[1]
     try:
-        for _ in range(64):
+        # A required continuation needs a complete sweep. Spend spare local
+        # inspection time on short, healthy sweeps, before acquiring Project locks.
+        finish_by = time.monotonic() + 0.005 if continuation_due else None
+        for entry in range(4096 if continuation_due else 64):
+            if entry >= 64 and time.monotonic() >= finish_by:
+                break
             if next(scan):
                 scan.close()
                 runtime._machine_only_partition_scan = None

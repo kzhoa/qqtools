@@ -837,8 +837,10 @@ def has_reservation(runtime_root: Path, reservation_id: str) -> bool:
     return False
 
 
-def reservation_snapshot(runtime_root: Path, *, blocking: bool = True) -> ReservationSnapshot:
-    """Read active and unexpired provisional reservations without mutating state."""
+def reservation_snapshot(
+    runtime_root: Path, *, blocking: bool = True, reconcile_expired: bool = True
+) -> ReservationSnapshot:
+    """Read active and unexpired provisional reservations in both lanes."""
     paths = local_paths(runtime_root)
     with exclusive(paths["locks"] / "gpu-reservations.lock", blocking=blocking) as acquired:
         if not acquired:
@@ -859,9 +861,11 @@ def reservation_snapshot(runtime_root: Path, *, blocking: bool = True) -> Reserv
     # mutation in the other while it performs shared-root work.
     from .cpu_lane import cpu_reservation_snapshot
 
-    _policy, cpu_reservations = (
-        cpu_reservation_snapshot(runtime_root) if blocking else cpu_reservation_snapshot(runtime_root, blocking=False)
+    _policy, cpu_reservations = cpu_reservation_snapshot(
+        runtime_root, blocking=blocking, reconcile_expired=reconcile_expired
     )
+    if not reconcile_expired and any(item.get("state") not in {"active", "provisional"} for item in cpu_reservations):
+        raise ValueError("CPU reservation state is uncertain.")
     return ReservationSnapshot(
         gpu_snapshot.active + tuple(item for item in cpu_reservations if item.get("state") == "active"),
         gpu_snapshot.reserved_gpu_ids,

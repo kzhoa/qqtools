@@ -433,9 +433,10 @@ def request_repair(cfg: RootConfig, operation_id: str) -> bool:
                 cursor={"operation_id": operation_id},
             )
             _ensure_pending(cfg, operation_id, atomic_replace)
-            if descriptor["state"] == "prepared":
-                activate_work(cfg, descriptor)
-            return True
+        # Submission commits take the activation lock before the operation lock.
+        if descriptor["state"] == "prepared":
+            activate_work(cfg, descriptor)
+        return True
     except SubmissionControlUnavailable:
         raise
     except (OSError, ValueError) as exc:

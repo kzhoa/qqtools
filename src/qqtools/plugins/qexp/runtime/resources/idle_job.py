@@ -32,7 +32,10 @@ _OWNERSHIP_FIELDS = frozenset(
     }
 )
 _DEMAND_FIELDS = frozenset({"version", "revision"})
-_PHASES = frozenset({"launching", "running", "stopping"})
+_OWNERSHIP_PHASES_BY_VERSION = {
+    1: frozenset({"launching", "running", "stopping"}),
+    2: frozenset({"launching", "prepared", "running", "stopping"}),
+}
 
 
 class IdleJobAdmissionBlocked(ValueError):
@@ -123,12 +126,14 @@ def _validate_ownership(value: object) -> dict[str, Any]:
     record = value["idle_job"]
     if set(record) != _OWNERSHIP_FIELDS:
         raise ValueError("Idle Job ownership fields are malformed.")
-    if type(record["version"]) is not int or record["version"] != 1:
+    version = record["version"]
+    if type(version) is not int or version not in _OWNERSHIP_PHASES_BY_VERSION:
         raise ValueError("Idle Job ownership version is invalid.")
     runtime_id = _require_bounded_text(record["runtime_id"], "Idle Job runtime_id")
     boot_id = _require_uuid(record["boot_id"], "Idle Job boot_id")
     instance_id = _require_uuid_hex(record["instance_id"], "Idle Job instance_id")
-    if not isinstance(record["phase"], str) or record["phase"] not in _PHASES:
+    phase = record["phase"]
+    if not isinstance(phase, str) or phase not in _OWNERSHIP_PHASES_BY_VERSION[version]:
         raise ValueError("Idle Job ownership phase is invalid.")
     config_revision = record["config_revision"]
     if type(config_revision) is not int or config_revision < 0:
@@ -148,11 +153,11 @@ def _validate_ownership(value: object) -> dict[str, Any]:
         raise ValueError("Idle Job parent_start_ticks must be a non-negative integer.")
     created_at = _require_utc_text(record["created_at"], "Idle Job created_at")
     return {
-        "version": 1,
+        "version": version,
         "runtime_id": runtime_id,
         "boot_id": boot_id,
         "instance_id": instance_id,
-        "phase": record["phase"],
+        "phase": phase,
         "config_revision": config_revision,
         "gpu_ids": list(gpu_ids),
         "parent_pid": parent_pid,

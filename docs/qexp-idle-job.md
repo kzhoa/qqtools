@@ -78,6 +78,27 @@ instance and reevaluates selection. Linux parent-death guards reclaim the comman
 process group after abrupt agent or supervisor death. Restart reconciles durable
 ownership before launching another instance.
 
+A `waiting` instance with reason `preparing` already owns cleanup responsibility.
+The command can start once the agent rechecks training and issues a one-time
+permission. Restarting the agent during preparation reclaims the instance.
+Training submitted from another machine can commit during local ownership
+writes. Training admission on this machine may still wait for local storage
+and verified cleanup.
+
+On a Project created by an older version, upgrade the participating writers
+before opting that Project into the `idle-job-activation-writers-v1` schema
+capability. From the registered MachineRuntime, run
+`qexp admin upgrade advance --project PROJECT_ID --enable-idle-job-activation-writers`.
+Fresh Projects already require the capability. Until cutover, a machine with that Project enabled continues
+serving training and withholds Idle Job. After cutover older training writers
+will refuse the newer schema.
+
+Before rolling back to an agent that reads only v1 ownership, disable Idle Job
+with the newer binary, wait for `disabled`, and verify that `idle-job/ownership.json`
+has been released. Older binaries reject a v2 owner. If cleanup is blocked,
+keep the newer binary available to reconcile it. Upgrading with an existing v1
+owner preserves that owner's format through cleanup.
+
 ## Status and troubleshooting
 
 Idle Job status is separate from experiment progress and completion rates.

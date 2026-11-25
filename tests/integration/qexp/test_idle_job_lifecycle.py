@@ -600,3 +600,263 @@ def test_held_reservation_cannot_create_repeated_interval_resets(tmp_path, estab
     clock[0] += 2
     assert supervisor.tick(gpu_policy=POLICY)["reason"] == "gpu_reserved"
     assert (idle_job_status(runtime)["interval_detail"] or {}) == detail
+
+
+def _pause_controller_for_crash(root, stage, reached):
+    from qqtools.plugins.qexp.agent import idle_job as idle
+
+    runtime = MachineRuntime(root)
+    clock = [0]
+    supervisor = IdleJobSupervisor(runtime, monotonic=lambda: clock[0])
+
+    def pause(*args, **kwargs):
+        reached.set()
+        time.sleep(30)
+        raise AssertionError("crash barrier timed out")
+
+    if stage == "prepared":
+        supervisor._spawn_prepared = pause
+    elif stage == "intent":
+        idle.write_idle_job_ownership = pause
+    else:
+        idle.send_idle_launch_permit = pause
+    while True:
+        supervisor.tick(gpu_policy=POLICY)
+        clock[0] = 90
+        time.sleep(0.01)
+
+
+@pytest.mark.parametrize("stage", ["intent", "prepared", "authorized"])
+def test_controller_crash_cannot_replay_a_launch(tmp_path, stage):
+    import multiprocessing
+
+    runtime = _runtime(tmp_path)
+    marker = tmp_path / "ran"
+    set_idle_job_config(runtime, command=f"{sys.executable} -c \"from pathlib import Path; Path('{marker}').touch()\"")
+    set_idle_job_config(runtime, idle_delay_seconds=90)
+    ctx = multiprocessing.get_context("spawn")
+    reached = ctx.Event()
+    controller = ctx.Process(target=_pause_controller_for_crash, args=(runtime.root, stage, reached))
+    controller.start()
+    try:
+        assert reached.wait(8)
+        owner = read_idle_job_ownership(runtime.root)
+        assert (owner is None) == (stage == "intent")
+        if owner:
+            assert owner["phase"] == "prepared"
+        assert not marker.exists()
+    finally:
+        controller.kill()
+        controller.join(5)
+        assert not controller.is_alive()
+
+    recovered = IdleJobSupervisor(runtime)
+    try:
+        # Give recovery idle demand, with a fresh long interval so a new
+        # instance cannot obscure replay of the original.
+        _until(recovered, lambda _: read_idle_job_ownership(runtime.root) is None)
+        assert not marker.exists()
+        assert reserve(runtime.root, "training", [0])["reservation"]["task_id"] == "training"
+    finally:
+        assert recovered.shutdown()
+
+
+@pytest.mark.parametrize("corrupt", ["intent", "exit"])
+def test_prepared_recovery_retains_mismatched_evidence(tmp_path, monkeypatch, corrupt):
+    from qqtools.plugins.qexp.agent import idle_job
+    from qqtools.plugins.qexp.runtime.store import atomic_replace, read_json
+
+    runtime = _runtime(tmp_path)
+    supervisor = IdleJobSupervisor(runtime)
+
+    def crash(_preparation):
+        raise KeyboardInterrupt()
+
+    monkeypatch.setattr(supervisor, "_spawn_prepared", crash)
+    with pytest.raises(KeyboardInterrupt):
+        supervisor.tick(gpu_policy=POLICY)
+    owner = read_idle_job_ownership(runtime.root)
+    directory = idle_job_instance_path(runtime.root, owner["instance_id"])
+    path = directory / "intent.json"
+    original = read_json(path)
+    if corrupt == "intent":
+        import copy
+
+        value = copy.deepcopy(original)
+        value["idle_job_intent"].update(instance_id="f" * 32, parent_pid=1, parent_start_ticks=0)
+        atomic_replace(path, value)
+    else:
+        atomic_replace(
+            directory / "exit.json",
+            {
+                "idle_job_exit": {
+                    "version": 1,
+                    "runtime_id": owner["runtime_id"],
+                    "instance_id": "f" * 32,
+                    "boot_id": owner["boot_id"],
+                    "returncode": None,
+                    "exited_at": idle_job.utc_now(),
+                    "reason": "launch_failed",
+                }
+            },
+        )
+        monkeypatch.setattr(idle_job, "idle_job_processes_exited", lambda path: True)
+    try:
+        restarted = IdleJobSupervisor(runtime)
+        assert restarted.tick(gpu_policy=POLICY)["state"] == "blocked"
+        assert read_idle_job_ownership(runtime.root)["instance_id"] == owner["instance_id"]
+        with pytest.raises(IdleJobAdmissionBlocked):
+            reserve(runtime.root, "training", [0])
+    finally:
+        # No helper was started. Restore the unmodified record so the original
+        # controller can seal its synchronously interrupted preparation.
+        atomic_replace(path, original)
+        (directory / "exit.json").unlink(missing_ok=True)
+        supervisor._preparation.spawn_failed = True
+        assert supervisor.shutdown()
+
+
+def test_instance_parent_directory_is_synced_before_prepared_owner(tmp_path, monkeypatch):
+    import os
+
+    from qqtools.plugins.qexp.agent import idle_job
+
+    runtime = _runtime(tmp_path)
+    supervisor = IdleJobSupervisor(runtime)
+    instances = runtime.root / "idle-job" / "instances"
+    sync = os.fsync
+    write = idle_job.write_idle_job_ownership
+    observed = []
+    owners = []
+
+    def capture(fd):
+        if instances.is_dir() and os.path.samestat(os.fstat(fd), instances.stat()):
+            observed.append(True)
+        return sync(fd)
+
+    def publish(root, owner):
+        if owner["phase"] == "prepared":
+            assert observed
+            owners.append(owner["instance_id"])
+        return write(root, owner)
+
+    monkeypatch.setattr(os, "fsync", capture)
+    monkeypatch.setattr(idle_job, "write_idle_job_ownership", publish)
+    try:
+        assert supervisor.tick(gpu_policy=POLICY)["reason"] == "preparing"
+        assert len(owners) == 1
+    finally:
+        assert supervisor.shutdown()
+
+
+def _contending_training(root, lane, channel):
+    def admit():
+        return reserve(root, "competing-training", [0]) if lane == "gpu" else reserve_cpu(root, "competing-training", 1)
+
+    with channel:
+        channel.send(("attempt", time.monotonic()))
+        try:
+            admit()
+        except IdleJobAdmissionBlocked:
+            channel.send(("revoked", time.monotonic()))
+        else:
+            raise AssertionError("training acquired an unconfirmed owner")
+        assert channel.recv() == "retry"
+        with pytest.raises(IdleJobAdmissionBlocked):
+            admit()
+        channel.send("still_blocked")
+        assert channel.recv() == "cleaned"
+        assert admit()["reservation"]["task_id"] == "competing-training"
+        channel.send(("reserved", time.monotonic()))
+
+
+@pytest.mark.parametrize("lane", ["cpu", "gpu"])
+def test_local_training_waits_for_slow_prepared_publication_and_cleanup(tmp_path, monkeypatch, lane, record_property):
+    import multiprocessing
+
+    from qqtools.plugins.qexp.runtime.resources import idle_job as admission
+
+    runtime = _runtime(tmp_path)
+    set_cpu_lane_capacity(runtime.root, capacity=1)
+    supervisor = IdleJobSupervisor(runtime)
+    ctx = multiprocessing.get_context("spawn")
+    client, server = ctx.Pipe()
+    child = ctx.Process(target=_contending_training, args=(runtime.root, lane, server))
+    write = admission.atomic_replace
+    timeline = {}
+
+    def publish(path, value):
+        def slow_disk(step):
+            if step != "directory_fsync" or timeline or path.name != "ownership.json":
+                return
+            child.start()
+            assert client.poll(5)
+            event, timeline["attempt"] = client.recv()
+            assert event == "attempt"
+            assert not client.poll(0.12)
+            timeline["disk_resumed"] = time.monotonic()
+
+        return write(path, value, io_step_observer=slow_disk)
+
+    try:
+        with monkeypatch.context() as inject:
+            inject.setattr(admission, "atomic_replace", publish)
+            supervisor.tick(gpu_policy=POLICY)
+        assert client.poll(5)
+        event, timeline["revoked"] = client.recv()
+        assert event == "revoked"
+        assert read_idle_job_ownership(runtime.root)["phase"] == "stopping"
+        client.send("retry")
+        assert client.poll(3) and client.recv() == "still_blocked"
+        _until(supervisor, lambda _: read_idle_job_ownership(runtime.root) is None, demand="busy")
+        timeline["cleaned"] = time.monotonic()
+        client.send("cleaned")
+        assert client.poll(5)
+        event, timeline["reserved"] = client.recv()
+        assert event == "reserved"
+        child.join(3)
+        assert child.exitcode == 0
+        assert list(timeline.values()) == sorted(timeline.values())
+        record_property("attempt_to_revoked_seconds", timeline["revoked"] - timeline["attempt"])
+        record_property("revoked_to_cleaned_seconds", timeline["cleaned"] - timeline["revoked"])
+    finally:
+        if child.is_alive():
+            child.kill()
+            child.join(3)
+        client.close()
+        server.close()
+        assert supervisor.shutdown()
+
+
+def test_ambiguous_owner_publication_retains_cleanup_until_verified(tmp_path, monkeypatch):
+    from qqtools.plugins.qexp.agent import idle_job
+    from qqtools.plugins.qexp.runtime.resources import idle_job as admission
+
+    runtime = _runtime(tmp_path)
+    supervisor = IdleJobSupervisor(runtime)
+    replace = admission.atomic_replace
+    seen = []
+
+    def ambiguous(path, value):
+        def fail(stage):
+            if stage == "directory_fsync" and path.name == "ownership.json":
+                owner = read_idle_job_ownership(runtime.root)
+                assert owner["phase"] == "prepared"
+                seen.append(owner["instance_id"])
+                raise OSError("cannot confirm directory persistence")
+
+        return replace(path, value, io_step_observer=fail)
+
+    try:
+        with monkeypatch.context() as delayed:
+            delayed.setattr(admission, "atomic_replace", ambiguous)
+            delayed.setattr(idle_job, "spawn_idle_job", lambda *a, **kw: pytest.fail("spawn after unknown write"))
+            delayed.setattr(supervisor, "_seal_unstarted_locked", lambda prep: False)
+            assert supervisor.tick(gpu_policy=POLICY)["reason"] == "cleanup_uncertain"
+        assert seen == [read_idle_job_ownership(runtime.root)["instance_id"]]
+        with pytest.raises(IdleJobAdmissionBlocked):
+            reserve(runtime.root, "training", [0])
+        _until(supervisor, lambda _: read_idle_job_ownership(runtime.root) is None, demand="busy")
+        assert reserve(runtime.root, "training", [0])["reservation"]["task_id"] == "training"
+    finally:
+        assert supervisor.shutdown()

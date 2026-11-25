@@ -1,5 +1,6 @@
 """Exercise Idle Job authorization with real local admission and process ownership."""
 
+import multiprocessing
 import sys
 import threading
 import time
@@ -44,10 +45,14 @@ def held_briefly(lock, *, timeout=1.0):
 def decision(tmp_path, monkeypatch, request):
     runtime = MachineRuntime(tmp_path / "machine")
     initialize_machine(runtime, "test-machine", agent_mode="daemon")
+    project_count = {"registered": 1, "two_projects": 2, "five_projects": 5}.get(getattr(request, "param", None), 0)
+    command = f'{sys.executable} -c "import time; time.sleep(90)"'
+    if project_count == 2:
+        command = f"{sys.executable} -c \"from pathlib import Path; Path('command-ran').touch()\""
     set_idle_job_config(
         runtime,
         enabled=True,
-        command=f'{sys.executable} -c "import time; time.sleep(90)"',
+        command=command.replace("command-ran", str(tmp_path / "command-ran")),
         idle_delay_seconds=60,
         stop_timeout_seconds=0.2,
     )
@@ -61,11 +66,10 @@ def decision(tmp_path, monkeypatch, request):
     monkeypatch.setattr(
         idle_job_integration, "_gpu_policy_observation", lambda *a, **kw: (policy, {"revision": 0}, (0,))
     )
-    with_project = getattr(request, "param", None) == "registered"
-    if with_project:
+    for number in range(project_count):
         from qqtools.plugins.qexp import init_shared_root
 
-        project = init_shared_root(tmp_path / "project" / ".qexp", "test-machine")
+        project = init_shared_root(tmp_path / f"project-{number}" / ".qexp", "test-machine")
         runtime.add_binding(project.shared_root, project.machine_name)
     revision, bindings = runtime.load_registry()
     runtime.authority_ready_generations = {b.project_id: b.registration_generation for b in bindings}
@@ -84,7 +88,7 @@ def decision(tmp_path, monkeypatch, request):
         )
 
     try:
-        if with_project:
+        if project_count:
             from qqtools.plugins.qexp.agent.dispatch_loop import dispatch_machine_cycle_locked
 
             deadline = time.monotonic() + 20
@@ -314,7 +318,11 @@ def test_lock_miss_uses_one_turn_budget(decision, monkeypatch, running, sustaine
             assert status["state"] == "running"
             assert supervisor._process["pid"] == pid
         else:
-            assert status["reason"] in {"launching", "running"}, status
+            assert (status["state"], status["reason"]) == ("waiting", "preparing"), status
+            deadline = time.monotonic() + 5
+            while tick()["state"] != "running":
+                assert time.monotonic() < deadline
+                time.sleep(0.01)
     finally:
         thread.join(3)
         assert not thread.is_alive()
@@ -622,3 +630,375 @@ def test_unowned_deferred_disable_does_not_override_current_unknown(decision):
     set_idle_job_config(runtime, enabled=True)
     status = supervisor.tick(demand="unknown")
     assert (status["state"], status["reason"]) == ("waiting", "unknown_demand")
+
+
+def _submit_and_cancel_every_project(configs, runtime_root, working_dir):
+    from qqtools.plugins.qexp import submit
+    from qqtools.plugins.qexp.commands.task import cancel
+
+    for cfg in configs:
+        task = submit(cfg, ["true"], requested_gpus=1, working_dir=working_dir)
+        cancel(cfg, task.task_id, reservation_runtime_root=runtime_root)
+
+
+@pytest.mark.parametrize("decision", ["two_projects"], indirect=True)
+@pytest.mark.parametrize("stage", ["file_fsync", "directory_fsync"])
+def test_remote_training_commits_during_ownership_persistence(decision, tmp_path, monkeypatch, stage):
+    import os
+    import posix
+
+    from qqtools.plugins.qexp.runtime.resources import idle_job as admission
+
+    monkeypatch.setattr(os, "fsync", posix.fsync)
+    runtime, _, supervisor, now, tick = decision
+    configs = [binding.root_config() for binding in runtime.load_registry()[1]]
+    writer = multiprocessing.get_context("spawn").Process(
+        target=_submit_and_cancel_every_project, args=(configs, runtime.root, tmp_path)
+    )
+    observed = []
+    replace = admission.atomic_replace
+
+    def publish(path, payload):
+        if observed or path.name != "ownership.json":
+            return replace(path, payload)
+
+        def barrier(step):
+            if step == stage:
+                observed.append(path.exists())
+                writer.start()
+                try:
+                    writer.join(8)
+                    assert writer.exitcode == 0, "training writer could not finish while publication was paused"
+                finally:
+                    if writer.is_alive():
+                        writer.kill()
+                        writer.join(3)
+                assert not (tmp_path / "command-ran").exists()
+
+        return replace(path, payload, io_step_observer=barrier)
+
+    monkeypatch.setattr(admission, "atomic_replace", publish)
+    now[0] = 60
+    end = time.monotonic() + 12
+    while not observed or supervisor._idle_since is not None:
+        status = tick()
+        assert time.monotonic() < end, status
+        time.sleep(0.01)
+    assert observed == [stage == "directory_fsync"]
+    assert not (tmp_path / "command-ran").exists()
+
+
+def _timed_training_writes(configs, runtime_root, channel):
+    from qqtools.plugins.qexp import submit
+    from qqtools.plugins.qexp.commands.task import cancel
+
+    with channel:
+        for i in range(8):
+            cfg = configs[i % len(configs)]
+            started = time.monotonic()
+            channel.send(("attempt", i, started))
+            task = submit(cfg, ["true"], requested_gpus=1, working_dir=cfg.project_root)
+            channel.send(("committed", i, time.monotonic()))
+            cancel(cfg, task.task_id, reservation_runtime_root=runtime_root)
+        channel.send(("finished", 8, time.monotonic()))
+
+
+@pytest.mark.parametrize("guards_enabled", [False, True], ids=["control", "two_guards"])
+def test_training_writer_progress_on_overlapping_projects(tmp_path, guards_enabled, record_property):
+    from contextlib import ExitStack
+
+    from qqtools.plugins.qexp import init_shared_root
+    from qqtools.plugins.qexp.agent.idle_guard_client import IdleGuardClient
+    from qqtools.plugins.qexp.agent.idle_guard_digest import idle_guard_digest
+    from qqtools.plugins.qexp.runtime.project_activation import read_project_activation
+
+    configs = [init_shared_root(tmp_path / root / ".qexp", "writer") for root in ("one", "two")]
+    ctx = multiprocessing.get_context("spawn")
+    reader, sender = ctx.Pipe(False)
+    stop = threading.Event()
+
+    def authorize(client, revision, epoch, bindings, deadline):
+        rows = []
+        for b in bindings:
+            record = (read_project_activation(b.shared_root) or {}).get("project_activation", {})
+            rows.append(
+                (
+                    b.project_id,
+                    b.registration_generation,
+                    str(b.shared_root),
+                    record.get("epoch"),
+                    record.get("sequence"),
+                )
+            )
+        with client.authorize(revision, epoch, idle_guard_digest(rows), len(bindings), deadline) as granted:
+            return granted
+
+    def repeat(args, grants):
+        while not stop.is_set():
+            if authorize(*args, time.monotonic() + 0.05):
+                grants.append(time.monotonic())
+            stop.wait(0.003)
+
+    with ExitStack() as stack:
+        stack.enter_context(reader)
+        stack.enter_context(sender)
+        workers = []
+        for name in ("left", "right"):
+            runtime = MachineRuntime(tmp_path / name)
+            initialize_machine(runtime, name, agent_mode="daemon")
+            for cfg in configs:
+                runtime.add_binding(cfg.shared_root, name)
+            if guards_enabled:
+                executor = ProjectIOExecutor(runtime)
+                epoch = executor.begin_epoch()
+                stack.callback(executor.shutdown)
+                revision, bindings = runtime.load_registry()
+                client = IdleGuardClient(executor)
+                stack.callback(client.close)
+                client.start(revision)
+                args = (client, revision, epoch, bindings)
+                assert authorize(*args, time.monotonic() + 4)
+                grants = []
+                workers.append((threading.Thread(target=repeat, args=(args, grants)), grants))
+
+        writer = ctx.Process(target=_timed_training_writes, args=(configs, runtime.root, sender))
+        events = []
+        for thread, _ in workers:
+            thread.start()
+        writer.start()
+        try:
+            deadline = time.monotonic() + 12
+            while time.monotonic() < deadline and reader.poll(max(0, deadline - time.monotonic())):
+                event = reader.recv()
+                events.append(event)
+                if event[0] == "finished":
+                    break
+            assert events and events[-1][0] == "finished", events
+            writer.join(1)
+            assert writer.exitcode == 0
+        finally:
+            if writer.is_alive():
+                writer.kill()
+                writer.join(3)
+            stop.set()
+            for thread, _ in workers:
+                thread.join(2)
+                assert not thread.is_alive()
+        attempts = {i: t for kind, i, t in events if kind == "attempt"}
+        committed = {i: t for kind, i, t in events if kind == "committed"}
+        assert attempts.keys() == committed.keys() == set(range(8))
+        assert all(any(attempts[0] <= t <= events[-1][2] for t in grants) for _, grants in workers)
+        record_property("max_submit_seconds", max(committed[i] - attempts[i] for i in attempts))
+
+
+def _acquire_training_lock(root):
+    from qqtools.plugins.qexp.runtime.locks import schema_reader_lock
+
+    with schema_reader_lock(root, blocking=False) as acquired:
+        assert acquired
+
+
+@pytest.mark.parametrize("decision", ["registered"], indirect=True)
+@pytest.mark.parametrize("stage", ["spawn", "launch_status", "running_status", "failure_cleanup"])
+def test_local_side_effects_release_project_exclusion(decision, monkeypatch, stage):
+    from qqtools.plugins.qexp.agent import idle_job
+
+    runtime, _, supervisor, now, tick = decision
+    root = runtime.load_registry()[1][0].shared_root
+    checked = []
+
+    def barrier():
+        if checked:
+            return
+        writer = multiprocessing.get_context("spawn").Process(target=_acquire_training_lock, args=(root,))
+        writer.start()
+        try:
+            writer.join(5)
+            assert writer.exitcode == 0
+        finally:
+            if writer.is_alive():
+                writer.kill()
+                writer.join(3)
+        checked.append(True)
+
+    original_spawn = idle_job.spawn_idle_job
+
+    def spawn(*args, **kwargs):
+        if stage == "spawn":
+            barrier()
+        if stage == "failure_cleanup":
+            raise OSError("injected spawn failure")
+        return original_spawn(*args, **kwargs)
+
+    monkeypatch.setattr(idle_job, "spawn_idle_job", spawn)
+    publish = supervisor._publish
+
+    def publish_with_barrier(*, state, reason):
+        if (stage, reason) in {("launch_status", "preparing"), ("running_status", "running")}:
+            barrier()
+        return publish(state=state, reason=reason)
+
+    monkeypatch.setattr(supervisor, "_publish", publish_with_barrier)
+    cleanup = supervisor._preparation_failed_locked
+
+    def clean_failed(error):
+        barrier()
+        return cleanup(error)
+
+    if stage == "failure_cleanup":
+        monkeypatch.setattr(supervisor, "_preparation_failed_locked", clean_failed)
+    now[0] = 60
+    deadline = time.monotonic() + 8
+    while not checked:
+        status = tick()
+        assert time.monotonic() < deadline, status
+        time.sleep(0.01)
+
+
+@pytest.mark.parametrize("decision", ["registered"], indirect=True)
+def test_training_commit_to_reservation_timeline(decision, tmp_path, monkeypatch, record_property):
+    from qqtools.plugins.qexp import submit
+    from qqtools.plugins.qexp.agent import idle_job
+    from qqtools.plugins.qexp.runtime import submission
+    from qqtools.plugins.qexp.runtime.resources.idle_job import read_idle_job_ownership
+    from qqtools.plugins.qexp.runtime.resources.reservations import reserve
+
+    runtime, _, supervisor, now, tick = decision
+    now[0] = 60
+    timeout = time.monotonic() + 8
+    while tick()["state"] != "running":
+        assert time.monotonic() < timeout
+        time.sleep(0.01)
+    marks = {}
+    write = submission._submission_atomic_writer
+    request_stop = idle_job.request_idle_job_stop
+
+    def writer(path, envelope, **kwargs):
+        result = write(path, envelope, **kwargs)
+        if envelope.get("submission", {}).get("state") == "committed":
+            marks.setdefault("commit", time.monotonic())
+        return result
+
+    def stop(directory, reason):
+        marks.setdefault("observed", time.monotonic())
+        request_stop(directory, reason)
+        marks.setdefault("stop", time.monotonic())
+
+    monkeypatch.setattr(submission, "_submission_atomic_writer", writer)
+    monkeypatch.setattr(idle_job, "request_idle_job_stop", stop)
+    cfg = runtime.load_registry()[1][0].root_config()
+    marks["attempt"] = time.monotonic()
+    task = submit(cfg, ["true"], requested_gpus=1, working_dir=tmp_path)
+    marks["due"] = time.monotonic() + 0.02
+    time.sleep(0.025)
+    marks["start"] = time.monotonic()
+    tick()
+    assert "stop" in marks, "first due decision must revoke after demand or incomplete proof"
+    while read_idle_job_ownership(runtime.root) is not None:
+        supervisor.tick("busy")
+        assert time.monotonic() < timeout
+        time.sleep(0.01)
+    marks["cleaned"] = time.monotonic()
+    assert reserve(runtime.root, task.task_id, [0])["reservation"]["task_id"] == task.task_id
+    marks["reserved"] = time.monotonic()
+    order = ("attempt", "commit", "due", "start", "observed", "stop", "cleaned", "reserved")
+    assert [marks[k] for k in order] == sorted(marks.values())
+    record_property("submission_operation", task.submission_operation_id)
+    for earlier, later in zip(order, order[1:]):
+        record_property(f"{earlier}_to_{later}_seconds", marks[later] - marks[earlier])
+
+
+@pytest.mark.parametrize("decision", ["registered"], indirect=True)
+def test_same_generation_renewal_after_prior_safe_horizon_breaks_countdown(decision):
+    from datetime import datetime, timedelta, timezone
+
+    from qqtools.plugins.qexp.lease import load_lease_policy
+    from qqtools.plugins.qexp.runtime.locks import exclusive
+    from qqtools.plugins.qexp.runtime.paths import machine_registration_path
+    from qqtools.plugins.qexp.runtime.store import atomic_replace, read_json
+
+    runtime, _, supervisor, now, tick = decision
+    binding = runtime.load_registry()[1][0]
+    cfg = binding.root_config()
+    path = machine_registration_path(cfg.shared_root, cfg.machine_name)
+    original = read_json(path)
+    skew = load_lease_policy(cfg).max_clock_skew_seconds
+    near = datetime.now(timezone.utc) + timedelta(seconds=skew + 0.5)
+    lock = cfg.shared_root / "locks" / "registrations.lock"
+    with exclusive(lock):
+        atomic_replace(path, {"registration": {**original["registration"], "eligibility_expires_at": near.isoformat()}})
+    now[0] = 59
+    assert tick()["reason"] == "idle_delay"
+    time.sleep(0.55)
+    with exclusive(lock):
+        atomic_replace(path, original)
+    now[0] = 60
+    assert tick()["reason"] == "unknown_demand"
+    assert supervisor._idle_since is None
+    assert tick()["reason"] == "idle_delay"
+
+
+@pytest.mark.parametrize("decision", ["five_projects"], indirect=True)
+@pytest.mark.parametrize("overdue", [False, True], ids=["four_occupied", "two_overdue"])
+def test_training_arrival_stops_locally_without_a_project_slot(decision, tmp_path, monkeypatch, overdue):
+    import signal
+
+    from qqtools.plugins.qexp import submit
+    from qqtools.plugins.qexp.agent.project_io_protocol import PROJECT_IO_OVERDUE_SECONDS
+    from qqtools.plugins.qexp.runtime.resources.idle_job import read_idle_job_ownership
+    from qqtools.plugins.qexp.runtime.resources.reservations import reserve
+
+    runtime, executor, supervisor, now, tick = decision
+    now[0] = 60
+    end = time.monotonic() + 8
+    while tick()["state"] != "running":
+        assert time.monotonic() < end
+        time.sleep(0.01)
+    revision, bindings = runtime.load_registry()
+    ctrl = runtime.project_io_controller
+    ctrl.disarm_idle_job_guard(clear_census=False)
+    # Warm-up completed real startup/census requests. Consume their durable
+    # results before occupying the four request slots with controlled workers.
+    while pending := executor.unresolved_requests():
+        executor.poll()
+        for request in pending:
+            if request.operation_kind == "idle_decision_guard":
+                executor.resolve_stale_idle_decision_guard(request.request_id, request)
+            else:
+                executor.consume(request.request_id, request)
+        assert time.monotonic() < end
+        time.sleep(0.01)
+    owner = read_idle_job_ownership(runtime.root)
+    stopped = []
+    try:
+        count = 2 if overdue else 4
+        for binding in bindings[:count]:
+            request = executor.prepare_validate_binding(binding, revision)
+            executor.start(request.request_id)
+            process = executor._children[request.request_id]
+            process.send_signal(signal.SIGSTOP)
+            stopped.append(process)
+        task = submit(bindings[-1].root_config(), ["true"], requested_gpus=1, working_dir=tmp_path)
+        with monkeypatch.context() as age:
+            if overdue:
+                future = time.time() + PROJECT_IO_OVERDUE_SECONDS + 1
+                age.setattr(time, "time", lambda: future)
+            status = executor.status_view()
+            assert status["overdue_worker_count"] == (2 if overdue else 0)
+            assert status["free_slot_count"] == 4 - count
+            started = time.monotonic()
+            result = tick()
+            assert result["state"] == "stopping", result
+            assert time.monotonic() - started < 0.25
+            revoked = read_idle_job_ownership(runtime.root)
+            assert (revoked["instance_id"], revoked["phase"]) == (owner["instance_id"], "stopping")
+            assert (runtime.root / "idle-job" / "instances" / owner["instance_id"] / "stop.json").is_file()
+        while read_idle_job_ownership(runtime.root) is not None:
+            supervisor.tick("busy")
+            assert time.monotonic() < end
+            time.sleep(0.01)
+        assert reserve(runtime.root, task.task_id, [0])["reservation"]["task_id"] == task.task_id
+        assert all(p.poll() is None for p in stopped)
+    finally:
+        for process in stopped:
+            process.send_signal(signal.SIGCONT)

@@ -41,6 +41,7 @@ from .locks import (
 )
 from .operation_store import operation_exists
 from .paths import group_path, idempotency_path, submission_path, task_path
+from .project_activation import project_activation_transaction
 from .ready import (
     ReadyMemberPublicationError,
     assert_ready_writer_compatible,
@@ -123,8 +124,11 @@ def publish_submission(cfg: object, operation: dict[str, Any]) -> None:
     from .maintenance_outbox import activate_work
 
     descriptor = _prepare_submission_work(cfg, operation)
-    _publish_submission(cfg, operation, _atomic_writer=_submission_atomic_writer)
-    activate_work(cfg, descriptor)
+    is_commit = submission.get("state") == "committed"
+    activation = project_activation_transaction(cfg, "submission_commit") if is_commit else nullcontext()
+    with activation:
+        _publish_submission(cfg, operation, _atomic_writer=_submission_atomic_writer)
+        activate_work(cfg, descriptor, publish_activation=not is_commit)
 
 
 @contextmanager

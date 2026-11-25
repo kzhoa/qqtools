@@ -1254,6 +1254,12 @@ def build_parser() -> argparse.ArgumentParser:
     admin_upgrade_sub = admin_upgrade.add_subparsers(dest="admin_upgrade_action", required=True)
     for name in ("status", "advance"):
         action = admin_upgrade_sub.add_parser(name, help=f"{name.capitalize()} registered Project upgrades.")
+        if name == "advance":
+            action.add_argument(
+                "--enable-idle-job-activation-writers",
+                action="store_true",
+                help="Require activation-aware writers after all writers for the selected Project are upgraded.",
+            )
         _add_output_format(action)
         bind_command(
             action,

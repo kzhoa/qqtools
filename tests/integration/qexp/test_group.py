@@ -45,7 +45,11 @@ def test_pause_and_resume_change_dispatch_epoch(tmp_path: Path):
     paused = list_groups(cfg)[0]["group"]
     assert paused["dispatch_state"] == "paused"
     assert paused["dispatch_epoch"] == 1
+    from qqtools.plugins.qexp.runtime.project_activation import read_project_activation
+
+    previous = read_project_activation(cfg.shared_root)
     group_control(cfg, "exp", "resume")
+    assert previous != read_project_activation(cfg.shared_root)
     assert list_groups(cfg)[0]["group"]["dispatch_state"] == "active"
 
 

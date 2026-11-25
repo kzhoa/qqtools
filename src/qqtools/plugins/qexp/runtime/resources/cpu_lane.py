@@ -200,14 +200,15 @@ def initialize_cpu_lane_capacity(runtime_root: Path | Any, *, capacity: int) -> 
 
 
 def cpu_reservation_snapshot(
-    runtime_root: Path, *, blocking: bool = True
+    runtime_root: Path, *, blocking: bool = True, reconcile_expired: bool = True
 ) -> tuple[CpuLanePolicy, tuple[dict[str, Any], ...]]:
     """Return a lock-consistent CPU policy and usage-bearing reservations."""
     paths = local_paths(runtime_root)
     with exclusive(paths["locks"] / "cpu-lane.lock", blocking=blocking) as acquired:
         if not acquired:
             raise BlockingIOError("CPU reservations are being updated.")
-        _release_expired(paths)
+        if reconcile_expired:
+            _release_expired(paths)
         return _policy(paths), tuple(_reservations(paths))
 
 

@@ -20,13 +20,13 @@ from qqtools.plugins.qexp.runtime.store import atomic_replace, read_json
 pytestmark = [pytest.mark.integration, pytest.mark.qexp_fast_io]
 
 
-def _occupy(root):
+def _occupy(root, version=1, phase="running"):
     record = {
-        "version": 1,
+        "version": version,
         "runtime_id": "machine-runtime",
         "instance_id": uuid.uuid4().hex,
         "boot_id": str(uuid.uuid4()),
-        "phase": "running",
+        "phase": phase,
         "config_revision": 1,
         "gpu_ids": [0],
         "parent_pid": 123,
@@ -39,8 +39,9 @@ def _occupy(root):
 
 
 @pytest.mark.parametrize("lane", ["same_gpu", "different_gpu", "cpu"])
-def test_training_waits_for_entire_idle_job_cleanup(tmp_path, lane):
-    record = _occupy(tmp_path)
+@pytest.mark.parametrize(("version", "phase"), [(1, "launching"), (1, "running"), (1, "stopping"), (2, "prepared")])
+def test_training_waits_for_entire_idle_job_cleanup(tmp_path, lane, version, phase):
+    record = _occupy(tmp_path, version, phase)
     set_cpu_lane_capacity(tmp_path, capacity=1)
 
     def admit():
@@ -51,7 +52,7 @@ def test_training_waits_for_entire_idle_job_cleanup(tmp_path, lane):
     with pytest.raises(IdleJobAdmissionBlocked):
         admit()
     assert not reservation_snapshot(tmp_path).reservations
-    assert read_idle_job_ownership(tmp_path)["phase"] == "stopping"
+    assert read_idle_job_ownership(tmp_path) == {**record, "phase": "stopping"}
     assert read_idle_job_demand(tmp_path) == 1
     assert (
         read_json(idle_job_instance_path(tmp_path, record["instance_id"]) / "stop.json")["reason"] == "training_demand"
@@ -96,3 +97,15 @@ def test_machine_replacement_cannot_discard_uncertain_idle_job(tmp_path):
         initialize_machine(runtime, "replacement", detach_old_runtime=True, confirmed=True)
     assert runtime.instance_id == before
     assert read_idle_job_ownership(runtime.root) == record
+
+
+@pytest.mark.parametrize(("version", "phase"), [(True, "running"), (1, "prepared"), (3, "running"), (2, "ready")])
+def test_unsupported_owner_blocks_training_without_rewrite(tmp_path, version, phase):
+    record = _occupy(tmp_path)
+    path = tmp_path / "idle-job" / "ownership.json"
+    atomic_replace(path, {"idle_job": {**record, "version": version, "phase": phase}})
+    original = path.read_bytes()
+    with pytest.raises(ValueError):
+        reserve(tmp_path, "training", [0])
+    assert path.read_bytes() == original
+    assert not reservation_snapshot(tmp_path).reservations

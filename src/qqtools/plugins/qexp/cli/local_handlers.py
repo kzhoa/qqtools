@@ -43,7 +43,14 @@ from ..agent.setup import (
 from ..commands import configuration as configuration_commands
 from ..commands import context as context_commands
 from ..gpu_policy import parse_gpu_id_list, reset_gpu_policy, set_gpu_policy, show_gpu_policy
-from ..layout import clear_context, load_context, load_root_config, migrate_schema5_to_schema6, save_context
+from ..layout import (
+    clear_context,
+    enable_idle_job_activation_writers,
+    load_context,
+    load_root_config,
+    migrate_schema5_to_schema6,
+    save_context,
+)
 from ..runtime.resources.cpu_lane import get_cpu_lane_policy, set_cpu_lane_capacity
 from ..runtime.store import read_json
 from ..runtime.upgrade.framework import UpgradeCoordinator
@@ -118,7 +125,7 @@ def _try_save_context(shared_root: str) -> None:
         )
 
 
-def _upgrade_project_config(runtime: MachineRuntime, identifier: str):
+def _upgrade_project_binding(runtime: MachineRuntime, identifier: str):
     """Resolve an explicit registered project for a repair or project-scoped retry."""
     candidate = str(identifier)
     canonical = Path(candidate).expanduser().resolve() if candidate.endswith(".qexp") or "/" in candidate else None
@@ -130,7 +137,7 @@ def _upgrade_project_config(runtime: MachineRuntime, identifier: str):
     ]
     if len(matches) != 1:
         raise CliUsageError(f"machine registry must identify exactly one project for {identifier!r}.")
-    return matches[0].root_config()
+    return matches[0]
 
 
 def _accessible_nested_upgrade(item: object) -> dict[str, object] | None:
@@ -838,6 +845,23 @@ def dispatch_local(
         runtime = MachineRuntime(args.machine_runtime_root)
         action = handler.removeprefix("admin_upgrade_")
         project = getattr(args, "project", None)
+        if getattr(args, "enable_idle_job_activation_writers", False):
+            if project is None:
+                raise CliUsageError("--enable-idle-job-activation-writers requires an explicit --project.")
+            binding = _upgrade_project_binding(runtime, project)
+            try:
+                selected = binding.root_config()
+                enable_idle_job_activation_writers(selected, expected_project_id=binding.project_id)
+            except (OSError, RuntimeError, ValueError) as exc:
+                raise CliOperationalError(str(exc)) from exc
+            result = UpgradeCoordinator(selected).status()
+            result.update(
+                outcome="completed",
+                reason="Idle Job activation writer capability enabled.",
+                idle_job_activation_writers=True,
+            )
+            result = _upgrade_payload(result, action, project_root=selected.shared_root)
+            return CommandOutcome(0, CliOutput(OutputKind.UPGRADE_PROJECT, result))
         if action in {"status", "advance"}:
             if project is None:
                 result = (
@@ -848,7 +872,7 @@ def dispatch_local(
                 result = _upgrade_payload(result, action)
                 kind = OutputKind.UPGRADE_REGISTRY_STATUS if action == "status" else OutputKind.UPGRADE_ADVANCE
             else:
-                selected = _upgrade_project_config(runtime, project)
+                selected = _upgrade_project_binding(runtime, project).root_config()
                 coordinator = UpgradeCoordinator(selected)
                 result = coordinator.status() if action == "status" else coordinator.advance(force_retry=True)
                 result = _upgrade_payload(result, action, project_root=selected.shared_root)
@@ -856,7 +880,7 @@ def dispatch_local(
             return CommandOutcome(0, CliOutput(kind, result))
         if project is None:
             raise CliUsageError(f"admin upgrade {action} requires explicit --project PATH.")
-        selected = _upgrade_project_config(runtime, project)
+        selected = _upgrade_project_binding(runtime, project).root_config()
         coordinator = UpgradeCoordinator(selected)
         if action == "pause":
             result = coordinator.request_pause(args.reason)

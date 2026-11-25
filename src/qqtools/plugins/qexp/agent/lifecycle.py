@@ -777,7 +777,11 @@ def run_machine_agent_loop(
                             # whose enabled projects have been reconciled.
                             policy_revision_acknowledged = policy_revision_requested
                     partition_observation = (
-                        _observe_unregistered_partitions(machine_runtime, observed_bindings)
+                        _observe_unregistered_partitions(
+                            machine_runtime,
+                            observed_bindings,
+                            continuation_due=idle_job_supervisor is not None and idle_job_supervisor.has_local_instance,
+                        )
                         if cycle_completed and enablement_view_converged
                         else "blocked"
                     )
@@ -898,6 +902,8 @@ def run_machine_agent_loop(
                     idle_since = None
                 pending_wait = getattr(machine_runtime, "pending_launch_wait_seconds", None)
                 wait_seconds = pending_wait(loop_interval) if callable(pending_wait) else loop_interval
+                if idle_job_supervisor is not None:
+                    wait_seconds = idle_job_supervisor.pending_wait_seconds(wait_seconds)
                 project_io_controller = getattr(machine_runtime, "project_io_controller", None)
                 if isinstance(project_io_controller, ProjectIOController):
                     try:

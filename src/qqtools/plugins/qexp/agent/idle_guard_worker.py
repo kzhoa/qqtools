@@ -8,19 +8,26 @@ import os
 import select
 import socket
 import stat
+import time
 from collections.abc import Callable
 from contextlib import ExitStack
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from ..config_types import RootConfig
-from ..lease import parse_utc
+from ..layout import is_idle_job_activation_writers_root
+from ..lease import holder_safe_deadline, load_lease_policy
 from ..runtime import project_activation
 from ..runtime.paths import lock_path, shared_paths
 from ..runtime.records import validate_identifier
 from ..runtime.registration_protocol import read_registration_document, validate_registration
 from .bindings import ProjectBinding
-from .idle_guard_digest import IDLE_DECISION_SECONDS, IdleGuardCheckpoint, idle_guard_digest
+from .idle_guard_digest import (
+    IDLE_DECISION_SECONDS,
+    MAX_REGISTRATION_HORIZON_NS,
+    IdleGuardCheckpoint,
+    idle_guard_digest,
+)
 from .project_io_protocol import ProjectIORequest
 
 _IDLE_MILLISECONDS = 15_000
@@ -63,7 +70,7 @@ def _send_project_locks(channel: socket.socket, root: Path) -> tuple[os.stat_res
     return root_stat, opened
 
 
-def _read_checkpoint(binding: ProjectBinding) -> IdleGuardCheckpoint:
+def _read_checkpoint(binding: ProjectBinding) -> tuple[IdleGuardCheckpoint, int]:
     root = binding.shared_root
     project = shared_paths(root)["project"]
     if not stat.S_ISDIR(project.lstat().st_mode):
@@ -72,6 +79,8 @@ def _read_checkpoint(binding: ProjectBinding) -> IdleGuardCheckpoint:
     if identity != {"project": {"project_id": binding.project_id, "shared_root": str(root)}}:
         raise ValueError("Idle Job guard Project identity differs from its registry binding.")
     cfg = RootConfig.from_canonical_paths(root, root.parent, binding.machine_name, Path(binding.runtime_root))
+    if not is_idle_job_activation_writers_root(cfg):
+        raise ValueError("Idle Job guard requires Project activation writer support.")
     envelope = read_registration_document(cfg)
     record = envelope.get("registration") if envelope else None
     validate_registration(record, binding.project_id, cfg, allow_source=True)
@@ -80,10 +89,23 @@ def _read_checkpoint(binding: ProjectBinding) -> IdleGuardCheckpoint:
         or record["runtime_instance_id"] != binding.runtime_instance_id
         or record["runtime_root"] != binding.runtime_root
         or record["state"] != "eligible"
-        or parse_utc(record["eligibility_expires_at"])
-        <= datetime.now(timezone.utc) + timedelta(seconds=IDLE_DECISION_SECONDS)
     ):
+        raise ValueError("Idle Job guard registration differs from its eligible registry binding.")
+    policy = load_lease_policy(cfg)
+    try:
+        safe_expiry = holder_safe_deadline(record["eligibility_expires_at"], policy.max_clock_skew_seconds)
+    except OverflowError as exc:
+        raise ValueError("Idle Job guard registration deadline is out of range.") from exc
+    # Sample monotonic time before UTC so a pause between reads shortens the proof.
+    monotonic_now_ns = time.monotonic_ns()
+    remaining = safe_expiry - datetime.now(timezone.utc)
+    if remaining <= timedelta(seconds=IDLE_DECISION_SECONDS):
         raise ValueError("Idle Job guard requires registration eligibility through the decision deadline.")
+    # Account for UTC sampling precision when converting to integer nanoseconds.
+    remaining_us = remaining // timedelta(microseconds=1) - 1
+    registration_horizon_ns = monotonic_now_ns + remaining_us * 1_000
+    if not 0 < registration_horizon_ns <= MAX_REGISTRATION_HORIZON_NS:
+        raise ValueError("Idle Job guard registration deadline is out of range.")
     checkpoint = project_activation.read_project_activation(root)
     try:
         project_activation.activation_pending_path(root).lstat()
@@ -92,19 +114,22 @@ def _read_checkpoint(binding: ProjectBinding) -> IdleGuardCheckpoint:
     else:
         raise RuntimeError("Idle Job guard found a pending Project activation.")
     current = checkpoint["project_activation"] if checkpoint is not None else {}
-    return (
+    row = (
         binding.project_id,
         binding.registration_generation,
         str(root),
         current.get("epoch"),
         current.get("sequence"),
     )
+    return row, registration_horizon_ns
 
 
 def _answer_check(channel: socket.socket, bindings: tuple[ProjectBinding, ...]) -> None:
     try:
         opened = [_send_project_locks(channel, binding.shared_root) for binding in bindings]
-        digest = idle_guard_digest(_read_checkpoint(binding) for binding in bindings)
+        observations = [_read_checkpoint(binding) for binding in bindings]
+        digest = idle_guard_digest(row for row, _ in observations)
+        horizon_ns = min((deadline_ns for _, deadline_ns in observations), default=None)
         for binding, (root_stat, locks) in zip(bindings, opened, strict=True):
             if not os.path.samestat(root_stat, binding.shared_root.lstat()):
                 raise RuntimeError("Idle Job guard Project root changed during the check.")
@@ -114,7 +139,8 @@ def _answer_check(channel: socket.socket, bindings: tuple[ProjectBinding, ...]) 
     except _UNAVAILABLE_ERRORS:
         channel.send(b"unknown")
         return
-    channel.send(b"ok:" + digest.encode("ascii"))
+    response = f"ok:{digest}" if horizon_ns is None else f"ok:{digest}:{horizon_ns}"
+    channel.send(response.encode("ascii"))
 
 
 def _enabled_bindings(

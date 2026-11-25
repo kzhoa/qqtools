@@ -22,6 +22,8 @@ from contextlib import AbstractContextManager, ExitStack, nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from socket import socket
+from subprocess import Popen
 from typing import Any
 
 from ..gpu_policy import GpuReservationPolicy, resolve_gpu_policy, validate_gpu_reservation
@@ -39,9 +41,11 @@ from ..runtime.resources.idle_job import (
     write_idle_job_ownership,
 )
 from ..runtime.resources.reservations import reservation_snapshot
-from ..runtime.store import atomic_replace, iter_json, json_encoded_size, read_json, read_json_limited
+from ..runtime.responsibility_store import DurableIO
+from ..runtime.store import atomic_replace, json_encoded_size, read_json, read_json_limited
 from .bindings import ProjectBinding
 from .config import load_agent_config
+from .idle_guard_digest import IDLE_DECISION_SECONDS
 from .idle_job_config import (
     IdleJobConfig,
     command_argv,
@@ -61,11 +65,13 @@ from .idle_job_diagnostics import (
 )
 from .idle_job_process import (
     current_boot_id,
+    idle_job_intent_matches_owner,
     idle_job_processes_exited,
     read_idle_job_process,
     request_idle_job_stop,
     spawn_idle_job,
 )
+from .idle_launch_permit import create_idle_launch_permit, poll_idle_launch_ready, send_idle_launch_permit
 from .launch_handoff_state import LaunchHandoffState
 
 IDLE_JOB_STATUS_VERSION = 1
@@ -75,9 +81,10 @@ NORMAL_EXIT_RETRY_SECONDS = 1.0
 MAX_RETAINED_IDLE_JOB_INSTANCES = 5
 DEFAULT_SHUTDOWN_EXTRA_SECONDS = 5.0
 SUPERVISOR_POLL_SECONDS = 0.05
+PREPARATION_TIMEOUT_SECONDS = 30.0
 
 _INSTANCE_ID_PATTERN = re.compile(r"[0-9a-f]{32}\Z")
-_ACTIVE_STATES = frozenset({"launching", "running", "stopping"})
+_ACTIVE_STATES = frozenset({"launching", "prepared", "running", "stopping"})
 _STATUS_STATES = frozenset({"disabled", "waiting", "running", "stopping", "backoff", "blocked"})
 _STOP_REASONS = frozenset(
     {
@@ -169,6 +176,52 @@ class _ConfigObservation:
     def __init__(self, config: IdleJobConfig, agent_mode: str) -> None:
         self.config = config
         self.agent_mode = agent_mode
+
+
+@dataclass(slots=True)
+class _PreparedIdleJob:
+    owner: dict[str, Any]
+    intent: dict[str, Any]
+    directory: Path
+    observation_key: str
+    idle_since: float
+    ready_until: float
+    endpoint: socket | None = None
+    child: Popen[bytes] | None = None
+    ready: bool = False
+    permit_sent: bool = False
+    spawn_failed: bool = False
+
+    def close_permit(self) -> None:
+        endpoint, self.endpoint = self.endpoint, None
+        if endpoint is not None:
+            endpoint.close()
+
+    def matches(self, owner: dict[str, Any]) -> bool:
+        return self.owner == {**owner, "phase": "prepared"}
+
+    def intent_matches(self) -> bool:
+        path = self.directory / "intent.json"
+        try:
+            if not stat.S_ISDIR(self.directory.lstat().st_mode):
+                return False
+            mode = path.lstat().st_mode
+        except FileNotFoundError:
+            return False
+        if not stat.S_ISREG(mode):
+            return False
+        return read_json_limited(path, max_bytes=65_536, record_type="idle_job_intent") == {
+            "idle_job_intent": self.intent
+        }
+
+
+_UNOBSERVED_OWNER = object()
+
+
+def _same_owner(left: dict[str, Any] | None, right: object) -> bool:
+    if left is None or not isinstance(right, dict):
+        return left is right
+    return {**left, "phase": right["phase"]} == right
 
 
 def _root(value: Any) -> Path:
@@ -431,6 +484,10 @@ def _default_status(runtime_id: str | None, *, state: str, reason: str) -> dict[
     }
 
 
+def _owner_preparing(owner: Mapping[str, Any]) -> bool:
+    return owner["version"] == 2 and owner["phase"] in {"prepared", "launching"}
+
+
 def _idle_job_status(runtime: Any) -> dict[str, Any]:
     """Read the independent machine-local Idle Job status projection.
 
@@ -451,11 +508,14 @@ def _idle_job_status(runtime: Any) -> dict[str, Any]:
     try:
         payload = _read_status_payload(root, include_diagnostics=True)
     except FileNotFoundError:
-        payload = _default_status(
-            runtime_id,
-            state="blocked" if ownership_exists else "disabled",
-            reason="malformed_status" if ownership_exists else "disabled",
-        )
+        if ownership is not None and _owner_preparing(ownership):
+            payload = _default_status(runtime_id, state="waiting", reason="preparing")
+        else:
+            payload = _default_status(
+                runtime_id,
+                state="blocked" if ownership_exists else "disabled",
+                reason="malformed_status" if ownership_exists else "disabled",
+            )
     except (OSError, TypeError, ValueError, KeyError):
         payload = _default_status(runtime_id, state="blocked", reason="malformed_status")
     if payload.get("runtime_id") is None:
@@ -477,7 +537,10 @@ def _idle_job_status(runtime: Any) -> dict[str, Any]:
                 payload["configured_gpu_ids"] = list(config.gpu_ids)
                 if not config.enabled:
                     payload.update(state="disabled", reason="disabled", process=None, started_at=None)
-                elif payload["state"] in {"running", "stopping", "disabled"} or payload["reason"] == "launching":
+                elif payload["state"] in {"running", "stopping", "disabled"} or payload["reason"] in {
+                    "launching",
+                    "preparing",
+                }:
                     state = _canonical_state(
                         read_json_limited(_state_path(root), max_bytes=65_536, record_type="idle_job_state")
                     )
@@ -512,15 +575,21 @@ def _idle_job_status(runtime: Any) -> dict[str, Any]:
         payload["supervision_active"] = True
         return payload
     expected_state = ownership["phase"]
-    visible_state = "waiting" if expected_state == "launching" else expected_state
-    if payload.get("state") == "disabled" or payload.get("state") not in {"waiting", "running", "stopping"}:
+    preparing = _owner_preparing(ownership)
+    if preparing:
+        payload.update(process=None, started_at=None)
+        if payload["state"] != "blocked":
+            payload.update(state="waiting", reason="preparing")
+    elif payload.get("state") == "disabled" or payload.get("state") not in {"waiting", "running", "stopping"}:
+        visible_state = "waiting" if expected_state == "launching" else expected_state
         payload["state"] = visible_state
     payload["supervision_active"] = True
     payload["runtime_id"] = ownership["runtime_id"]
     payload["config_revision"] = ownership["config_revision"]
     payload["resolved_gpu_ids"] = list(ownership["gpu_ids"])
     payload["log_path"] = str(idle_job_instance_path(root, ownership["instance_id"]) / "command.log")
-    payload["started_at"] = payload.get("started_at") or ownership["created_at"]
+    if not preparing and (ownership["version"] == 1 or expected_state == "running"):
+        payload["started_at"] = payload.get("started_at") or ownership["created_at"]
     return payload
 
 
@@ -560,7 +629,7 @@ class IdleJobSupervisor:
         self._observation_key: str | None = None
         self._last_handoff_revision: int | None = None
         self._last_decision_evidence: IdleDecisionEvidence | None = None
-        self._deferred_stop: tuple[str, str | None] | None = None
+        self._deferred_stop: tuple[str, str | None, dict[str, Any] | None | object] | None = None
         # Restart interrupts proof of continuous idleness.
         self._idle_since: float | None = None
         self._retry_at: float | None = None
@@ -585,6 +654,7 @@ class IdleJobSupervisor:
         self._last_stop_instance_id: str | None = None
         self._state_corrupt = False
         self._children = []
+        self._preparation: _PreparedIdleJob | None = None
         self._supervision_active = True
         self._load_state()
 
@@ -720,6 +790,7 @@ class IdleJobSupervisor:
             self._last_demand_detail = None
 
     def _blocked(self, reason: str) -> dict[str, Any]:
+        self._close_prepared_permit()
         self._clear_idle_interval(reason)
         self._status_state = "blocked"
         self._status_reason = reason
@@ -886,23 +957,15 @@ class IdleJobSupervisor:
             {"idle_elapsed_seconds": elapsed, "last_reset": self._last_interval_reset, "last_stop": self._last_stop}
         )
 
-    def _idle_elapsed(self, now_wall: float) -> float:
-        if self._idle_since is None:
-            self._idle_since = self._now()
-            return 0.0
-        return max(0.0, self._now() - self._idle_since)
-
-    def _ownership_for_instance(self, instance_id: str) -> dict[str, Any] | None:
-        try:
-            return read_idle_job_ownership(self.root)
-        except (OSError, RuntimeError, TypeError, ValueError, KeyError):
-            return None
+    def _close_prepared_permit(self) -> None:
+        if self._preparation is not None:
+            self._preparation.close_permit()
 
     def _set_owner_fields(self, owner: dict[str, Any], process: dict[str, Any] | None) -> None:
         self._instance_id = owner["instance_id"]
         self._resolved_gpu_ids = list(owner["gpu_ids"])
         self._config_revision = owner["config_revision"]
-        self._started_at = owner["created_at"]
+        self._started_at = owner["created_at"] if owner["version"] == 1 or process is not None else None
         self._log_path = str(idle_job_instance_path(self.root, owner["instance_id"]) / "command.log")
         self._process = _copy_json(process) if process is not None else None
 
@@ -947,9 +1010,10 @@ class IdleJobSupervisor:
         instance_dir = idle_job_instance_path(self.root, owner["instance_id"])
         try:
             exit_record = _read_exit_record(instance_dir)
-        except (OSError, TypeError, ValueError, KeyError):
-            exit_record = None
-        try:
+            if exit_record is not None and any(
+                exit_record[key] != owner[key] for key in ("instance_id", "runtime_id", "boot_id")
+            ):
+                return False
             self._terminal_exit(owner, exit_record, fallback)
             if exit_record is None:
                 atomic_replace(instance_dir / "exit.json", {"idle_job_exit": self._last_exit})
@@ -959,6 +1023,9 @@ class IdleJobSupervisor:
             return False
         if current is not None:
             return False
+        if self._preparation is not None and self._preparation.matches(owner):
+            self._close_prepared_permit()
+            self._preparation = None
         self._instance_id = None
         self._started_at = None
         self._log_path = self._log_path or str(instance_dir / "command.log")
@@ -973,6 +1040,10 @@ class IdleJobSupervisor:
             owner = read_idle_job_ownership(self.root)
         except (OSError, RuntimeError, TypeError, ValueError, KeyError):
             return None, "malformed_ownership"
+        preparation = self._preparation
+        if preparation is not None and (owner is None or not preparation.matches(owner)):
+            preparation.close_permit()
+            self._preparation = preparation = None
         if owner is None:
             self._instance_id = None
             self._process = None
@@ -993,6 +1064,8 @@ class IdleJobSupervisor:
             self._set_owner_fields(owner, None)
             return owner, "foreign_instance"
         try:
+            if not idle_job_intent_matches_owner(instance_dir, owner):
+                return owner, "foreign_instance"
             process = read_idle_job_process(instance_dir)
         except (OSError, RuntimeError, TypeError, ValueError, KeyError):
             self._set_owner_fields(owner, None)
@@ -1006,6 +1079,14 @@ class IdleJobSupervisor:
             return owner, "foreign_process"
         try:
             exited = idle_job_processes_exited(instance_dir)
+            if (
+                not exited
+                and preparation is not None
+                and (
+                    preparation.spawn_failed or (preparation.child is not None and preparation.child.poll() is not None)
+                )
+            ):
+                exited = self._seal_unstarted_locked(preparation)
         except (OSError, RuntimeError, TypeError, ValueError, KeyError):
             self._set_owner_fields(owner, process)
             return owner, "cleanup_uncertain"
@@ -1014,10 +1095,14 @@ class IdleJobSupervisor:
                 self._set_owner_fields(owner, process)
                 return owner, "cleanup_uncertain"
             return None, None
-        if owner["phase"] == "running" and process is None:
+        command_started = process is not None and (owner["version"] == 1 or process.get("command_started") is True)
+        if owner["phase"] == "running" and not command_started:
             self._set_owner_fields(owner, None)
             return owner, "process_unregistered"
-        if owner["phase"] == "launching" and process is not None:
+        if owner["phase"] == "prepared" and command_started:
+            self._set_owner_fields(owner, None)
+            return owner, "unexpected_command_start"
+        if owner["phase"] == "launching" and command_started:
             running = dict(owner)
             running["phase"] = "running"
             try:
@@ -1026,12 +1111,13 @@ class IdleJobSupervisor:
                 self._set_owner_fields(owner, process)
                 return owner, "ownership_update_failed"
             owner = running
-        self._set_owner_fields(owner, process)
+        self._set_owner_fields(owner, process if command_started else None)
         return owner, None
 
     def _stop_locked(
         self, reason: str, owner: dict[str, Any] | None = None
     ) -> tuple[dict[str, Any] | None, str | None]:
+        self._close_prepared_permit()
         self._clear_idle_interval(reason)
         self._observation_key = None
         current = owner
@@ -1073,27 +1159,6 @@ class IdleJobSupervisor:
         self._deferred_stop = None
         return current, None
 
-    def _reserved_gpu_ids_locked(self) -> set[int]:
-        paths = machine_runtime_paths(self.root)
-        result: set[int] = set()
-        now = datetime.now(timezone.utc)
-        for directory, provisional in ((paths["active"], False), (paths["provisional"], True)):
-            for path in iter_json(directory):
-                try:
-                    value = read_json(path).get("reservation", {})
-                    if provisional:
-                        expires_at = value.get("expires_at")
-                        if expires_at:
-                            expiry = datetime.fromisoformat(str(expires_at).replace("Z", "+00:00"))
-                            if expiry <= now:
-                                continue
-                    ids = value.get("gpu_ids", [])
-                    if isinstance(ids, list):
-                        result.update(gpu_id for gpu_id in ids if type(gpu_id) is int and gpu_id >= 0)
-                except (OSError, TypeError, ValueError, KeyError):
-                    raise _SupervisorBlocked("GPU reservation state is uncertain")
-        return result
-
     def _make_instance_directory(self, instance_id: str) -> Path:
         instances = self.root / "idle-job" / "instances"
         if instances.exists():
@@ -1106,6 +1171,9 @@ class IdleJobSupervisor:
         if path.exists() or path.is_symlink():
             raise _SupervisorBlocked("Idle Job instance already exists")
         path.mkdir()
+        durability = DurableIO()
+        for parent in (instances, instances.parent, self.root):
+            durability.sync_directory(parent, "idle_job_prepare")
         return path
 
     def _record_failure_locked(self, reason: str, *, error: BaseException | None = None) -> dict[str, Any]:
@@ -1128,113 +1196,129 @@ class IdleJobSupervisor:
         self._persist_state()
         return self._publish(state="backoff", reason=reason)
 
-    def _launch_locked(
-        self,
-        config: IdleJobConfig,
-        resolved: tuple[int, ...],
-        boot_id: str,
-    ) -> dict[str, Any]:
+    def _persist_preparation_locked(
+        self, config: IdleJobConfig, resolved: tuple[int, ...], boot_id: str
+    ) -> _PreparedIdleJob:
         instance_id = uuid.uuid4().hex
-        try:
-            instance_dir = self._make_instance_directory(instance_id)
-            parent_start_ticks = process_start_time_ticks(os.getpid())
-            if parent_start_ticks is None:
-                raise _SupervisorBlocked("cannot establish supervisor process identity")
-            command = command_argv(config.command)
-            working_directory = Path(config.working_directory) if config.working_directory else self.root
-            intent = {
-                "version": 1,
-                "runtime_id": self.runtime_id,
-                "instance_id": instance_id,
-                "command": list(command),
-                "working_directory": str(working_directory),
-                "gpu_ids": list(resolved),
-                "stop_timeout_seconds": config.stop_timeout_seconds,
-                "parent_pid": os.getpid(),
-                "parent_start_ticks": parent_start_ticks,
-                "boot_id": boot_id,
-            }
-            atomic_replace(instance_dir / "intent.json", {"idle_job_intent": intent})
-            owner = {
-                "version": 1,
-                "runtime_id": self.runtime_id,
-                "boot_id": boot_id,
-                "instance_id": instance_id,
-                "phase": "launching",
-                "config_revision": config.revision,
-                "gpu_ids": list(resolved),
-                "parent_pid": os.getpid(),
-                "parent_start_ticks": parent_start_ticks,
-                "created_at": utc_now(),
-            }
-            write_idle_job_ownership(self.root, owner)
-            self._set_owner_fields(owner, None)
-            child = spawn_idle_job(
-                instance_dir,
-                runtime_id=self.runtime_id,
-                instance_id=instance_id,
-                command=command,
-                working_directory=working_directory,
-                gpu_ids=resolved,
-                stop_timeout_seconds=config.stop_timeout_seconds,
-                parent_pid=os.getpid(),
-                parent_start_ticks=parent_start_ticks,
-            )
-            self._children.append(child)
-        except (OSError, RuntimeError, TypeError, ValueError, KeyError) as exc:
-            # Popen did not return: no supervisor was launched successfully.
-            # Seal the unique intent against future spawning before releasing
-            # ownership, and make this terminal failure eligible for retention.
-            try:
-                owner = read_idle_job_ownership(self.root)
-                if owner is not None and owner.get("instance_id") == instance_id:
-                    atomic_replace(
-                        instance_dir / "exit.json",
-                        {
-                            "idle_job_exit": {
-                                "version": 1,
-                                "runtime_id": self.runtime_id,
-                                "instance_id": instance_id,
-                                "boot_id": boot_id,
-                                "returncode": None,
-                                "reason": "launch_failed",
-                                "exited_at": utc_now(),
-                            }
-                        },
-                    )
-                    if not self._clear_owner_after_exit(owner, fallback="launch_failed"):
-                        return self._blocked("cleanup_uncertain")
-                    return self._publish(state="backoff", reason="launch_failed")
-            except (OSError, RuntimeError, TypeError, ValueError, KeyError):
-                return self._blocked("cleanup_uncertain")
-            self._instance_id = None
-            return self._record_failure_locked("launch_failed", error=exc)
+        parent_pid = os.getpid()
+        parent_start_ticks = process_start_time_ticks(parent_pid)
+        idle_since = self._idle_since
+        observation_key = self._observation_key
+        if parent_start_ticks is None or idle_since is None or observation_key is None:
+            raise _SupervisorBlocked("cannot establish Idle Job preparation identity")
+        instance_dir = self._make_instance_directory(instance_id)
+        owner = {
+            "version": 2,
+            "runtime_id": self.runtime_id,
+            "boot_id": boot_id,
+            "instance_id": instance_id,
+            "phase": "prepared",
+            "config_revision": config.revision,
+            "gpu_ids": list(resolved),
+            "parent_pid": parent_pid,
+            "parent_start_ticks": parent_start_ticks,
+            "created_at": utc_now(),
+        }
+        intent = {
+            "version": 2,
+            "runtime_id": self.runtime_id,
+            "instance_id": instance_id,
+            "command": list(command_argv(config.command)),
+            "working_directory": str(Path(config.working_directory) if config.working_directory else self.root),
+            "gpu_ids": list(resolved),
+            "stop_timeout_seconds": config.stop_timeout_seconds,
+            "parent_pid": parent_pid,
+            "parent_start_ticks": parent_start_ticks,
+            "boot_id": boot_id,
+        }
+        preparation = _PreparedIdleJob(
+            owner, intent, instance_dir, observation_key, idle_since, time.monotonic() + PREPARATION_TIMEOUT_SECONDS
+        )
+        self._preparation = preparation
+        atomic_replace(instance_dir / "intent.json", {"idle_job_intent": intent})
+        write_idle_job_ownership(self.root, owner)
+        self._set_owner_fields(owner, None)
+        return preparation
 
-        try:
-            process = read_idle_job_process(instance_dir)
-        except (OSError, RuntimeError, TypeError, ValueError, KeyError):
-            self._process = None
-            return self._blocked("malformed_process")
-        if process is not None:
-            if (
-                process.get("runtime_id") != self.runtime_id
-                or process.get("instance_id") != instance_id
-                or process.get("boot_id") != boot_id
-            ):
-                return self._blocked("foreign_process")
-            running = dict(owner)
-            running["phase"] = "running"
+    def _seal_unstarted_locked(self, preparation: _PreparedIdleJob) -> bool:
+        """Seal an exact preparation after its only spawn attempt was ruled out or reaped."""
+        child = preparation.child
+        if (child is None and not preparation.spawn_failed) or (child is not None and child.poll() is None):
+            return False
+        if not preparation.intent_matches():
+            return False
+        for name in ("supervisor.json", "process.json"):
             try:
-                write_idle_job_ownership(self.root, running)
-            except (OSError, RuntimeError, TypeError, ValueError, KeyError):
-                return self._blocked("ownership_update_failed")
-            self._set_owner_fields(running, process)
-            self._retry_at = None
-            self._persist_state()
-            return self._publish(state="running", reason="running")
-        self._retry_at = None
-        self._persist_state()
-        return self._publish(state="launching", reason="launching")
+                (preparation.directory / name).lstat()
+            except FileNotFoundError:
+                continue
+            return False
+        exit_path = preparation.directory / "exit.json"
+        try:
+            exit_path.lstat()
+        except FileNotFoundError:
+            atomic_replace(
+                exit_path,
+                {
+                    "idle_job_exit": {
+                        "version": 1,
+                        "runtime_id": preparation.owner["runtime_id"],
+                        "instance_id": preparation.owner["instance_id"],
+                        "boot_id": preparation.owner["boot_id"],
+                        "returncode": None,
+                        "reason": "launch_failed",
+                        "exited_at": utc_now(),
+                    }
+                },
+            )
+        return idle_job_processes_exited(preparation.directory)
+
+    def _preparation_failed_locked(self, error: BaseException) -> dict[str, Any]:
+        preparation = self._preparation
+        if preparation is not None:
+            preparation.spawn_failed = True
+        self._close_prepared_permit()
+        owner = read_idle_job_ownership(self.root)
+        if owner is not None:
+            if (
+                preparation is None
+                or not preparation.matches(owner)
+                or not self._seal_unstarted_locked(preparation)
+                or not self._clear_owner_after_exit(owner, fallback="launch_failed")
+            ):
+                return self._blocked("cleanup_uncertain")
+            return self._publish(state="backoff", reason="launch_failed")
+        self._preparation = None
+        self._instance_id = None
+        if preparation is not None:
+            self._seal_unstarted_locked(preparation)
+        return self._record_failure_locked("launch_failed", error=error)
+
+    def _spawn_prepared(self, preparation: _PreparedIdleJob) -> None:
+        """Start a gated helper after relinquishing the Project and admission locks."""
+        if time.monotonic() >= preparation.ready_until:
+            raise _SupervisorBlocked("Idle Job preparation expired before spawn")
+        controller, helper = create_idle_launch_permit()
+        preparation.endpoint = controller
+        intent = preparation.intent
+        try:
+            with helper:
+                preparation.child = spawn_idle_job(
+                    preparation.directory,
+                    runtime_id=intent["runtime_id"],
+                    instance_id=intent["instance_id"],
+                    command=tuple(intent["command"]),
+                    working_directory=Path(intent["working_directory"]),
+                    gpu_ids=tuple(intent["gpu_ids"]),
+                    stop_timeout_seconds=intent["stop_timeout_seconds"],
+                    parent_pid=intent["parent_pid"],
+                    parent_start_ticks=intent["parent_start_ticks"],
+                    permit_socket=helper,
+                )
+            self._children.append(preparation.child)
+        except BaseException:
+            preparation.close_permit()
+            raise
 
     def _verified_terminal(self, path: Path, boot_id: str) -> tuple[float, str] | None:
         if not _safe_instance_id(path.name) or not _instance_directory_is_safe(path):
@@ -1296,9 +1380,12 @@ class IdleJobSupervisor:
         self._instance_id = None
         return self._publish(state=state, reason=reason)
 
-    def _defer_stop(self, reason: str) -> dict[str, Any]:
+    def _defer_stop(
+        self, reason: str, expected_owner: dict[str, Any] | None | object = _UNOBSERVED_OWNER
+    ) -> dict[str, Any]:
+        self._close_prepared_permit()
         if self._deferred_stop is None:
-            self._deferred_stop = (reason, self._pending_demand_check)
+            self._deferred_stop = (reason, self._pending_demand_check, expected_owner)
         self._clear_idle_interval(reason)
         self._observation_key = None
         if self._instance_id is None and reason == "unknown_demand":
@@ -1306,13 +1393,28 @@ class IdleJobSupervisor:
         return self._blocked("ownership_reconciliation_failed")
 
     def _settle_stop(
-        self, boot_id: str, config: IdleJobConfig | None, reason: str, *, resume_if_unowned: bool = False
+        self,
+        boot_id: str,
+        config: IdleJobConfig | None,
+        reason: str,
+        *,
+        resume_if_unowned: bool = False,
+        expected_owner: dict[str, Any] | None | object = _UNOBSERVED_OWNER,
     ) -> dict[str, Any] | None:
         """Stop under the ownership fence, deferring an unverified owner to a later tick."""
+        self._close_prepared_permit()
         try:
             with idle_job_guard(self.root, blocking=False) as acquired:
                 if not acquired:
-                    return self._defer_stop(reason)
+                    return self._defer_stop(reason, expected_owner)
+                if expected_owner is not _UNOBSERVED_OWNER and not _same_owner(
+                    read_idle_job_ownership(self.root), expected_owner
+                ):
+                    self._deferred_stop = None
+                    self._clear_idle_interval(reason)
+                    self._observation_key = None
+                    self._last_handoff_revision = None
+                    return self._blocked("ownership_changed")
                 owner, error = self._reconcile_locked(boot_id)
                 if error is not None:
                     return self._blocked(error)
@@ -1343,13 +1445,120 @@ class IdleJobSupervisor:
         except (OSError, RuntimeError, TypeError, ValueError, KeyError):
             return self._blocked("supervision_failed")
 
-    def _reject_idle_decision(self, boot_id: str, config: IdleJobConfig, check: str) -> dict[str, Any]:
+    def _reject_idle_decision(
+        self, boot_id: str, config: IdleJobConfig, check: str, owner: dict[str, Any] | None
+    ) -> dict[str, Any]:
         self.set_demand_observation(
             "unknown", build_demand_observation(check), agent_instance_id=self._pending_agent_instance_id
         )
-        status = self._settle_stop(boot_id, config, "unknown_demand")
+        status = self._settle_stop(boot_id, config, "unknown_demand", expected_owner=owner)
         assert status is not None
         return status
+
+    def _observe_local_idle_locked(
+        self,
+        owner: dict[str, Any] | None,
+        observation: _ConfigObservation,
+        policy_key: str,
+        resolved: tuple[int, ...],
+        reservation_policy: GpuReservationPolicy | None,
+        evidence: IdleDecisionEvidence | None,
+    ) -> tuple[dict[str, Any] | None, str, str | None]:
+        """Inspect local fences without publishing state or reconciling ownership."""
+        current_owner = read_idle_job_ownership(self.root)
+        if not _same_owner(current_owner, owner):
+            raise _IdleDecisionRejected("demand_census_unknown")
+        owner = current_owner
+        current = self._load_config()
+        demand_revision = read_idle_job_demand(self.root)
+        key = self._observation_key_for("idle", demand_revision, current.config, policy_key)
+        if current.config != observation.config or current.agent_mode != observation.agent_mode:
+            return owner, key, "config_changed"
+        if owner is not None:
+            if owner["phase"] == "stopping":
+                return owner, key, "stopping"
+            if owner["config_revision"] != current.config.revision:
+                return owner, key, "config_changed"
+            if tuple(owner["gpu_ids"]) != resolved:
+                return owner, key, "gpu_changed"
+            if self._idle_since is not None and self._observation_key != key:
+                raise _IdleDecisionRejected("demand_census_unknown")
+        if evidence is not None:
+            cpu_policy = get_cpu_lane_policy(self.root, blocking=False)
+            if (
+                cpu_policy.revision != evidence.cpu_policy_revision
+                or cpu_policy.capacity != evidence.cpu_capacity
+                or ((self._idle_since is not None or owner is not None) and self._last_decision_evidence != evidence)
+            ):
+                raise _IdleDecisionRejected("demand_census_unknown")
+        try:
+            snapshot = reservation_snapshot(self.root, blocking=False, reconcile_expired=False)
+        except (AttributeError, OSError, RuntimeError, TypeError, ValueError, KeyError) as exc:
+            raise _IdleDecisionRejected("demand_census_unknown") from exc
+        if snapshot.active or snapshot.provisional:
+            return owner, key, "gpu_reserved"
+        paths = machine_runtime_paths(self.root)
+        with exclusive(paths["reservation_lock"], blocking=False) as acquired:
+            if not acquired:
+                raise _IdleDecisionRejected("demand_census_unknown")
+            current_policy, _ = self._policy_mapping(reservation_policy)
+            if self._policy_key(current_policy, resolved) != policy_key or (
+                evidence is not None and not evidence.matches_gpu_policy(current_policy)
+            ):
+                raise _IdleDecisionRejected("demand_census_unknown")
+            try:
+                if reservation_policy is not None:
+                    validate_gpu_reservation(self.root, list(resolved), reservation_policy)
+            except (OSError, RuntimeError, TypeError, ValueError, KeyError):
+                return owner, key, "gpu_policy_unavailable"
+        return owner, key, None
+
+    def _finish_idle_observation_locked(
+        self,
+        owner: dict[str, Any] | None,
+        config: IdleJobConfig,
+        resolved: tuple[int, ...],
+        key: str,
+        reason: str | None,
+        launch_allowed: bool,
+        boot_id: str,
+        now_wall: float,
+    ) -> dict[str, Any] | _PreparedIdleJob:
+        """Apply the observed outcome with the local admission fence still held."""
+        if reason is not None:
+            self._clear_idle_interval(reason, replacement_key=key if key != self._observation_key else None)
+            if reason == "stopping":
+                self._close_prepared_permit()
+                return self._publish(state="stopping", reason=reason)
+            if owner is not None:
+                _, error = self._stop_locked(reason, owner)
+                if error is not None:
+                    return self._blocked(error)
+                return self._publish(state="stopping", reason=reason)
+            if reason == "gpu_policy_unavailable":
+                return self._blocked(reason)
+            self._resolved_gpu_ids = list(resolved)
+            return self._publish(state="waiting", reason=reason)
+        if owner is not None:
+            if _owner_preparing(owner):
+                return self._publish(state="waiting", reason="preparing")
+            return self._publish(state=owner["phase"], reason=owner["phase"])
+        if not launch_allowed:
+            if key != self._observation_key:
+                self._clear_idle_interval("observation_changed", replacement_key=key)
+                self._observation_key = key
+            return self._publish(state="waiting", reason="partition_scan_pending")
+
+        self._reset_observation_if_changed(key, now_wall)
+        self._resolved_gpu_ids = list(resolved)
+        if self._idle_since is None or self._now() - self._idle_since < config.idle_delay_seconds:
+            return self._publish(state="waiting", reason="idle_delay")
+        if self._retry_at is not None and now_wall < self._retry_at:
+            return self._publish(state="backoff", reason="backoff")
+        try:
+            return self._persist_preparation_locked(config, resolved, boot_id)
+        except (OSError, RuntimeError, TypeError, ValueError, KeyError) as exc:
+            return self._preparation_failed_locked(exc)
 
     def tick(
         self,
@@ -1378,41 +1587,70 @@ class IdleJobSupervisor:
             observation = self._load_config()
             config = observation.config
         except (OSError, RuntimeError, TypeError, ValueError, KeyError):
-            config = None
-        else:
-            self._set_config_fields(config)
+            status = self._settle_stop(boot_id, None, "config_invalid")
+            assert status is not None
+            return status
+        self._set_config_fields(config)
 
         resume_if_unowned = False
-        if config is None:
-            stop_reason = "config_invalid"
-        elif not config.enabled:
+        expected_stop_owner = _UNOBSERVED_OWNER
+        if not config.enabled:
             stop_reason = "disabled"
         elif observed_demand == "busy":
             stop_reason = "busy"
         elif observed_demand == "unknown":
             stop_reason = "unknown_demand"
         elif self._deferred_stop is not None:
-            stop_reason, self._pending_demand_check = self._deferred_stop
+            stop_reason, self._pending_demand_check, expected_stop_owner = self._deferred_stop
             resume_if_unowned = True
         else:
             stop_reason = None
-
         if stop_reason is not None:
-            status = self._settle_stop(boot_id, config, stop_reason, resume_if_unowned=resume_if_unowned)
+            status = self._settle_stop(
+                boot_id, config, stop_reason, resume_if_unowned=resume_if_unowned, expected_owner=expected_stop_owner
+            )
             if status is not None:
                 return status
-        assert config is not None
 
-        if not guarded:
+        if guarded:
+            # A selector outside the observed inventory already requires local
+            # stopping, even if admission is too busy to reconcile the owner.
             try:
-                with idle_job_guard(self.root, blocking=False) as acquired:
-                    if not acquired:
-                        return self._defer_stop("unknown_demand")
-                    _, error = self._reconcile_locked(boot_id)
-                    if error is not None:
-                        return self._blocked(error)
-            except (OSError, RuntimeError, TypeError, ValueError, KeyError):
-                return self._blocked("ownership_reconciliation_failed")
+                resolve_idle_job_gpus(config.gpu_ids, decision_evidence.visible_gpu_ids)
+            except ValueError:
+                status = self._settle_stop(boot_id, config, "gpu_policy_unavailable")
+                assert status is not None
+                return status
+
+        try:
+            with idle_job_guard(self.root, blocking=False) as acquired:
+                if not acquired:
+                    return self._defer_stop("unknown_demand")
+                owner, error = self._reconcile_locked(boot_id)
+                if error is not None:
+                    return self._blocked(error)
+        except (OSError, RuntimeError, TypeError, ValueError, KeyError):
+            return self._blocked("ownership_reconciliation_failed")
+
+        preparation = self._preparation
+        if (
+            owner is not None
+            and owner["phase"] == "prepared"
+            and (
+                preparation is None
+                or (not preparation.permit_sent and preparation.endpoint is None)
+                or (not preparation.permit_sent and time.monotonic() >= preparation.ready_until)
+            )
+        ):
+            return self._reject_idle_decision(boot_id, config, "demand_census_unknown", owner)
+        if (
+            not launch_allowed
+            and owner is not None
+            and (
+                owner["phase"] not in {"prepared", "stopping"} or (preparation is not None and preparation.permit_sent)
+            )
+        ):
+            return self._reject_idle_decision(boot_id, config, "demand_census_unknown", owner)
 
         try:
             resolved, policy, reservation_policy = (
@@ -1422,148 +1660,115 @@ class IdleJobSupervisor:
             )
             policy_key = self._policy_key(policy, resolved)
         except _IdleDecisionRejected as exc:
-            return self._reject_idle_decision(boot_id, config, str(exc))
+            return self._reject_idle_decision(boot_id, config, str(exc), owner)
         except (OSError, RuntimeError, TypeError, ValueError, KeyError) as exc:
             reason = "gpu_reserved" if isinstance(exc, _GpuReserved) else "gpu_policy_unavailable"
-            status = self._settle_stop(boot_id, config, reason)
+            status = self._settle_stop(boot_id, config, reason, expected_owner=owner)
             assert status is not None
             return status
 
         try:
-            handoffs = (
-                getattr(self.runtime, "pending_launch_handoffs", None)
-                if expected_handoff_revision is not None
-                else None
-            )
-            has_handoff_fence = isinstance(handoffs, LaunchHandoffState)
-            handoff_guard = handoffs.read_guard(blocking=not guarded) if has_handoff_fence else nullcontext(True)
-            with ExitStack() as stack:
-                if guarded and (
-                    decision_guard is None or decision_deadline is None or not stack.enter_context(decision_guard)
-                ):
-                    raise _IdleDecisionRejected("demand_census_unknown")
-                if not stack.enter_context(handoff_guard):
-                    raise _IdleDecisionRejected("launch_handoff_pending")
-                if not stack.enter_context(idle_job_guard(self.root, blocking=False)):
-                    raise _IdleDecisionRejected("demand_census_unknown")
-                current_owner, error = self._reconcile_locked(boot_id)
-                if error is not None:
-                    return self._blocked(error)
-                try:
-                    current_observation = self._load_config()
-                    current_demand_revision = read_idle_job_demand(self.root)
-                except (OSError, RuntimeError, TypeError, ValueError, KeyError):
-                    return self._blocked("config_changed")
-                key = self._observation_key_for(
-                    observed_demand, current_demand_revision, current_observation.config, policy_key
-                )
-                config_changed = (
-                    current_observation.config != config or current_observation.agent_mode != observation.agent_mode
-                )
-                if config_changed or (current_owner is not None and current_owner["phase"] == "stopping"):
-                    self._clear_idle_interval(
-                        "config_changed" if config_changed else "stopping",
-                        replacement_key=key if key != self._observation_key else None,
-                    )
-                if config_changed:
-                    return self._publish(state="waiting", reason="config_changed")
-                if decision_evidence is not None and (current_owner is None or current_owner["phase"] != "stopping"):
-                    current_policy, _ = self._policy_mapping(gpu_policy)
-                    cpu_policy = get_cpu_lane_policy(self.root, blocking=False)
-                    if (
-                        time.monotonic() >= decision_deadline
-                        or not decision_evidence.matches_gpu_policy(current_policy)
-                        or cpu_policy.revision != decision_evidence.cpu_policy_revision
-                        or cpu_policy.capacity != decision_evidence.cpu_capacity
-                        or (
-                            (self._idle_since is not None or current_owner is not None)
-                            and self._last_decision_evidence != decision_evidence
+            if preparation is not None and preparation.endpoint is not None and not preparation.ready:
+                preparation.ready = poll_idle_launch_ready(preparation.endpoint)
+            handoffs = getattr(self.runtime, "pending_launch_handoffs", None)
+            has_handoff_fence = isinstance(handoffs, LaunchHandoffState) and expected_handoff_revision is not None
+            handoff_guard = handoffs.read_guard(blocking=False) if has_handoff_fence else nullcontext(True)
+            paths = machine_runtime_paths(self.root)
+            deadline = decision_deadline if guarded else time.monotonic() + IDLE_DECISION_SECONDS
+            if deadline is None:
+                raise _IdleDecisionRejected("demand_census_unknown")
+            with ExitStack() as admission:
+                with ExitStack() as local:
+                    with ExitStack() as project:
+                        if guarded and (decision_guard is None or not project.enter_context(decision_guard)):
+                            raise _IdleDecisionRejected("demand_census_unknown")
+                        if not local.enter_context(exclusive(paths["config_lock"], blocking=False)):
+                            raise _IdleDecisionRejected("demand_census_unknown")
+                        if not local.enter_context(handoff_guard):
+                            raise _IdleDecisionRejected("launch_handoff_pending")
+                        if not admission.enter_context(idle_job_guard(self.root, blocking=False)):
+                            raise _IdleDecisionRejected("demand_census_unknown")
+                        if expected_handoff_revision is not None:
+                            revision, pending = handoffs.snapshot() if has_handoff_fence else (None, False)
+                            if (
+                                pending
+                                or revision != expected_handoff_revision
+                                or self._last_handoff_revision
+                                not in (
+                                    None,
+                                    revision,
+                                )
+                            ):
+                                raise _IdleDecisionRejected("launch_handoff_pending")
+                        owner, key, reason = self._observe_local_idle_locked(
+                            owner, observation, policy_key, resolved, reservation_policy, decision_evidence
                         )
-                    ):
-                        raise _IdleDecisionRejected("demand_census_unknown")
-                if current_owner is not None and current_owner["config_revision"] != config.revision:
-                    current_owner, stop_error = self._stop_locked("config_changed", current_owner)
-                    if stop_error is not None:
-                        return self._blocked(stop_error)
-                    if current_owner is not None:
-                        return self._publish(state="stopping", reason="config_changed")
-                if current_owner is not None and tuple(current_owner["gpu_ids"]) != resolved:
-                    current_owner, stop_error = self._stop_locked("gpu_changed", current_owner)
-                    if stop_error is not None:
-                        return self._blocked(stop_error)
-                    if current_owner is not None:
-                        return self._publish(state="stopping", reason="gpu_changed")
-                if current_owner is not None and current_owner["phase"] == "stopping":
-                    return self._publish(state="stopping", reason="stopping")
-                if expected_handoff_revision is not None:
-                    revision, has_pending = handoffs.snapshot() if has_handoff_fence else (None, False)
-                    if (
-                        has_pending
-                        or revision != expected_handoff_revision
-                        or self._last_handoff_revision not in (None, revision)
-                    ):
-                        raise _IdleDecisionRejected("launch_handoff_pending")
-                    self._last_handoff_revision = revision
-                if current_owner is not None:
-                    return self._publish(state=current_owner["phase"], reason=current_owner["phase"])
-
-                if not launch_allowed and key != self._observation_key:
-                    self._clear_idle_interval("observation_changed", replacement_key=key)
-                    self._observation_key = key
-                elif launch_allowed:
-                    self._reset_observation_if_changed(key, now_wall)
-                try:
-                    snapshot = (
-                        reservation_snapshot(self.root, blocking=False) if guarded else reservation_snapshot(self.root)
-                    )
-                except (OSError, RuntimeError, TypeError, ValueError, KeyError):
-                    if guarded:
-                        raise _IdleDecisionRejected("demand_census_unknown") from None
-                    return self._blocked("reservation_observation_unavailable")
-                if snapshot.active or snapshot.provisional:
-                    self._clear_idle_interval("gpu_reserved")
-                    self._resolved_gpu_ids = list(resolved)
-                    return self._publish(state="waiting", reason="gpu_reserved")
-                if decision_evidence is not None:
-                    if time.monotonic() >= decision_deadline:
-                        raise _IdleDecisionRejected("demand_census_unknown")
-                    self._last_decision_evidence = decision_evidence
-                if not launch_allowed:
-                    return self._publish(state="waiting", reason="partition_scan_pending")
-                elapsed = self._idle_elapsed(now_wall)
-                if elapsed < config.idle_delay_seconds:
-                    self._resolved_gpu_ids = list(resolved)
-                    return self._publish(state="waiting", reason="idle_delay")
-                if self._retry_at is not None and now_wall < self._retry_at:
-                    self._resolved_gpu_ids = list(resolved)
-                    return self._publish(state="backoff", reason="backoff")
-
-                paths = machine_runtime_paths(self.root)
-                with exclusive(paths["reservation_lock"], blocking=not guarded) as acquired:
-                    if not acquired:
-                        raise _IdleDecisionRejected("demand_census_unknown")
-                    try:
-                        current_reserved = self._reserved_gpu_ids_locked()
-                    except _SupervisorBlocked:
-                        return self._blocked("reservation_observation_unavailable")
-                    if snapshot.active or snapshot.provisional or current_reserved:
-                        self._clear_idle_interval("gpu_reserved")
-                        self._resolved_gpu_ids = list(resolved)
-                        return self._publish(state="waiting", reason="gpu_reserved")
-                    if reservation_policy is not None:
+                        endpoint = None
+                        if reason is None and owner is not None and owner["phase"] == "prepared":
+                            if (
+                                preparation is None
+                                or self._idle_since != preparation.idle_since
+                                or key != preparation.observation_key
+                                or not preparation.intent_matches()
+                                or _read_stop_reason(preparation.directory) is not None
+                            ):
+                                raise _IdleDecisionRejected("demand_census_unknown")
+                            if not preparation.permit_sent and time.monotonic() >= preparation.ready_until:
+                                raise _IdleDecisionRejected("demand_census_unknown")
+                            if launch_allowed and preparation.ready:
+                                endpoint = preparation.endpoint
+                        if (guarded or endpoint is not None) and time.monotonic() >= deadline:
+                            raise _IdleDecisionRejected("demand_census_unknown")
+                    # The admission and local config/handoff fences still cover
+                    # this decision. All Project proof locks have been released.
+                    if endpoint is not None and preparation is not None:
                         try:
-                            validate_gpu_reservation(self.root, list(resolved), reservation_policy)
-                        except (OSError, RuntimeError, TypeError, ValueError, KeyError):
-                            return self._blocked("gpu_policy_unavailable")
-                    if guarded and time.monotonic() >= decision_deadline:
-                        raise _IdleDecisionRejected("demand_census_unknown")
-                    return self._launch_locked(config, resolved, boot_id)
+                            send_idle_launch_permit(endpoint, preparation.owner["instance_id"], deadline)
+                            preparation.permit_sent = True
+                        finally:
+                            preparation.close_permit()
+                        return self._payload(state="waiting", reason="preparing")
+                self._last_handoff_revision = expected_handoff_revision
+                self._last_decision_evidence = decision_evidence
+                result = self._finish_idle_observation_locked(
+                    owner, config, resolved, key, reason, launch_allowed, boot_id, now_wall
+                )
+            if isinstance(result, _PreparedIdleJob):
+                try:
+                    self._spawn_prepared(result)
+                except (OSError, RuntimeError, TypeError, ValueError, KeyError) as exc:
+                    result.spawn_failed = True
+                    with idle_job_guard(self.root, blocking=False) as acquired:
+                        if not acquired:
+                            return self._blocked("cleanup_uncertain")
+                        return self._preparation_failed_locked(exc)
+                with idle_job_guard(self.root, blocking=False) as acquired:
+                    if not acquired:
+                        return self._defer_stop("unknown_demand", result.owner)
+                    if read_idle_job_ownership(self.root) != result.owner:
+                        return self._blocked("ownership_changed")
+                    self._retry_at = None
+                    return self._publish(state="waiting", reason="preparing")
+            return result
         except _IdleDecisionRejected as exc:
-            return self._reject_idle_decision(boot_id, config, str(exc))
+            return self._reject_idle_decision(boot_id, config, str(exc), owner)
         except (OSError, RuntimeError, TypeError, ValueError, KeyError):
-            if decision_evidence is not None:
-                return self._reject_idle_decision(boot_id, config, "demand_census_unknown")
+            if guarded or preparation is not None:
+                return self._reject_idle_decision(boot_id, config, "demand_census_unknown", owner)
             return self._blocked("supervision_failed")
+
+    @property
+    def has_local_instance(self) -> bool:
+        return self._instance_id is not None
+
+    def pending_wait_seconds(self, wait_seconds: float) -> float:
+        """Revisit a gated candidate without sleeping for the full daemon interval."""
+        preparation = self._preparation
+        if preparation is not None and (preparation.endpoint is not None or preparation.permit_sent):
+            if time.monotonic() >= preparation.ready_until:
+                return wait_seconds
+            return min(wait_seconds, SUPERVISOR_POLL_SECONDS)
+        return wait_seconds
 
     def shutdown(self, timeout: float | None = None, *, timeout_seconds: float | None = None) -> bool:
         """Request ``agent_stop`` and wait a bounded period for ownership release."""
@@ -1579,6 +1784,8 @@ class IdleJobSupervisor:
         if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not math.isfinite(float(timeout)):
             raise ValueError("timeout must be a finite nonnegative number")
         timeout = max(0.0, float(timeout))
+        self._close_prepared_permit()
+        self._clear_idle_interval("agent_stop")
         try:
             boot_id = current_boot_id()
         except (OSError, RuntimeError, TypeError, ValueError):

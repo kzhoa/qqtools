@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -16,6 +16,7 @@ from ..layout import load_machine_registration, save_machine_registration
 from ..lease import LeasePolicy, lease_expiry, load_lease_policy, parse_utc
 from .locks import exclusive, machine_lock
 from .paths import machine_registration_path, shared_paths
+from .project_activation import project_activation_transaction
 from .records import utc_now
 from .registration_protocol import (
     RECOVERY_PROTOCOL,
@@ -154,7 +155,7 @@ def registration_write_guard(
     allow_reactivation: bool = False,
     force_renewal: bool = False,
 ) -> Iterator[dict[str, Any] | None]:
-    """Hold only shared registration locks; renew the exact eligible generation.
+    """Renew the exact registration generation under shared Project locks.
 
     ``is_current`` must recheck the caller's captured local identity without
     holding a MachineRuntime lock. Every successor mutation needs its own fence.
@@ -229,11 +230,20 @@ def registration_write_guard(
                 record["client_version"] = __version__
                 record["eligibility_expires_at"] = next_expiry
                 record["updated_at"] = utc_now()
-                if not is_current():
+                activation = (
+                    project_activation_transaction(cfg, "registration_reactivation", before_write=before_shared_write)
+                    if is_reactivation
+                    else nullcontext()
+                )
+                with activation:
+                    if is_current():
+                        if before_shared_write is not None:
+                            before_shared_write()
+                        save_machine_registration(cfg, {"registration": record})
+                    else:
+                        record = None
+                if record is None:
                     yield None
                     return
-                if before_shared_write is not None:
-                    before_shared_write()
-                save_machine_registration(cfg, {"registration": record})
                 observe_registration_renewal(previous_expiry, policy, is_reactivation=is_reactivation or force_renewal)
             yield record if is_current() else None
