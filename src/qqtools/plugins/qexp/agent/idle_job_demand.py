@@ -249,7 +249,9 @@ class IdleJobDemandCoordinator:
         active_request_identities = {
             association.identity for request_id, association in self._requests.items() if request_id in started_requests
         }
-        for cache_identity, (base_identity, _binding) in current.items():
+        for cache_identity, (base_identity, binding) in current.items():
+            if not controller.runtime.working_set.has_current_activation(binding):
+                continue
             if controller._scheduler_quiescence_is_current(base_identity):
                 continue
             if has_capacity_match and cache_identity in active_request_identities:
@@ -483,6 +485,8 @@ class IdleJobDemandCoordinator:
         for cache_identity, (base_identity, binding) in window:
             if offered >= offer_limit:
                 break
+            if not controller.runtime.working_set.has_current_activation(binding):
+                continue
             if controller._scheduler_quiescence_is_current(base_identity):
                 continue
             round_state = self._rounds.get(cache_identity)
@@ -535,6 +539,12 @@ class IdleJobDemandCoordinator:
             if expected_round is None
             else expected_round.probe_state
         )
+        round_state = expected_round
+        if round_state is None:
+            turn = controller.runtime.working_set.observed_scheduler_turn(binding)
+            if turn is None:
+                return
+            round_state = _IdleJobRound(turn, _json_copy(state))
         try:
             request = controller.executor.prepare_idle_job_probe(
                 binding,
@@ -546,12 +556,7 @@ class IdleJobDemandCoordinator:
         except (OSError, RuntimeError, ValueError, KeyError, TypeError):
             self._record_failure(controller, service_key)
             return
-        round_state = expected_round
-        if round_state is None:
-            round_state = _IdleJobRound(
-                controller.runtime.working_set.begin_turn(binding, "scheduler"), _json_copy(state)
-            )
-            self._rounds[cache_identity] = round_state
+        self._rounds[cache_identity] = round_state
         request_id = request.request_id
         self._requests[request_id] = _RequestAssociation(cache_identity, round_state)
         try:

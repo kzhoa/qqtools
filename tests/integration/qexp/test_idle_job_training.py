@@ -22,8 +22,9 @@ pytestmark = [pytest.mark.integration, pytest.mark.qexp_fast_io]
 def _running_owner(runtime):
     deadline = time.monotonic() + 20
     while time.monotonic() < deadline:
-        if get_machine_agent_status(runtime)["idle_job"]["state"] == "running":
-            return read_idle_job_ownership(runtime.root)
+        owner = read_idle_job_ownership(runtime.root)
+        if owner is not None and owner["phase"] == "running":
+            return owner
         time.sleep(0.05)
     pytest.fail(f"Idle Job did not start: {get_machine_agent_status(runtime)}")
 
