@@ -2,10 +2,16 @@
 
 ## Unreleased
 
+## v1.3.31
+
 - feat: show recorded Project upgrade repairs in qexp status and explain the
   observed checks that keep a machine Idle Job waiting, with bounded diagnostics
   and agent-instance freshness.
-
+- fix: recheck training demand before starting a prepared qexp Idle Job and
+  prevent execution after writer cutover. Bound the work spent checking demand
+  and explaining rejected launches.
+- fix: keep qexp maintenance eligible during slow queue selection and report
+  progress accurately.
 - fix: resume qexp dependency projection migration within high-degree Tasks during
   backfill and both audits, preserving the per-slice metadata budget.
 - perf: amortize qexp daemon upgrade worker startup across bounded windows of
