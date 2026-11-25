@@ -7577,10 +7577,10 @@ def test_scheduler_claim_worker_exit_retries_same_request_and_offer(tmp_path: Pa
         available_cpu_slots=0,
     )
     assert classify_executor_offer(runtime.root, offer_identity) == "matching_provisional"
-    now[0] += 5.0
     completions = {}
     deadline = time.monotonic() + 5.0
     while time.monotonic() < deadline:
+        now[0] += 0.1
         completions = controller.advance_scheduler_claims(
             bindings,
             revision,
@@ -8334,6 +8334,10 @@ def test_idle_job_census_is_activation_scoped_and_does_not_retire_scheduler(tmp_
         state = runtime.working_set._states[runtime.working_set._identity(binding)]
         assert "scheduler" not in state.acknowledged_lanes
         assert not controller.scheduler_is_quiescent(binding, revision)
+        scheduler_turn = runtime.working_set.begin_turn(binding, "scheduler")
+        runtime.working_set.acknowledge(scheduler_turn, quiescent=True)
+        advance_until("idle", capacity=2)
+        assert runtime.working_set.is_lane_quiescent(binding, "scheduler")
         submit(cfg, ["echo", "requires-two"], requested_gpus=2, working_dir=tmp_path)
         runtime.working_set.activate(binding, "new_local_work")
         assert (

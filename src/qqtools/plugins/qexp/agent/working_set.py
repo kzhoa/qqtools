@@ -632,6 +632,27 @@ class BindingWorkingSet:
                 self._wake_generations.get(identity, 0),
             )
 
+    def observed_scheduler_turn(self, binding: ProjectBinding) -> BindingTurn | None:
+        """Capture a demand probe's activation identity without claiming a scheduler turn."""
+        identity = self._identity(binding)
+        with self._lock:
+            state = self._states.get(identity)
+            if (
+                state is None
+                or state.binding != binding
+                or state.unknown
+                or not state.consumer_registered
+                or not state.activation_observed
+            ):
+                return None
+            return BindingTurn(
+                *identity,
+                binding.shared_root,
+                "scheduler",
+                state.checkpoint,
+                wake_generation=self._wake_generations.get(identity, 0),
+            )
+
     def is_current_turn(self, turn: BindingTurn, *, blocking: bool = True) -> bool:
         """Check local proof identity without waking a binding or advancing a lane."""
         if not self._lock.acquire(blocking=blocking):
