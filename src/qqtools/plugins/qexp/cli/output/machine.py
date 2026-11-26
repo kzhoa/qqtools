@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from textwrap import fill
 from typing import Any
 
 from ...takeover_contract import TAKEOVER_PHASES, TAKEOVER_PLAN_ID
@@ -173,6 +174,15 @@ def _render_status(result: Mapping[str, Any], presentation: Mapping[str, object]
     warnings = warnings if isinstance(warnings, Sequence) and not isinstance(warnings, (str, bytes)) else ()
     scheduler = result.get("scheduler_diagnostics")
     scheduler = scheduler if isinstance(scheduler, Mapping) else None
+    readiness = result.get("scheduling_readiness")
+    heartbeat = agent.get("heartbeat", {}) if isinstance(agent, Mapping) else {}
+    snapshot = result.get("project_snapshot", {})
+    coverage = readiness.get("diagnostic_coverage", {}) if isinstance(readiness, Mapping) else {}
+    takeover = result.get("takeover")
+    recovery = result.get("diagnostic_recovery")
+    has_primary_action = "primary_action" in result
+    primary = result.get("primary_action")
+    primary_command = primary["command"] if primary is not None else None
 
     project_line = presentation.get("project_line")
     implicit = presentation.get("implicit_project") is True and isinstance(project_line, str)
@@ -180,7 +190,7 @@ def _render_status(result: Mapping[str, Any], presentation: Mapping[str, object]
         project_header = project_line
     else:
         project_path = project.get("path") if isinstance(project, Mapping) else project
-        project_header = f"Project: {project_path}"
+        project_header = f"Project: {encode_display_text(str(project_path))}"
     enrollment = {
         "registered": "registered",
         "inventory_only": "inventory entry without a local binding",
@@ -188,10 +198,12 @@ def _render_status(result: Mapping[str, Any], presentation: Mapping[str, object]
         "unavailable": "unknown (check the local registry and inventory)",
     }.get(participation_state, participation_state)
     lines = [project_header, f"Local enrollment: {enrollment}"]
+    binding_impact = None
     if participation_state == "registered" and isinstance(participation, Mapping) and "binding" in participation:
         binding = participation["binding"]
         if binding is None:
-            lines.append("Local binding: unverified (local identity and shared registration could not be matched)")
+            lines.append("Local binding: unverified (identity and registration could not be matched)")
+            binding_impact = "Local admission eligibility could not be established."
         else:
             name = encode_display_text(binding["machine_name"])
             details = []
@@ -200,43 +212,98 @@ def _render_status(result: Mapping[str, Any], presentation: Mapping[str, object]
             if binding["write_eligibility"] == "expired":
                 details.append("write eligibility expired")
             lines.append(f"Local binding: {name}" + (f" ({', '.join(details)})" if details else ""))
+            if details:
+                binding_impact = "This binding cannot admit new Tasks locally."
+
+    is_mode_conflict = bool(configured_mode and observed_mode and configured_mode != observed_mode)
+    if has_primary_action:
+        upgrade = result.get("upgrade")
+        impact = None
+        if (
+            participation_state == "registered"
+            and isinstance(upgrade, Mapping)
+            and upgrade.get("state") == "repair_required"
+        ):
+            admission_blocked = upgrade.get("admission_blocked")
+            if admission_blocked is True:
+                impact = "The Project upgrade blocks new training until repaired."
+            elif admission_blocked is False:
+                impact = "The migration needs repair. Its admission check reports unblocked."
+            else:
+                impact = "The Project upgrade needs repair. Its effect on admission is unknown."
+        elif participation_state in {"unregistered", "inventory_only"}:
+            impact = "Local admission requires Project enrollment on this runtime."
+        elif participation_state == "unavailable":
+            impact = "Local enrollment and admission eligibility could not be verified."
+        elif takeover is not None:
+            impact = "An accepted takeover may affect local admission. Check its current phase."
+        elif binding_impact is not None:
+            impact = binding_impact
+        elif agent_state == "stopped":
+            impact = "The agent reports that it stopped. Local scheduling is unverified."
+        elif agent_state == "unavailable":
+            impact = "Scheduling by the local agent could not be verified."
+        elif is_mode_conflict:
+            impact = "The reported agent mode differs from the configured scheduling mode."
+        elif heartbeat.get("freshness") in {"stale", "unknown"}:
+            impact = "Current local agent scheduling could not be verified."
+        elif isinstance(recovery, Mapping) and recovery.get("state") == "blocked":
+            impact = "Blocked diagnostic recovery leaves local scheduling evidence incomplete."
+        elif snapshot.get("freshness") in {"stale", "unknown"}:
+            impact = "A current Project scheduling snapshot is unavailable."
+        elif coverage.get("state") in {"incomplete", "unknown"} or (
+            scheduler is not None and scheduler.get("status") == "unavailable"
+        ):
+            impact = "Diagnostic coverage is incomplete for local scheduling."
+        elif scheduler and (scheduler.get("active_count") or scheduler.get("active_findings")):
+            impact = "Scheduling diagnostics report active findings for this Project."
+        elif task_state != "active" or task_reason:
+            impact = "The Task observation index cannot provide a current overview."
+        if impact is not None:
+            lines.append(impact)
+        if binding_impact is not None and binding_impact != impact:
+            lines.append(binding_impact)
+
     agent_reason = _status_reason(agent.get("reason")) if isinstance(agent, Mapping) else None
-    lines.append(f"Local agent: {agent_state}" + (f" ({agent_reason})" if agent_reason else ""))
-    if isinstance(agent, Mapping) and agent.get("observed_at"):
-        lines.append(f"Agent observed: {agent['observed_at']}")
+    evidence = [f"Local agent: {agent_state}" + (f" ({agent_reason})" if agent_reason else "")]
+    if not isinstance(readiness, Mapping) and isinstance(agent, Mapping) and agent.get("observed_at"):
+        evidence.append(f"Agent observed: {agent['observed_at']}")
     if configured_mode != observed_mode:
         if configured_mode:
-            lines.append(f"Configured agent mode: {configured_mode}")
+            evidence.append(f"Configured agent mode: {configured_mode}")
         if observed_mode:
-            lines.append(f"Observed agent mode: {observed_mode}")
+            evidence.append(f"Observed agent mode: {observed_mode}")
     if task_state != "active" or task_reason:
         reason = _status_reason(task_reason)
-        lines.append(f"Task observation index: {task_state}" + (f" ({reason})" if reason else ""))
-    sections = ["\n".join(lines)]
-    if "takeover" in result:
-        sections.append(_render_status_takeover(result["takeover"]))
+        evidence.append(f"Task observation index: {task_state}" + (f" ({reason})" if reason else ""))
 
-    readiness = result.get("scheduling_readiness")
     if isinstance(readiness, Mapping):
-        heartbeat = agent.get("heartbeat", {}) if isinstance(agent, Mapping) else {}
-        snapshot = result.get("project_snapshot", {})
-        coverage = readiness.get("diagnostic_coverage", {})
-        sections.append(
-            _section(
-                "Scheduling observation",
+        coverage_state = coverage.get("state")
+        scheduling_evidence = _details(
+            (
+                ("Machine heartbeat", heartbeat.get("freshness")),
                 (
-                    ("Machine heartbeat", heartbeat.get("freshness")),
-                    ("Heartbeat observed at", heartbeat.get("observed_at")),
-                    ("Project snapshot", snapshot.get("freshness")),
-                    ("Snapshot observed at", snapshot.get("observed_at")),
-                    ("Project-binding diagnostic coverage", coverage.get("state")),
-                    ("Scheduling readiness", readiness.get("state")),
-                    ("Reasons", [_status_reason(reason) for reason in readiness.get("reasons", ())]),
+                    "Heartbeat observed at",
+                    heartbeat.get("observed_at") if heartbeat.get("freshness") == "stale" else None,
                 ),
+                ("Project snapshot", snapshot.get("freshness")),
+                ("Snapshot observed at", snapshot.get("observed_at") if snapshot.get("freshness") == "stale" else None),
+                ("Diagnostic coverage", f"{coverage_state} (Project binding)" if coverage_state else None),
+                ("Scheduling evidence", readiness.get("state")),
             )
         )
+        if scheduling_evidence:
+            evidence.append(scheduling_evidence)
+    if primary is None:
+        sections = ["\n".join([*lines, *evidence])]
+    else:
+        explanation = fill(primary["explanation"], width=80, break_long_words=False, break_on_hyphens=False)
+        sections = ["\n".join(lines), f"Next: {primary_command}\n{explanation}", "\n".join(evidence)]
+    if takeover is not None:
+        if takeover["operation_status_command"] == primary_command:
+            takeover = {**takeover, "operation_status_command": None}
+        sections.append(_render_status_takeover(takeover))
 
-    recovery = result.get("diagnostic_recovery")
     repair_preview = None
     if isinstance(recovery, Mapping) and recovery.get("state") in {
         "pending",
@@ -248,6 +315,11 @@ def _render_status(result: Mapping[str, Any], presentation: Mapping[str, object]
         runtime_root = recovery.get("machine_runtime_root")
         if recovery_state == "blocked":
             repair_preview = recovery.get("next_action")
+        recovery_detail = {
+            "pending": "Recovery progress is unverified.",
+            "progressing": "Recovery is underway. No recovery command needs repeating.",
+            "awaiting_observation": "Fresh Project evidence is needed to verify recovery.",
+        }.get(recovery_state)
         sections.append(
             _section(
                 "Machine scheduler diagnostic recovery",
@@ -257,7 +329,8 @@ def _render_status(result: Mapping[str, Any], presentation: Mapping[str, object]
                     ("Reason", _status_reason(recovery.get("reason"))),
                     ("Last progress", recovery.get("last_progress_at")),
                     ("Next check", recovery.get("next_check_at")),
-                    ("Read-only preview", repair_preview),
+                    ("Read-only preview", repair_preview if repair_preview != primary_command else None),
+                    ("Guidance", recovery_detail),
                 ),
             )
         )
@@ -304,13 +377,13 @@ def _render_status(result: Mapping[str, Any], presentation: Mapping[str, object]
     if warning_rows:
         sections.append(_section("Warnings", warning_rows))
 
-    actions = [action for action in result["next_actions"] if action != repair_preview]
-    if actions:
-        # Registration is the first canonical action for an unbound Project.
-        labels = ["Run"] * len(actions)
-        if participation_state in {"unregistered", "inventory_only"}:
-            labels[0] = "To run Tasks on this machine"
-        sections.append(_section("Next actions", tuple(zip(labels, actions, strict=True))))
+    if not has_primary_action:
+        actions = [action for action in result["next_actions"] if action != repair_preview]
+        if actions:
+            labels = ["Run"] * len(actions)
+            if participation_state in {"unregistered", "inventory_only"}:
+                labels[0] = "To run Tasks on this machine"
+            sections.append(_section("Next actions", tuple(zip(labels, actions, strict=True))))
     sections.append(_details((("Project takeover preview help", result.get("takeover_preview_help")),)))
     return "\n\n".join(section for section in sections if section)
 
@@ -385,6 +458,13 @@ def _validate_status(result: Any) -> None:
                 raise ValueError(f"{label}.write_eligibility must be eligible or expired")
     if "scheduler_diagnostics" in value:
         _mapping(value["scheduler_diagnostics"], "status payload.scheduler_diagnostics")
+    if value.get("primary_action") is not None:
+        label = "status payload.primary_action"
+        primary = _mapping(value["primary_action"], label)
+        for key in ("command", "explanation"):
+            text = _required(primary, key, label)
+            if not isinstance(text, str) or not text.strip():
+                raise ValueError(f"{label}.{key} must be a non-empty string")
     if "takeover" in value:
         _validate_status_takeover(_required_mapping(value, "takeover", "status payload"), "status payload.takeover")
     if "takeover_preview_help" in value and (

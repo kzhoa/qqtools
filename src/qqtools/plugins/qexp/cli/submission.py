@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import shlex
 import sys
@@ -11,9 +12,11 @@ from pathlib import Path
 from typing import Any
 
 from ..activation import AgentActivationError, ensure_local_agent_active
-from ..agent.context import ExecutionContext
+from ..agent.bindings import MachineRegistryError
+from ..agent.context import MACHINE_RUNTIME_ENV, ExecutionContext, default_machine_runtime_root
 from ..agent.diagnostic_recovery import diagnostics_repair_command, read_scheduler_recovery
 from ..agent.helpers import _active_machine_identity
+from ..agent.identity import MachineRuntimeIdentityError
 from ..commands import task as task_commands
 from ..layout import load_context
 from ..manifest import UNSET, normalize_command_submission, parse_submission_manifest
@@ -484,6 +487,15 @@ def _prepare_submission_request(
     return request
 
 
+def _submission_presentation(args: argparse.Namespace, runtime_root: Path) -> dict[str, object]:
+    request = args._submission_request
+    presentation: dict[str, object] = {"task": {"name": request.normalized_specs[0].get("name")}}
+    runtime_selected = getattr(args, "machine_runtime_root", None) is not None or os.environ.get(MACHINE_RUNTIME_ENV)
+    if runtime_selected and runtime_root != default_machine_runtime_root():
+        presentation["machine_runtime_root"] = str(runtime_root)
+    return presentation
+
+
 def dispatch_submission(
     args: argparse.Namespace,
     cfg: object,
@@ -518,6 +530,7 @@ def dispatch_submission(
     # verified commit or erase the IDs from a quiet/JSON response.
     payload = _submission_result_payload(request, values)
     exit_code = 0
+    presentation: dict[str, object] = {}
     if payload["outcome"] == "committed":
         runtime = execution_context.machine_runtime
         if request.no_activate:
@@ -525,12 +538,22 @@ def dispatch_submission(
         else:
             try:
                 started = ensure_local_agent_active(cfg, reason="submit", machine_runtime=runtime)
-            except AgentActivationError as activation_error:
+            except (
+                AgentActivationError,
+                MachineRegistryError,
+                MachineRuntimeIdentityError,
+                OSError,
+                json.JSONDecodeError,
+            ) as activation_error:
                 exit_code = 1
                 payload["error"] = {"code": "activation_failed", "message": str(activation_error)}
-                follow_up = activation_error.next_action or shlex.join(
-                    ["qexp", "--machine-runtime-root", str(runtime.root), "agent", "start"]
-                )
+                prefix = ["qexp", "--machine-runtime-root", str(runtime.root)]
+                if isinstance(activation_error, AgentActivationError):
+                    follow_up = activation_error.next_action or shlex.join([*prefix, "agent", "start"])
+                elif isinstance(activation_error, MachineRuntimeIdentityError):
+                    follow_up = shlex.join([*prefix, "admin", "repair", "identity", "--dry-run"])
+                else:
+                    follow_up = shlex.join([*prefix, "--project", str(request.project.path), "status"])
                 payload["activation"] = {"outcome": "failed", "follow_up_command": follow_up}
             else:
                 outcome = "started" if started is True else "already_running" if started is False else "requested"
@@ -539,7 +562,12 @@ def dispatch_submission(
         if request.quiet:
             for task_id in payload["task_ids"]:
                 print(task_id)
+            if exit_code:
+                print("qexp: Tasks submitted. Local agent activation failed. Do not submit again.", file=sys.stderr)
+                print(f"Next: {payload['activation']['follow_up_command']}", file=sys.stderr)
             return CommandOutcome(exit_code)
+
+        presentation = _submission_presentation(args, runtime.root)
 
         try:
             identity = _active_machine_identity(runtime)
@@ -555,11 +583,5 @@ def dispatch_submission(
                 "next_action": recovery.get("next_action") or diagnostics_repair_command(runtime),
             }
 
-    presentation = {
-        "task": {
-            "task_id": request.normalized_specs[0].get("task_id"),
-            "name": request.normalized_specs[0].get("name"),
-        }
-    }
     output = None if request.quiet else CliOutput(OutputKind.SUBMISSION, payload, presentation)
     return CommandOutcome(exit_code, output)

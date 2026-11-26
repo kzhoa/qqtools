@@ -27,7 +27,8 @@ def test_committed_submission_reports_activation_failure_and_recovery() -> None:
     human = render(output, "human")
 
     assert json.loads(render(output, "json")) == payload
-    assert "Committed" in human
+    assert "submitted" in human.splitlines()[0].lower()
+    assert "Do not submit again." in human
     assert "activation failed" in human.lower()
     assert "agent unavailable" in human
     assert "qexp agent start" in human

@@ -1,4 +1,6 @@
 import json
+import os
+import shlex
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -409,7 +411,15 @@ def test_unbound_context_allows_reads_but_mutations_explain_join_and_recovery(
     assert main(["task", "list", "--format=json"]) == 0
     assert main(["submit", "--no-activate", "--", "echo", "blocked"]) == 2
     error = capsys.readouterr().err
-    assert "qexp project register" in error
+    command = next(line for line in error.splitlines() if line.startswith("qexp ") and "project register" in line)
+    assert shlex.split(command) == [
+        "qexp",
+        "--machine-runtime-root",
+        os.environ["QEXP_MACHINE_RUNTIME_ROOT"],
+        "project",
+        "register",
+        str(cfg.project_root),
+    ]
     assert not list((cfg.shared_root / "tasks").glob("*.json"))
 
 
@@ -434,7 +444,16 @@ def test_submit_requires_explicit_project_registration(tmp_path: Path, capsys):
         "ok",
     ]
     assert main(args) == 2
-    assert "qexp project register" in capsys.readouterr().err
+    error = capsys.readouterr().err
+    command = next(line for line in error.splitlines() if line.startswith("qexp ") and "project register" in line)
+    assert shlex.split(command) == [
+        "qexp",
+        "--machine-runtime-root",
+        str(tmp_path / "machine-runtime"),
+        "project",
+        "register",
+        str(cfg.project_root),
+    ]
 
 
 def test_agent_start_rejects_removed_background_flag(tmp_path: Path):
@@ -879,6 +898,14 @@ def test_machine_agent_status_rejects_an_uninitialized_runtime(tmp_path: Path, c
     error = json.loads(output.out)["error"]
     assert error["code"] == "operational_failure"
     assert "qexp init --machine NAME" in error["message"]
+    assert shlex.split(error["next_action"]) == [
+        "qexp",
+        "--machine-runtime-root",
+        str(runtime_root),
+        "init",
+        "--machine",
+        "NAME",
+    ]
 
 
 def test_read_only_task_list_does_not_initialize_machine_runtime(
@@ -912,7 +939,21 @@ def test_legacy_project_requires_explicit_migration(tmp_path: Path, monkeypatch,
     )
 
     assert main([*base, "start", "--timeout", "0.1"]) == 2
-    assert "legacy_project_requires_migration" in capsys.readouterr().out
+    output = capsys.readouterr().out
+    assert "legacy registration" in output
+    command = next(line.strip() for line in output.splitlines() if "admin migrate agent" in line)
+    assert shlex.split(command) == [
+        "qexp",
+        "--machine-runtime-root",
+        str(runtime_root),
+        "admin",
+        "migrate",
+        "agent",
+        "--project",
+        str(cfg.project_root),
+        "--machine",
+        cfg.machine_name,
+    ]
 
 
 def test_global_agent_status_and_stop_do_not_require_project_context(tmp_path: Path, monkeypatch, capsys) -> None:

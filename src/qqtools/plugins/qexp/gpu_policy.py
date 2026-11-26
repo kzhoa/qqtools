@@ -19,7 +19,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping
 
-from .runtime.locks import exclusive
+from .runtime.locks import exclusive, shared
 from .runtime.paths import machine_runtime_paths
 from .runtime.records import utc_now
 from .runtime.resources.idle_job import idle_job_guard
@@ -689,7 +689,7 @@ def _pending_fallback_view(view: GpuPolicyView) -> GpuPolicyView:
     )
 
 
-def show_gpu_policy(runtime: Any) -> dict[str, Any]:
+def show_gpu_policy(runtime: Any, *, read_only: bool = False) -> dict[str, Any]:
     """Return effective policy and machine reservation diagnostics."""
     root = _runtime_root(runtime)
     discovery, env_ids, env_status, running = _effective_context(root)
@@ -711,8 +711,12 @@ def show_gpu_policy(runtime: Any) -> dict[str, Any]:
         view = replace(view, agent_running=running)
     paths = machine_runtime_paths(root)
     try:
-        with exclusive(paths["reservation_lock"]):
+        lock_path = paths["reservation_lock"]
+        lock = shared(lock_path, create=False) if read_only else exclusive(lock_path)
+        with lock as acquired:
             reserved = _reservation_ids_locked(root)
+            if not acquired and lock_path.exists():
+                raise OSError("GPU reservation writer started during observation.")
     except (OSError, RuntimeError, ValueError):
         reserved = set()
         view = replace(

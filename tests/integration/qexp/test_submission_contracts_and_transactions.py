@@ -19,8 +19,8 @@ pytestmark = [pytest.mark.integration, pytest.mark.qexp_fast_io]
 # QQTOOLS-COMPAT-0015: verify the provisional Group publication writer fence and recovery path.
 
 
-def _project(tmp_path: Path):
-    project = tmp_path / "project"
+def _project(tmp_path: Path, directory: str = "project"):
+    project = tmp_path / directory
     cfg = init_shared_root(project / ".qexp", "gpu-1", runtime_root=tmp_path / "runtime")
     machine_runtime = MachineRuntime(tmp_path / "machine-runtime")
     machine_runtime.ensure_binding(cfg.shared_root, cfg.machine_name)
@@ -69,7 +69,7 @@ def test_command_mode_json_uses_complete_submission_result(
         "task_ids": [result["task_ids"][0]],
         "preview": None,
         "error": None,
-        "activation": None,
+        "activation": {"outcome": "requested", "follow_up_command": None},
     }
     assert captured.err.startswith("qexp: prepared operation_id=")
     assert f"idempotency_key={result['idempotency_key']}" in captured.err
@@ -339,7 +339,7 @@ def test_activation_failure_human_states_commit_failure_and_recovery(
 ) -> None:
     from qqtools.plugins.qexp.activation import AgentActivationError
 
-    project, cfg, machine_runtime = _project(tmp_path)
+    project, cfg, machine_runtime = _project(tmp_path, "training project")
     monkeypatch.setattr(
         "qqtools.plugins.qexp.cli.submission.ensure_local_agent_active",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(AgentActivationError("agent unavailable")),
@@ -348,11 +348,155 @@ def test_activation_failure_human_states_commit_failure_and_recovery(
     assert main([*_submit_prefix(project, cfg, machine_runtime), "--", "echo", "ok"]) == 1
 
     output = capsys.readouterr().out
-    assert "Committed" in output
-    assert "activation failed" in output.lower()
+    assert "submitted" in output.splitlines()[0].lower()
+    assert "activation failed" in output.splitlines()[0].lower()
+    assert "Do not submit again." in output
     assert "agent unavailable" in output
     assert "agent start" in output
     assert str(machine_runtime.root) in output
+    task_id = next(line.removeprefix("Task ID: ") for line in output.splitlines() if line.startswith("Task ID: "))
+    assert read_json(cfg.shared_root / "tasks" / f"{task_id}.json")["task"]["task_id"] == task_id
+    for action in ("show", "logs"):
+        command = next(line[line.index("qexp ") :] for line in output.splitlines() if f"task {action}" in line)
+        assert shlex.split(command) == [
+            "qexp",
+            "--machine-runtime-root",
+            str(machine_runtime.root),
+            "--project",
+            str(project),
+            "task",
+            action,
+            task_id,
+        ]
+
+
+@pytest.mark.parametrize("outcome", ["preview", "not_requested", "started", "failed"])
+def test_manifest_human_separates_submission_from_activation(tmp_path, monkeypatch, capsys, outcome):
+    from qqtools.plugins.qexp.activation import AgentActivationError
+
+    project, cfg, runtime = _project(tmp_path, "training project")
+    task_ids = ["train-" + "x" * 84, "train-b"]
+    manifest = tmp_path / "training manifest.yaml"
+    manifest.write_text(
+        "group:\n  name: study\n  workers: [gpu-1]\ntasks:\n"
+        + "".join(
+            f"  - task_id: {task_id}\n    command: [echo, ok]\n    requested_gpus: 0\n    requested_cpus: 1\n"
+            for task_id in task_ids
+        ),
+        encoding="utf-8",
+    )
+    calls = []
+
+    def activate(*args, **kwargs):
+        calls.append(kwargs["machine_runtime"])
+        if outcome == "failed":
+            raise AgentActivationError("agent unavailable")
+        return True
+
+    monkeypatch.setattr("qqtools.plugins.qexp.cli.submission.ensure_local_agent_active", activate)
+    options = {"preview": ["--dry-run"], "not_requested": ["--no-activate"]}.get(outcome, [])
+    assert main([*_submit_prefix(project, cfg, runtime), "--file", str(manifest), *options]) == (outcome == "failed")
+
+    output = capsys.readouterr().out
+    if outcome == "preview":
+        assert "no tasks were submitted" in output.splitlines()[0].lower()
+        assert not calls
+        assert all(not (cfg.shared_root / "tasks" / f"{task_id}.json").exists() for task_id in task_ids)
+        return
+
+    assert "submitted" in output.splitlines()[0].lower()
+    assert all(task_id in output for task_id in task_ids)
+    command = next(line[line.index("qexp ") :] for line in output.splitlines() if "group show" in line)
+    assert shlex.split(command) == [
+        "qexp",
+        "--machine-runtime-root",
+        str(runtime.root),
+        "--project",
+        str(project),
+        "group",
+        "show",
+        "study",
+    ]
+    assert "tasks are running" not in output.lower()
+    if outcome == "failed":
+        assert "activation failed" in output.lower() and "Do not submit again." in output
+    elif outcome == "not_requested":
+        assert "local agent activation was not requested" in output.lower()
+    else:
+        assert "local agent started" in output.lower()
+    assert [call.root for call in calls] == ([] if outcome == "not_requested" else [runtime.root])
+
+
+@pytest.mark.parametrize("output_format", ["human", "json", "quiet"])
+def test_activation_read_failure_keeps_committed_ids(tmp_path, monkeypatch, capsys, output_format):
+    project, cfg, runtime = _project(tmp_path, "training project")
+
+    def fail_binding_read(*args, **kwargs):
+        raise PermissionError("cannot reread local registration")
+
+    monkeypatch.setattr(MachineRuntime, "matching_binding", fail_binding_read)
+    options = ["--quiet"] if output_format == "quiet" else ["--format", output_format]
+    task_id = "already-submitted"
+    assert main([*_submit_prefix(project, cfg, runtime), *options, "--task-id", task_id, "--", "echo", "ok"]) == 1
+    captured = capsys.readouterr()
+    if output_format == "quiet":
+        assert captured.out.splitlines() == [task_id]
+    else:
+        if output_format == "json":
+            result = json.loads(captured.out)
+            assert result["outcome"] == "committed"
+            assert result["task_ids"] == [task_id]
+            assert result["error"]["code"] == "activation_failed"
+            follow_up = result["activation"]["follow_up_command"]
+        else:
+            assert "Do not submit again." in captured.out
+            assert "Task ID: already-submitted" in captured.out
+            follow_up = next(
+                line.removeprefix("Next: ") for line in captured.out.splitlines() if line.startswith("Next: ")
+            )
+        assert shlex.split(follow_up) == [
+            "qexp",
+            "--machine-runtime-root",
+            str(runtime.root),
+            "--project",
+            str(project),
+            "status",
+        ]
+    assert (cfg.shared_root / "tasks" / f"{task_id}.json").exists()
+
+
+@pytest.mark.parametrize("malformed", [False, True])
+def test_activation_handles_registry_loss_after_commit(tmp_path, monkeypatch, capsys, malformed):
+    from qqtools.plugins.qexp.activation import ensure_local_agent_active
+    from qqtools.plugins.qexp.agent.setup import initialize_machine, initialize_project, register_projects
+
+    project = tmp_path / "training project"
+    runtime = MachineRuntime(tmp_path / "machine runtime")
+    initialize_machine(runtime, "gpu-1")
+    initialize_project(project)
+    assert register_projects(runtime, [project])["projects"][0]["status"] == "registered"
+    cfg = runtime.verified_execution_context(project / ".qexp").cfg
+    assert runtime.paths["inventory"].is_file()
+    task_id = "already-submitted"
+
+    def remove_registry_before_activation(*args, **kwargs):
+        assert (cfg.shared_root / "tasks" / f"{task_id}.json").is_file()
+        if malformed:
+            runtime.paths["registry"].write_text('{"registry": {}}', encoding="utf-8")
+        else:
+            runtime.paths["registry"].unlink()
+        return ensure_local_agent_active(*args, **kwargs)
+
+    monkeypatch.setattr(
+        "qqtools.plugins.qexp.cli.submission.ensure_local_agent_active", remove_registry_before_activation
+    )
+    assert main([*_submit_prefix(project, cfg, runtime), "--task-id", task_id, "--", "echo", "ok"]) == 1
+    captured = capsys.readouterr()
+    assert "Do not submit again." in captured.out
+    assert "Task ID: already-submitted" in captured.out
+    assert "machine registry" in captured.out
+    assert "task show" in captured.out
+    assert not runtime.paths["pid"].exists()
 
 
 def test_unexpected_activation_exception_is_not_downgraded(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -382,8 +526,9 @@ def test_unexpected_submission_workflow_exception_is_not_downgraded(
         main([*_submit_prefix(project, cfg, machine_runtime), "--", "echo", "ok"])
 
 
+@pytest.mark.parametrize("output_format", ["human", "json", "quiet"])
 def test_finalization_failure_preserves_committed_result(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], output_format: str
 ) -> None:
     from qqtools.plugins.qexp.runtime import submission as submission_runtime
 
@@ -394,17 +539,35 @@ def test_finalization_failure_preserves_committed_result(
         lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("finalizer unavailable")),
     )
 
-    assert main([*_submit_prefix(project, cfg, machine_runtime), "--format", "json", "--", "echo", "ok"]) == 1
+    options = ["--quiet"] if output_format == "quiet" else ["--format", output_format]
+    assert main([*_submit_prefix(project, cfg, machine_runtime), *options, "--", "echo", "ok"]) == 1
 
-    result = json.loads(capsys.readouterr().out)
+    captured = capsys.readouterr()
+    if output_format == "human":
+        assert not captured.out
+        assert "Submitted 1 Task. A post-submission step failed." in captured.err
+        assert "Do not submit again." in captured.err
+        assert "finalizer unavailable" in captured.err
+        task_id = next(
+            line.removeprefix("Task ID: ") for line in captured.err.splitlines() if line.startswith("Task ID: ")
+        )
+        assert (cfg.shared_root / "tasks" / f"{task_id}.json").exists()
+        assert "task show" in captured.err
+        return
+    if output_format == "quiet":
+        (task_id,) = captured.out.splitlines()
+        assert (cfg.shared_root / "tasks" / f"{task_id}.json").exists()
+        return
+    result = json.loads(captured.out)
     assert result["outcome"] == "committed"
     assert result["operation"]["state"] == "committed"
     assert result["task_ids"]
     assert result["error"]["code"] == "finalization_pending"
 
 
+@pytest.mark.parametrize("output_format", ["human", "json"])
 def test_interruption_after_commit_preserves_verified_ids(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], output_format: str
 ) -> None:
     from qqtools.plugins.qexp.runtime import submission as submission_runtime
 
@@ -415,15 +578,23 @@ def test_interruption_after_commit_preserves_verified_ids(
         lambda *_args, **_kwargs: (_ for _ in ()).throw(KeyboardInterrupt()),
     )
 
-    assert main([*_submit_prefix(project, cfg, machine_runtime), "--format", "json", "--", "echo", "ok"]) == 130
+    assert main([*_submit_prefix(project, cfg, machine_runtime), "--format", output_format, "--", "echo", "ok"]) == 130
 
     captured = capsys.readouterr()
+    assert "Do not submit again." in captured.err
+    if output_format == "human":
+        assert "Submitted 1 Task." in captured.err and "interrupted" in captured.err
+        task_id = next(
+            line.removeprefix("Task ID: ") for line in captured.err.splitlines() if line.startswith("Task ID: ")
+        )
+        assert (cfg.shared_root / "tasks" / f"{task_id}.json").exists()
+        assert "task show" in captured.err
+        return
     result = json.loads(captured.out)
     assert result["outcome"] == "committed"
     assert result["operation"]["state"] == "committed"
     assert result["task_ids"]
     assert result["error"]["code"] == "interrupted"
-    assert "retry with the same key" in captured.err
 
 
 def test_recovery_identifiers_are_disclosed_before_provisional_group_failure(

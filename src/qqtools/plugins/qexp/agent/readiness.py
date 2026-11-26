@@ -3,19 +3,162 @@
 from __future__ import annotations
 
 import time
+from datetime import datetime, timezone
 from math import isfinite
 from pathlib import Path
+from stat import S_ISREG
 from typing import Any, Callable
 
 from ..machine_config import is_legacy_agent_project
 from ..models import AGENT_MODE_DAEMON
-from ..runtime.store import read_json
+from ..runtime.store import read_json, read_json_limited
 from .config import load_agent_config
 from .context import MachineRuntime
 from .helpers import _active_machine_identity
-from .inventory import ProjectInventoryEntry, exact_binding_for_entry, reconcile_live_bindings_locked
+from .inventory import (
+    InventoryReconciliation,
+    ProjectInventoryEntry,
+    exact_binding_for_entry,
+    reconcile_live_bindings_locked,
+)
+from .snapshot_publication_health import observation_freshness
 
 DEFAULT_START_TIMEOUT_SECONDS = 30.0
+_PROJECT_STATUS_SAMPLE = 8
+_SNAPSHOT_RECEIPT_BYTES = 4096
+
+
+def _snapshot_observation_reason(
+    path: Path, *, runtime_id: str, instance_id: str, generation: str, now: datetime
+) -> str | None:
+    try:
+        if path.parent.is_symlink() or path.parent.parent.is_symlink() or not S_ISREG(path.lstat().st_mode):
+            return "snapshot_observation_unavailable"
+        receipt = read_json_limited(path, max_bytes=_SNAPSHOT_RECEIPT_BYTES, record_type="snapshot_observation").get(
+            "snapshot_observation"
+        )
+    except (OSError, ValueError, RecursionError):
+        return "snapshot_observation_unavailable"
+    if not isinstance(receipt, dict):
+        return "snapshot_observation_unavailable"
+    if (
+        receipt.get("runtime_id") != runtime_id
+        or receipt.get("agent_instance_id") != instance_id
+        or receipt.get("registration_generation") != generation
+    ):
+        return "snapshot_observation_identity_mismatch"
+    freshness = observation_freshness(
+        receipt.get("snapshot_at"), receipt.get("heartbeat_interval_seconds"), now=now, intervals=3
+    )
+    return {"unknown": "snapshot_observation_invalid", "stale": "snapshot_observation_expired"}.get(freshness)
+
+
+def machine_project_readiness(
+    runtime: MachineRuntime,
+    reconciliation: InventoryReconciliation | None,
+    identity: tuple[int, str, int] | None,
+    process_status: dict[str, Any],
+    *,
+    runtime_id: str,
+    agent_mode: str,
+    policy_revision: int,
+    ready: bool,
+    projects: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Sample current receipt evidence from only the observed machine-local roster."""
+    view: dict[str, Any] = {
+        "state": "inventory_unknown",
+        "enabled_count": None,
+        "fresh_count": None,
+        "checked_count": 0,
+        "affected_projects": [],
+        "reason": "project_roster_unavailable",
+    }
+    if reconciliation is None:
+        return view
+    if not reconciliation.converged:
+        view["reason"] = next(iter(reconciliation.blockers), "inventory_mirror_incomplete")
+        return view
+
+    bound = {(binding.project_id, binding.shared_root): binding for binding in reconciliation.bindings}
+    enabled = {pair: binding for pair, binding in bound.items() if binding.enabled}
+    for entry in reconciliation.entries:
+        pair = (entry.project_id, entry.shared_root)
+        if entry.enabled and pair not in bound:
+            enabled[pair] = None
+    view["enabled_count"] = len(enabled)
+    if (
+        identity is None
+        or process_status.get("state") != "active"
+        or not identity[1]
+        or type(process_status.get("pid")) is not int
+        or type(process_status.get("pid_start_time_ticks")) is not int
+        or (process_status["pid"], process_status.get("instance_id"), process_status["pid_start_time_ticks"])
+        != identity
+        or process_status.get("runtime_id") != runtime_id
+    ):
+        view.update(state="inactive", reason="agent_identity_unverified")
+        return view
+
+    inventory_revision = process_status.get("inventory_revision")
+    startup_ready = (
+        ready
+        and process_status.get("ready") is True
+        and type(inventory_revision) is int
+        and inventory_revision == reconciliation.inventory_revision
+        and process_status.get("observed_agent_mode") == agent_mode
+        and process_status.get("policy_revision_requested") == policy_revision
+        and process_status.get("policy_revision_acknowledged") == policy_revision
+    )
+    view.update(state="pending", fresh_count=0, reason="startup_readiness_unverified")
+    if not enabled:
+        if startup_ready and agent_mode == AGENT_MODE_DAEMON:
+            view.update(state="machine_only", reason=None)
+        return view
+
+    project_reports = {(report.get("project_id"), report.get("shared_root")): report for report in projects}
+    now = datetime.now(timezone.utc)
+    sample = sorted(enabled)[:_PROJECT_STATUS_SAMPLE]
+    fresh = 0
+    affected = []
+    for project_id, shared_root in sample:
+        binding = enabled[project_id, shared_root]
+        if binding is None:
+            reason = "not_registered"
+        else:
+            reason = _snapshot_observation_reason(
+                runtime.project_paths(project_id)["root"] / "snapshot-observation.json",
+                runtime_id=runtime_id,
+                instance_id=identity[1],
+                generation=binding.registration_generation,
+                now=now,
+            )
+            if reason is None:
+                fresh += 1
+            report = project_reports.get((project_id, str(shared_root)), {})
+            eligibility = report.get("eligibility", {})
+            if report.get("state") == "superseded":
+                reason = "superseded"
+            elif isinstance(eligibility, dict) and eligibility.get("state") in {"unregistered", "invalid", "expired"}:
+                reason = eligibility["state"]
+        if reason is not None:
+            project_path = shared_root.parent if shared_root.name == ".qexp" else shared_root
+            affected.append({"path": str(project_path), "reason": reason})
+    view.update(fresh_count=fresh, checked_count=len(sample), affected_projects=affected)
+    reconciled = process_status.get("reconciled_project_ids")
+    reconciled_ids = {item for item in reconciled if isinstance(item, str)} if isinstance(reconciled, list) else set()
+    if (
+        startup_ready
+        and fresh == len(enabled)
+        and not affected
+        and all(project_id in reconciled_ids for project_id, _root in enabled)
+    ):
+        view.update(state="observed", reason=None)
+    elif len(enabled) > len(sample):
+        view["reason"] = "project_sample_limited"
+    elif affected:
+        view["reason"] = "project_observations_incomplete"
+    return view
 
 
 def capture_readiness_snapshot(runtime: MachineRuntime | str | Path | None) -> dict[str, Any]:
@@ -223,7 +366,7 @@ def evaluate_readiness(runtime: MachineRuntime | str | Path | None, snapshot: di
             project["machine_name"] = binding.machine_name
             project["registration_generation"] = binding.registration_generation
         projects.append(project)
-        if project["status"] != "registered":
+        if project["reason"] is not None:
             reasons.append(f"{project_id}:{project['reason']}")
     if not status.get("ready"):
         reasons.append("agent_not_ready")
@@ -285,5 +428,6 @@ __all__ = [
     "allows_machine_only_start",
     "capture_readiness_snapshot",
     "evaluate_readiness",
+    "machine_project_readiness",
     "wait_for_readiness",
 ]

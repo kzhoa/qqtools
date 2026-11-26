@@ -1,6 +1,7 @@
 """Exercise bounded status for the selected Project-local registration."""
 
 import json
+import shlex
 
 import pytest
 
@@ -193,3 +194,35 @@ def test_unbound_status_bypasses_execution_context_lookup(projects, capsys, monk
     assert result["local_participation"]["state"] == "unregistered"
     assert result["takeover_preview_help"]
     assert not runtime.root.exists()
+
+
+def test_status_prioritizes_missing_enrollment_over_missing_agent_evidence(projects, capsys, tmp_path):
+    _, root, _ = projects
+    runtime = MachineRuntime(tmp_path / "different local runtime")
+    initialize_machine(runtime, "other")
+    before = runtime.paths["registry"].read_bytes()
+    args = status_args(runtime, root)
+
+    assert main([*args, "--format=json"]) == 0
+    result = json.loads(capsys.readouterr().out)
+    assert result["local_participation"]["state"] == "unregistered"
+    assert result["local_agent"]["state"] != "active"
+    assert result["scheduling_readiness"]["state"] == "unknown"
+    primary = result["primary_action"]
+    assert shlex.split(primary["command"]) == [
+        "qexp",
+        "--machine-runtime-root",
+        str(runtime.root),
+        "project",
+        "register",
+        str(root),
+    ]
+    assert primary["explanation"]
+
+    assert main(args) == 0
+    human = capsys.readouterr().out
+    assert human.startswith(f"Project: {root}\n")
+    assert primary["explanation"] in " ".join(human.splitlines())
+    assert human.count(primary["command"]) == 1
+    assert runtime.paths["registry"].read_bytes() == before
+    assert not runtime.paths["pid"].exists()

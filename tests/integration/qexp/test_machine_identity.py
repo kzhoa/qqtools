@@ -2,6 +2,7 @@
 
 import json
 import os
+import shlex
 from hashlib import sha256
 from pathlib import Path
 
@@ -9,7 +10,7 @@ import pytest
 
 from qqtools.plugins.qexp.agent.context import MachineRuntime, MachineRuntimeUninitializedError
 from qqtools.plugins.qexp.agent.identity import MachineRuntimeIdentityError
-from qqtools.plugins.qexp.agent.setup import initialize_machine
+from qqtools.plugins.qexp.agent.setup import initialize_machine, initialize_project
 from qqtools.plugins.qexp.cli.entrypoint import main
 from qqtools.plugins.qexp.infrastructure.host import host_instance_id
 from qqtools.plugins.qexp.runtime.store import atomic_replace
@@ -28,6 +29,75 @@ def test_fresh_runtime_advises_init_without_creating_files(tmp_path: Path) -> No
     assert not runtime.root.exists()
     initialize_machine(runtime, "gpu-1")
     runtime.require_initialized()
+
+
+@pytest.mark.parametrize("known_project", [False, True])
+def test_init_human_guides_fresh_setup_without_enrolling(tmp_path, monkeypatch, capsys, known_project):
+    runtime = MachineRuntime(tmp_path / "machine runtime")
+    project = tmp_path / "training project"
+    project.mkdir()
+    monkeypatch.chdir(project)
+    monkeypatch.delenv("QEXP_SHARED_ROOT", raising=False)
+    if known_project:
+        initialize_project(project)
+    before = _snapshot(project)
+
+    assert main(["--machine-runtime-root", str(runtime.root), "init", "--machine", "gpu-1"]) == 0
+
+    output = capsys.readouterr().out
+    assert "initialized" in output.splitlines()[0].lower()
+    assert "gpu-1" in output
+    assert str(runtime.root) in output
+    assert "no project was registered" in output.lower()
+    assert "no agent was started" in output.lower()
+    registration = next(line[line.index("qexp ") :] for line in output.splitlines() if "project register" in line)
+    assert shlex.split(registration) == [
+        "qexp",
+        "--machine-runtime-root",
+        str(runtime.root),
+        "project",
+        "register",
+        str(project) if known_project else ".",
+    ]
+    assert ("qexp project init" in output) is not known_project
+    assert _snapshot(project) == before
+    assert runtime.load_registry()[1] == []
+    assert not runtime.paths["pid"].exists()
+
+
+def test_init_refusal_reports_runtime_and_keeps_replacement_explicit(tmp_path, capsys):
+    runtime = MachineRuntime(tmp_path / "machine runtime")
+    initialize_machine(runtime, "original")
+    before = _snapshot(runtime.root)
+
+    assert main(["--machine-runtime-root", str(runtime.root), "init", "--machine", "replacement"]) == 2
+
+    captured = capsys.readouterr()
+    assert str(runtime.root) in captured.err
+    assert "--yes" in captured.err
+    assert "local authority" in captured.err.lower()
+    assert "project init" not in captured.err
+    assert _snapshot(runtime.root) == before
+
+
+def test_init_reports_scoped_inspection_for_missing_identity_with_residue(tmp_path, capsys):
+    runtime = MachineRuntime(tmp_path / "machine runtime")
+    initialize_machine(runtime, "original")
+    runtime.paths["identity"].unlink()
+    before = _snapshot(runtime.root)
+
+    assert main(["--machine-runtime-root", str(runtime.root), "init", "--machine", "replacement", "--yes"]) == 1
+
+    captured = capsys.readouterr()
+    assert "existing runtime data" in captured.err
+    commands = [line[line.index("qexp ") :] for line in captured.err.splitlines() if "admin repair identity" in line]
+    assert any(
+        shlex.split(command.strip("'."))
+        == ["qexp", "--machine-runtime-root", str(runtime.root), "admin", "repair", "identity", "--dry-run"]
+        for command in commands
+    )
+    assert "project init" not in captured.err
+    assert _snapshot(runtime.root) == before
 
 
 @pytest.mark.parametrize(

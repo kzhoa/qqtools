@@ -289,6 +289,14 @@ shared registrations, Tasks, claims, or reservations. Verified or ambiguous live
 always blocks replacement. Ordinary replacement also requires all recovery and terminal-publication
 obligations to be settled.
 
+A successful fresh `init` names the new machine and selected runtime. Its human
+result explains that Project enrollment and agent startup are separate steps.
+When an initialized Project is available through ordinary Project selection,
+the guidance supplies a registration command for that path and runtime.
+Otherwise it explains how to initialize and enroll the intended directory.
+Successful replacement reports the change in local authority and any retained
+archive and unresolved obligations.
+
 Machine identity checks distinguish a fresh runtime from unreadable or malformed identity.
 Only a missing identity with no remaining runtime data receives initialization guidance.
 A missing identity alongside configuration, inventory, generations, reservations or execution
@@ -1713,6 +1721,13 @@ and preview results exit 0. Stable error codes include `invalid_input`, `context
 `commit_unknown`, and `interrupted`. Caught interruption exits 130. A post-commit activation or
 finalization error retains `committed`, the verified IDs, and exits 1 with an operational error.
 
+Command and manifest submissions report verified Task IDs and Project-scoped
+inspection commands. A preview explicitly reports that it submitted no Tasks.
+A committed result describes local activation separately from Task execution.
+When activation fails after commit, the result tells the user to keep the IDs
+and avoid a duplicate submission, then supplies the scoped follow-up. With
+`--no-activate`, the result reports that this command skipped local activation.
+
 Manifest omission is distinct from explicit null. Null optional mappings (`group`, `defaults`,
 `placement`, `placement.sharing`, and `placement.sharing.offer`) behave as omitted mappings.
 `group.name`, `group.workers`, `task_id`, and `name` use their documented unspecified behavior;
@@ -1844,21 +1859,22 @@ and omits a duplicate Selection source row. JSON status retains the structured s
 receives the ordinary Project notice on stderr. If status fails after selection but before rendering,
 the selected Project line is emitted on stderr before the error.
 
-The default human `status` presentation starts with the selected Project path and local enrollment,
-then presents local agent and Task-observation evidence. An active Task observation is an index
-condition and does not assert a running-Task count. A registered Project with a clean active
-observation, complete diagnostic coverage, no warnings, and no active findings omits the action
-section. Material enrollment, observation, agent, mode, warning, diagnostic-coverage, and finding
-conditions retain bounded next actions, with the highest-priority action first. Scheduler findings
-show only the bounded samples returned by the Project summary, their stable reason, available
-Project or Attempt scope, observation time, aggregate and displayed counts, and a finite diagnostic
-command mapping. Human output prints the same ordered commands as the JSON
-`next_actions` string array. A normal observation returns an empty array. Each command
-pins the observed MachineRuntime and any relevant Project. Confirmed non-enrollment
-offers registration for local execution. Unreadable enrollment evidence calls for inspecting
-the selected registry and inventory paths with `ls -ld`. An unavailable, truncated, or incomplete
-scheduler summary offers a bounded Project-filtered diagnostics read. Sampled findings
-also filter by stable reason. These follow-ups require no additional reads during status.
+Human `status` starts with the selected Project, local enrollment and the
+verified local binding name. It reports when the binding is disabled, expired
+or unverified. It distinguishes local agent heartbeat, Project snapshot
+freshness, Task index state and diagnostic coverage. An active Task index and
+zero scheduling findings each leave Task execution unverified.
+
+JSON retains `next_actions` as an ordered command array and adds
+`primary_action`, either null or an object with `command` and `explanation`.
+Human output gives the primary action and its purpose. Each follow-up supplies
+the known runtime and Project scope. Missing enrollment offers registration
+for local execution. Unavailable enrollment evidence points to the local
+registry and inventory. Project-scoped diagnostics can explain missing
+observations or incomplete coverage. Takeover preview help remains accessible
+as a separate entry point for users who intend to select a target by name.
+Scheduler finding details are limited to the bounded samples returned by the
+Project summary. These follow-ups require no additional status reads.
 
 Project JSON includes `upgrade` with `state`, `migration`, `phase`,
 `admission_blocked`, and `reason`. The overview reads the selected root's canonical
@@ -2352,10 +2368,10 @@ machine authority and therefore affect every registered Project. Activation-trig
 require their Project to be registered; `submit --no-activate` may still persist work without
 starting the agent.
 
-`restart` waits for the old process to stop and its replacement to start, but does not add a
-readiness wait. It reports available evidence and otherwise says `Ready: pending`; a later
-`agent status` observes convergence. Lifecycle status reports configured `daemon|on_demand`
-policy separately from a differing observed process mode.
+`restart` waits for the old process to stop and the replacement to start. Its
+result reports the available readiness evidence at that point. A later
+`agent status` can observe convergence. Lifecycle status reports configured
+`daemon|on_demand` policy separately from a differing observed process mode.
 
 Machine runtime loss is not project loss. A replacement machine agent starts from explicitly
 registered bindings and does not infer, supervise, or declare the terminal state of processes
@@ -2598,9 +2614,25 @@ Ordinary reruns remain attached to the blocked generation. The flag never
 reinterprets an untrusted legacy cursor or discards Task and Attempt truth.
 
 `agent run` is a foreground debugging stream with no `--format` or finite startup record.
-`agent restart` reports process replacement and current readiness evidence without waiting for
-Project convergence; use `agent status` for the subsequent configured-mode, observed-mode, and
-readiness view.
+`agent start` reports the result of its bounded startup wait and distinguishes
+machine-only daemon readiness from startup readiness with enabled Projects.
+`agent restart` reports process replacement and current evidence without
+waiting for Project convergence. Its follow-up points to the observation or
+inspection relevant to the reported state.
+
+`agent restart` and `agent status` JSON include the configured `agent_name`
+and `project_readiness`. The readiness `state` is `inventory_unknown`, `inactive`, `machine_only`, `pending`, or
+`observed`. `enabled_count` is the size of the verified enabled roster or null
+when the roster is unknown. `checked_count` counts sampled roster entries.
+`fresh_count` counts fresh Project observations in that sample and is null
+when the roster or active process is unverified. `affected_projects` lists
+sampled paths and their blocker or missing evidence. `reason` describes a
+machine-level limitation when present. The sample checks at most eight entries
+and leaves unsampled Projects unverified. Verified machine-only startup
+requires a known empty enabled roster and current daemon readiness. An
+observation describes the current runtime, agent and binding, while Task
+execution has its own evidence. Existing lifecycle result fields retain
+their original meaning.
 
 The `active` and `history` commands are finite machine-local reads and support human or JSON
 output. `--limit` defaults to 32 and accepts 1--32. `active` is one live top-N

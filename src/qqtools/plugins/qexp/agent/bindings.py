@@ -14,6 +14,10 @@ REGISTRY_VERSION = 2
 SOURCE_REGISTRY_VERSION = 1
 
 
+class MachineRegistryError(RuntimeError):
+    """The local Project registry cannot supply trustworthy evidence."""
+
+
 @dataclass(frozen=True, slots=True)
 class ProjectBinding:
     project_id: str
@@ -133,13 +137,13 @@ def decode_registry(value: dict[str, Any]) -> tuple[int, tuple[ProjectBinding, .
         or type(registry.get("version")) is not int
         or registry["version"] not in {SOURCE_REGISTRY_VERSION, REGISTRY_VERSION}
     ):
-        raise RuntimeError("machine registry is malformed or unsupported.")
+        raise MachineRegistryError("machine registry is malformed or unsupported.")
     revision = registry.get("revision")
     bindings = registry.get("bindings")
     if type(revision) is not int or revision < 0 or not isinstance(bindings, list):
-        raise RuntimeError("machine registry is malformed.")
+        raise MachineRegistryError("machine registry is malformed.")
     try:
         parsed = tuple(sorted((ProjectBinding.from_dict(item) for item in bindings), key=lambda item: item.project_id))
     except (TypeError, ValueError) as exc:
-        raise RuntimeError("machine registry contains a malformed project binding.") from exc
+        raise MachineRegistryError("machine registry contains a malformed project binding.") from exc
     return revision, parsed

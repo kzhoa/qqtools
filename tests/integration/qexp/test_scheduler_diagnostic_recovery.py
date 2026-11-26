@@ -121,6 +121,10 @@ def test_restart_from_project_recovers_full_store_without_foreground_repair(proj
     human = capsys.readouterr().out
     assert "awaiting observation" not in human.lower()
     assert "superseded" not in human.lower()
+    assert main(["agent", "status"]) == 0
+    machine_human = capsys.readouterr().out.lower()
+    assert "recovery is awaiting" not in machine_human
+    assert "recovery is progressing" not in machine_human
 
 
 def test_restart_blocker_gives_direct_preview_and_committed_queue_outcome(project_machine, capsys, monkeypatch):

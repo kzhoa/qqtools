@@ -242,11 +242,17 @@ def fence_recovery_admission(runtime: MachineRuntime, binding: ProjectBinding) -
             )
 
 
-def inspect_recovery_admission(runtime: MachineRuntime, binding: ProjectBinding) -> dict:
+def inspect_recovery_admission(
+    runtime: MachineRuntime, binding: ProjectBinding, *, runtime_id: str | None = None
+) -> dict:
     """Read an advisory enrollment snapshot without activating or repairing state."""
     try:
         cfg = binding.root_config()
-        status = runtime.registration_status(binding)
+        status = (
+            runtime.registration_status(binding)
+            if runtime_id is None
+            else runtime.registration_status(binding, runtime_id=runtime_id)
+        )
         if status["state"] == "superseded":
             return {"state": "superseded", "blockers": [], "diagnostic_only": True}
         if not status["write_eligible"] or status["recovery_protocol"] != RECOVERY_PROTOCOL:

@@ -156,10 +156,10 @@ qexp agent status  # observe readiness after process replacement
 qexp agent stop
 ```
 
-`agent restart` waits for replacement of the agent process, not for every Project to converge.
-Its result can therefore say `Ready: pending`; use the following `agent status` to observe later
-readiness. Status keeps configured `daemon|on_demand` policy distinct from a differing observed
-mode.
+`agent restart` returns after process replacement and reports the Project evidence available at
+that time. Follow the scoped inspection command if readiness is still unverified. Use
+`qexp status` from a Project to see its verified local binding, snapshot freshness and
+diagnostic coverage. `qexp agent status` shows the machine-level summary and any mode mismatch.
 
 Daemon mode also supports `agent start` before any Project is registered. Optional
 [Idle Job commands](docs/qexp-idle-job.md) can use selected GPUs during proven
@@ -175,13 +175,13 @@ to apply it:
 qexp config set agent --log-max-size 10MiB
 qexp config show agent
 qexp agent restart
-qexp agent status
+qexp agent status --format json
 ```
 
 The size is a rotation trigger, not a strict cap: concurrent native writes can overshoot it before
 the next one-second check. Rotated `_agent_*.log` files are retained beside `agent.log`; qexp does
 not delete archives or old instance directories. The operating system may clean `/tmp`, including
-on reboot. `agent status` reports the current or latest log path, capture health, effective size,
+on reboot. `agent status --format json` reports the current or latest log path, capture health, effective size,
 and bounded exit evidence without reading log contents. An unexplained disappearance is reported
 as unknown rather than being guessed as an OOM or signal exit. Foreground `agent run` preserves
 terminal output and records only qexp-managed diagnostics in its instance log.

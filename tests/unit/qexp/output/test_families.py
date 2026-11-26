@@ -6,7 +6,6 @@ from pathlib import Path
 import pytest
 
 from qqtools.plugins.qexp.cli.output import CliOutput, OutputKind, render
-from qqtools.plugins.qexp.cli.output.agent import _control_plane_next_action
 
 
 def _gpu_policy_view() -> dict[str, object]:
@@ -45,17 +44,6 @@ def _project_io_isolation(**overrides: object) -> dict[str, object]:
     }
     isolation.update(overrides)
     return isolation
-
-
-def test_control_plane_next_action_reserves_restart_for_lane_failures() -> None:
-    restart = _control_plane_next_action({}, {"state": "stopped"}, {"state": "healthy"})
-    assert restart == "inspect qexp agent diagnostics active, then run qexp agent restart"
-
-    publications = {"project_snapshot_publications": {"items": [{"overdue": True}]}}
-    retry = _control_plane_next_action(publications, {"state": "healthy"}, {"state": "healthy"})
-    assert retry == (
-        "inspect qexp agent diagnostics active; restart is not required while the heartbeat remains responsive"
-    )
 
 
 def test_submission_result_fixtures_satisfy_json_and_human_contracts() -> None:
@@ -217,15 +205,13 @@ def test_agent_status_separates_project_io_health_from_activity() -> None:
         "human",
     )
 
-    assert "Attention required\n  Project I/O isolation status: degraded" in degraded
-    assert "  Blocking projects: project-a" in degraded
-    assert "  Workers (active / overdue / exit unverified): 1 / 1 / 0" in degraded
-    assert "Attention required" not in active
-    assert "Project I/O activity\n  State: in progress" in active
-    assert "  Active workers: 4" in active
-    assert "  Free executor slots: 0" in active
-    assert "Blocking projects" not in active
-    assert "Project I/O activity" not in empty
+    assert "Project I/O isolation is degraded." in degraded
+    assert "project-a" in degraded
+    assert "qexp --machine-runtime-root /machine-runtime agent diagnostics active" in degraded
+    assert "Project I/O isolation is degraded" not in active
+    assert "Project I/O isolation is degraded" not in empty
+    assert "qexp agent restart" not in active
+    assert "qexp agent restart" not in empty
 
 
 @pytest.mark.parametrize(
@@ -408,23 +394,19 @@ def test_agent_status_groups_diagnostics_for_human_scanning() -> None:
 
     rendered = render(CliOutput(OutputKind.AGENT_STATUS, payload), "human")
 
-    assert "Diagnostics\n  State: available\n  Capture: detached\n  Capture health: healthy" in rendered
-    assert "Current startup\n  Startup outcome: started\n  Signal attempts: none" in rendered
-    assert "Previous exit (stale)\n  Source: last_exit\n  Reason: stopped_by_signal" in rendered
-    assert "  Handled signal: 15\n  Cleanup: succeeded\n  Instance: previous-instance" in rendered
-    assert "  Full details: qexp agent status --format json" in rendered
-    assert "Cleanup steps" not in rendered
-    assert "Diagnostic coverage\n  Evicted count: 0\n  Unresolved evicted through: 0" in rendered
-    assert "Scheduling diagnostics\n  State: available\n  Coverage: incomplete" in rendered
-    assert "  Reason: probe_data_unavailable" in rendered
-    assert "Control plane\n  State: degraded\n  Authority: healthy" in rendered
-    assert "Heartbeat\n  State: retrying\n  Thread alive: yes" in rendered
-    assert "  Consecutive failures: 2\n  Reason: registry_unavailable" in rendered
-    assert "Affected Projects\n  project-a: backoff (worker_start_failed)" in rendered
-    assert (
-        "Next action: inspect qexp agent diagnostics active; restart is not required while the heartbeat remains "
-        "responsive" in rendered
-    )
+    assert rendered.startswith("Agent active.\nMachineRuntime root: /machine-runtime\n")
+    assert "Control plane heartbeat is retrying." in rendered
+    assert "Registry unavailable." in rendered
+    assert "Project snapshot publication is overdue." in rendered
+    assert "project-a: backoff (worker_start_failed)" in rendered
+    assert "Scheduler diagnostic coverage is incomplete." in rendered
+    assert "Probe data unavailable." in rendered
+    assert rendered.count("qexp --machine-runtime-root /machine-runtime agent diagnostics active") == 1
+    assert "agent restart" not in rendered
+    assert "Capture health" not in rendered
+    assert "Current startup" not in rendered
+    assert "Previous exit" not in rendered
+    assert "Last cycle started" not in rendered
     assert json.loads(render(CliOutput(OutputKind.AGENT_STATUS, payload), "json")) == payload
 
 
@@ -442,7 +424,7 @@ def test_agent_status_omits_previous_exit_section_without_exit_evidence() -> Non
 
     rendered = render(CliOutput(OutputKind.AGENT_STATUS, payload), "human")
 
-    assert "Diagnostics\n  State: available" in rendered
+    assert rendered == "Agent active.\nMachineRuntime root: /machine-runtime"
     assert "Previous exit" not in rendered
     assert "Full details" not in rendered
 

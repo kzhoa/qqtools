@@ -28,6 +28,36 @@ _REASON_CODE = re.compile(r"^[a-z][a-z0-9_]{0,95}$")
 _RequestStage = Literal["queued", "started", "result_ready", "consumed", "published"]
 
 
+_OBSERVATION_TIMESTAMP = re.compile(
+    r"[0-9]{4}-[0-9]{2}-[0-9]{2}[Tt][0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]+)?"
+    r"(?:[Zz]|[+-](?:[01][0-9]|2[0-3]):[0-5][0-9])"
+)
+
+
+def observation_timestamp(raw: object) -> datetime | None:
+    """Decode a bounded ISO timestamp carrying an explicit offset."""
+    if not isinstance(raw, str) or len(raw) > 64 or _OBSERVATION_TIMESTAMP.fullmatch(raw) is None:
+        return None
+    try:
+        return datetime.fromisoformat(raw[:-1] + "+00:00" if raw.endswith(("Z", "z")) else raw)
+    except ValueError:
+        return None
+
+
+def observation_freshness(
+    seen_at: object, interval: object, *, now: datetime, intervals: int = 1
+) -> Literal["unknown", "fresh", "stale"]:
+    observed = observation_timestamp(seen_at)
+    if observed is None or observed > now or type(interval) not in {int, float} or interval <= 0:
+        return "unknown"
+    try:
+        if not math.isfinite(interval):
+            return "unknown"
+    except OverflowError:
+        return "unknown"
+    return "fresh" if (now - observed).total_seconds() / intervals <= interval else "stale"
+
+
 @dataclass(slots=True)
 class _PublicationProgress:
     stale_after: float

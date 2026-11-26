@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 from dataclasses import InitVar, dataclass, field
 from pathlib import Path
+from stat import S_ISREG
 from typing import Any, Iterable
 
 from ..runtime.store import atomic_replace, read_json
@@ -197,12 +198,49 @@ def save_inventory_locked(runtime: Any, revision: int, entries: Iterable[Project
         machine_runtime.invalidate_inventory_cache()
 
 
-def reconcile_live_bindings_locked(runtime: Any, *, repair: bool = True) -> InventoryReconciliation:
-    """Inspect or repair exact live mirrors under inventory and registry locks."""
+def observe_live_bindings(runtime: Any, *, runtime_id: str) -> InventoryReconciliation:
+    """Read one consistent roster without creating layout, lock files, or records."""
+    from .registration_replacement import _intent_path
+
+    paths = (runtime.paths["identity"], _inventory_path(runtime), runtime.paths["registry"], _intent_path(runtime))
+
+    def roster_witness() -> tuple[object, ...]:
+        witness = []
+        for path in paths:
+            try:
+                info = path.lstat()
+            except FileNotFoundError:
+                if path == paths[-1]:
+                    witness.append(None)
+                    continue
+                raise
+            if not S_ISREG(info.st_mode):
+                raise RuntimeError(f"MachineRuntime roster record is not a regular file: {path}")
+            witness.append((info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns))
+        return tuple(witness)
+
+    before = roster_witness()
+    if runtime.observe_instance_id() != runtime_id:
+        raise RuntimeError("MachineRuntime identity changed during roster observation.")
+    result = _reconcile_live_bindings(runtime, repair=False, runtime_id=runtime_id)
+    if roster_witness() != before:
+        raise RuntimeError("MachineRuntime roster changed during observation.")
+    return result
+
+
+def reconcile_live_bindings_locked(runtime: Any) -> InventoryReconciliation:
+    """Repair exact live mirrors under inventory and registry locks."""
     machine_runtime = _as_runtime(runtime)
     if not machine_runtime._inventory_lock_depth or not machine_runtime._registry_guard_depth.get():
         raise RuntimeError("Project inventory reconciliation requires inventory and registry guards.")
-    inventory_revision, entries = load_inventory(machine_runtime)
+    return _reconcile_live_bindings(machine_runtime, repair=True, runtime_id=machine_runtime.instance_id)
+
+
+def _reconcile_live_bindings(machine_runtime: Any, *, repair: bool, runtime_id: str) -> InventoryReconciliation:
+    if repair:
+        inventory_revision, entries = load_inventory(machine_runtime)
+    else:
+        inventory_revision, entries = decode_inventory(read_json(_inventory_path(machine_runtime)))
     registry_revision, bindings = machine_runtime.load_registry_uncached()
     from .registration_replacement import read_registration_intents
 
@@ -211,8 +249,7 @@ def reconcile_live_bindings_locked(runtime: Any, *, repair: bool = True) -> Inve
     if takeover is not None:
         pending_project = takeover.transition.project_id
     next_entries = list(entries)
-    blockers: list[str] = []
-    runtime_id = machine_runtime.instance_id
+    blockers = ["project_registration_transition_pending"] if not repair and pending_project is not None else []
     runtime_root = str(machine_runtime.root)
 
     for binding in bindings:

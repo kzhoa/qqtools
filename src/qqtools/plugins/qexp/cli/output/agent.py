@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import math
 import re
+import shlex
+import textwrap
 from collections.abc import Mapping, Sequence
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 from ...config_types import MAX_IDLE_JOB_STOP_TIMEOUT_SECONDS
@@ -74,22 +77,6 @@ def _render_affected_projects(value: object) -> str:
     return "Affected Projects\n" + "\n".join(lines) if lines else ""
 
 
-def _control_plane_next_action(
-    control_plane: Mapping[str, Any], heartbeat: Mapping[str, Any], authority: Mapping[str, Any]
-) -> str | None:
-    if heartbeat.get("state") in {"degraded", "stalled", "stopped"} or authority.get("state") in {
-        "degraded",
-        "stalled",
-        "stopped",
-    }:
-        return "inspect qexp agent diagnostics active, then run qexp agent restart"
-    publications = control_plane.get("project_snapshot_publications")
-    items = publications.get("items") if isinstance(publications, Mapping) else None
-    if isinstance(items, Sequence) and any(isinstance(item, Mapping) and item.get("overdue") is True for item in items):
-        return "inspect qexp agent diagnostics active; restart is not required while the heartbeat remains responsive"
-    return None
-
-
 def _project_readiness(project: Mapping[str, Any]) -> tuple[bool, Any, Any]:
     """Return the ready decision, displayed state, and actionable reason."""
     status = project.get("status")
@@ -107,6 +94,18 @@ def _project_readiness(project: Mapping[str, Any]) -> tuple[bool, Any, Any]:
 
 
 def _render_agent_operation(result: Mapping[str, Any], _presentation: Mapping[str, object]) -> str:
+    action = result.get("action")
+    if action == "restarted":
+        return _render_agent_restart(result)
+    if action in {"started", "already_running"} and "inventory_revision" in result:
+        lines = ["Agent started." if action == "started" else "Agent already running."]
+        lines.extend(_agent_scope_lines(result))
+        projects = result.get("projects")
+        if projects:
+            lines.append("Startup readiness verified for the enabled Projects.")
+        else:
+            lines.append("Machine-only daemon ready with no enabled Projects.")
+        return "\n".join(lines)
     projects = result.get("projects")
     project_rows: list[tuple[Any, ...]] = []
     if isinstance(projects, Sequence) and not isinstance(projects, (str, bytes)):
@@ -158,23 +157,6 @@ def _render_agent_operation(result: Mapping[str, Any], _presentation: Mapping[st
     blockers = [row[:3] for row in project_rows if not row[3]]
     if blockers:
         rendered += "\n\n" + _table(("Project", "State", "Reason"), blockers[:10], empty_message="No Project blockers.")
-    recovery = result.get("diagnostic_recovery")
-    if result.get("action") == "restarted" and isinstance(recovery, Mapping):
-        state = recovery.get("state")
-        if state in {"pending", "progressing", "blocked", "awaiting_observation"}:
-            root = recovery.get("machine_runtime_root")
-            rendered += "\n\n" + _status_section(
-                "Scheduler diagnostic recovery",
-                (
-                    ("Scope", "machine runtime (all Projects)"),
-                    ("Machine runtime", encode_display_text(root) if isinstance(root, str) else None),
-                    ("State", state.replace("_", " ")),
-                    ("Reason", recovery.get("reason")),
-                    ("Last progress", recovery.get("last_progress_at")),
-                    ("Next check", recovery.get("next_check_at")),
-                    ("Read-only preview", recovery.get("next_action") if state == "blocked" else None),
-                ),
-            )
     return rendered
 
 
@@ -262,151 +244,318 @@ def _render_idle_job_status(status: Mapping[str, Any]) -> str:
     return "\n".join((rendered, *(f"  {line}" for line in (message, *lines))))
 
 
+def _agent_scope_lines(result: Mapping[str, Any]) -> list[str]:
+    root = result.get("machine_runtime_root")
+    lines = [f"MachineRuntime root: {encode_display_text(str(root))}"] if root is not None else []
+    configured = result.get("configured_agent_mode")
+    observed = result.get("observed_agent_mode")
+    if configured:
+        mode = str(configured).replace("_", " ")
+        readiness = result.get("project_readiness") or {}
+        if (
+            observed
+            and observed != configured
+            and result.get("agent_state") == "active"
+            and readiness.get("reason") != "replacement_observation_unavailable"
+        ):
+            mode += f" configured, {str(observed).replace('_', ' ')} observed"
+        lines.append(f"Mode: {mode}")
+    return lines
+
+
+def _machine_command(result: Mapping[str, Any], *args: str) -> str:
+    root = result.get("machine_runtime_root")
+    scope = ("--machine-runtime-root", str(root)) if root is not None else ()
+    return shlex.join(("qexp", *scope, *args))
+
+
+def _next_step(description: str, command: str) -> list[str]:
+    return [*textwrap.wrap(description, width=80), f"  {command}"]
+
+
+_STATUS_REASONS = {
+    "agent_not_ready": "The agent has not reported startup readiness.",
+    "authority_unavailable": "Current registration authority could not be verified.",
+    "concurrent_inventory_change": "The Project inventory changed during startup.",
+    "concurrent_registry_change": "The Project registry changed during startup.",
+    "enablement_mirror_diverged": "The Project inventory and registry disagree about enablement.",
+    "identity_path_conflict": "The Project ID and path disagree with local registration.",
+    "initial_reconciliation_pending": "Initial Project reconciliation is pending.",
+    "invalid": "The Project registration could not be verified.",
+    "inventory_entry_removed": "The Project inventory entry was removed during startup.",
+    "inventory_mirror_incomplete": "The Project inventory and registry have not converged.",
+    "legacy_project_requires_migration": "The Project still uses a legacy registration.",
+    "no_enabled_projects": "This agent mode requires an enabled Project registered here.",
+    "not_registered": "The Project is in the inventory and needs registration.",
+    "project_roster_unavailable": "The Project inventory or registry could not be read.",
+    "registry_enablement_unknown": "The Project inventory or registry could not be read.",
+    "replacement_observation_unavailable": "The replacement process has no matching status observation yet.",
+    "snapshot_observation_expired": "The latest Project snapshot observation has expired.",
+    "snapshot_observation_identity_mismatch": "The snapshot is from another agent or registration.",
+    "snapshot_observation_invalid": "The Project snapshot observation is invalid.",
+    "snapshot_observation_unavailable": "A current Project snapshot observation is unavailable.",
+    "stale_agent_identity": "The status record does not match the current agent process.",
+    "stale_runtime_generation": "The status record is from another runtime identity.",
+    "superseded": "The local Project registration has been superseded.",
+    "unregistered": "The current Project registration is missing.",
+}
+
+
+def _reason_text(value: object) -> str:
+    reason = str(value)
+    return _STATUS_REASONS.get(reason, reason.replace("_", " ").capitalize().removesuffix(".") + ".")
+
+
+def _readiness_card(result: Mapping[str, Any], *, restarting: bool = False) -> tuple[list[str], tuple[str, str] | None]:
+    readiness = result.get("project_readiness")
+    if not isinstance(readiness, Mapping):
+        if not restarting:
+            return [], None
+        readiness = {}
+    state = readiness.get("state")
+    enabled = readiness.get("enabled_count")
+    if state == "machine_only":
+        return ["Machine-only daemon ready with no enabled Projects."], None
+    if state == "observed":
+        scope = "1 enabled Project" if enabled == 1 else f"all {enabled} enabled Projects"
+        return [f"Project readiness verified for {scope}."], None
+    if state == "inactive" and not restarting and result.get("agent_state") == "stopped":
+        return ["Project readiness is unavailable while the agent is stopped."], None
+
+    lines = ["Project readiness has not been verified."]
+    reason = readiness.get("reason")
+    if state == "inventory_unknown":
+        lines.append(_reason_text(reason or "project_roster_unavailable"))
+    elif state == "inactive":
+        lines.append("A current agent process identity could not be verified.")
+    elif state == "pending":
+        fresh = readiness.get("fresh_count")
+        checked = readiness.get("checked_count")
+        if checked:
+            lines.append(f"Fresh observations for {fresh} of {checked} Projects checked.")
+            if checked < enabled:
+                lines.append(f"The sample covers {checked} of {enabled} enabled Projects.")
+        if reason == "startup_readiness_unverified":
+            lines.append("Startup readiness for the current Project inventory is pending.")
+    affected = readiness.get("affected_projects") or ()
+    for project in affected[:3]:
+        lines.extend(
+            (
+                f"  Project: {encode_display_text(project['path'])}",
+                *textwrap.wrap(
+                    _reason_text(project["reason"]), width=80, initial_indent="    ", subsequent_indent="    "
+                ),
+            )
+        )
+    if len(affected) > 3:
+        lines.append(f"  {len(affected) - 3} more checked Projects need attention.")
+    if state == "inventory_unknown" and reason != "replacement_observation_unavailable":
+        root = Path(result["machine_runtime_root"])
+        return lines, (
+            "Inspect the Project inventory and registry paths.",
+            shlex.join(("ls", "-ld", "--", str(root / "inventory.json"), str(root / "registry.json"))),
+        )
+    if restarting or not affected:
+        return lines, ("Recheck process and Project readiness.", _machine_command(result, "agent", "status"))
+    project = affected[0]
+    return lines, (
+        "Inspect the affected Project's local agent and scheduling evidence.",
+        _machine_command(result, "--project", project["path"], "status"),
+    )
+
+
+def _diagnostic_recovery_card(result: Mapping[str, Any]) -> tuple[list[str], tuple[str, str] | None]:
+    recovery = result.get("diagnostic_recovery")
+    if not isinstance(recovery, Mapping):
+        return [], None
+    state = recovery.get("state")
+    messages = {
+        "pending": "Scheduler diagnostic recovery is pending for this runtime.",
+        "progressing": "Scheduler diagnostic recovery is progressing for this runtime.",
+        "blocked": "Scheduler diagnostic recovery is blocked for this runtime.",
+    }
+    if state not in messages:
+        return [], None
+    lines = [messages[state]]
+    if state == "progressing":
+        lines.append("Recovery can continue without another restart.")
+    if reason := recovery.get("reason"):
+        lines.append(_reason_text(reason))
+    if state == "blocked":
+        return lines, (
+            "Inspect the diagnostic recovery blocker without changing local state.",
+            _machine_command(result, "agent", "diagnostics", "repair", "--dry-run"),
+        )
+    return lines, None
+
+
+def _render_agent_restart(result: Mapping[str, Any]) -> str:
+    title = "Agent restarted." if result.get("previous_pid") is not None else "Agent started via restart."
+    lines = [title, *_agent_scope_lines(result)]
+    readiness, readiness_step = _readiness_card(result, restarting=True)
+    lines.extend(readiness)
+    view = result.get("project_readiness")
+    if isinstance(view, Mapping) and view.get("reason") == "replacement_observation_unavailable":
+        recovery, recovery_step = [], None
+    else:
+        recovery, recovery_step = _diagnostic_recovery_card(result)
+    lines.extend(recovery)
+    if step := recovery_step or readiness_step:
+        lines.extend(_next_step(*step))
+    return "\n".join(lines)
+
+
 def _render_agent_status(result: Mapping[str, Any], _presentation: Mapping[str, object]) -> str:
-    rendered = _render_agent_operation(result, _presentation)
-    if result.get("stop_reason") is not None:
-        rendered = f"{rendered}\n\nStop reason: {result.get('stop_reason')}"
-    idle_job = result.get("idle_job")
-    if isinstance(idle_job, Mapping):
-        idle_job_details = _render_idle_job_status(idle_job)
-        if idle_job_details:
-            rendered = f"{rendered}\n\n{idle_job_details}" if rendered else idle_job_details
-    project_io = result.get("project_io_isolation")
-    if isinstance(project_io, Mapping) and project_io.get("envelope") in {"degraded", "exceeded", "unknown"}:
-        project_io_details = _status_section(
-            "Attention required",
-            (
-                ("Project I/O isolation status", project_io.get("envelope")),
-                ("Blocking projects", project_io.get("blocking_project_ids")),
-                ("Oldest overdue request", project_io.get("oldest_overdue_at")),
-                ("Free executor slots", project_io.get("free_slot_count")),
-                ("Executor epoch", project_io.get("executor_epoch")),
-                (
-                    "Workers (active / overdue / exit unverified)",
-                    f"{project_io.get('active_worker_count')} / {project_io.get('overdue_worker_count')} / "
-                    f"{project_io.get('exit_unverified_worker_count')}",
-                ),
-                ("Unreaped workers", project_io.get("unreaped_worker_count")),
-            ),
-        )
-        if project_io_details:
-            rendered = f"{rendered}\n\n{project_io_details}" if rendered else project_io_details
-    elif (
-        isinstance(project_io, Mapping)
-        and project_io.get("envelope") == "healthy"
-        and project_io.get("free_slot_count") < project_io.get("capacity")
-    ):
-        project_io_details = _status_section(
-            "Project I/O activity",
-            (
-                ("State", "in progress"),
-                ("Active workers", project_io.get("active_worker_count")),
-                ("Free executor slots", project_io.get("free_slot_count")),
-            ),
-        )
-        if project_io_details:
-            rendered = f"{rendered}\n\n{project_io_details}" if rendered else project_io_details
-    control_plane = result.get("control_plane_health")
-    if isinstance(control_plane, Mapping):
-        heartbeat = control_plane.get("heartbeat")
-        heartbeat = heartbeat if isinstance(heartbeat, Mapping) else {}
-        authority = control_plane.get("authority")
-        authority = authority if isinstance(authority, Mapping) else {}
-        heartbeat_failure = heartbeat.get("last_failure")
-        heartbeat_failure = heartbeat_failure if isinstance(heartbeat_failure, Mapping) else {}
-        control_plane_sections = [
-            _status_section(
-                "Control plane",
-                (
-                    ("State", control_plane.get("state")),
-                    ("Authority", authority.get("state")),
-                    (
-                        "Next action",
-                        _control_plane_next_action(control_plane, heartbeat, authority),
-                    ),
-                ),
-            ),
-            _status_section(
-                "Heartbeat",
-                (
-                    ("State", heartbeat.get("state")),
-                    ("Thread alive", heartbeat.get("thread_alive")),
-                    ("Last cycle started", heartbeat.get("last_cycle_started_at")),
-                    ("Last cycle completed", heartbeat.get("last_cycle_completed_at")),
-                    ("Last success", heartbeat.get("last_success_at")),
-                    ("Last failure", heartbeat.get("last_failure_at")),
-                    ("Consecutive failures", heartbeat.get("consecutive_failures")),
-                    ("Reason", heartbeat_failure.get("reason_code")),
-                    ("Cycle duration", heartbeat.get("cycle_duration_seconds")),
-                    ("Missed deadlines", heartbeat.get("missed_deadlines")),
-                ),
-            ),
-            _render_affected_projects(control_plane.get("project_snapshot_publications")),
-        ]
-        control_plane_details = "\n\n".join(section for section in control_plane_sections if section)
-        if control_plane_details:
-            rendered = f"{rendered}\n\n{control_plane_details}" if rendered else control_plane_details
-    diagnostics = result.get("diagnostics")
-    if isinstance(diagnostics, Mapping):
-        last_exit = diagnostics.get("last_exit")
-        last_exit = last_exit if isinstance(last_exit, Mapping) else {}
-        diagnostic_sections = [
-            _status_section(
-                "Diagnostics",
-                (
-                    ("State", diagnostics.get("state")),
-                    ("Capture", diagnostics.get("capture_mode")),
-                    ("Capture health", diagnostics.get("capture_health")),
-                    ("Log", diagnostics.get("log_path")),
-                    ("Persistent log available", diagnostics.get("log_available")),
-                    ("Instance", diagnostics.get("instance_id")),
-                    (
-                        "Log rotation (configured)",
-                        diagnostics.get("configured_log_max_size", diagnostics.get("configured_log_max_bytes")),
-                    ),
-                    (
-                        "Log rotation (effective)",
-                        diagnostics.get("effective_log_max_size", diagnostics.get("effective_log_max_bytes")),
-                    ),
-                ),
-            ),
-            _status_section("Current startup", _status_mapping_fields(diagnostics.get("summary"))),
-            _status_section(
-                "Previous exit (stale)" if diagnostics.get("last_exit_stale") else "Previous exit",
-                (
-                    ("Source", diagnostics.get("last_exit_source")),
-                    ("Reason", last_exit.get("reason")),
-                    ("Handled signal", last_exit.get("handled_signal")),
-                    ("Cleanup", last_exit.get("cleanup_outcome")),
-                    ("Instance", last_exit.get("instance_id")),
-                    (
-                        "Full details",
-                        "qexp agent status --format json"
-                        if last_exit or diagnostics.get("last_exit_source") is not None
-                        else None,
-                    ),
-                ),
-            ),
-            _status_section("Diagnostic coverage", _status_mapping_fields(diagnostics.get("coverage"))),
-        ]
-        diagnostic_details = "\n\n".join(section for section in diagnostic_sections if section)
-        if diagnostic_details:
-            rendered = f"{rendered}\n\n{diagnostic_details}" if rendered else diagnostic_details
+    active = result.get("agent_state") == "active"
+    name = result.get("agent_name")
+    if active:
+        lines = ["Agent active."]
+    elif result.get("pid") is not None:
+        lines = ["Agent process state is unverified."]
+    else:
+        lines = ["Agent stopped."]
+    if isinstance(name, str):
+        lines.append(f"Machine name: {encode_display_text(name)}")
+    lines.extend(_agent_scope_lines(result))
+    if reason := result.get("stop_reason"):
+        lines.append(f"Stop reason: {_reason_text(reason)}")
+    readiness, readiness_step = _readiness_card(result)
+    lines.extend(readiness)
+
+    diagnostics_step = (
+        "Inspect machine scheduler diagnostics for the reported blocker.",
+        _machine_command(result, "agent", "diagnostics", "active"),
+    )
+    control_step = None
+    publication_step = None
+    control = result.get("control_plane_health")
+    if isinstance(control, Mapping):
+        heartbeat = control.get("heartbeat") or {}
+        authority = control.get("authority") or {}
+        affected = _render_affected_projects(control.get("project_snapshot_publications"))
+        for label, lane in (("Heartbeat", heartbeat), ("Authority", authority)):
+            state = lane.get("state")
+            if state in {"degraded", "stalled", "retrying"} or (active and state in {"stopped", "unknown"}):
+                lines.append(f"Control plane {label.lower()} is {state}.")
+                failure = lane.get("last_failure") or {}
+                if reason := failure.get("reason_code"):
+                    lines.extend(
+                        textwrap.wrap(_reason_text(reason), width=80, initial_indent="  ", subsequent_indent="  ")
+                    )
+                if state in {"degraded", "stalled", "stopped"}:
+                    control_step = diagnostics_step
+                else:
+                    publication_step = diagnostics_step
+        if affected:
+            lines.extend(("Project snapshot publication is overdue.", affected))
+            publication_step = diagnostics_step
+        elif not control_step and control.get("state") in {"degraded", "stalled", "stopped"} and active:
+            lines.append(f"Control plane is {control['state']}.")
+            control_step = diagnostics_step
+
+    recovery, recovery_step = _diagnostic_recovery_card(result)
+    lines.extend(recovery)
+    warnings_step = None
+    isolation = result.get("project_io_isolation")
+    if isinstance(isolation, Mapping):
+        envelope = isolation.get("envelope")
+        if envelope in {"degraded", "exceeded"} or (active and envelope == "unknown"):
+            lines.append(f"Project I/O isolation is {envelope}.")
+            for project_id in (isolation.get("blocking_project_ids") or ())[:4]:
+                lines.append(f"  Project ID: {encode_display_text(project_id)}")
+            warnings_step = diagnostics_step
+
     scheduler = result.get("scheduler_diagnostics")
     if isinstance(scheduler, Mapping):
-        scheduler_details = _status_section(
-            "Scheduling diagnostics",
+        active_count = scheduler.get("active_count")
+        diagnostic_reason = scheduler.get("reason")
+        if scheduler.get("coverage") == "incomplete" or (active and scheduler.get("status") == "unavailable"):
+            lines.append("Scheduler diagnostic coverage is incomplete.")
+            if diagnostic_reason:
+                lines.append(f"  {_reason_text(diagnostic_reason)}")
+            warnings_step = diagnostics_step
+        elif isinstance(diagnostic_reason, str) and "clock" in diagnostic_reason:
+            lines.append(_reason_text(diagnostic_reason))
+            warnings_step = diagnostics_step
+        if type(active_count) is int and active_count > 0:
+            lines.append(f"Active scheduler findings: {active_count}")
+            warnings_step = diagnostics_step
+
+    diagnostics = result.get("diagnostics")
+    if isinstance(diagnostics, Mapping):
+        capture = diagnostics.get("capture_health")
+        if active and capture in {"degraded", "unavailable"}:
+            lines.append(f"Agent log capture is {capture}.")
+            if log_path := diagnostics.get("log_path"):
+                lines.append(f"  Log: {encode_display_text(log_path)}")
+            warnings_step = warnings_step or (
+                "Inspect the full machine status for log capture details.",
+                _machine_command(result, "agent", "status", "--format", "json"),
+            )
+        last_exit = diagnostics.get("last_exit")
+        if not active and isinstance(last_exit, Mapping) and last_exit.get("reason"):
+            lines.append(f"Previous agent exit: {_reason_text(last_exit['reason'])}")
+
+    project_warnings = []
+    for project in result.get("projects") or ():
+        eligibility = project.get("eligibility") or {}
+        if project.get("state") in {"superseded", "conflicting"} or eligibility.get("state") in {
+            "invalid",
+            "expired",
+            "revoked",
+        }:
+            project_warnings.append(project)
+    for project in project_warnings[:3]:
+        path = project.get("shared_root") or project.get("project_id")
+        state = project.get("state")
+        reason = state if state in {"superseded", "conflicting"} else project["eligibility"]["state"]
+        displayed_path = str(path).removesuffix("/.qexp") or "/"
+        if any(
+            displayed_path == item["path"]
+            for item in (result.get("project_readiness") or {}).get("affected_projects", ())[:3]
+        ):
+            continue
+        lines.extend(
             (
-                ("State", scheduler.get("status")),
-                ("Coverage", scheduler.get("coverage")),
-                ("Observed", scheduler.get("observed_at")),
-                ("Active findings", scheduler.get("active_count")),
-                ("Reason", scheduler.get("reason")),
-            ),
+                f"Project registration needs attention: {encode_display_text(displayed_path)}",
+                f"  {_reason_text(reason)}",
+            )
         )
-        if scheduler_details:
-            rendered = f"{rendered}\n\n{scheduler_details}" if rendered else scheduler_details
-    return rendered
+    if project_warnings and (path := project_warnings[0].get("shared_root")):
+        readiness_step = (
+            "Inspect the affected Project's local registration.",
+            _machine_command(result, "--project", path, "status"),
+        )
+
+    idle_step = None
+    idle_job = result.get("idle_job")
+    if isinstance(idle_job, Mapping) and idle_job.get("state") in {"waiting", "blocked", "failed", "stopping"}:
+        for line in _render_idle_job_status(idle_job).splitlines():
+            command = line.strip().removeprefix("Inspect: ")
+            if command != line.strip():
+                if idle_step is None:
+                    try:
+                        parts = shlex.split(command)
+                    except ValueError:
+                        continue
+                    if (
+                        parts[:1] == ["qexp"]
+                        and parts[-2:-1] == ["--project"]
+                        and parts[-5:-2] == ["admin", "upgrade", "status"]
+                    ):
+                        idle_step = (
+                            "Inspect the Project upgrade affecting the Idle Job.",
+                            _machine_command(result, "admin", "upgrade", "status", "--project", parts[-1]),
+                        )
+            else:
+                lines.extend(textwrap.wrap(line, width=80, break_long_words=False, break_on_hyphens=False))
+    for warning in (result.get("warnings") or ())[:3]:
+        message = warning.get("message") if isinstance(warning, Mapping) else warning
+        if message:
+            lines.extend(textwrap.wrap(str(message), width=80, break_long_words=False, break_on_hyphens=False))
+    if step := control_step or recovery_step or readiness_step or publication_step or idle_step or warnings_step:
+        lines.extend(_next_step(*step))
+    return "\n".join(lines)
 
 
 def _render_scheduler_diagnostics(result: Mapping[str, Any], _presentation: Mapping[str, object]) -> str:
@@ -485,21 +634,57 @@ def _render_agent_config(result: Mapping[str, Any], _presentation: Mapping[str, 
     )
 
 
-def _render_agent_readiness(result: Mapping[str, Any], _presentation: Mapping[str, object]) -> str:
-    return _operation(
-        "agent start",
-        "ready" if result.get("ready") else "not ready",
-        (
-            ("MachineRuntime root", result.get("machine_runtime_root")),
-            ("Runtime ID", result.get("runtime_id")),
-            ("Agent state", result.get("agent_state")),
-            ("Requested policy revision", result.get("requested_policy_revision")),
-            ("Observed policy revision", result.get("observed_policy_revision")),
-            ("Inventory revision", result.get("inventory_revision")),
-            ("Reasons", result.get("reasons", result.get("reason"))),
-            ("Projects", result.get("projects")),
-        ),
-    )
+def _render_agent_readiness(result: Mapping[str, Any], presentation: Mapping[str, object]) -> str:
+    if result.get("ready") is True:
+        lines = ["Agent startup readiness verified."]
+    elif result.get("timed_out"):
+        lines = ["Agent startup timed out before a ready state was verified."]
+    else:
+        lines = ["Agent start blocked. A ready agent has not been verified."]
+    lines.extend(_agent_scope_lines(result))
+    if result.get("agent_state") == "active":
+        lines.append("The agent is reported running.")
+    else:
+        lines.append("The agent has not been observed running.")
+
+    paths = presentation.get("project_paths")
+    paths = paths if isinstance(paths, Mapping) else {}
+    step = ("Inspect the latest agent state and Project readiness.", _machine_command(result, "agent", "status"))
+    blockers = [item for item in result["projects"] if isinstance(item, Mapping) and item.get("reason")]
+    if not blockers and (reason := result.get("reason")):
+        lines.append(_reason_text(reason))
+    for project in blockers[:3]:
+        project_id = str(project.get("project_id"))
+        path = paths.get(project_id)
+        lines.append(f"Project: {encode_display_text(str(path or project_id))}")
+        lines.append(f"  {_reason_text(project['reason'])}")
+    if blockers:
+        first = blockers[0]
+        path = paths.get(first.get("project_id"))
+        if path and first.get("reason") == "legacy_project_requires_migration" and first.get("machine_name"):
+            name = first["machine_name"]
+            machine = [f"--machine={name}"] if name.startswith("-") else ["--machine", name]
+            step = (
+                "Migrate this Project's existing agent registration explicitly.",
+                _machine_command(result, "admin", "migrate", "agent", "--project", path, *machine),
+            )
+        elif path and first.get("status") == "inventory_only" and first.get("reason") == "not_registered":
+            step = (
+                "Register the enabled Project on this runtime.",
+                _machine_command(result, "project", "register", path),
+            )
+        elif path:
+            step = (
+                "Inspect the affected Project's local agent and scheduling evidence.",
+                _machine_command(result, "--project", path, "status"),
+            )
+    elif result.get("reason") == "no_enabled_projects":
+        step = (
+            "Enter the intended Project directory before enrolling it on this runtime.",
+            _machine_command(result, "project", "register", "."),
+        )
+    lines.extend(_next_step(*step))
+    return "\n".join(lines)
 
 
 def _render_cpu_lane(result: CpuLanePayload, _presentation: Mapping[str, object]) -> str:
@@ -590,6 +775,8 @@ def _validate_agent_operation(result: Any) -> None:
     if action in lifecycle_actions:
         for key in ("machine_runtime_root", "agent_state", "pid", "is_running"):
             _required(value, key, "agent-operation payload")
+        if "project_readiness" in value:
+            _validate_project_readiness(value["project_readiness"])
         return
     raise ValueError(f"agent-operation payload has unknown action {action!r}")
 
@@ -635,6 +822,41 @@ def _validate_agent_readiness(result: Any) -> None:
     _sequence(value["projects"], "agent-readiness payload.projects")
 
 
+def _validate_project_readiness(value: Any) -> None:
+    label = "project_readiness"
+    view = _mapping(value, label)
+    state = _required(view, "state", label)
+    if state not in {"inventory_unknown", "machine_only", "pending", "observed", "inactive"}:
+        raise ValueError(f"{label}.state is invalid")
+    checked = _required_int(view, "checked_count", label)
+    enabled = _required(view, "enabled_count", label)
+    fresh = _required(view, "fresh_count", label)
+    if (
+        not 0 <= checked <= 8
+        or (enabled is not None and (type(enabled) is not int or enabled < checked))
+        or (fresh is not None and (type(fresh) is not int or not 0 <= fresh <= checked))
+    ):
+        raise ValueError(f"{label} contains inconsistent counts")
+    if (state == "inventory_unknown") != (enabled is None) or (state in {"inventory_unknown", "inactive"}) != (
+        fresh is None
+    ):
+        raise ValueError(f"{label} contains counts that do not match its state")
+    if state == "machine_only" and enabled != 0:
+        raise ValueError(f"{label}.state machine_only requires an empty roster")
+    if state == "observed" and (not enabled or fresh != enabled):
+        raise ValueError(f"{label}.state observed requires a fresh observation for every enabled Project")
+    affected = _required_sequence(view, "affected_projects", label)
+    if len(affected) > checked:
+        raise ValueError(f"{label}.affected_projects exceeds the checked count")
+    for item in affected:
+        project = _mapping(item, f"{label}.affected_projects item")
+        if not all(isinstance(project.get(key), str) and project[key] for key in ("path", "reason")):
+            raise TypeError(f"{label}.affected_projects items require a path and reason")
+    reason = _required(view, "reason", label)
+    if reason is not None and not isinstance(reason, str):
+        raise TypeError(f"{label}.reason must be a string or null")
+
+
 def _validate_agent_status(result: Any) -> None:
     value = _mapping(result, "agent-status payload")
     if _required(value, "action", "agent-status payload") != "status":
@@ -646,6 +868,10 @@ def _validate_agent_status(result: Any) -> None:
         _validate_project(project, f"agent-status payload.projects[{index}]")
     upgrade = _required_mapping(value, "upgrade", "agent-status payload")
     _validate_upgrade_registry(upgrade)
+    if "project_readiness" in value:
+        _validate_project_readiness(value["project_readiness"])
+    if "agent_name" in value and not isinstance(value["agent_name"], str):
+        raise TypeError("agent-status payload.agent_name must be a string")
     if "gpu_policy" in value:
         _validate_gpu_policy_view(value["gpu_policy"], "agent-status payload.gpu_policy")
     if "warnings" in value:

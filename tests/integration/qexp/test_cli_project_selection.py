@@ -42,7 +42,9 @@ def test_status_followups_execute_in_selected_machine_runtime(tmp_path: Path, mo
     actions = payload["next_actions"]
     assert main(args) == 0
     human = capsys.readouterr().out
-    assert all(human.count(command) == 1 for command in actions)
+    assert payload["primary_action"]["command"] == actions[0]
+    assert human.count(actions[0]) == 1
+    assert all(command not in human for command in actions[1:])
     register = shlex.split(actions[0])
     assert register == ["qexp", "--machine-runtime-root", str(selected), "project", "register", str(project)]
     _status(register[1:], capsys)

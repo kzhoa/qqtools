@@ -7,8 +7,9 @@ import shlex
 from collections.abc import Mapping, Sequence
 from typing import Any
 
+from ..project_presentation import encode_display_text
 from .core import OutputContract, OutputKind
-from .primitives import _details, _mapping, _required, _required_mapping, _required_sequence, _sequence, _value
+from .primitives import _mapping, _required, _required_mapping, _required_sequence, _sequence, _value
 
 _DIAGNOSTIC_FIELDS = {
     "version",
@@ -121,9 +122,9 @@ def _render_submission(result: Mapping[str, Any], presentation: Mapping[str, obj
     if outcome == "preview":
         preview = result.get("preview") or {}
         tasks = preview.get("tasks", ()) if isinstance(preview, Mapping) else ()
-        lines = [f"Preview ({len(tasks)} task{'s' if len(tasks) != 1 else ''})"]
+        lines = [f"Preview of {len(tasks)} Task{'s' if len(tasks) != 1 else ''}. No Tasks were submitted."]
         if project_path:
-            lines.append(f"Project: {project_path}")
+            lines.append(f"Project: {encode_display_text(str(project_path))}")
         lines.append(
             f"Group action: {preview.get('group_action', 'unknown') if isinstance(preview, Mapping) else 'unknown'}"
         )
@@ -147,48 +148,111 @@ def _render_submission(result: Mapping[str, Any], presentation: Mapping[str, obj
         activation = result.get("activation")
         activation = activation if isinstance(activation, Mapping) else {}
         activation_outcome = activation.get("outcome")
-        lines = [f"Committed {len(task_ids)} task{'s' if len(task_ids) != 1 else ''}."]
+        error = result.get("error")
+        error = error if isinstance(error, Mapping) else {}
+        heading = f"Submitted {len(task_ids)} Task{'s' if len(task_ids) != 1 else ''}."
+        lines = [heading]
         if activation_outcome == "failed":
-            error = result.get("error")
-            error = error if isinstance(error, Mapping) else {}
-            lines.extend(
-                (
-                    "Agent activation failed.",
-                    f"Task IDs: {_value(task_ids)}",
-                    f"Error: {_value(error.get('message'))}",
-                    f"Next: {_value(activation.get('follow_up_command'))}",
-                )
+            lines[0] = f"{heading} Local agent activation failed."
+            lines.append("Do not submit again.")
+        elif error:
+            lines[0] = (
+                f"{heading} A post-submission step was interrupted."
+                if error.get("code") == "interrupted"
+                else f"{heading} A post-submission step failed."
             )
-        elif isinstance(activation_outcome, str):
-            lines.append(f"Agent activation: {activation_outcome.replace('_', ' ')}")
-        if project_path:
-            lines.append(f"Project: {project_path}")
-        if activation_outcome != "failed":
-            if mode == "command":
-                task = presentation.get("task", {})
-                task_mapping = task if isinstance(task, Mapping) else {}
-                task_id = task_mapping.get("task_id") or (task_ids[0] if task_ids else None)
-                name = task_mapping.get("name")
-                lines.extend((f"Task ID: {_value(task_id)}", f"Name: {_value(name)}", f"Group: {_value(group_name)}"))
-                if project_path and task_id:
-                    locator = shlex.join(["qexp", "--project", str(project_path), "task", "show", str(task_id)])
-                    logs = shlex.join(["qexp", "--project", str(project_path), "task", "logs", str(task_id)])
-                    lines.extend([f"Show: {locator}", f"Logs: {logs}"])
-            elif group_name:
-                lines.append(f"Group: {group_name}")
-                if project_path:
-                    lines.append(
-                        f"Inspect: {shlex.join(['qexp', '--project', str(project_path), 'group', 'show', str(group_name)])}"
-                    )
-            else:
-                lines.append(f"Task IDs: {_value(task_ids)}")
-        recovery = result.get("diagnostic_recovery")
-        if isinstance(recovery, Mapping) and recovery.get("state") == "blocked":
-            from ..project_presentation import encode_display_text
+            lines.append("Do not submit again.")
+        else:
+            activation_status = {
+                "started": "Local agent started.",
+                "already_running": "Local agent was already running.",
+                "requested": "Local agent activation requested.",
+                "not_requested": "Local agent activation was not requested.",
+            }.get(activation_outcome)
+            if activation_status:
+                lines.extend((activation_status, "Check Task status to verify execution."))
 
-            lines.append("")
+        locator = ["qexp"]
+        runtime_root = presentation.get("machine_runtime_root")
+        if isinstance(runtime_root, str) and runtime_root:
+            locator.extend(("--machine-runtime-root", runtime_root))
+        if project_path:
+            project_path = str(project_path)
+            lines.append(f"Project: {encode_display_text(project_path)}")
+            locator.extend(("--project", project_path))
+
+        task_id = task_ids[0] if mode == "command" and len(task_ids) == 1 else None
+        if task_id is not None:
+            task = presentation.get("task")
+            name = task.get("name") if isinstance(task, Mapping) else None
+            lines.extend((f"Task ID: {task_id}", f"Name: {_value(name)}", f"Group: {_value(group_name)}"))
+        else:
+            lines.append("Task IDs:" if task_ids else "Task IDs: none")
+            lines.extend(f"  {task_id}" for task_id in task_ids)
+            if group_name:
+                lines.append(f"Group: {group_name}")
+
+        if error:
+            message = _value(error.get("message"))
+            if activation_outcome == "failed" and message.startswith(
+                ("project is not registered; run '", "legacy project metadata detected; run '")
+            ):
+                message = message.partition("; run '")[0] + "."
+            if activation_outcome == "failed" and message.endswith(
+                " Run 'qexp admin repair identity --dry-run' for a read-only diagnosis."
+            ):
+                message = message.removesuffix(" Run 'qexp admin repair identity --dry-run' for a read-only diagnosis.")
+            lines.append(f"Error: {message}")
+        follow_up = activation.get("follow_up_command")
+        if activation_outcome == "failed" and isinstance(follow_up, str) and follow_up:
+            try:
+                action = shlex.split(follow_up)
+            except ValueError:
+                action = []
+            action = action[3:] if action[:2] == ["qexp", "--machine-runtime-root"] else action[1:]
+            match action:
+                case ["agent", "start", *_]:
+                    instruction = "Start the local agent with the command below."
+                case ["project", "register", *_]:
+                    instruction = "Register this Project on the local machine runtime with the command below."
+                case ["admin", "migrate", "agent", *_]:
+                    instruction = "Migrate this Project's legacy agent registration with the command below."
+                case ["init", *_]:
+                    instruction = "Resume the pending machine replacement with the command below."
+                case ["admin", "repair", "identity", *_]:
+                    instruction = "Inspect the runtime identity and any remaining local evidence."
+                case ["--project", _, "status"]:
+                    instruction = "Inspect this Project's local binding and agent evidence."
+                case _:
+                    instruction = "Address the local activation failure with the command below."
+            lines.extend((instruction, f"Next: {follow_up}"))
+
+        if project_path:
+            if task_id is not None:
+                task_operand = ["--", task_id] if task_id.startswith("-") else [task_id]
+                lines.extend(
+                    (
+                        f"Show: {shlex.join([*locator, 'task', 'show', *task_operand])}",
+                        f"Logs: {shlex.join([*locator, 'task', 'logs', *task_operand])}",
+                    )
+                )
+            elif group_name:
+                group_operand = ["--", group_name] if group_name.startswith("-") else [group_name]
+                lines.append(f"Inspect: {shlex.join([*locator, 'group', 'show', *group_operand])}")
+            elif task_ids:
+                first = task_ids[0]
+                task_operand = ["--", first] if first.startswith("-") else [first]
+                lines.append(f"Show first Task: {shlex.join([*locator, 'task', 'show', *task_operand])}")
+
+        recovery = result.get("diagnostic_recovery")
+        if (
+            activation_outcome in {"started", "already_running", "requested"}
+            and isinstance(recovery, Mapping)
+            and recovery.get("state") == "blocked"
+        ):
             lines.extend(
                 (
+                    "",
                     f"Machine scheduler diagnostic recovery blocked ({_value(recovery.get('reason'))}).",
                     f"Machine runtime: {encode_display_text(recovery['machine_runtime_root'])}",
                     f"Read-only preview: {recovery['next_action']}",

@@ -245,6 +245,23 @@ def test_project_status_distinguishes_heartbeat_snapshot_and_post_repair_verific
     assert "snapshot_stale" in pending["scheduling_readiness"]["reasons"]
     assert pending["diagnostic_recovery"]["state"] == "awaiting_observation"
     assert pending["scheduler_diagnostics"]["coverage"] == "incomplete"
+    follow_up = pending["primary_action"]
+    assert shlex.split(follow_up["command"]) == [
+        "qexp",
+        "--machine-runtime-root",
+        str(runtime.root),
+        "agent",
+        "diagnostics",
+        "active",
+        "--project-id",
+        binding.project_id,
+    ]
+    assert follow_up["explanation"]
+    human = render(CliOutput(OutputKind.STATUS, pending), "human")
+    for evidence in ("fresh", "stale", "incomplete", "awaiting observation"):
+        assert evidence in human.lower()
+    assert follow_up["command"] in human
+    assert "running normally" not in human.lower()
 
     receipt["snapshot_at"] = heartbeat_at
     atomic_replace(receipt_path, {"snapshot_observation": {**receipt, "registration_generation": "other"}})
@@ -295,6 +312,7 @@ def test_project_status_distinguishes_heartbeat_snapshot_and_post_repair_verific
     assert verified["scheduling_readiness"]["state"] == "observed"
     assert verified["scheduling_readiness"]["diagnostic_coverage"] == {"scope": "project_binding", "state": "complete"}
     assert verified["diagnostic_recovery"]["state"] == "verified"
+    assert "scheduler diagnostic recovery" not in render(CliOutput(OutputKind.STATUS, verified), "human").lower()
     assert report_path.read_bytes() == before
 
     with store._writer_lock():

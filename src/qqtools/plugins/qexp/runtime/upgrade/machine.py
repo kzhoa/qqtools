@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import time
 from bisect import bisect_left, insort
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from threading import Event, Thread
@@ -364,9 +365,12 @@ class MachineUpgradeWorker:
             self.runtime.upgrade_next_pass_at = time.monotonic() + self.budget.min_pass_interval_seconds
 
 
-def inspect_registered_upgrades(runtime: MachineRuntime) -> dict[str, Any]:
-    """Read every registered binding without scanning its historical Tasks or Attempts."""
-    _revision, bindings = runtime.load_registry()
+def inspect_registered_upgrades(
+    runtime: MachineRuntime, *, bindings: Iterable[ProjectBinding] | None = None, runtime_id: str | None = None
+) -> dict[str, Any]:
+    """Inspect upgrades for an observed roster, or load the current registry when omitted."""
+    if bindings is None:
+        _revision, bindings = runtime.load_registry()
     projects: list[dict[str, Any]] = []
     inaccessible: list[dict[str, Any]] = []
     for binding in bindings:
@@ -374,6 +378,11 @@ def inspect_registered_upgrades(runtime: MachineRuntime) -> dict[str, Any]:
             **binding.to_dict(),
             "discovery_source": "machine_registry",
         }
+        state = (
+            runtime.binding_state(binding)
+            if runtime_id is None
+            else runtime.binding_state(binding, runtime_id=runtime_id)
+        )
         try:
             status = UpgradeCoordinator(binding.root_config()).status()
         except (OSError, RuntimeError, ValueError, KeyError, TypeError) as exc:
@@ -394,9 +403,9 @@ def inspect_registered_upgrades(runtime: MachineRuntime) -> dict[str, Any]:
                 "migrations": [],
             }
             inaccessible.append({**base, "upgrade": status})
-            projects.append({**base, "state": runtime.binding_state(binding), "upgrade": status})
+            projects.append({**base, "state": state, "upgrade": status})
             continue
-        project = {**base, "state": runtime.binding_state(binding), "upgrade": status}
+        project = {**base, "state": state, "upgrade": status}
         if status.get("state") == "inaccessible":
             inaccessible.append(project)
         projects.append(project)

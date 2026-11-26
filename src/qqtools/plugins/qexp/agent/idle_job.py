@@ -488,14 +488,14 @@ def _owner_preparing(owner: Mapping[str, Any]) -> bool:
     return owner["version"] == 2 and owner["phase"] in {"prepared", "launching"}
 
 
-def _idle_job_status(runtime: Any) -> dict[str, Any]:
+def _idle_job_status(runtime: Any, *, runtime_id: str | None = None) -> dict[str, Any]:
     """Read the independent machine-local Idle Job status projection.
 
     A malformed status or ownership record is reported as ``blocked``.  The
     function never infers ``disabled`` while an ownership file is present.
     """
     root = _root(runtime)
-    runtime_id = _runtime_id_without_initializing(runtime, root)
+    runtime_id = runtime_id or _runtime_id_without_initializing(runtime, root)
     ownership_exists = _ownership_file_exists(root)
     try:
         ownership = read_idle_job_ownership(root)
@@ -593,9 +593,9 @@ def _idle_job_status(runtime: Any) -> dict[str, Any]:
     return payload
 
 
-def idle_job_status(runtime: Any) -> dict[str, Any]:
+def idle_job_status(runtime: Any, *, runtime_id: str | None = None) -> dict[str, Any]:
     """Read Idle Job status and its last observed interval without refreshing evidence."""
-    payload = _idle_job_status(runtime)
+    payload = _idle_job_status(runtime, runtime_id=runtime_id)
     payload["demand_detail"] = payload.get("demand_detail") if _reports_unknown_demand(payload) else None
     payload.setdefault("interval_detail", None)
     return payload

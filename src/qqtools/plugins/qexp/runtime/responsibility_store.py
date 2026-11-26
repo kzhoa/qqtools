@@ -917,8 +917,10 @@ class Ledger:
             self._validate_slot(directory, key, entry, header)
             return entry
 
-    def has_members(self) -> bool:
+    def has_members(self, *, read_only: bool = False) -> bool:
         """Check the fixed bucket headers; incomplete storage cannot prove idle."""
+        if read_only:
+            return any(self.observe_count(bucket) for bucket in range(BUCKETS))
         for bucket in range(BUCKETS):
             with self._locked(bucket) as directory:
                 if self._header(directory)["count"]:

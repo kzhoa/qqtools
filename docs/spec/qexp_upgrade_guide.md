@@ -255,10 +255,9 @@ python -m pip install --upgrade qqtools
 qexp agent restart
 ```
 
-Restart success means that the old global-agent process stopped and its replacement started; it
-does not wait for every Project to become ready or claim that activation or legacy cleanup has
-completed. The result may say `Ready: pending`. Observe later convergence first with
-`qexp agent status`, then inspect the bounded machine registry view with:
+Restart success means that the old global-agent process stopped and its replacement started.
+The result reports available Project readiness evidence. Use `qexp agent status` to check
+later convergence. To inspect the machine registry's upgrade view, run:
 
 ```bash
 qexp admin upgrade status --format json
@@ -690,9 +689,9 @@ stops new claims intentionally rather than scheduling potentially wrong work.
    qexp agent restart
    ```
 
-   Restart does not wait for Project readiness. If it reports `Ready: pending`, run
-   `qexp agent status` until the required Project evidence is ready or an actionable blocker is
-   reported.
+   Restart returns after process replacement. If Project readiness is unverified,
+   follow the scoped inspection in the result. Use `qexp status` from the affected
+   Project to inspect its binding and current scheduling evidence.
 
 `admin repair` regenerates the ready markers, catalog, and reservations. It does not discard
 Task or Attempt truth. If repair reports `blocked`, resolve the listed operation or execution

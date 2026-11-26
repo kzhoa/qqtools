@@ -3,15 +3,18 @@
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import os
 import shlex
 import sys
 from pathlib import Path
+from typing import Any
 
 from ..agent.config import agent_config_payload, set_agent_config
 from ..agent.context import MachineRuntime, MachineRuntimeUninitializedError
 from ..agent.diagnostic_recovery import repair_scheduler_diagnostics
+from ..agent.identity import MachineRuntimeIdentityError
 from ..agent.idle_job_config import load_idle_job_config, set_idle_job_config
 from ..agent.lifecycle import (
     MachineAgentStartBlockedError,
@@ -73,6 +76,7 @@ from ..schema6_upgrade import (
 from .errors import CliOperationalError, CliUsageError
 from .outcome import CommandOutcome
 from .output import CliOutput, OutputKind
+from .project_presentation import encode_display_text
 
 LOCAL_HANDLERS = frozenset(
     {
@@ -425,6 +429,78 @@ def _schema_migration_payload(
     return result
 
 
+def _scoped_machine_command(runtime: MachineRuntime, *args: str) -> str:
+    return shlex.join(("qexp", "--machine-runtime-root", str(runtime.root), *args))
+
+
+def _machine_scope(runtime: MachineRuntime) -> str:
+    return f"MachineRuntime root: {encode_display_text(str(runtime.root))}"
+
+
+def _machine_operation_error(
+    runtime: MachineRuntime, exc: BaseException, *, output_format: str, status_is_safe: bool = False
+) -> CliOperationalError:
+    message = str(exc)
+    if isinstance(exc, MachineRuntimeUninitializedError):
+        init = _scoped_machine_command(runtime, "init", "--machine", "NAME")
+        if output_format == "json":
+            return CliOperationalError(message, next_action=init)
+        return CliOperationalError(
+            f"qexp machine runtime is uninitialized.\n{_machine_scope(runtime)}\n"
+            "Choose the intended machine name, then initialize this runtime.\n"
+            f"  {init}"
+        )
+    if isinstance(exc, MachineRuntimeIdentityError):
+        diagnosis = _scoped_machine_command(runtime, "admin", "repair", "identity", "--dry-run")
+        if output_format == "json":
+            return CliOperationalError(message, next_action=diagnosis)
+        message = message.removesuffix(" Run 'qexp admin repair identity --dry-run' for a read-only diagnosis.")
+        return CliOperationalError(
+            f"{message}\n{_machine_scope(runtime)}\n"
+            f"Inspect the identity and remaining local evidence without changes.\n  {diagnosis}"
+        )
+
+    config_missing = message == "qexp machine global config is missing; run 'qexp init --machine NAME'."
+    if config_missing:
+        message = "qexp machine global config is missing."
+    lines = [message, _machine_scope(runtime)]
+    if status_is_safe and not config_missing:
+        lines.extend(
+            (
+                "Inspect the current agent and Project evidence.",
+                f"  {_scoped_machine_command(runtime, 'agent', 'status')}",
+            )
+        )
+    elif config_missing or isinstance(exc, OSError):
+        lines.append("Check the selected runtime mount and access to its configuration.")
+    return CliOperationalError("\n".join(lines))
+
+
+def _start_readiness_output(result: dict[str, Any], snapshot: dict[str, Any]) -> CliOutput:
+    project_paths = {}
+    for item in snapshot.get("entries", ()):
+        shared_root = Path(item["shared_root"])
+        project_paths[item["project_id"]] = str(shared_root.parent if shared_root.name == ".qexp" else shared_root)
+    return CliOutput(OutputKind.AGENT_READINESS, result, {"project_paths": project_paths})
+
+
+def _expected_machine_metadata_error(exc: BaseException) -> bool:
+    """Recognize config and record failures raised without a dedicated error type."""
+    return (
+        isinstance(exc, (OSError, MachineRuntimeIdentityError, json.JSONDecodeError, UnicodeError))
+        or str(exc).startswith(
+            (
+                "Expected JSON object at ",
+                "machine global agent config is malformed",
+                "qexp machine global config is missing",
+                "machine runtime identity changed while observing ",
+                "machine runtime root is not writable:",
+            )
+        )
+        or (isinstance(exc, RuntimeError) and isinstance(exc.__cause__, ValueError))
+    )
+
+
 def dispatch_local(
     handler: str,
     args: argparse.Namespace,
@@ -453,38 +529,57 @@ def dispatch_local(
         if not target_name:
             raise CliUsageError("init requires explicit --machine NAME.")
         runtime = MachineRuntime(args.machine_runtime_root)
-        facts = machine_init_facts(runtime)
+        scope = _machine_scope(runtime)
+        try:
+            facts = machine_init_facts(runtime)
+        except SetupOperationalError as exc:
+            raise _machine_operation_error(runtime, exc, output_format=args.format, status_is_safe=True) from exc
+        except (OSError, RuntimeError, ValueError) as exc:
+            if not _expected_machine_metadata_error(exc):
+                raise
+            raise _machine_operation_error(runtime, exc, output_format=args.format) from exc
         confirmed = bool(args.yes)
         expected_old_runtime_id = None
         if args.detach_old_runtime and facts.get("old_runtime_id"):
             print(
-                "WARNING: --detach-old-runtime preserves old local evidence in an isolated archive "
-                "without completing recovery or changing shared Tasks, claims, or registrations.",
+                "WARNING: --detach-old-runtime preserves old local evidence in an isolated\n"
+                "archive without completing recovery or changing shared Tasks, claims, or\n"
+                "registrations.",
                 file=sys.stderr,
             )
         if facts.get("old_runtime_id") and not confirmed:
+            consequence = (
+                f"{scope}\n"
+                "Confirmation is required before replacing local authority. Shared Tasks,\n"
+                "claims, and registrations are preserved."
+            )
             if args.format == "json":
-                raise CliOperationalError("machine identity replacement requires --yes when --format=json is selected.")
+                raise CliOperationalError(
+                    f"machine identity replacement requires --yes when --format=json is selected.\n{consequence}"
+                )
             isatty = getattr(sys.stdin, "isatty", None)
             if not callable(isatty) or not isatty():
-                raise CliUsageError("machine identity replacement requires --yes in noninteractive input.")
-            print("Machine identity replacement will:", file=sys.stderr)
+                raise CliUsageError(
+                    f"machine identity replacement requires --yes in noninteractive input.\n{consequence}"
+                )
+            mode = args.agent_mode or facts.get("current_agent_mode") or "daemon"
+            machine = [f"--machine={target_name}"] if target_name.startswith("-") else ["--machine", target_name]
+            confirmation_args = ["init", *machine, "--agent-mode", mode, "--yes"]
+            if args.detach_old_runtime:
+                confirmation_args.append("--detach-old-runtime")
+            print("Machine identity replacement will create a new runtime ID.", file=sys.stderr)
+            print(scope, file=sys.stderr)
             print(f"  old runtime ID: {facts.get('old_runtime_id')}", file=sys.stderr)
             print(f"  current name: {facts.get('current_name') or '-'}", file=sys.stderr)
             print(f"  requested name: {target_name}", file=sys.stderr)
-            print(
-                f"  requested mode: {args.agent_mode or facts.get('current_agent_mode') or 'daemon'}",
-                file=sys.stderr,
-            )
-            print(f"  obligations: {facts.get('obligations') or 'none'}", file=sys.stderr)
-            print("  this creates a new runtime ID and replaces local authority.", file=sys.stderr)
-            print(
-                f"  shell-safe command: qexp init --machine {shlex.quote(target_name)} --yes",
-                file=sys.stderr,
-            )
+            print(f"  requested mode: {mode}", file=sys.stderr)
+            for obligation in facts.get("obligations") or ():
+                print(f"  obligation: {encode_display_text(obligation)}", file=sys.stderr)
+            print("  This replaces local authority and preserves shared Project records.", file=sys.stderr)
+            print(f"  {_scoped_machine_command(runtime, *confirmation_args)}", file=sys.stderr)
             answer = input("Continue? [y/N] ")
             if answer.strip().lower() not in {"y", "yes"}:
-                raise CliUsageError("machine identity replacement cancelled; no state was changed.")
+                raise CliUsageError(f"machine identity replacement cancelled; no state was changed.\n{scope}")
             confirmed = True
             expected_old_runtime_id = facts["old_runtime_id"]
         try:
@@ -497,10 +592,25 @@ def dispatch_local(
                 expected_old_runtime_id=expected_old_runtime_id,
             )
         except SetupUsageError as exc:
-            raise CliUsageError(str(exc)) from exc
+            raise CliUsageError(f"{exc}\n{scope}") from exc
         except SetupOperationalError as exc:
-            raise CliOperationalError(str(exc)) from exc
-        return CommandOutcome(0, CliOutput(OutputKind.MACHINE_INIT, result))
+            raise _machine_operation_error(runtime, exc, output_format=args.format, status_is_safe=True) from exc
+        except (OSError, RuntimeError, ValueError) as exc:
+            if not _expected_machine_metadata_error(exc):
+                raise
+            raise _machine_operation_error(runtime, exc, output_format=args.format) from exc
+        presentation: dict[str, object] = {}
+        if result["action"] == "initialized" and args.format != "json":
+            try:
+                selection = context_commands.resolve_project(getattr(args, "project", None))
+            except (context_commands.ProjectSelectionError, OSError):
+                pass
+            except RuntimeError as exc:
+                if not str(exc).startswith("Symlink loop from "):
+                    raise
+            else:
+                presentation["project_path"] = str(selection.shared_root.parent)
+        return CommandOutcome(0, CliOutput(OutputKind.MACHINE_INIT, result, presentation))
     if handler.startswith("project_"):
         if handler == "project_takeover":
             selected_groups = tuple(args.add_primary_worker or ())
@@ -675,36 +785,40 @@ def dispatch_local(
         if handler == "agent_start" and (
             isinstance(args.timeout, bool) or not math.isfinite(args.timeout) or args.timeout <= 0
         ):
-            raise CliUsageError("agent start timeout must be a positive finite number of seconds.")
+            raise CliUsageError(
+                f"agent start timeout must be a positive finite number of seconds.\n{_machine_scope(runtime)}"
+            )
         try:
             snapshot = capture_readiness_snapshot(runtime)
             _registry_revision, current_bindings = runtime.load_registry()
         except (
-            MachineAgentStartBlockedError,
-            MachineRuntimeUninitializedError,
             OSError,
             RuntimeError,
             ValueError,
             KeyError,
             TypeError,
         ) as exc:
-            raise CliOperationalError(str(exc)) from exc
+            raise _machine_operation_error(runtime, exc, output_format=args.format, status_is_safe=True) from exc
         registered_ids = {binding.project_id for binding in current_bindings if binding.enabled}
         if (not snapshot["project_ids"] and not allows_machine_only_start(runtime, snapshot)) or (
             snapshot["project_ids"] and not registered_ids.intersection(snapshot["project_ids"])
         ):
             result = evaluate_readiness(runtime, snapshot)
-            return CommandOutcome(2, CliOutput(OutputKind.AGENT_READINESS, result))
+            return CommandOutcome(2, _start_readiness_output(result, snapshot))
         ready = evaluate_readiness(runtime, snapshot)
         started_process = None
         if not ready["ready"]:
             try:
                 started_process, _status = ensure_machine_agent_started(runtime)
-            except (MachineAgentStartBlockedError, MachineAgentStartError, MachineRuntimeUninitializedError) as exc:
-                raise CliOperationalError(str(exc)) from exc
+            except (MachineAgentStartBlockedError, MachineAgentStartError) as exc:
+                raise _machine_operation_error(runtime, exc, output_format=args.format, status_is_safe=True) from exc
+            except (OSError, RuntimeError, ValueError) as exc:
+                if not _expected_machine_metadata_error(exc):
+                    raise
+                raise _machine_operation_error(runtime, exc, output_format=args.format) from exc
             ready = wait_for_readiness(runtime, snapshot, timeout_seconds=args.timeout)
         if not ready["ready"]:
-            return CommandOutcome(2, CliOutput(OutputKind.AGENT_READINESS, ready))
+            return CommandOutcome(2, _start_readiness_output(ready, snapshot))
         action = "started" if started_process is not None else "already_running"
         operation = {
             **ready,
@@ -795,8 +909,10 @@ def dispatch_local(
         if handler == "agent_status":
             try:
                 status = get_machine_agent_status(runtime)
-            except MachineRuntimeUninitializedError as exc:
-                raise CliOperationalError(str(exc)) from exc
+            except (OSError, RuntimeError, ValueError) as exc:
+                if not _expected_machine_metadata_error(exc):
+                    raise
+                raise _machine_operation_error(runtime, exc, output_format=args.format) from exc
             output = CliOutput(OutputKind.AGENT_STATUS, {"action": "status", **status})
         elif handler == "agent_stop":
             try:
@@ -809,15 +925,39 @@ def dispatch_local(
         else:
             try:
                 process = restart_machine_agent(runtime)
-            except (
-                MachineAgentStartBlockedError,
-                MachineAgentStartError,
-                MachineAgentStopError,
-                MachineRuntimeUninitializedError,
-            ) as exc:
-                raise CliOperationalError(str(exc)) from exc
-            status = get_machine_agent_status(runtime)
+            except MachineAgentStopError as exc:
+                detail = f"{exc}\nThe stop step failed before a replacement could start."
+                raise _machine_operation_error(
+                    runtime, MachineAgentStopError(detail), output_format=args.format, status_is_safe=True
+                ) from exc
+            except (MachineAgentStartBlockedError, MachineAgentStartError) as exc:
+                raise _machine_operation_error(runtime, exc, output_format=args.format, status_is_safe=True) from exc
+            except (OSError, RuntimeError, ValueError) as exc:
+                if not _expected_machine_metadata_error(exc):
+                    raise
+                raise _machine_operation_error(runtime, exc, output_format=args.format) from exc
+            try:
+                status = get_machine_agent_status(runtime)
+            except (OSError, RuntimeError, ValueError) as exc:
+                if not _expected_machine_metadata_error(exc):
+                    raise
+                status = {
+                    "machine_runtime_root": str(runtime.root),
+                    "agent_state": "active",
+                    "projects": [],
+                    "reason": "status_observation_unavailable",
+                }
             ready = status.get("ready")
+            if status.get("pid") != process.pid:
+                status["project_readiness"] = {
+                    "state": "inventory_unknown",
+                    "enabled_count": None,
+                    "fresh_count": None,
+                    "checked_count": 0,
+                    "affected_projects": [],
+                    "reason": "replacement_observation_unavailable",
+                }
+                ready = None
             output = CliOutput(
                 OutputKind.AGENT_OPERATION,
                 {

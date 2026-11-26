@@ -57,7 +57,7 @@ from ..runtime.registration_protocol import (
 )
 from ..runtime.responsibility_store import DurableIO
 from ..runtime.store import atomic_replace, read_json
-from .bindings import REGISTRY_VERSION, ProjectBinding, decode_registry
+from .bindings import REGISTRY_VERSION, MachineRegistryError, ProjectBinding, decode_registry
 
 
 def _is_path_present(path: Path) -> bool:
@@ -133,7 +133,7 @@ class MachineRegistration:
                 metadata = path.lstat()
             except FileNotFoundError:
                 if self.paths["inventory"].exists():
-                    raise RuntimeError("machine registry is missing.")
+                    raise MachineRegistryError("machine registry is missing.")
                 witness = None
                 with self._registry_cache_lock:
                     if (
@@ -149,7 +149,7 @@ class MachineRegistration:
                     self._registry_cache_bindings = parsed
                 return revision, parsed
             if not stat.S_ISREG(metadata.st_mode):
-                raise RuntimeError("machine registry must be a regular non-symlink file.")
+                raise MachineRegistryError("machine registry must be a regular non-symlink file.")
             witness = (
                 metadata.st_dev,
                 metadata.st_ino,
@@ -164,7 +164,7 @@ class MachineRegistration:
                     and self._registry_cache_bindings is not None
                 ):
                     return self._registry_cache_revision, self._registry_cache_bindings
-            revision, parsed = self._decode_registry(read_json(path))
+            revision, parsed = self._read_registry_record(path)
             try:
                 after = path.lstat()
             except FileNotFoundError:
@@ -194,6 +194,13 @@ class MachineRegistration:
     def _decode_registry(value: dict[str, Any]) -> tuple[int, tuple[ProjectBinding, ...]]:
         return decode_registry(value)
 
+    def _read_registry_record(self, path: Path) -> tuple[int, tuple[ProjectBinding, ...]]:
+        try:
+            value = read_json(path)
+        except (ValueError, RecursionError) as exc:
+            raise MachineRegistryError(f"machine registry is unreadable at {path}: {exc}") from exc
+        return self._decode_registry(value)
+
     def load_registry_uncached(self) -> tuple[int, list[ProjectBinding]]:
         """Read and validate the physical registry without consulting process cache."""
         path = self.paths["registry"]
@@ -202,10 +209,10 @@ class MachineRegistration:
                 metadata = path.lstat()
             except FileNotFoundError:
                 if self.paths["inventory"].exists():
-                    raise RuntimeError("machine registry is missing.")
+                    raise MachineRegistryError("machine registry is missing.")
                 return 0, []
             if not stat.S_ISREG(metadata.st_mode):
-                raise RuntimeError("machine registry must be a regular non-symlink file.")
+                raise MachineRegistryError("machine registry must be a regular non-symlink file.")
             witness = (
                 metadata.st_dev,
                 metadata.st_ino,
@@ -213,7 +220,7 @@ class MachineRegistration:
                 metadata.st_mtime_ns,
                 metadata.st_ctime_ns,
             )
-            revision, parsed = self._decode_registry(read_json(path))
+            revision, parsed = self._read_registry_record(path)
             try:
                 after = path.lstat()
             except FileNotFoundError:
@@ -815,7 +822,7 @@ class MachineRegistration:
             publish_recovery_registration_locked(cfg, registration)
             return True
 
-    def registration_status(self, binding: ProjectBinding) -> dict[str, Any]:
+    def registration_status(self, binding: ProjectBinding, *, runtime_id: str | None = None) -> dict[str, Any]:
         """Return current shared ownership and write-eligibility diagnostics."""
         protocol = {"registration_version": None, "recovery_protocol": None}
         try:
@@ -829,7 +836,7 @@ class MachineRegistration:
                 "recovery_protocol": record.get("recovery_protocol"),
             }
             self.validate_registration_record(record, binding.project_id, cfg)
-            runtime_instance_id = self._current_instance_id()
+            runtime_instance_id = self._current_instance_id() if runtime_id is None else runtime_id
         except (OSError, RuntimeError, ValueError, KeyError, TypeError) as exc:
             return {"state": "invalid", "write_eligible": False, "generation": None, "error": str(exc), **protocol}
         same_generation = record.get("generation") == binding.registration_generation

@@ -206,10 +206,11 @@ def test_restart_reports_process_replacement_and_pending_readiness() -> None:
         },
     )
 
-    assert "Previous PID: 11" in output
-    assert "PID: 22" in output
-    assert "Configured mode: daemon" in output
-    assert "Ready: pending" in output
+    assert output.startswith("Agent restarted.\n")
+    assert "Project readiness has not been verified." in output
+    assert "qexp --machine-runtime-root /runtime agent status" in output
+    assert "0/0" not in output
+    assert "continue without another restart" not in output
 
 
 def test_task_show_selects_the_authoritative_attempt_not_lexicographic_tail() -> None:

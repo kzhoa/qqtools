@@ -774,8 +774,8 @@ class MachineRuntime:
     def _registration_state(record: dict[str, Any]) -> str:
         return MachineRegistration.registration_state(record)
 
-    def registration_status(self, binding: ProjectBinding) -> dict[str, Any]:
-        return self.registration.registration_status(binding)
+    def registration_status(self, binding: ProjectBinding, *, runtime_id: str | None = None) -> dict[str, Any]:
+        return self.registration.registration_status(binding, runtime_id=runtime_id)
 
     def refresh_binding_eligibility(
         self,
@@ -1039,7 +1039,7 @@ class MachineRuntime:
                 self.activation_consumer_retirements.complete(binding)
         return binding
 
-    def binding_blockers(self, binding: ProjectBinding) -> list[str]:
+    def binding_blockers(self, binding: ProjectBinding, *, read_only: bool = False) -> list[str]:
         blockers: list[str] = []
         for name in ("provisional", "active", "cpu_provisional", "cpu_active"):
             for path in iter_evidence_files(self.paths[name], recursive=True):
@@ -1054,10 +1054,12 @@ class MachineRuntime:
                     blockers.append(f"reservation_unavailable:{path.stem}")
                 elif reservation["project_id"] == binding.project_id:
                     blockers.append(f"reservation:{reservation.get('reservation_id', path.stem)}")
-        blockers.extend(sorted(self.iter_recovery_blockers(binding)))
+        blockers.extend(sorted(self.iter_recovery_blockers(binding, read_only=read_only)))
         return blockers
 
-    def iter_recovery_blockers(self, binding: ProjectBinding, *, should_use_capture: bool = False) -> Iterator[str]:
+    def iter_recovery_blockers(
+        self, binding: ProjectBinding, *, should_use_capture: bool = False, read_only: bool = False
+    ) -> Iterator[str]:
         """Retain local, imported and incomplete-migration recovery obligations."""
         from ..runtime.responsibility import responsibility_root
         from ..runtime.responsibility_capture import has_pending_writer_capture
@@ -1132,18 +1134,23 @@ class MachineRuntime:
         membership = responsibility_root(paths["root"])
         if is_path_present(membership):
             try:
-                if Ledger(membership).has_members():
+                if Ledger(membership, is_observation=read_only).has_members(read_only=read_only):
                     yield "recovery_responsibilities"
             except (OSError, RuntimeError, ValueError, KeyError, TypeError):
                 yield "recovery_responsibilities_unavailable"
 
-    def binding_state(self, binding: ProjectBinding) -> str:
-        registration_state = self.registration_status(binding)["state"]
+    def binding_state(self, binding: ProjectBinding, *, runtime_id: str | None = None) -> str:
+        registration = (
+            self.registration_status(binding)
+            if runtime_id is None
+            else self.registration_status(binding, runtime_id=runtime_id)
+        )
+        registration_state = registration["state"]
         if registration_state == "superseded":
             return "superseded"
         if binding.enabled:
             return "enabled"
-        return "draining" if self.binding_blockers(binding) else "disabled"
+        return "draining" if self.binding_blockers(binding, read_only=runtime_id is not None) else "disabled"
 
     def load_cursor(self) -> str | None:
         if not self.paths["cursor"].exists():

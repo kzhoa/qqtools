@@ -8,6 +8,7 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 
 from ...takeover_contract import TAKEOVER_CANCELLABLE_PHASES, TAKEOVER_PHASES, TAKEOVER_PLAN_ID
+from ..project_presentation import encode_display_text
 from .core import OutputContract, OutputKind
 from .primitives import (
     _details,
@@ -23,22 +24,40 @@ from .primitives import (
 )
 
 
-def _render_machine_init(result: Mapping[str, Any], _presentation: Mapping[str, object]) -> str:
-    action = str(result.get("action") or "completed").replace("_", " ")
-    return _operation(
-        action,
-        "completed",
-        (
-            ("MachineRuntime root", result.get("machine_runtime_root")),
-            ("Agent name", result.get("agent_name")),
-            ("Agent mode", result.get("agent_mode")),
-            ("Runtime ID", result.get("new_runtime_id")),
-            ("Old runtime ID", result.get("old_runtime_id")),
-            ("Detached", result.get("detached")),
-            ("Archive", result.get("archive_path")),
-            ("Obligations", result.get("obligations")),
-        ),
-    )
+def _render_machine_init(result: Mapping[str, Any], presentation: Mapping[str, object]) -> str:
+    root = str(result["machine_runtime_root"])
+    replaced = result["action"] == "reinitialized"
+    lines = [
+        "Machine identity replaced." if replaced else "Machine identity initialized.",
+        f"Machine name: {encode_display_text(str(result['agent_name']))}",
+        f"MachineRuntime root: {encode_display_text(root)}",
+        f"Agent mode: {result['agent_mode'].replace('_', ' ')}",
+    ]
+    if replaced:
+        lines.append("The new runtime identity replaces the old local authority.")
+        lines.append("Shared Project records, Tasks, and claims are preserved.")
+        if result.get("detached"):
+            lines.append("Old local evidence was detached in an isolated archive.")
+        if archive := result.get("archive_path"):
+            lines.append(f"Archive: {encode_display_text(archive)}")
+        for obligation in result.get("obligations") or ():
+            lines.append(f"  Unresolved obligation: {encode_display_text(obligation)}")
+        return "\n".join(lines)
+    lines.append("No Project was registered and no agent was started.")
+    project = presentation.get("project_path")
+    if isinstance(project, str):
+        lines.extend((f"Project: {encode_display_text(project)}", "Next, register this Project on the new runtime."))
+    else:
+        project = "."
+        lines.extend(
+            (
+                "Enter the intended Project directory. For a new Project, initialize it first.",
+                "  qexp project init",
+                "Then register the Project on the new runtime.",
+            )
+        )
+    command = shlex.join(("qexp", "--machine-runtime-root", root, "project", "register", project))
+    return "\n".join((*lines, f"  {command}"))
 
 
 def _render_project_operation(result: Mapping[str, Any], _presentation: Mapping[str, object]) -> str:

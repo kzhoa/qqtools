@@ -52,25 +52,17 @@ def managed_project_agent_status(
     )
 
 
-def _registration_error(cfg: RootConfig) -> AgentActivationError:
+def _registration_error(cfg: RootConfig, runtime: MachineRuntime) -> AgentActivationError:
+    prefix = ["qexp", "--machine-runtime-root", str(runtime.root)]
+    machine = [f"--machine={cfg.machine_name}"] if cfg.machine_name.startswith("-") else ["--machine", cfg.machine_name]
     if is_legacy_agent_project(cfg):
-        command = shlex.join(
-            [
-                "qexp",
-                "admin",
-                "migrate",
-                "agent",
-                "--project",
-                str(cfg.shared_root),
-                "--machine",
-                cfg.machine_name,
-            ]
+        action = ["admin", "migrate", "agent", "--project", str(cfg.shared_root), *machine]
+        return AgentActivationError(
+            f"legacy project metadata detected; run '{shlex.join(['qexp', *action])}'.",
+            next_action=shlex.join([*prefix, *action]),
         )
-        return AgentActivationError(f"legacy project metadata detected; run '{command}'.", next_action=command)
-    return AgentActivationError(
-        "project is not registered; run 'qexp project register <PATH>'.",
-        next_action="qexp project register <PATH>",
-    )
+    command = shlex.join([*prefix, "project", "register", *machine, str(cfg.project_root)])
+    return AgentActivationError(f"project is not registered; run '{command}'.", next_action=command)
 
 
 def _ensure_machine_agent_started(
@@ -132,7 +124,7 @@ def ensure_local_agent_active(cfg: RootConfig, *, reason: str, machine_runtime: 
     del reason
     runtime = machine_runtime or MachineRuntime()
     if runtime.matching_binding(cfg) is None:
-        raise _registration_error(cfg)
+        raise _registration_error(cfg, runtime)
     try:
         is_started, status = _ensure_machine_agent_started(runtime)
     except MachineAgentStartBlockedError as exc:
@@ -163,7 +155,7 @@ def start_local_agent(
     del require_eligible_work
     runtime = machine_runtime or MachineRuntime()
     if runtime.matching_binding(cfg) is None:
-        raise _registration_error(cfg)
+        raise _registration_error(cfg, runtime)
     is_started, status = _ensure_machine_agent_started(runtime)
     if not is_started:
         return "already_running", status
@@ -185,7 +177,7 @@ def run_local_agent_foreground(
     """Run the unique machine agent in the foreground."""
     runtime = machine_runtime or MachineRuntime()
     if runtime.matching_binding(cfg) is None:
-        raise _registration_error(cfg)
+        raise _registration_error(cfg, runtime)
     if get_machine_agent_status(runtime)["is_running"]:
         raise RuntimeError("machine agent is already running; use 'qexp agent status'.")
     write_event(

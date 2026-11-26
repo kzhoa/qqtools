@@ -112,11 +112,12 @@ from .helpers import (
 from .idle_job import IdleJobSupervisor, idle_job_status
 from .idle_job_diagnostics import display_demand_detail
 from .idle_job_integration import advance_machine_idle_job
-from .inventory import exact_binding_for_entry, load_inventory, reconcile_live_bindings_locked
+from .inventory import exact_binding_for_entry, load_inventory, observe_live_bindings, reconcile_live_bindings_locked
 from .project_admin import _stop_verified_legacy_agent, migrate_project
 from .project_io_controller import ProjectIOController
 from .project_io_executor import ProjectIOExecutor
 from .project_io_stop import publish_project_stop_snapshots
+from .readiness import machine_project_readiness
 from .recovery_capture import inspect_recovery_capture
 from .recovery_enrollment import RecoveryEnrollment
 from .scheduler_diagnostics import SchedulerDiagnosticStore, unavailable_summary
@@ -141,7 +142,25 @@ def get_machine_agent_status(
     machine_runtime = runtime if isinstance(runtime, MachineRuntime) else MachineRuntime(runtime)
     machine_runtime.require_initialized()
     agent_config = load_agent_config(machine_runtime)
-    identity = _active_machine_identity(machine_runtime)
+    runtime_id = machine_runtime.observe_instance_id()
+    observation_errors = (OSError, RuntimeError, ValueError, KeyError, TypeError)
+    try:
+        process_status = read_json(machine_runtime.paths["agent"] / "status.json").get("machine_agent", {})
+    except (OSError, TypeError, ValueError, RecursionError):
+        process_status = {}
+    if isinstance(process_status, dict):
+        try:
+            identity = _active_machine_identity(machine_runtime)
+        except (OSError, ValueError, RecursionError):
+            identity = None
+        except AttributeError as exc:
+            # The status envelope may have been replaced between the two reads.
+            if exc.name != "get" or isinstance(exc.obj, dict):
+                raise
+            identity = None
+    else:
+        process_status = {}
+        identity = None
     pid = identity[0] if identity is not None else _read_pid(machine_runtime)
     running = bool(identity or (pid and not probe_local_pid))
     from .registration_replacement import CANCELLABLE_PHASES, read_replacement_intent
@@ -150,29 +169,33 @@ def get_machine_agent_status(
         pending_replacement = read_replacement_intent(machine_runtime)
     except (OSError, RuntimeError, ValueError, KeyError, TypeError) as exc:
         pending_replacement = {"phase": "unavailable", "error": str(exc)}
-    with machine_runtime.inventory_guard():
-        with machine_runtime.registry_guard():
-            reconciliation = reconcile_live_bindings_locked(machine_runtime, repair=False)
-    revision = reconciliation.registry_revision
-    bindings = list(reconciliation.bindings)
-    inventory_revision = reconciliation.inventory_revision
-    inventory_entries = list(reconciliation.entries)
     try:
-        process_status = read_json(machine_runtime.paths["agent"] / "status.json").get("machine_agent", {})
-    except (OSError, TypeError, ValueError):
-        process_status = {}
-    if not isinstance(process_status, dict):
-        process_status = {}
+        reconciliation = observe_live_bindings(machine_runtime, runtime_id=runtime_id)
+    except observation_errors:
+        reconciliation = None
+    revision = reconciliation.registry_revision if reconciliation is not None else None
+    bindings = reconciliation.bindings if reconciliation is not None else ()
+    inventory_revision = reconciliation.inventory_revision if reconciliation is not None else None
+    inventory_entries = reconciliation.entries if reconciliation is not None else ()
+    inventory_converged = reconciliation is not None and reconciliation.converged
+    blockers = reconciliation.blockers if reconciliation is not None else ("registry_enablement_unknown",)
     try:
         project_io_isolation = ProjectIOExecutor(machine_runtime).status_view()
     except Exception:
         project_io_isolation = ProjectIOExecutor._unknown_status()
-    upgrade = inspect_registered_upgrades(machine_runtime)
+    try:
+        upgrade = inspect_registered_upgrades(machine_runtime, bindings=bindings, runtime_id=runtime_id)
+    except observation_errors:
+        upgrade = inspect_registered_upgrades(machine_runtime, bindings=())
+        upgrade.update(aggregate_state="inaccessible", all_roots_complete=False)
+    if reconciliation is None:
+        upgrade.update(aggregate_state="inaccessible", all_roots_complete=False)
     try:
         diagnostics = diagnostics_status(
             machine_runtime,
             configured_log_max_bytes=agent_config.log_max_bytes,
             active_identity=identity,
+            runtime_id=runtime_id,
         )
     except Exception:
         diagnostics = None
@@ -184,28 +207,36 @@ def get_machine_agent_status(
         exact_binding, binding_conflict = (
             exact_binding_for_entry(inventory_entry, bindings) if inventory_entry is not None else (None, True)
         )
-        inventory_converged = (
+        binding_inventory_converged = (
             exact_binding == binding
             and not binding_conflict
             and inventory_entry is not None
             and inventory_entry.enabled == binding.enabled
         )
         try:
-            eligibility = machine_runtime.registration_status(binding)
-        except (OSError, RuntimeError, ValueError, KeyError, TypeError) as exc:
+            eligibility = machine_runtime.registration_status(binding, runtime_id=runtime_id)
+        except observation_errors as exc:
             eligibility = {"state": "invalid", "write_eligible": False, "error": str(exc)}
+        try:
+            state = machine_runtime.binding_state(binding, runtime_id=runtime_id)
+        except observation_errors:
+            state = "unavailable"
+        try:
+            group_authority = inspect_group_authority(binding.root_config())
+        except observation_errors as exc:
+            group_authority = {"state": "unavailable", "detail": str(exc), "diagnostic_only": True}
         project = {
             **binding.to_dict(),
             "effective_enabled": binding.enabled,
             "inventory_enabled": inventory_entry.enabled if inventory_entry is not None else None,
-            "inventory_converged": inventory_converged,
+            "inventory_converged": binding_inventory_converged,
             "registry_revision": revision,
             "inventory_revision": inventory_revision,
-            "state": machine_runtime.binding_state(binding),
+            "state": state,
             "eligibility": eligibility,
-            "recovery_enrollment": inspect_recovery_admission(machine_runtime, binding),
+            "recovery_enrollment": inspect_recovery_admission(machine_runtime, binding, runtime_id=runtime_id),
             "recovery_capture": inspect_recovery_capture(machine_runtime, binding),
-            "group_authority": inspect_group_authority(binding.root_config()),
+            "group_authority": group_authority,
             "write_eligible": eligibility.get("write_eligible", False),
             "upgrade": next(
                 (
@@ -244,12 +275,16 @@ def get_machine_agent_status(
         if (inventory_entry.project_id, inventory_entry.shared_root) in bound_pairs:
             continue
         _binding, conflict = exact_binding_for_entry(inventory_entry, bindings)
+        try:
+            mount_available = inventory_entry.shared_root.is_dir()
+        except OSError:
+            mount_available = False
         projects.append(
             {
                 **inventory_entry.to_dict(),
                 "state": "conflicting" if conflict else "inventory_only",
                 "status": "conflicting" if conflict else "inventory_only",
-                "mount_available": inventory_entry.shared_root.is_dir(),
+                "mount_available": mount_available,
                 "machine_name": inventory_entry.name_override,
                 "registration_generation": None,
                 "runtime_instance_id": None,
@@ -260,11 +295,11 @@ def get_machine_agent_status(
                 "inventory_revision": inventory_revision,
                 "eligibility": {"state": "unregistered", "write_eligible": False},
                 "write_eligible": False,
-                "reason": "missing_mount" if not inventory_entry.shared_root.is_dir() else "not_registered",
+                "reason": "missing_mount" if not mount_available else "not_registered",
             }
         )
     try:
-        gpu_policy = show_gpu_policy(machine_runtime)
+        gpu_policy = show_gpu_policy(machine_runtime, read_only=True)
     except (OSError, RuntimeError, ValueError, KeyError, TypeError):
         gpu_policy = {
             "mode": "auto",
@@ -283,7 +318,7 @@ def get_machine_agent_status(
             "agent_running": running,
         }
     try:
-        idle_job = idle_job_status(machine_runtime)
+        idle_job = idle_job_status(machine_runtime, runtime_id=runtime_id)
     except (OSError, RuntimeError, TypeError, ValueError, KeyError):
         idle_job = {
             "state": "blocked",
@@ -299,20 +334,33 @@ def get_machine_agent_status(
         idle_job.get("demand_detail"),
         agent_instance_id=identity[1] if running and identity is not None else None,
     )
+    ready = bool(process_status.get("ready")) and running and inventory_converged
     result = {
         "machine_runtime_root": str(machine_runtime.root),
-        "runtime_id": machine_runtime.instance_id,
+        "runtime_id": runtime_id,
+        "agent_name": agent_config.name,
         "configured_agent_mode": agent_config.agent_mode,
         "observed_agent_mode": process_status.get("observed_agent_mode"),
         "requested_policy_revision": process_status.get("policy_revision_requested", agent_config.revision),
         "acknowledged_policy_revision": process_status.get("policy_revision_acknowledged"),
         "policy_revision_requested": process_status.get("policy_revision_requested", agent_config.revision),
         "policy_revision_acknowledged": process_status.get("policy_revision_acknowledged"),
-        "readiness": bool(process_status.get("ready")) and running and reconciliation.converged,
-        "ready": bool(process_status.get("ready")) and running and reconciliation.converged,
+        "readiness": ready,
+        "ready": ready,
         "inventory_revision": inventory_revision,
-        "inventory_converged": reconciliation.converged,
-        "enablement_blockers": list(reconciliation.blockers),
+        "inventory_converged": inventory_converged,
+        "enablement_blockers": list(blockers),
+        "project_readiness": machine_project_readiness(
+            machine_runtime,
+            reconciliation,
+            identity,
+            process_status,
+            runtime_id=runtime_id,
+            agent_mode=agent_config.agent_mode,
+            policy_revision=agent_config.revision,
+            ready=ready,
+            projects=projects,
+        ),
         "reconciled_project_ids": process_status.get("reconciled_project_ids", []),
         "agent_state": "active" if running else "stopped",
         "stop_reason": process_status.get("stop_reason"),

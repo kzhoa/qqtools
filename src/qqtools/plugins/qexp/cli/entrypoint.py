@@ -38,6 +38,7 @@ from .submission import (
     _prepare_submission_request,
     _submission_error_payload,
     _submission_parse_failure_payload,
+    _submission_presentation,
     dispatch_submission,
 )
 
@@ -270,6 +271,22 @@ def _resolve_cfg(
         try:
             execution_context = machine_runtime.verified_execution_context(selection.shared_root)
         except ProjectBindingRequiredError as exc:
+            if args.command_spec.handler == "submit":
+                shared_root = selection.shared_root
+                blocker = str(exc).removesuffix(f"; run 'qexp project register {shared_root}'.")
+                command = shlex.join(
+                    [
+                        "qexp",
+                        "--machine-runtime-root",
+                        str(machine_runtime.root),
+                        "project",
+                        "register",
+                        str(shared_root.parent),
+                    ]
+                )
+                raise CliUsageError(
+                    f"{blocker}.\nRegister this Project on the selected machine runtime with the command below.\n{command}"
+                ) from exc
             raise CliUsageError(
                 f"{exc} To join this machine for the first time, run 'qexp project register <PATH>'; "
                 "to restore a missing current-generation binding, run "
@@ -357,6 +374,18 @@ def _emit_deferred_fallback(
         presentation.mark_presented()
 
 
+def _print_committed_submission_error(
+    args: argparse.Namespace, payload: dict[str, object], execution_context: ExecutionContext | None
+) -> None:
+    runtime = (
+        execution_context.machine_runtime
+        if execution_context is not None
+        else MachineRuntime(getattr(args, "machine_runtime_root", None))
+    )
+    presentation = _submission_presentation(args, runtime.root)
+    print(render(CliOutput(OutputKind.SUBMISSION, payload, presentation), "human"), file=sys.stderr)
+
+
 def main(argv: list[str] | None = None) -> int:
     raw_argv = list(sys.argv[1:] if argv is None else argv)
     _set_parse_modes(raw_argv)
@@ -383,6 +412,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     finally:
         _set_parse_modes(None)
+    execution_context: ExecutionContext | None = None
     resolved_cfg: RootConfig | None = None
     project_presentation: ProjectPresentationState | None = None
     presentation_deferred = False
@@ -559,30 +589,40 @@ def main(argv: list[str] | None = None) -> int:
             except (TypeError, ValueError):
                 diagnostic_line = None
         if getattr(args, "quiet", False):
+            for task_id in payload["task_ids"]:
+                print(task_id)
             print(f"qexp: {exc}", file=sys.stderr)
-            if diagnostic_line is not None:
-                print(diagnostic_line, file=sys.stderr)
         elif getattr(args, "format", "human") == "json":
             print(json.dumps(payload))
             print(f"qexp: {exc}", file=sys.stderr)
+        elif payload["outcome"] == "committed":
+            _print_committed_submission_error(args, payload, execution_context)
         else:
             print(f"qexp: {exc}", file=sys.stderr)
-            if diagnostic_line is not None:
-                print(diagnostic_line, file=sys.stderr)
+        if diagnostic_line is not None and getattr(args, "format", "human") != "json":
+            print(diagnostic_line, file=sys.stderr)
         return exit_code
     except KeyboardInterrupt as exc:
         if handler == "submit":
             payload, _exit_code = _submission_error_payload(args, exc)
-            payload["error"] = {"code": "interrupted", "message": "submission interrupted; retry with the same key."}
+            committed = payload["outcome"] == "committed"
+            message = (
+                "Submission interrupted after commit. Do not submit again."
+                if committed
+                else "submission interrupted; retry with the same key."
+            )
+            payload["error"] = {"code": "interrupted", "message": message}
             if getattr(args, "quiet", False):
                 for task_id in payload["task_ids"]:
                     print(task_id)
-                print("qexp: submission interrupted; retry with the same key.", file=sys.stderr)
+                print(f"qexp: {message}", file=sys.stderr)
             elif getattr(args, "format", "human") == "json":
                 print(json.dumps(payload))
-                print(f"qexp: {payload['error']['message']}", file=sys.stderr)
+                print(f"qexp: {message}", file=sys.stderr)
+            elif committed:
+                _print_committed_submission_error(args, payload, execution_context)
             else:
-                print(f"qexp: {payload['error']['message']}", file=sys.stderr)
+                print(f"qexp: {message}", file=sys.stderr)
             return 130
         if handler == "task_show" and bool(getattr(args, "watch", False)):
             _emit_deferred_fallback(project_presentation, is_deferred=presentation_deferred)

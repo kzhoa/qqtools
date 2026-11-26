@@ -29,8 +29,18 @@ def test_unregistered_current_project_requires_explicit_registration(tmp_path: P
     cfg = init_shared_root(tmp_path / ".qexp", "gpu-1", runtime_root=tmp_path / "legacy-runtime")
     runtime = _runtime(tmp_path / "machine-runtime")
 
-    with pytest.raises(RuntimeError, match="qexp project register"):
+    with pytest.raises(AgentActivationError, match="project is not registered") as error:
         ensure_local_agent_active(cfg, reason="submit", machine_runtime=runtime)
+    assert shlex.split(error.value.next_action) == [
+        "qexp",
+        "--machine-runtime-root",
+        str(runtime.root),
+        "project",
+        "register",
+        "--machine",
+        cfg.machine_name,
+        str(cfg.project_root),
+    ]
 
 
 def test_legacy_project_requires_explicit_migration(tmp_path: Path) -> None:

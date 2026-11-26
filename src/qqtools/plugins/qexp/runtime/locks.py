@@ -64,10 +64,17 @@ def exclusive(path: Path, *, blocking: bool = True) -> Iterator[bool]:
 
 
 @contextmanager
-def shared(path: Path, *, blocking: bool = True) -> Iterator[bool]:
-    """Hold a shared filesystem lock for a schema reader."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    handle = path.open("a+")
+def shared(path: Path, *, blocking: bool = True, create: bool = True) -> Iterator[bool]:
+    """Hold a shared filesystem lock, optionally observing an existing lock only."""
+    if create:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        handle = path.open("a+")
+    else:
+        try:
+            handle = path.open("r")
+        except FileNotFoundError:
+            yield False
+            return
     has_lock = False
     try:
         flags = fcntl.LOCK_SH if blocking else fcntl.LOCK_SH | fcntl.LOCK_NB

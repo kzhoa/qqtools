@@ -160,9 +160,9 @@ def _valid_component(value: object, label: str) -> str:
     return value
 
 
-def _runtime_identity(runtime: Any) -> tuple[Path, str, str]:
+def _runtime_identity(runtime: Any, *, runtime_id: str | None = None) -> tuple[Path, str, str]:
     root = Path(runtime.root).expanduser().resolve()
-    runtime_id = runtime.instance_id
+    runtime_id = runtime.instance_id if runtime_id is None else runtime_id
     if not isinstance(runtime_id, str) or not runtime_id:
         raise ValueError("runtime.instance_id must be a non-empty string")
     runtime_key = sha256(f"{root}\0{runtime_id}".encode("utf-8")).hexdigest()
@@ -1301,13 +1301,14 @@ def diagnostics_status(
     *,
     configured_log_max_bytes: int,
     active_identity: tuple[int, str, int] | None,
+    runtime_id: str | None = None,
 ) -> dict[str, Any]:
     """Return bounded diagnostic facts without opening or scanning agent logs."""
     configured = _valid_threshold(configured_log_max_bytes)
     if configured is None:
         raise ValueError("configured_log_max_bytes is outside the supported range")
     try:
-        _root, runtime_id, runtime_key = _runtime_identity(runtime)
+        _root, runtime_id, runtime_key = _runtime_identity(runtime, runtime_id=runtime_id)
         paths = _runtime_paths(runtime)
         if not _runtime_diagnostic_dirs_valid(paths):
             raise PermissionError("diagnostic directory ownership is invalid")

@@ -3,11 +3,10 @@
 from __future__ import annotations
 
 import json
-import math
 import os
-import re
 import shlex
 import stat
+from collections.abc import Mapping
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -20,7 +19,7 @@ from ..agent.diagnostic_recovery import diagnostics_repair_command, read_schedul
 from ..agent.identity import decode_identity_record
 from ..agent.inventory import ProjectInventoryEntry, decode_inventory
 from ..agent.scheduler_diagnostics import SchedulerDiagnosticStore, unavailable_summary
-from ..agent.snapshot_publication_health import SNAPSHOT_COVERAGE_FILENAME
+from ..agent.snapshot_publication_health import SNAPSHOT_COVERAGE_FILENAME, observation_freshness, observation_timestamp
 from ..agent.takeover_intent import (
     _CANCELLABLE_PHASES,
     _INTENT_NAME,
@@ -481,6 +480,79 @@ def _follow_up_actions(
     return actions
 
 
+def _primary_status_action(runtime: MachineRuntime, result: Mapping[str, Any]) -> dict[str, str] | None:
+    """Prioritize one action from the bounded status evidence."""
+    participation = result["local_participation"]["state"]
+    binding = result["local_participation"]["binding"]
+    actions = result["next_actions"]
+    project_id = result["project"]["project_id"]
+    prefix = ["qexp", "--machine-runtime-root", str(runtime.root)]
+    agent_status = shlex.join([*prefix, "agent", "status"])
+    if participation == "registered" and result["upgrade"]["state"] == "repair_required":
+        command = actions[0]
+        if project_id.startswith("-"):
+            command = shlex.join([*prefix, "admin", "upgrade", "status", f"--project={project_id}"])
+        return {"command": command, "explanation": "Inspect the Project upgrade and its repair requirement."}
+    if participation in {"unregistered", "inventory_only"}:
+        return {"command": actions[0], "explanation": "Enroll this Project on the selected runtime."}
+    if participation == "unavailable":
+        return {"command": actions[0], "explanation": "Inspect the local registry and inventory files."}
+    if takeover := result.get("takeover"):
+        return {
+            "command": takeover["operation_status_command"],
+            "explanation": "Check the phase and blockers of the accepted Project takeover.",
+        }
+    if binding is None or not binding["enabled"] or binding["write_eligibility"] == "expired":
+        return {"command": agent_status, "explanation": "Inspect this runtime's registration status."}
+
+    agent = result["local_agent"]
+    configured, observed = agent["configured_mode"], agent["observed_mode"]
+    if agent["state"] in {"unavailable", "stopped"}:
+        return {"command": agent_status, "explanation": "Check whether the local agent is running."}
+    if configured and observed and configured != observed:
+        return {"command": agent_status, "explanation": "Compare the configured and observed agent modes."}
+    if agent["heartbeat"]["freshness"] != "fresh":
+        return {"command": agent_status, "explanation": "Inspect the local agent's heartbeat health."}
+
+    recovery = result["diagnostic_recovery"]
+    if recovery["state"] == "blocked":
+        return {"command": recovery["next_action"], "explanation": "Preview the diagnostic recovery blocker."}
+
+    diagnostics = result["scheduler_diagnostics"]
+    readiness = result["scheduling_readiness"]
+    if (
+        result["project_snapshot"]["freshness"] != "fresh"
+        or readiness["diagnostic_coverage"]["state"] != "complete"
+        or diagnostics["status"] != "available"
+        or diagnostics["active_count"]
+        or diagnostics["active_findings"]
+    ):
+        if diagnostics["reason"] == "project_id_unavailable":
+            return {
+                "command": agent_status,
+                "explanation": "Inspect machine-wide status. A Project diagnostic filter is unavailable.",
+            }
+        project_filter = [f"--project-id={project_id}"] if project_id.startswith("-") else ["--project-id", project_id]
+        return {
+            "command": shlex.join([*prefix, "agent", "diagnostics", "active", *project_filter]),
+            "explanation": "Inspect reported scheduling findings. This check leaves dispatch unverified.",
+        }
+
+    if not actions:
+        return None
+    command = actions[0]
+    match shlex.split(command)[3:]:
+        case ["--project", _, "task", "list"]:
+            explanation = "Inspect the Tasks reported for this Project."
+        case ["config", "show", "agent"]:
+            explanation = "Inspect this runtime's agent configuration."
+        case ["agent", "diagnostics", "active", *_]:
+            explanation = "Inspect reported scheduling findings. This check leaves dispatch unverified."
+        case _:
+            explanation = "Inspect the local agent and its runtime status."
+    return {"command": command, "explanation": explanation}
+
+
 def project_status(
     cfg: RootConfig,
     *,
@@ -658,6 +730,7 @@ def project_status(
     }
     if takeover is not None:
         result["takeover"] = takeover
+    result["primary_action"] = _primary_status_action(machine_runtime, result)
     return result
 
 
@@ -677,35 +750,9 @@ def _scheduling_observations(
         except (ValueError, RecursionError):
             return {}
 
-    def timestamp(raw: object) -> datetime | None:
-        if (
-            not isinstance(raw, str)
-            or len(raw) > 64
-            or re.fullmatch(
-                r"[0-9]{4}-[0-9]{2}-[0-9]{2}[Tt][0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]+)?"
-                r"(?:[Zz]|[+-](?:[01][0-9]|2[0-3]):[0-5][0-9])",
-                raw,
-            )
-            is None
-        ):
-            return None
-        try:
-            return datetime.fromisoformat(raw[:-1] + "+00:00" if raw.endswith(("Z", "z")) else raw)
-        except ValueError:
-            return None
-
     def freshness(seen_at: object, interval: object, *, intervals: int = 1) -> dict[str, object]:
-        observed = timestamp(seen_at)
-        unknown = {"observed_at": None, "freshness": "unknown"}
-        if observed is None or observed > now or type(interval) not in {int, float} or interval <= 0:
-            return unknown
-        try:
-            if not math.isfinite(interval):
-                return unknown
-        except OverflowError:
-            return unknown
-        age = (now - observed).total_seconds()
-        return {"observed_at": seen_at, "freshness": "fresh" if age / intervals <= interval else "stale"}
+        state = observation_freshness(seen_at, interval, now=now, intervals=intervals)
+        return {"observed_at": seen_at if state != "unknown" else None, "freshness": state}
 
     active_instance = None
     runtime_id = binding.runtime_instance_id if binding is not None else None
@@ -757,8 +804,8 @@ def _scheduling_observations(
     recovery = read_scheduler_recovery(runtime, instance_id=active_instance, read_json=read_optional)
     coverage = diagnostics["coverage"] if binding is not None else "unknown"
     complete_coverage = diagnostics["status"] == "available" and coverage == "complete"
-    retired_at = timestamp(diagnostics.get("last_retirement_at"))
-    reported_progress_at = timestamp(recovery.get("last_progress_at"))
+    retired_at = observation_timestamp(diagnostics.get("last_retirement_at"))
+    reported_progress_at = observation_timestamp(recovery.get("last_progress_at"))
     if (
         recovery["state"] in {"idle", "awaiting_observation"}
         and active_instance is not None
@@ -778,10 +825,10 @@ def _scheduling_observations(
         and checkpoint.get("agent_instance_id") == active_instance
         and checkpoint.get("registration_generation") == binding.registration_generation
     ):
-        progress_at = timestamp(recovery.get("last_progress_at"))
-        snapshot_at = timestamp(checkpoint.get("snapshot_at"))
-        accepted_at = timestamp(checkpoint.get("accepted_at"))
-        producer_at = timestamp(checkpoint.get("observed_at"))
+        progress_at = observation_timestamp(recovery.get("last_progress_at"))
+        snapshot_at = observation_timestamp(checkpoint.get("snapshot_at"))
+        accepted_at = observation_timestamp(checkpoint.get("accepted_at"))
+        producer_at = observation_timestamp(checkpoint.get("observed_at"))
         ordered = (
             snapshot_at is not None
             and accepted_at is not None
@@ -790,8 +837,8 @@ def _scheduling_observations(
         )
         overflow = diagnostics.get("overflow", {})
         omitted_scopes = overflow.get("omitted_scopes")
-        latest_omission = timestamp(overflow.get("latest_observed_at"))
-        heartbeat_at = timestamp(heartbeat["observed_at"])
+        latest_omission = observation_timestamp(overflow.get("latest_observed_at"))
+        heartbeat_at = observation_timestamp(heartbeat["observed_at"])
         # Current scoped observations can cover historical control-plane omissions.
         # Keep the machine-wide overflow marker and its uncertainty.
         scoped_overflow_rechecked = (
