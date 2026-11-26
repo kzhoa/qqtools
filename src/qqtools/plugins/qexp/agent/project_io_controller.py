@@ -4410,7 +4410,7 @@ class ProjectIOController:
 
     def record_scheduler_coverage(self, checkpoint: ProducerCoverageCheckpoint, *, instance_id: str) -> None:
         """Persist a bounded, rotating slice of covered Project snapshot receipts."""
-        bindings = checkpoint.covered_bindings
+        bindings = sorted(checkpoint.observed_at_by_binding)
         if not bindings:
             return
         cursor = self._snapshot_coverage_cursor
@@ -4428,7 +4428,10 @@ class ProjectIOController:
             if evidence is None:
                 continue
             snapshot_at, accepted_at = evidence
+            observed_at = checkpoint.observed_at_by_binding[project_id, generation]
             try:
+                if datetime.fromisoformat(observed_at) <= datetime.fromisoformat(accepted_at):
+                    continue
                 atomic_replace(
                     self.runtime.project_paths(project_id)["root"] / SNAPSHOT_COVERAGE_FILENAME,
                     {
@@ -4438,7 +4441,7 @@ class ProjectIOController:
                             "registration_generation": generation,
                             "snapshot_at": snapshot_at,
                             "accepted_at": accepted_at,
-                            "observed_at": checkpoint.observed_at,
+                            "observed_at": observed_at,
                         }
                     },
                 )

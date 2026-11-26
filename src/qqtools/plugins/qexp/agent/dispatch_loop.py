@@ -201,6 +201,7 @@ def _enablement_reconciliation_probe(
     return {
         "identity": decision_identity,
         "outcome": "converged" if reconciliation.converged else "blocked",
+        "coverage_observed_at": datetime.now(timezone.utc).isoformat(),
         "coverage": "complete",
         "source_revision": source_revision,
         "details": {"progress": "converged" if reconciliation.converged else "blocked"},

@@ -15,7 +15,7 @@ from typing import Any
 from ..runtime.locks import exclusive
 from ..runtime.store import atomic_replace, read_json_limited, require_json_size
 from .context import MachineRuntime, _effective_runtime_id
-from .helpers import _pid_start_time_ticks
+from .helpers import _MAX_REPAIR_STATUS_BYTES, _REPAIR_IDENTITY_FILE, _pid_start_time_ticks, _status_file_witness
 from .identity import decode_identity_record
 from .scheduler_diagnostics import SchedulerDiagnosticStore
 
@@ -69,9 +69,16 @@ def _verified_agent(runtime: MachineRuntime, runtime_id: str) -> _ActiveIdentity
             return None
         pid = int(pid_record)
         status_path = runtime.paths["agent"] / "status.json"
-        if not stat.S_ISREG(status_path.lstat().st_mode):
+        info = status_path.lstat()
+        if not stat.S_ISREG(info.st_mode):
             return None
-        status = read_json_limited(status_path, max_bytes=64 * 1024, record_type="machine_agent").get("machine_agent")
+        if info.st_size > _MAX_REPAIR_STATUS_BYTES:
+            record = _read_bounded_json(status_path.with_name(_REPAIR_IDENTITY_FILE))
+            if record.get("status_witness") != _status_file_witness(status_path.lstat()):
+                return None
+        else:
+            record = read_json_limited(status_path, max_bytes=_MAX_REPAIR_STATUS_BYTES, record_type="machine_agent")
+        status = record.get("machine_agent")
         if not isinstance(status, dict) or status.get("state") != "active" or status.get("runtime_id") != runtime_id:
             return None
         instance_id = status.get("instance_id")

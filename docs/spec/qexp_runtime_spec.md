@@ -1679,8 +1679,11 @@ transitions are replayed before advancing, with exact active revision checks.
 Manual apply copies the capped store to a private sibling
 `diagnostics/scheduler-v1-backup-<id>/`, verifies its contents, and durably
 publishes it before any live mutation. It rechecks agent ownership after the
-backup and during repair. Interrupted apply can be retried against the current
-store. An unverified backup leaves live evidence intact. The operation does not
+backup and during repair. For a process status larger than 64 KiB, the status
+publisher writes a bounded ownership projection in `agent/status-identity.json`.
+Repair checks its status-file witness, runtime, PID and process start ticks.
+Replacing the status file invalidates the previous projection. Interrupted apply
+can be retried against the current store. An unverified backup leaves live evidence intact. The operation does not
 acquire Project truth locks or change any execution ownership or recovery ledger.
 
 The machine-scoped progress report is bounded and stored separately at
@@ -1693,8 +1696,10 @@ agent instance. A complete producer checkpoint in the binding’s local
 `snapshot-coverage.json` identifies the covered registration and the accepted
 snapshot it follows. A bounded rotating window writes these receipts after the
 complete cycle has committed. A fresh checkpoint for the selected
-registration is required after retirement. A later overflow omission needs new
-observations before selected status can report complete coverage. The machine-wide
+registration is required after retirement. Reusing a cached probe preserves its
+original observation time for each binding. Verification also requires a currently
+available summary with complete coverage for the selected binding. A later
+overflow omission needs new observations before selected status can report complete coverage. The machine-wide
 overflow marker remains visible in machine diagnostics.
 
 Machine-wide hard limits are 4 KiB per finding/decision, 256 active findings or

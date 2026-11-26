@@ -821,7 +821,7 @@ def _scheduling_observations(
             and ordered
             and progress_at is not None
             and snapshot_at > progress_at
-            and (diagnostics["reason"] != "active_overflow" or scoped_overflow_rechecked)
+            and complete_coverage
         ):
             recovery = {
                 **recovery,

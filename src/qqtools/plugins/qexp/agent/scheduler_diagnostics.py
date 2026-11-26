@@ -147,8 +147,7 @@ _RECOVERY_RECORD_LIMITS = {
 
 @dataclass(frozen=True, slots=True)
 class ProducerCoverageCheckpoint:
-    observed_at: str
-    covered_bindings: tuple[tuple[str, str], ...]
+    observed_at_by_binding: dict[tuple[str, str], str]
 
 
 class _StoreReadError(ValueError):
@@ -1406,7 +1405,8 @@ class SchedulerDiagnosticStore:
                 complete = False
                 reason = "probe_data_unavailable"
                 saw_probe = False
-                covered_bindings: set[tuple[str, str]] = set()
+                cycle_observed_at = observed_at or datetime.now(timezone.utc).isoformat()
+                binding_times: dict[tuple[str, str], datetime] = {}
                 for probe in iter_publication_probes(probes):
                     if not saw_probe:
                         complete = True
@@ -1416,7 +1416,12 @@ class SchedulerDiagnosticStore:
                         complete = False
                         reason = "probe_coverage_incomplete"
                     else:
-                        covered_bindings.update(_covered_bindings(probe.covered_bindings))
+                        timestamp = (
+                            cycle_observed_at if probe.coverage_observed_at is None else probe.coverage_observed_at
+                        )
+                        observation = datetime.fromisoformat(_validated_timestamp(timestamp))
+                        for binding in _covered_bindings(probe.covered_bindings):
+                            binding_times[binding] = max(binding_times.get(binding, observation), observation)
                     decision = probe.decision
                     if decision is not None and decisions_written < 3:
                         try:
@@ -1469,9 +1474,10 @@ class SchedulerDiagnosticStore:
                             break
                 next_summary["producer_coverage_complete"] = complete
                 checkpoint = None
-                if complete and covered_bindings:
-                    checkpoint_at = _validated_timestamp(observed_at or datetime.now(timezone.utc).isoformat())
-                    checkpoint = ProducerCoverageCheckpoint(checkpoint_at, tuple(sorted(covered_bindings)))
+                if complete and binding_times:
+                    checkpoint = ProducerCoverageCheckpoint(
+                        {binding: observation.isoformat() for binding, observation in binding_times.items()}
+                    )
                 if next_metadata["overflow_count"]:
                     complete = False
                     reason = "active_overflow"

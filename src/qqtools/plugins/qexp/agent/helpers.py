@@ -26,7 +26,7 @@ from ..runtime.resources.reservations import (
     reconcile_snapshot,
     reservation_snapshot,
 )
-from ..runtime.store import atomic_replace, iter_json, read_json, replace_snapshot_if_changed
+from ..runtime.store import atomic_replace, iter_json, read_json, read_json_limited, replace_snapshot_if_changed
 from ..runtime.work_budget import diagnostic_increment, diagnostic_span
 from ..scheduler import fail_attempt, resume_starting_attempt
 from .config import load_agent_config
@@ -263,6 +263,14 @@ def _active_machine_identity(runtime: MachineRuntime) -> tuple[int, str, int] | 
     return pid, instance_id, start_ticks
 
 
+_MAX_REPAIR_STATUS_BYTES = 64 * 1024
+_REPAIR_IDENTITY_FILE = "status-identity.json"
+
+
+def _status_file_witness(info: os.stat_result) -> list[int]:
+    return [info.st_dev, info.st_ino, info.st_ctime_ns, info.st_size]
+
+
 def _publish_process_status(
     runtime: MachineRuntime,
     *,
@@ -309,7 +317,28 @@ def _publish_process_status(
         "capture_mode": capture_mode,
     }
     machine_agent.update({key: value for key, value in optional.items() if value is not None})
-    replace_snapshot_if_changed(runtime.paths["agent"] / "status.json", {"machine_agent": machine_agent})
+    status_path = runtime.paths["agent"] / "status.json"
+    replace_snapshot_if_changed(status_path, {"machine_agent": machine_agent})
+    # Large rosters still need a bounded ownership check. Bind the projection
+    # to this exact atomic status file so a stopped or replaced agent invalidates it.
+    try:
+        info = status_path.stat()
+        if info.st_size > _MAX_REPAIR_STATUS_BYTES:
+            identity = {
+                key: machine_agent.get(key)
+                for key in ("state", "runtime_id", "instance_id", "pid", "pid_start_time_ticks")
+            }
+            projection = {"machine_agent": identity, "status_witness": _status_file_witness(info)}
+            path = status_path.with_name(_REPAIR_IDENTITY_FILE)
+            try:
+                if stat.S_ISREG(path.lstat().st_mode) and read_json_limited(path, max_bytes=4096) == projection:
+                    return
+            except (FileNotFoundError, ValueError):
+                pass
+            atomic_replace(path, projection)
+    except (OSError, ValueError):
+        # A later publication retries the advisory projection.
+        pass
 
 
 def _binding_config(runtime: MachineRuntime, binding: ProjectBinding) -> RootConfig:

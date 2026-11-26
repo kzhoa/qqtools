@@ -206,7 +206,11 @@ def test_enablement_reconciliation_finding_coalesces_and_resolves_after_exact_co
         changed=True,
     )
     converged_probe = _enablement_reconciliation_probe(runtime, converged)
-    store.publish_cycle({}, {}, (converged_probe,), {}, observed_at="2026-09-28T00:01:00Z")
+    checkpoint = store.publish_cycle({}, {}, (converged_probe,), {}, observed_at="2026-09-28T00:01:00Z")
+    assert (
+        checkpoint.observed_at_by_binding[binding.project_id, binding.registration_generation]
+        == converged_probe["coverage_observed_at"]
+    )
 
     assert store.reconcile_cycle((converged_probe,), resolved_at="2026-09-28T00:01:01Z")
     assert store.active_view(producer="enablement_reconciliation")["items"] == []

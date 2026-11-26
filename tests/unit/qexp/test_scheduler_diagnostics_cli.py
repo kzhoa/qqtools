@@ -259,11 +259,12 @@ def test_project_status_distinguishes_heartbeat_snapshot_and_post_repair_verific
     controller._snapshot_coverage_cursor = None
     controller._snapshot_health = SimpleNamespace(snapshot_evidence=lambda **_identity: (heartbeat_at, heartbeat_at))
 
-    def publish(project, observed_at):
+    def publish(project, observed_at, *, cached=()):
         checkpoint = store.publish_cycle(
             None,
             None,
             (
+                *cached,
                 {
                     "coverage": "complete",
                     "covered_bindings": [
@@ -277,17 +278,36 @@ def test_project_status_distinguishes_heartbeat_snapshot_and_post_repair_verific
         assert checkpoint is not None
         controller.record_scheduler_coverage(checkpoint, instance_id="current-agent")
 
-    publish("other-project", None)
+    cached = {
+        "coverage": "complete",
+        "coverage_observed_at": stale_at,
+        "covered_bindings": [
+            {"project_id": binding.project_id, "registration_generation": binding.registration_generation}
+        ],
+    }
+    publish("other-project", None, cached=(cached,))
     assert status()["diagnostic_recovery"]["state"] == "awaiting_observation"
     publish(binding.project_id, (now - timedelta(seconds=2)).isoformat())
     assert status()["diagnostic_recovery"]["state"] == "awaiting_observation"
-    publish(binding.project_id, None)
+    publish(binding.project_id, None, cached=(cached,))
     before = report_path.read_bytes()
     verified = status()
     assert verified["scheduling_readiness"]["state"] == "observed"
     assert verified["scheduling_readiness"]["diagnostic_coverage"] == {"scope": "project_binding", "state": "complete"}
     assert verified["diagnostic_recovery"]["state"] == "verified"
     assert report_path.read_bytes() == before
+
+    with store._writer_lock():
+        unavailable = status()
+    assert unavailable["scheduler_diagnostics"]["status"] == "unavailable"
+    assert unavailable["diagnostic_recovery"]["state"] == "awaiting_observation"
+
+    store.publish_cycle(None, None, ({"coverage": "incomplete"},), None)
+    assert status()["diagnostic_recovery"]["state"] == "awaiting_observation"
+    publish(binding.project_id, None)
+
+    publish("other-project", None, cached=(cached,))
+    assert status()["diagnostic_recovery"]["state"] == "verified"
 
     receipt["snapshot_at"] = datetime.now(timezone.utc).isoformat()
     atomic_replace(receipt_path, {"snapshot_observation": receipt})
@@ -324,7 +344,7 @@ def test_complete_coverage_services_all_bindings_through_a_bounded_rotating_wind
             for project, _generation in covered
         )
 
-    checkpoint = ProducerCoverageCheckpoint(timestamp, covered)
+    checkpoint = ProducerCoverageCheckpoint(dict.fromkeys(covered, datetime.now(timezone.utc).isoformat()))
     controller.record_scheduler_coverage(checkpoint, instance_id="current")
     assert count() == 16
     for _turn in range(4):

@@ -1,4 +1,5 @@
 import json
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -8,6 +9,7 @@ import pytest
 from qqtools.plugins.qexp.agent import diagnostic_recovery
 from qqtools.plugins.qexp.agent import scheduler_diagnostics as diagnostics
 from qqtools.plugins.qexp.agent.context import MachineRuntime
+from qqtools.plugins.qexp.agent.helpers import _pid_start_time_ticks, _publish_process_status
 from qqtools.plugins.qexp.agent.scheduler_diagnostics import SchedulerDiagnosticStore
 from qqtools.plugins.qexp.agent.setup import initialize_machine
 from qqtools.plugins.qexp.cli.entrypoint import main
@@ -254,3 +256,40 @@ def test_recovery_shutdown_fences_a_pending_atomic_publication(store, monkeypatc
     assert stopped["reason"] == "ownership_unverified"
     assert store.active_view()["total"] == 1
     assert store.history_view()["items"] == []
+
+
+def test_large_agent_roster_keeps_repair_bounded_and_invalidates_stale_identity(store):
+    runtime = MachineRuntime(store.runtime_root)
+    initialize_machine(runtime, "test-machine", agent_mode="daemon")
+    _observe(store, overdue_identity(runtime, "selected", "generation", 1))
+    pid = os.getpid()
+    runtime.paths["pid"].write_text(str(pid))
+    roster = [f"{index:032x}" for index in range(2000)]
+
+    def publish(instance_id):
+        _publish_process_status(
+            runtime,
+            instance_id=instance_id,
+            pid=pid,
+            start_ticks=_pid_start_time_ticks(pid),
+            waiting_for_first_registration=False,
+            runtime_id=runtime.instance_id,
+            reconciled_project_ids=roster,
+        )
+
+    publish("successor")
+    status = runtime.paths["agent"] / "status.json"
+    assert status.stat().st_size > 64 * 1024
+    assert diagnostic_recovery.repair_scheduler_diagnostics(runtime, apply=False)["eligible"] == 1
+
+    # Replacing status invalidates the projection until its writer republishes it.
+    replacement = status.with_suffix(".replacement")
+    replacement.write_bytes(status.read_bytes())
+    replacement.replace(status)
+    blocked = diagnostic_recovery.repair_scheduler_diagnostics(runtime, apply=True)
+    assert blocked["reason"] == "ownership_unverified"
+    assert blocked["retired"] == 0
+    publish("successor")
+    result = diagnostic_recovery.repair_scheduler_diagnostics(runtime, apply=True)
+    assert result["backup_verified"] is True
+    assert result["retired"] == 1
