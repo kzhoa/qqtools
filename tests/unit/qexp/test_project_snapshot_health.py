@@ -78,7 +78,8 @@ def test_snapshot_progress_stages_use_deterministic_clocks_and_recover() -> None
     assert failed["consecutive_failures"] == 1
     assert failed["retry_at"] == "2026-10-16T00:00:08Z"
 
-    tracker.report_request(identity, "agent-instance", 5.0, "request-1", stage="published")
+    tracker.report_request(identity, "agent-instance", 5.0, "request-2", stage="consumed")
+    tracker.report_request(identity, "agent-instance", 5.0, "request-2", stage="published")
     published = tracker.view()["items"][0]
     assert published["stage"] == "published"
     assert published["last_published_at"] == "2026-10-16T00:00:03Z"
@@ -118,3 +119,25 @@ def test_snapshot_health_view_is_bounded_and_worst_first() -> None:
     assert [item["project_id"] for item in tracker.view()["items"]] == ["project-09"]
     tracker.reset_instance("replacement")
     assert tracker.view() == {"items": [], "total": 0, "omitted_count": 0}
+
+
+def test_rapid_retries_remain_overdue_and_old_completion_does_not_reset_freshness() -> None:
+    clock = _Clock()
+    tracker = SnapshotPublicationHealth(monotonic=clock.monotonic, utc_clock=clock.utc_now, max_retry_seconds=60)
+    tracker.reset_instance("agent-instance")
+    identity = _identity()
+    for attempt in range(16):
+        clock.advance(1.0)
+        tracker.begin_intent(identity, "agent-instance", 5.0, new_attempt=True)
+        tracker.report_failure(identity, "agent-instance", 5.0, reason="publication_failed", request_id=f"r{attempt}")
+    overdue = tracker.view()["items"][0]
+    assert overdue["overdue"] is True
+    assert overdue["request_id"] == "r15"
+
+    tracker.report_request(identity, "agent-instance", 5.0, "r16", stage="consumed")
+    tracker.report_request(identity, "agent-instance", 5.0, "r15", stage="published")
+    assert tracker.view()["items"][0]["overdue"] is True
+    tracker.report_request(identity, "agent-instance", 5.0, "r16", stage="published")
+    success = tracker.view()["items"][0]
+    assert success["overdue"] is False
+    assert success["publication_sequence"] == 1

@@ -11,6 +11,7 @@ from pathlib import Path
 
 from ..agent.config import agent_config_payload, set_agent_config
 from ..agent.context import MachineRuntime, MachineRuntimeUninitializedError
+from ..agent.diagnostic_recovery import repair_scheduler_diagnostics
 from ..agent.idle_job_config import load_idle_job_config, set_idle_job_config
 from ..agent.lifecycle import (
     MachineAgentStartBlockedError,
@@ -90,6 +91,7 @@ LOCAL_HANDLERS = frozenset(
         "agent_status",
         "agent_diagnostics_active",
         "agent_diagnostics_history",
+        "agent_diagnostics_repair",
         "agent_stop",
         "agent_restart",
         "agent_config_gpus_show",
@@ -759,6 +761,12 @@ def dispatch_local(
                 },
             ),
         )
+    if handler == "agent_diagnostics_repair":
+        runtime = MachineRuntime(args.machine_runtime_root)
+        report = repair_scheduler_diagnostics(runtime, apply=args.apply)
+        deferred = report["pending_transition"] or (report["deferred"] or 0) > 0
+        exit_code = int(args.apply and (report["state"] == "blocked" or deferred))
+        return CommandOutcome(exit_code, CliOutput(OutputKind.SCHEDULER_DIAGNOSTICS, report))
     if handler in {"agent_diagnostics_active", "agent_diagnostics_history"}:
         runtime = MachineRuntime(args.machine_runtime_root)
         try:

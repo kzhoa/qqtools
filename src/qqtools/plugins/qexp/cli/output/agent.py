@@ -9,6 +9,7 @@ from datetime import datetime
 from typing import Any
 
 from ...config_types import MAX_IDLE_JOB_STOP_TIMEOUT_SECONDS
+from ..project_presentation import encode_display_text
 from .admin import _validate_upgrade_registry
 from .core import OutputContract, OutputKind
 from .primitives import (
@@ -157,6 +158,23 @@ def _render_agent_operation(result: Mapping[str, Any], _presentation: Mapping[st
     blockers = [row[:3] for row in project_rows if not row[3]]
     if blockers:
         rendered += "\n\n" + _table(("Project", "State", "Reason"), blockers[:10], empty_message="No Project blockers.")
+    recovery = result.get("diagnostic_recovery")
+    if result.get("action") == "restarted" and isinstance(recovery, Mapping):
+        state = recovery.get("state")
+        if state in {"pending", "progressing", "blocked", "awaiting_observation"}:
+            root = recovery.get("machine_runtime_root")
+            rendered += "\n\n" + _status_section(
+                "Scheduler diagnostic recovery",
+                (
+                    ("Scope", "machine runtime (all Projects)"),
+                    ("Machine runtime", encode_display_text(root) if isinstance(root, str) else None),
+                    ("State", state.replace("_", " ")),
+                    ("Reason", recovery.get("reason")),
+                    ("Last progress", recovery.get("last_progress_at")),
+                    ("Next check", recovery.get("next_check_at")),
+                    ("Read-only preview", recovery.get("next_action") if state == "blocked" else None),
+                ),
+            )
     return rendered
 
 
@@ -392,21 +410,50 @@ def _render_agent_status(result: Mapping[str, Any], _presentation: Mapping[str, 
 
 
 def _render_scheduler_diagnostics(result: Mapping[str, Any], _presentation: Mapping[str, object]) -> str:
-    rows = []
-    for item in result.get("items", []):
-        if not isinstance(item, Mapping):
-            continue
-        identity = item.get("identity")
-        identity = identity if isinstance(identity, Mapping) else {}
-        rows.append(
-            (
-                identity.get("producer"),
-                identity.get("reason_code"),
-                identity.get("project_id"),
-                identity.get("scope_type"),
-                item.get("last_observed_at", item.get("resolved_at")),
+    if result.get("action") == "diagnostics_repair":
+        backup = result.get("backup_path")
+        counts = (
+            (label, result[key] if result[key] is not None else "unknown")
+            for key, label in (
+                ("eligible", "Eligible"),
+                ("retired", "Retired"),
+                ("deferred", "Deferred"),
+                ("retained_current", "Retained current"),
+                ("retained_uncertain", "Retained uncertain"),
             )
         )
+        return _details(
+            (
+                ("Action", "scheduler diagnostic repair"),
+                ("Scope", "machine runtime (all Projects)"),
+                ("Machine runtime", encode_display_text(result["machine_runtime_root"])),
+                ("State", result["state"].replace("_", " ")),
+                ("Reason", result.get("reason")),
+                *counts,
+                ("Pending transition", result["pending_transition"]),
+                ("Backup", encode_display_text(backup) if isinstance(backup, str) else None),
+                ("Backup verified", result["backup_verified"]),
+                ("Apply needed", result["apply_needed"] if result["apply_needed"] is not None else "unknown"),
+                ("Next command", result.get("next_action")),
+            )
+        )
+    items = [item for item in result.get("items", []) if isinstance(item, Mapping)]
+    show_disposition = result.get("action") == "diagnostics_history" and any("disposition" in item for item in items)
+    headers = ("Producer", "Reason", "Project", "Scope", "Observed/resolved")
+    if show_disposition:
+        headers += ("Disposition",)
+    rows = []
+    for item in items:
+        identity = item.get("identity")
+        identity = identity if isinstance(identity, Mapping) else {}
+        row = (
+            identity.get("producer"),
+            identity.get("reason_code"),
+            identity.get("project_id"),
+            identity.get("scope_type"),
+            item.get("last_observed_at", item.get("resolved_at")),
+        )
+        rows.append((*row, item.get("disposition")) if show_disposition else row)
     rendered = _details(
         (
             ("Action", str(result.get("action", "scheduler diagnostics")).replace("_", " ")),
@@ -420,7 +467,7 @@ def _render_scheduler_diagnostics(result: Mapping[str, Any], _presentation: Mapp
         )
     )
     table = _table(
-        ("Producer", "Reason", "Project", "Scope", "Observed/resolved"),
+        headers,
         rows,
         empty_message="No scheduler diagnostics.",
     )
@@ -878,7 +925,35 @@ def _validate_project_io_isolation(value: Any) -> None:
 
 def _validate_scheduler_diagnostics(result: Any) -> None:
     value = _mapping(result, "scheduler-diagnostics payload")
-    action = _required(value, "action", "scheduler-diagnostics payload")
+    label = "scheduler-diagnostics payload"
+    action = _required(value, "action", label)
+    if action == "diagnostics_repair":
+        if _required_int(value, "schema_version", label) != 1 or _required(value, "scope", label) != "machine_runtime":
+            raise ValueError(f"{label} repair schema or scope is invalid")
+        if not isinstance(_required(value, "machine_runtime_root", label), str):
+            raise TypeError(f"{label}.machine_runtime_root must be a string")
+        if _required(value, "state", label) not in {
+            "pending",
+            "progressing",
+            "awaiting_observation",
+            "blocked",
+            "idle",
+        }:
+            raise ValueError(f"{label}.state is invalid")
+        for key in ("reason", "backup_path", "next_action"):
+            item = _required(value, key, label)
+            if item is not None and not isinstance(item, str):
+                raise TypeError(f"{label}.{key} must be a string or null")
+        for key in ("eligible", "retired", "deferred", "retained_current", "retained_uncertain"):
+            item = _required(value, key, label)
+            if item is not None and (type(item) is not int or item < 0):
+                raise ValueError(f"{label}.{key} must be a nonnegative integer or null")
+        for key in ("pending_transition", "backup_verified"):
+            _required_bool(value, key, label)
+        apply_needed = _required(value, "apply_needed", label)
+        if apply_needed is not None and type(apply_needed) is not bool:
+            raise TypeError(f"{label}.apply_needed must be a boolean or null")
+        return
     if action not in {"diagnostics_active", "diagnostics_history"}:
         raise ValueError("scheduler-diagnostics payload.action is invalid")
     for key in (

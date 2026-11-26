@@ -2062,6 +2062,29 @@ guarded idempotent effect settles. Invalid evidence remains visible and keeps th
 reported as unavailable or deferred work rather than persisted as invalid evidence. These
 diagnostics are derived observations and grant no repair, signal, release, or claim authority.
 
+#### Diagnostic recovery after an agent restart
+
+After acquiring MachineRuntime authority, the new agent retires scheduling findings
+whose validity ended with the former instance. History keeps their final observation
+with disposition `superseded`. Ownership conflicts and findings that require a
+fresh Project observation stay visible. Repeated publication attempts during one
+overdue interval update one finding for the same registration and agent instance.
+An accepted newer snapshot for that registration closes its episode.
+
+From the original Project, `qexp status` shows the local agent heartbeat and the
+selected registration's last successful snapshot separately, with their freshness.
+It also shows diagnostic coverage and its scope. JSON adds `local_agent.heartbeat`,
+`project_snapshot`, `scheduling_readiness`, and `diagnostic_recovery`. A heartbeat,
+diagnostic count, or successful snapshot alone cannot establish Task dispatch.
+Project status remains read-only.
+
+Restart can return while recovery is pending. Its result and subsequent Project
+status show known progress or a blocker. After retirement, Project status keeps
+verification pending until current coverage and a successful snapshot for the same
+registration have been observed after recovery. When operator action is needed,
+the command shows the MachineRuntime and a copyable repair preview. A diagnostic
+backlog leaves startup and submission available under their usual rules.
+
 ### Machine-agent control-plane health
 
 An active machine-agent process does not by itself certify that its control-plane heartbeat is
@@ -2541,6 +2564,7 @@ shell-safe continuation command.
 - `qexp agent status`
 - `qexp agent diagnostics active [--project-id ID] [--reason CODE] [--producer NAME] [--scope TYPE] [--limit N]`
 - `qexp agent diagnostics history [--project-id ID] [--cursor TOKEN] [--limit N]`
+- `qexp agent diagnostics repair (--dry-run | --apply)`
 - `qexp agent name [--set-to NAME]`
 - `qexp config show agent`
 - `qexp config set agent [--name NAME] [--agent-mode daemon|on_demand] [--log-max-size SIZE]`
@@ -2578,7 +2602,7 @@ reinterprets an untrusted legacy cursor or discards Task and Attempt truth.
 Project convergence; use `agent status` for the subsequent configured-mode, observed-mode, and
 readiness view.
 
-The diagnostics commands are finite machine-local reads and support human or JSON
+The `active` and `history` commands are finite machine-local reads and support human or JSON
 output. `--limit` defaults to 32 and accepts 1--32. `active` is one live top-N
 view ordered by severity, first observation, and canonical identity; it has no
 cursor and reports `truncated=true` when filters must be narrowed. Only immutable
@@ -2589,6 +2613,14 @@ An absent, unreadable, corrupt, unsupported, or not-yet-produced store returns a
 successful empty result with `coverage=unknown` and a stable reason. An evicted
 cursor returns a successful incomplete page with `reason=cursor_expired` and no
 continuation.
+
+`qexp agent diagnostics repair --dry-run` previews machine-wide recovery, including
+eligible findings, retained current or uncertain findings, pending work, and any
+blocker. It reports whether apply is needed. Explicit `--apply` rechecks ownership
+and exact finding revisions and creates a verified backup before changing the
+diagnostic store. It reports the backup path, verification result, and any deferred
+work. Both modes support human and JSON output. Repair can run while training
+continues and touches only scheduling diagnostics.
 
 The 1.3.22 CLI consolidation is an approved direct cutover. Retired `top`, `machines`, `doctor`,
 `clean`, `lease-policy`, `task keep-local`, `group retry-failed`, `group machines`, flat agent

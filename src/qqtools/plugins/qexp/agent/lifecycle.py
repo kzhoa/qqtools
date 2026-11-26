@@ -85,6 +85,11 @@ from .config import load_agent_config
 from .context import MachineRuntime, ProjectBinding, default_machine_runtime_root
 from .control_plane import _MachineControlPlane
 from .control_plane_health import read_control_plane_health
+from .diagnostic_recovery import (
+    maintain_scheduler_diagnostics,
+    publish_scheduler_recovery_start_failure,
+    read_scheduler_recovery,
+)
 from .diagnostics import (
     AgentLogService,
     bounded_exception_evidence,
@@ -334,6 +339,9 @@ def get_machine_agent_status(
         result["scheduler_diagnostics"] = SchedulerDiagnosticStore(machine_runtime).summary_view()
     except Exception:
         result["scheduler_diagnostics"] = unavailable_summary(machine_runtime.root, reason="summary_unavailable")
+    result["diagnostic_recovery"] = read_scheduler_recovery(
+        machine_runtime, instance_id=identity[1] if identity is not None else None
+    )
     return result
 
 
@@ -409,6 +417,8 @@ def run_machine_agent_loop(
     project_io_executor: ProjectIOExecutor | None = None
     idle_job_supervisor: IdleJobSupervisor | None = None
     scheduler_wakeup = threading.Event()
+    diagnostic_recovery_stop = threading.Event()
+    diagnostic_recovery_thread: threading.Thread | None = None
     stop = False
     stop_reason: str | None = None
     handled_signal: int | None = None
@@ -581,13 +591,14 @@ def run_machine_agent_loop(
                 effective_log_max_bytes=effective_log_max_bytes,
                 capture_mode=capture_mode,
             )
+            startup_runtime_id = machine_runtime.instance_id
             _publish_process_status(
                 machine_runtime,
                 instance_id=instance_id,
                 pid=os.getpid(),
                 start_ticks=start_ticks,
                 waiting_for_first_registration=True,
-                runtime_id=machine_runtime.instance_id,
+                runtime_id=startup_runtime_id,
                 configured_agent_mode=agent_config.agent_mode,
                 observed_agent_mode=observed_agent_mode,
                 policy_revision_requested=policy_revision_requested,
@@ -601,6 +612,24 @@ def run_machine_agent_loop(
                 capture_mode=capture_mode,
             )
             is_status_published = True
+            try:
+                recovery_thread = threading.Thread(
+                    target=maintain_scheduler_diagnostics,
+                    kwargs={
+                        "runtime": machine_runtime,
+                        "identity": (os.getpid(), instance_id, start_ticks),
+                        "runtime_id": startup_runtime_id,
+                        "stop_event": diagnostic_recovery_stop,
+                    },
+                    name="qexp-scheduler-diagnostic-recovery",
+                    daemon=True,
+                )
+                recovery_thread.start()
+                diagnostic_recovery_thread = recovery_thread
+            except (OSError, RuntimeError):
+                publish_scheduler_recovery_start_failure(
+                    machine_runtime, runtime_id=startup_runtime_id, instance_id=instance_id
+                )
             if log_service is not None:
                 try:
                     log_service.start()
@@ -927,6 +956,7 @@ def run_machine_agent_loop(
                 exception_text = f"{type(exc).__name__}\n"
             write_managed_log(exception_text)
         finally:
+            diagnostic_recovery_stop.set()
             frozen_stop_reason = stop_reason or "stopped"
             stop_reason = frozen_stop_reason
             primary_exception_evidence = safe_error_facts(primary_exception) if primary_exception is not None else None
@@ -937,6 +967,8 @@ def run_machine_agent_loop(
                 record_cleanup_step("project_io_executor_fence")
             else:
                 run_cleanup_step("project_io_executor_fence", project_io_executor.fence_epoch)
+            if diagnostic_recovery_thread is not None:
+                diagnostic_recovery_thread.join(timeout=0.1)
 
             def publish_stopping_evidence() -> None:
                 evidence: dict[str, object] = {

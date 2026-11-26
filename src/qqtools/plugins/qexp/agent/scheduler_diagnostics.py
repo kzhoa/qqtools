@@ -4,23 +4,32 @@ from __future__ import annotations
 
 import base64
 import binascii
+import fcntl
 import json
 import os
 import re
+import stat
 import time
 import uuid
 from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
-from ..runtime.locks import exclusive, shared
+from ..runtime.locks import exclusive
 from ..runtime.paths import machine_runtime_paths
 from ..runtime.records import utc_now
 from ..runtime.store import JSONRecordSizeError, atomic_replace, json_encoded_size, read_json_limited
 from .context import MachineRuntime
+from .scheduler_diagnostic_backup import (
+    FIXED_DIAGNOSTIC_FILES,
+    MAX_DIAGNOSTIC_TEMPORARIES,
+    create_scheduler_diagnostic_backup,
+    temporary_target,
+)
 from .scheduler_diagnostic_policy import (
     FindingObservationOmission,
     IgnoredFindingObservation,
@@ -57,6 +66,8 @@ MAX_CURSOR_BYTES = 1024
 MAX_PUBLICATION_OPERATIONS = 16
 MAX_PUBLICATION_BYTES = 64 * 1024
 MAX_PUBLICATION_ADMISSION_NS = 10_000_000
+MAX_MAINTENANCE_BYTES = 512 * 1024
+MAX_AUTOMATIC_RETIREMENTS = 4
 
 _TOKEN_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
@@ -107,11 +118,37 @@ _DETAIL_FIELDS = frozenset(
         "group_usage",
         "diagnostic_code",
         "progress",
+        "request_id",
+        "executor_epoch",
         "details_omitted",
     }
 )
 _REVISION_FIELD_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+_RECORD_NAME_RE = re.compile(r"^[0-9a-f]{64}\.json$")
+_PENDING_NAME_RE = re.compile(r"^[0-9a-f]{32}\.json$")
+_HEARTBEAT_REASONS = frozenset(
+    {
+        "heartbeat_thread_stopped",
+        "heartbeat_cycle_stalled",
+        "heartbeat_repeated_failure",
+        "heartbeat_diagnostic_coverage_loss",
+    }
+)
 _SEGMENT_NAME_RE = re.compile(r"^([1-9][0-9]*)-([1-9][0-9]*)\.json$")
+
+
+_RECOVERY_RECORD_LIMITS = {
+    Path("active"): (_RECORD_NAME_RE, MAX_ACTIVE_RECORDS, MAX_FINDING_BYTES),
+    Path("decisions"): (_RECORD_NAME_RE, MAX_DECISIONS, MAX_DECISION_BYTES),
+    Path("pending"): (_PENDING_NAME_RE, MAX_ACTIVE_RECORDS + 1, 16 * 1024),
+    Path("history/segments"): (_SEGMENT_NAME_RE, MAX_HISTORY_ENTRIES + 5, MAX_SEGMENT_BYTES),
+}
+
+
+@dataclass(frozen=True, slots=True)
+class ProducerCoverageCheckpoint:
+    observed_at: str
+    covered_bindings: tuple[tuple[str, str], ...]
 
 
 class _StoreReadError(ValueError):
@@ -130,21 +167,42 @@ class _StoreCapacityError(OSError):
     """A write would exceed one of the bounded store capacities."""
 
 
+class _DiagnosticLockUnavailable(OSError):
+    """The scheduler diagnostics writer is already held."""
+
+
+class _RepairOwnershipError(ValueError):
+    """A scheduler diagnostic repair owner could not be verified."""
+
+
 class _WriteBudget:
     """Bound one writer turn by storage operations, bytes, and admission time."""
 
-    def __init__(self, live_bytes: int) -> None:
+    def __init__(
+        self,
+        live_bytes: int,
+        *,
+        maintenance: bool = False,
+        mutation_allowed: Callable[[], bool] | None = None,
+    ) -> None:
         self.started_ns = time.monotonic_ns()
+        self.maintenance = maintenance
+        self.mutation_allowed = mutation_allowed
         self.live_bytes = live_bytes
         self.operations = 0
         self.encoded_bytes = 0
 
+    def require_mutation(self, _witness: os.stat_result | None = None) -> None:
+        if self.mutation_allowed is not None and not self.mutation_allowed():
+            raise _RepairOwnershipError
+
     def admit(self, encoded_bytes: int, *, final: bool = False) -> None:
         if self.operations >= MAX_PUBLICATION_OPERATIONS:
             raise _StoreCapacityError("publication_operation_limit")
-        if self.encoded_bytes + encoded_bytes > MAX_PUBLICATION_BYTES:
+        byte_limit = MAX_MAINTENANCE_BYTES if self.maintenance else MAX_PUBLICATION_BYTES
+        if self.encoded_bytes + encoded_bytes > byte_limit:
             raise _StoreCapacityError("publication_byte_limit")
-        if not final and time.monotonic_ns() - self.started_ns > MAX_PUBLICATION_ADMISSION_NS:
+        if not self.maintenance and not final and time.monotonic_ns() - self.started_ns > MAX_PUBLICATION_ADMISSION_NS:
             raise _StoreCapacityError("publication_admission_deadline")
         self.operations += 1
         self.encoded_bytes += encoded_bytes
@@ -162,23 +220,41 @@ class SchedulerDiagnosticStore:
     def _writer_lock(self) -> Iterator[None]:
         with exclusive(self.paths["scheduler_diagnostics_lock"], blocking=False) as acquired:
             if not acquired:
-                raise OSError("scheduler_diagnostics_lock_unavailable")
+                raise _DiagnosticLockUnavailable("scheduler_diagnostics_lock_unavailable")
             yield
 
     @contextmanager
-    def _reader_lock(self) -> Iterator[bool]:
+    def _reader_lock(self, *, raise_on_permission: bool = False) -> Iterator[bool]:
         lock_path = self.paths["scheduler_diagnostics_lock"]
         try:
-            if not _is_regular_file(lock_path):
-                yield False
-                return
-            with shared(lock_path, blocking=False) as acquired:
-                yield acquired
+            descriptor = os.open(lock_path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        except PermissionError:
+            if raise_on_permission:
+                raise
+            yield False
+            return
         except OSError:
             yield False
+            return
+        try:
+            if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                yield False
+                return
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            except OSError:
+                yield False
+                return
+            yield True
+        finally:
+            os.close(descriptor)
 
-    def _new_budget(self) -> _WriteBudget:
-        return _WriteBudget(_tree_bytes(self.paths["scheduler_diagnostics"]))
+    def _new_budget(
+        self, *, maintenance: bool = False, mutation_allowed: Callable[[], bool] | None = None
+    ) -> _WriteBudget:
+        return _WriteBudget(
+            _tree_bytes(self.paths["scheduler_diagnostics"]), maintenance=maintenance, mutation_allowed=mutation_allowed
+        )
 
     def _write(self, path: Path, value: dict[str, Any], budget: _WriteBudget, *, final: bool = False) -> None:
         encoded_bytes = json_encoded_size(value)
@@ -190,7 +266,11 @@ class SchedulerDiagnosticStore:
         if next_live > MAX_LIVE_BYTES or budget.live_bytes + encoded_bytes > MAX_PHYSICAL_PEAK_BYTES:
             raise _StoreCapacityError("store_capacity")
         budget.admit(encoded_bytes, final=final)
-        atomic_replace(path, value)
+        if budget.mutation_allowed is None:
+            atomic_replace(path, value)
+        else:
+            budget.require_mutation()
+            atomic_replace(path, value, before_replace=budget.require_mutation)
         budget.live_bytes = next_live
 
     def _unlink(self, path: Path, budget: _WriteBudget, *, final: bool = False) -> None:
@@ -201,6 +281,7 @@ class SchedulerDiagnosticStore:
         if not os.path.isfile(path) or path.is_symlink():
             raise _StoreReadError("store_corrupt")
         budget.admit(0, final=final)
+        budget.require_mutation()
         path.unlink()
         budget.live_bytes = max(0, budget.live_bytes - metadata.st_size)
 
@@ -353,6 +434,8 @@ class SchedulerDiagnosticStore:
             {
                 "snapshot_revision": next_metadata["snapshot_revision"],
                 "observed_at": observed_at,
+                "latest_overflow_at": next_metadata.get("latest_overflow_at"),
+                "last_retirement_at": next_metadata.get("last_retirement_at"),
                 "coverage": next_metadata["coverage"],
                 "reason": next_metadata["reason"],
                 "status": "available",
@@ -498,6 +581,7 @@ class SchedulerDiagnosticStore:
         if sample and sample not in metadata["omitted_scopes"] and len(metadata["omitted_scopes"]) < 16:
             metadata["omitted_scopes"].append(sample)
         metadata["observed_at"] = observed_at
+        metadata["latest_overflow_at"] = datetime.now(timezone.utc).isoformat()
 
     @staticmethod
     def _fit_record(kind: str, epoch: str, record: dict[str, Any], max_bytes: int) -> dict[str, Any]:
@@ -702,6 +786,7 @@ class SchedulerDiagnosticStore:
         observation_revision: int,
         source_revision: Mapping[str, object],
         resolved_at: str | None = None,
+        maintenance: bool = False,
     ) -> bool:
         """Commit immutable history before removing the exact captured active record."""
         _require_mapping(identity, "identity")
@@ -719,136 +804,170 @@ class SchedulerDiagnosticStore:
         if identity_incomplete or revision_omitted or (not safe_revision and not revisionless_unknown_registry):
             return False
         safe_time = _validated_timestamp(resolved_at)
-        digest = diagnostic_identity_digest(safe_identity)
         with self._writer_lock():
-            metadata_path = self.paths["scheduler_diagnostics_metadata"]
-            if not _is_regular_file(metadata_path):
+            if _has_pending_transition(self.paths["scheduler_diagnostics_pending"]):
                 return False
-            budget = self._new_budget()
-            metadata = self._load_metadata()
-            active_path = self.paths["scheduler_diagnostics_active"] / f"{digest}.json"
-            try:
-                active = self._read_envelope(
-                    active_path,
-                    kind="active",
-                    max_bytes=MAX_FINDING_BYTES,
-                    epoch=metadata["epoch"],
-                )
-            except _StoreReadError as exc:
-                if exc.reason == "store_corrupt" and not _is_regular_file(active_path):
-                    return False
-                raise
-            if (
-                active.get("identity") != safe_identity
-                or active.get("episode") != episode
-                or active.get("observation_revision") != observation_revision
-                or active.get("source_revision") != safe_revision
-            ):
-                return False
-
-            index = self._load_index(metadata["epoch"])
-            sequence = metadata["next_history_sequence"]
-            entry = {
-                "sequence": sequence,
-                "resolved_at": safe_time,
-                "identity": safe_identity,
-                "identity_digest": digest,
-                "episode": episode,
-                "severity": active.get("severity"),
-                "first_observed_at": active.get("first_observed_at"),
-                "last_observed_at": active.get("last_observed_at"),
-                "observation_count": active.get("observation_count"),
-                "observation_revision": observation_revision,
-                "source_revision": safe_revision,
-                "details": active.get("details", {}),
-                "details_omitted": active.get("details_omitted", False),
-            }
-            segment_name = f"{sequence}-{sequence}.json"
-            segment_path = self.paths["scheduler_diagnostics_history_segments"] / segment_name
-            segment = self._envelope("history_segment", metadata["epoch"], entries=[entry])
-            segment_size = _encoded_size(segment)
-            if segment_size > MAX_SEGMENT_BYTES:
-                return False
-
-            transition_id = uuid.uuid4().hex
-            pending_path = self.paths["scheduler_diagnostics_pending"] / f"{transition_id}.json"
-            pending = self._envelope(
-                "pending_resolution",
-                metadata["epoch"],
-                transition_id=transition_id,
-                identity=safe_identity,
-                identity_digest=digest,
+            return self._resolve_finding_locked(
+                safe_identity=safe_identity,
                 episode=episode,
                 observation_revision=observation_revision,
-                source_revision=safe_revision,
-                history_sequence=sequence,
-                segment_name=segment_name,
-                resolved_at=safe_time,
-                entry=entry,
+                safe_revision=safe_revision,
+                safe_time=safe_time,
+                budget=self._new_budget(maintenance=maintenance) if maintenance else self._new_budget(),
             )
-            if _encoded_size(pending) > 16 * 1024:
-                return False
-            self._write(pending_path, pending, budget)
 
-            if _is_regular_file(segment_path):
-                existing_segment = self._read_envelope(
-                    segment_path,
-                    kind="history_segment",
-                    max_bytes=MAX_SEGMENT_BYTES,
-                    epoch=metadata["epoch"],
-                )
-                if existing_segment.get("entries") != [entry]:
-                    raise _StoreReadError("store_corrupt")
-            else:
-                self._write(segment_path, segment, budget)
-
-            next_index, evicted_segments = _append_history_index(
-                index,
-                segment_name=segment_name,
-                sequence=sequence,
-                byte_count=segment_size,
-                observed_at=safe_time,
+    def _resolve_finding_locked(
+        self,
+        *,
+        safe_identity: dict[str, Any],
+        episode: str,
+        observation_revision: int,
+        safe_revision: dict[str, Any],
+        safe_time: str,
+        budget: _WriteBudget,
+        disposition: str | None = None,
+    ) -> bool:
+        metadata_path = self.paths["scheduler_diagnostics_metadata"]
+        if not _is_regular_file(metadata_path):
+            return False
+        metadata = self._load_metadata()
+        digest = diagnostic_identity_digest(safe_identity)
+        active_path = self.paths["scheduler_diagnostics_active"] / f"{digest}.json"
+        try:
+            active = self._read_envelope(
+                active_path,
+                kind="active",
+                max_bytes=MAX_FINDING_BYTES,
+                epoch=metadata["epoch"],
             )
-            if _encoded_size(self._envelope("history_index", metadata["epoch"], **_without_kind(next_index))) > (
-                256 * 1024
-            ):
+        except _StoreReadError as exc:
+            if exc.reason == "store_corrupt" and not _is_regular_file(active_path):
                 return False
-            # The index is the history commit point. Active removal always follows it.
-            self._write(
-                self.paths["scheduler_diagnostics_history_index"],
-                self._envelope("history_index", metadata["epoch"], **_without_kind(next_index)),
+            raise
+        if (
+            active.get("identity") != safe_identity
+            or active.get("episode") != episode
+            or active.get("observation_revision") != observation_revision
+            or active.get("source_revision") != safe_revision
+        ):
+            return False
+
+        index = self._load_index(metadata["epoch"])
+        sequence = metadata["next_history_sequence"]
+        if sequence <= index["max_sequence"]:
+            raise _StoreReadError("store_corrupt")
+        entry = {
+            "sequence": sequence,
+            "resolved_at": safe_time,
+            "identity": safe_identity,
+            "identity_digest": digest,
+            "episode": episode,
+            "severity": active.get("severity"),
+            "first_observed_at": active.get("first_observed_at"),
+            "last_observed_at": active.get("last_observed_at"),
+            "observation_count": active.get("observation_count"),
+            "observation_revision": observation_revision,
+            "source_revision": safe_revision,
+            "details": active.get("details", {}),
+            "details_omitted": active.get("details_omitted", False),
+        }
+        if disposition is not None:
+            entry["disposition"] = disposition
+            entry["count_saturated"] = active["count_saturated"]
+        segment_name = f"{sequence}-{sequence}.json"
+        segment_path = self.paths["scheduler_diagnostics_history_segments"] / segment_name
+        segment = self._envelope("history_segment", metadata["epoch"], entries=[entry])
+        segment_size = _encoded_size(segment)
+        if segment_size > MAX_SEGMENT_BYTES:
+            return False
+
+        transition_id = uuid.uuid4().hex
+        pending_path = self.paths["scheduler_diagnostics_pending"] / f"{transition_id}.json"
+        pending = self._envelope(
+            "pending_resolution",
+            metadata["epoch"],
+            transition_id=transition_id,
+            identity=safe_identity,
+            identity_digest=digest,
+            episode=episode,
+            observation_revision=observation_revision,
+            source_revision=safe_revision,
+            history_sequence=sequence,
+            segment_name=segment_name,
+            resolved_at=safe_time,
+            entry=entry,
+        )
+        if _encoded_size(pending) > 16 * 1024:
+            return False
+        self._write(pending_path, pending, budget)
+
+        if _is_regular_file(segment_path):
+            existing_segment = self._read_envelope(
+                segment_path,
+                kind="history_segment",
+                max_bytes=MAX_SEGMENT_BYTES,
+                epoch=metadata["epoch"],
+            )
+            if existing_segment.get("entries") != [entry]:
+                raise _StoreReadError("store_corrupt")
+        else:
+            self._write(segment_path, segment, budget)
+
+        next_index, evicted_segments = _append_history_index(
+            index,
+            segment_name=segment_name,
+            sequence=sequence,
+            byte_count=segment_size,
+            observed_at=safe_time,
+        )
+        if json_encoded_size(self._envelope("history_index", metadata["epoch"], **_without_kind(next_index))) > (
+            256 * 1024
+        ):
+            return False
+        # The index is the history commit point. Active removal always follows it.
+        self._write(
+            self.paths["scheduler_diagnostics_history_index"],
+            self._envelope("history_index", metadata["epoch"], **_without_kind(next_index)),
+            budget,
+        )
+        summary = self._read_summary_locked(metadata["epoch"])
+        next_summary = _summary_remove_active(summary, digest, safe_identity)
+        next_metadata = dict(metadata)
+        next_metadata["next_history_sequence"] = sequence + 1
+        next_metadata["eviction_count"] = min(
+            _SATURATING_COUNT, next_metadata["eviction_count"] + len(evicted_segments)
+        )
+        _apply_retained_window(next_metadata, next_index)
+        next_metadata["active_count"] = max(0, next_metadata["active_count"] - 1)
+        next_summary["retention"] = _retention_summary(next_index)
+        next_summary["applied_history_sequence"] = sequence
+        self._unlink(active_path, budget)
+        if disposition == "superseded":
+            next_metadata["last_retirement_at"] = datetime.now(timezone.utc).isoformat()
+        if disposition == "superseded" or metadata["reason"] == "recovery_pending":
+            coverage, reason = "incomplete", "recovery_pending"
+        elif metadata["overflow_count"]:
+            coverage, reason = "incomplete", metadata["reason"]
+        else:
+            coverage, reason = metadata["coverage"], None
+        self._commit_state(
+            next_metadata,
+            next_summary,
+            budget,
+            observed_at=safe_time,
+            coverage=coverage,
+            reason=reason,
+        )
+        for segment_meta in evicted_segments[:4]:
+            self._unlink(
+                self.paths["scheduler_diagnostics_history_segments"] / segment_meta["name"],
                 budget,
+                final=True,
             )
-            summary = self._read_summary_locked(metadata["epoch"])
-            next_summary = _summary_remove_active(summary, digest, safe_identity)
-            next_metadata = dict(metadata)
-            next_metadata["next_history_sequence"] = sequence + 1
-            next_metadata["eviction_count"] = min(
-                _SATURATING_COUNT, next_metadata["eviction_count"] + len(evicted_segments)
-            )
-            _apply_retained_window(next_metadata, next_index)
-            next_metadata["active_count"] = max(0, next_metadata["active_count"] - 1)
-            next_summary["retention"] = _retention_summary(next_index)
-            self._unlink(active_path, budget)
-            self._commit_state(
-                next_metadata,
-                next_summary,
-                budget,
-                observed_at=safe_time,
-                coverage=("incomplete" if metadata["overflow_count"] else metadata["coverage"]),
-                reason=(metadata["reason"] if metadata["overflow_count"] else None),
-            )
-            for segment_meta in evicted_segments:
-                old_name = segment_meta.get("name")
-                if isinstance(old_name, str) and _SEGMENT_NAME_RE.fullmatch(old_name):
-                    self._unlink(
-                        self.paths["scheduler_diagnostics_history_segments"] / old_name,
-                        budget,
-                        final=True,
-                    )
-            # A failure before this unlink leaves enough pending evidence for recover().
+        # The marker also carries cleanup responsibility when retention evicts a large batch.
+        if len(evicted_segments) <= 4:
             self._unlink(pending_path, budget, final=True)
-            return True
+        return True
 
     def active_view(
         self,
@@ -880,31 +999,10 @@ class SchedulerDiagnosticStore:
                     base["coverage"] = "incomplete"
                     base["reason"] = "recovery_pending"
                     base["truncated"] = True
-                paths = _active_paths(self.paths["scheduler_diagnostics_active"])
-                if len(paths) > MAX_ACTIVE_READ_RECORDS:
-                    raise _StoreReadError("active_store_oversized")
                 records: list[dict[str, Any]] = []
-                bytes_read = _file_size(self.paths["scheduler_diagnostics_metadata"])
-                for path in paths:
-                    size = _file_size(path)
-                    bytes_read += size
-                    if size > MAX_FINDING_BYTES or bytes_read > MAX_ACTIVE_READ_BYTES:
-                        raise _StoreReadError("active_store_oversized")
-                    record = self._read_envelope(
-                        path,
-                        kind="active",
-                        max_bytes=MAX_FINDING_BYTES,
-                        epoch=metadata["epoch"],
-                    )
-                    identity = record.get("identity")
-                    digest = record.get("identity_digest")
-                    if (
-                        not isinstance(identity, dict)
-                        or digest != path.stem
-                        or diagnostic_identity_digest(identity) != digest
-                        or not _valid_active_record(record)
-                    ):
-                        raise _StoreReadError("store_corrupt")
+                for _path, record in self._active_records_locked(metadata):
+                    assert record is not None
+                    identity = record["identity"]
                     if record["observation_revision"] > metadata["snapshot_revision"]:
                         base["coverage"] = "incomplete"
                         base["reason"] = "snapshot_incomplete"
@@ -939,6 +1037,82 @@ class SchedulerDiagnosticStore:
             return _active_empty(self.runtime_root, project_id, reason=exc.reason)
         except (OSError, RuntimeError, TypeError, ValueError):
             return _active_empty(self.runtime_root, project_id, reason="store_corrupt")
+
+    def _active_records_locked(
+        self, metadata: Mapping[str, Any], *, tolerate_malformed: bool = False
+    ) -> Iterator[tuple[Path, dict[str, Any] | None]]:
+        paths = _active_paths(self.paths["scheduler_diagnostics_active"])
+        if len(paths) > MAX_ACTIVE_READ_RECORDS:
+            raise _StoreReadError("active_store_oversized")
+        bytes_read = _file_size(self.paths["scheduler_diagnostics_metadata"])
+        for path in paths:
+            size = _file_size(path)
+            bytes_read += size
+            if bytes_read > MAX_ACTIVE_READ_BYTES:
+                raise _StoreReadError("active_store_oversized")
+            if size > MAX_FINDING_BYTES:
+                if not tolerate_malformed:
+                    raise _StoreReadError("active_store_oversized")
+                yield path, None
+                continue
+            try:
+                record = self._read_envelope(path, kind="active", max_bytes=MAX_FINDING_BYTES, epoch=metadata["epoch"])
+            except _StoreReadError as exc:
+                if isinstance(exc.__cause__, PermissionError):
+                    raise exc.__cause__ from exc
+                if not tolerate_malformed:
+                    raise
+                yield path, None
+                continue
+            identity = record.get("identity")
+            digest = record.get("identity_digest")
+            if (isinstance(digest, str) and digest != path.stem) or (
+                isinstance(identity, dict) and diagnostic_identity_digest(identity) != path.stem
+            ):
+                raise _StoreReadError("store_corrupt")
+            if not isinstance(record.get("severity"), str) or not _valid_active_record(record):
+                if not tolerate_malformed:
+                    raise _StoreReadError("store_corrupt")
+                yield path, None
+                continue
+            yield path, record
+
+    def active_findings_for_target(
+        self, *, producer: str, runtime_id: str, target_id: str, reason: str | None = None
+    ) -> dict[str, object]:
+        """Read all findings for one exact producer/runtime/target within the active store caps."""
+        _validate_filter_token(producer, "producer")
+        _validate_filter_token(reason, "reason")
+        _validate_filter_identifier(runtime_id, "runtime_id")
+        _validate_filter_identifier(target_id, "target_id")
+        if not _is_regular_file(self.paths["scheduler_diagnostics_metadata"]):
+            return {"items": [], "total": 0, "reason": _missing_metadata_reason(self.paths)}
+        try:
+            with self._reader_lock() as acquired:
+                if not acquired:
+                    return {"items": [], "total": 0, "reason": "store_unavailable"}
+                metadata = self._load_metadata()
+                view_reason = (
+                    "recovery_pending" if _has_pending_transition(self.paths["scheduler_diagnostics_pending"]) else None
+                )
+                items = []
+                for _path, record in self._active_records_locked(metadata):
+                    assert record is not None
+                    if record["observation_revision"] > metadata["snapshot_revision"]:
+                        view_reason = "snapshot_incomplete"
+                    identity = record["identity"]
+                    if (
+                        identity.get("producer") == producer
+                        and identity.get("runtime_id") == runtime_id
+                        and identity.get("target_id") == target_id
+                        and (reason is None or identity.get("reason_code") == reason)
+                    ):
+                        items.append(_active_item(record))
+                return {"items": items, "total": len(items), "reason": view_reason}
+        except _StoreReadError as exc:
+            return {"items": [], "total": 0, "reason": exc.reason}
+        except (OSError, RuntimeError, TypeError, ValueError):
+            return {"items": [], "total": 0, "reason": "store_corrupt"}
 
     def history_view(
         self,
@@ -1170,6 +1344,8 @@ class SchedulerDiagnosticStore:
                     "status": "available",
                     "coverage": "incomplete" if has_pending else record["coverage"],
                     "observed_at": record["observed_at"],
+                    "producer_coverage_complete": record.get("producer_coverage_complete"),
+                    "last_retirement_at": record.get("last_retirement_at"),
                     "snapshot_revision": record["snapshot_revision"],
                     "truncated": has_pending
                     or bool(record.get("truncated"))
@@ -1188,6 +1364,7 @@ class SchedulerDiagnosticStore:
                         "count": record.get("overflow_count", 0),
                         "omitted_observations": record.get("omitted_observations", 0),
                         "omitted_scopes": record.get("omitted_scopes", []),
+                        "latest_observed_at": record.get("latest_overflow_at"),
                     },
                     "retention": record.get("retention", {}),
                 }
@@ -1203,7 +1380,7 @@ class SchedulerDiagnosticStore:
         probes: Sequence[Mapping[str, object]] | Mapping[str, object] | None,
         working_set: Mapping[str, object] | None,
         observed_at: str | None = None,
-    ) -> None:
+    ) -> ProducerCoverageCheckpoint | None:
         """Best-effort coalesced publication of bounded scheduler-cycle data."""
         safe_time = _validated_timestamp(observed_at)
         try:
@@ -1229,6 +1406,7 @@ class SchedulerDiagnosticStore:
                 complete = False
                 reason = "probe_data_unavailable"
                 saw_probe = False
+                covered_bindings: set[tuple[str, str]] = set()
                 for probe in iter_publication_probes(probes):
                     if not saw_probe:
                         complete = True
@@ -1237,6 +1415,8 @@ class SchedulerDiagnosticStore:
                     if not probe.coverage_complete:
                         complete = False
                         reason = "probe_coverage_incomplete"
+                    else:
+                        covered_bindings.update(_covered_bindings(probe.covered_bindings))
                     decision = probe.decision
                     if decision is not None and decisions_written < 3:
                         try:
@@ -1280,12 +1460,18 @@ class SchedulerDiagnosticStore:
                                 budget=budget,
                             )
                             if record is None:
+                                complete = False
                                 break
                             findings_written += 1
                         except _StoreCapacityError:
                             complete = False
                             reason = "publication_budget_exhausted"
                             break
+                next_summary["producer_coverage_complete"] = complete
+                checkpoint = None
+                if complete and covered_bindings:
+                    checkpoint_at = _validated_timestamp(observed_at or datetime.now(timezone.utc).isoformat())
+                    checkpoint = ProducerCoverageCheckpoint(checkpoint_at, tuple(sorted(covered_bindings)))
                 if next_metadata["overflow_count"]:
                     complete = False
                     reason = "active_overflow"
@@ -1309,8 +1495,9 @@ class SchedulerDiagnosticStore:
                     coverage="complete" if complete else "incomplete",
                     reason=None if complete else reason,
                 )
+            return checkpoint
         except (OSError, RuntimeError, ValueError, TypeError, UnicodeError, OverflowError):
-            return
+            return None
 
     def reconcile_cycle(
         self,
@@ -1331,137 +1518,472 @@ class SchedulerDiagnosticStore:
                 observation_revision=candidate.observation_revision,
                 source_revision=candidate.source_revision,
                 resolved_at=safe_time,
+                maintenance=True,
             )
         return False
 
-    def recover(self) -> dict[str, int]:
-        """Finish exact indexed resolutions and remove a bounded set of orphan segments."""
-        if not _is_regular_file(self.paths["scheduler_diagnostics_metadata"]):
-            return {"recovered": 0, "discarded": 0}
-        if not _has_pending_transition(self.paths["scheduler_diagnostics_pending"]):
-            return {"recovered": 0, "discarded": 0}
-        recovered = 0
-        discarded = 0
-        with self._writer_lock():
-            safe_time = utc_now()
-            budget = self._new_budget()
+    def repair(
+        self,
+        *,
+        runtime_id: str,
+        owner: Callable[[], str | None],
+        apply: bool = False,
+        automatic: bool = False,
+        mutation_allowed: Callable[[], bool] | None = None,
+    ) -> dict[str, Any]:
+        """Preview or archive findings provably superseded by the verified agent."""
+        result = {
+            "state": "idle",
+            "eligible": 0,
+            "retained_current": 0,
+            "retained_uncertain": 0,
+            "retired": 0,
+            "deferred": 0,
+            "pending_transition": False,
+            "reconciled_pending": False,
+            "reason": None,
+            "backup_path": None,
+            "backup_verified": False,
+        }
+        root = self.paths["scheduler_diagnostics"]
+        try:
+            try:
+                root_mode = root.lstat().st_mode
+            except FileNotFoundError:
+                return result
+            if not stat.S_ISDIR(root_mode) or not stat.S_ISDIR(root.parent.lstat().st_mode):
+                raise _StoreReadError("store_corrupt")
+            lock_path = self.paths["scheduler_diagnostics_lock"]
+            try:
+                lock_mode = lock_path.lstat().st_mode
+            except FileNotFoundError as exc:
+                raise _DiagnosticLockUnavailable from exc
+            if not stat.S_ISREG(lock_mode):
+                raise _DiagnosticLockUnavailable
+            lock = self._writer_lock() if apply else self._reader_lock(raise_on_permission=True)
+            with lock as acquired:
+                if not apply and not acquired:
+                    raise _DiagnosticLockUnavailable
+                self._repair_locked(
+                    result,
+                    runtime_id=runtime_id,
+                    owner=owner,
+                    apply=apply,
+                    automatic=automatic,
+                    mutation_allowed=mutation_allowed,
+                )
+        except _DiagnosticLockUnavailable:
+            result.update(state="blocked", reason="lock_unavailable")
+        except _RepairOwnershipError:
+            result.update(state="blocked", reason="ownership_unverified")
+        except _StoreCapacityError:
+            result.update(state="blocked", reason="budget_exhausted")
+        except _StoreReadError as exc:
+            reason = "permission_denied" if isinstance(exc.__cause__, PermissionError) else "invalid_store"
+            result.update(state="blocked", reason=reason)
+        except PermissionError:
+            result.update(state="blocked", reason="permission_denied")
+        except OSError as exc:
+            reason = "permission_denied" if isinstance(exc.__cause__, PermissionError) else "invalid_store"
+            result.update(state="blocked", reason=reason)
+        except (RuntimeError, TypeError, ValueError, OverflowError):
+            result.update(state="blocked", reason="invalid_store")
+        return result
+
+    def _repair_locked(
+        self,
+        result: dict[str, Any],
+        *,
+        runtime_id: str,
+        owner: Callable[[], str | None],
+        apply: bool,
+        automatic: bool,
+        mutation_allowed: Callable[[], bool] | None,
+    ) -> None:
+        for name in ("active", "decisions", "history", "history_segments", "pending"):
+            if not stat.S_ISDIR(self.paths[f"scheduler_diagnostics_{name}"].lstat().st_mode):
+                raise _StoreReadError("store_corrupt")
+        metadata = self._load_metadata()
+        self._load_index(metadata["epoch"])
+        if not _is_regular_file(self.paths["scheduler_diagnostics_summary"]):
+            raise _StoreReadError("store_corrupt")
+        self._read_summary_locked(metadata["epoch"])
+
+        owner_id = _repair_owner(owner)
+        if _safe_identifier(runtime_id) is None:
+            owner_id = None
+        pending_dir = self.paths["scheduler_diagnostics_pending"]
+        pending = _pending_paths(pending_dir)
+        temporaries = _diagnostic_temporaries(self.paths["scheduler_diagnostics"])
+        result["pending_transition"] = bool(pending or temporaries)
+        retirement_limit = MAX_AUTOMATIC_RETIREMENTS if automatic else MAX_ACTIVE_RECORDS
+        cleanup_turns = retirement_limit if automatic else MAX_ACTIVE_RECORDS + MAX_HISTORY_ENTRIES // 4
+        budget = None
+
+        def require_owner() -> None:
+            if _repair_owner(owner) != owner_id:
+                raise _RepairOwnershipError
+
+        def make_backup() -> bool:
+            if automatic:
+                return True
+            try:
+                backup = create_scheduler_diagnostic_backup(
+                    self.paths["scheduler_diagnostics"],
+                    max_bytes=MAX_PHYSICAL_PEAK_BYTES,
+                    record_limits=_RECOVERY_RECORD_LIMITS,
+                )
+            except (OSError, ValueError):
+                result.update(state="blocked", reason="backup_failed")
+                return False
+            result.update(backup_path=str(backup), backup_verified=True)
+            require_owner()
+            return True
+
+        def drain_pending() -> None:
+            nonlocal budget, cleanup_turns, pending
+            while pending and cleanup_turns:
+                require_owner()
+                cleanup_turns -= 1
+                budget = _WriteBudget(budget.live_bytes, maintenance=True, mutation_allowed=mutation_allowed)
+                removed_candidate = None
+
+                def before_remove(active: dict[str, Any], entry: dict[str, Any], path: Path) -> None:
+                    nonlocal removed_candidate
+                    if not _complete_active_observation(active):
+                        raise _StoreReadError("store_corrupt")
+                    matches = _repair_target(active, runtime_id) not in {None, owner_id}
+                    if entry.get("disposition") == "superseded" and not matches:
+                        raise _RepairOwnershipError
+                    if matches:
+                        removed_candidate = path
+
+                try:
+                    self._recover_locked(pending[0], budget, before_remove=before_remove)
+                    result["reconciled_pending"] = True
+                finally:
+                    if removed_candidate is not None and not removed_candidate.exists():
+                        result["retired"] += 1
+                        result["reconciled_pending"] = True
+                    pending = _pending_paths(pending_dir)
+                    result["pending_transition"] = bool(pending)
+
+        backed_up = False
+        try:
+            if apply and owner_id is not None and (pending or temporaries):
+                backed_up = make_backup()
+                if backed_up:
+                    budget = self._new_budget(maintenance=True, mutation_allowed=mutation_allowed)
+                    for temporary in temporaries:
+                        require_owner()
+                        self._unlink(temporary, budget, final=True)
+                        result["reconciled_pending"] = True
+                    temporaries.clear()
+                    result["pending_transition"] = bool(pending)
+                    drain_pending()
+        finally:
+            # Replay may remove an active record or advance the committed revision.
+            # Enumerate only once, from its current state, then recheck each candidate exactly.
             metadata = self._load_metadata()
-            index = self._load_index(metadata["epoch"])
-            summary = self._read_summary_locked(metadata["epoch"])
-            indexed_names = {item["name"] for item in index["segments"]}
-            pending_paths = _pending_paths(self.paths["scheduler_diagnostics_pending"])
-            for pending_path in pending_paths[:1]:
-                pending = self._read_envelope(
-                    pending_path,
-                    kind="pending_resolution",
-                    max_bytes=16 * 1024,
-                    epoch=metadata["epoch"],
-                )
-                segment_name = pending.get("segment_name")
-                sequence = pending.get("history_sequence")
-                digest = pending.get("identity_digest")
-                episode = pending.get("episode")
-                identity = pending.get("identity")
-                if (
-                    not isinstance(segment_name, str)
-                    or not _SEGMENT_NAME_RE.fullmatch(segment_name)
-                    or type(sequence) is not int
-                    or not isinstance(digest, str)
-                    or not _DIGEST_RE.fullmatch(digest)
-                    or not isinstance(episode, str)
-                    or not _EPOCH_RE.fullmatch(episode)
-                    or not isinstance(identity, dict)
-                    or diagnostic_identity_digest(identity) != digest
-                ):
-                    raise _StoreReadError("pending_record_invalid")
-                segment_path = self.paths["scheduler_diagnostics_history_segments"] / segment_name
-                if segment_name not in indexed_names:
-                    if _is_regular_file(segment_path):
-                        self._unlink(segment_path, budget)
-                    self._unlink(pending_path, budget, final=True)
-                    discarded += 1
-                    continue
+            candidates = []
+            for path, record in self._active_records_locked(metadata, tolerate_malformed=True):
+                target = None
+                if record is not None and record["observation_revision"] <= metadata["snapshot_revision"]:
+                    target = _repair_target(record, runtime_id)
+                if owner_id is None or target is None:
+                    result["retained_uncertain"] += 1
+                elif target == owner_id:
+                    result["retained_current"] += 1
+                else:
+                    candidates.append((path, record))
+            result["eligible"] = len(candidates) + result["retired"]
+            result["deferred"] = len(candidates)
 
-                segment = self._read_envelope(
-                    segment_path,
-                    kind="history_segment",
-                    max_bytes=MAX_SEGMENT_BYTES,
-                    epoch=metadata["epoch"],
-                )
-                entries = segment.get("entries")
-                match = next(
-                    (
-                        item
-                        for item in entries or ()
-                        if isinstance(item, dict)
-                        and item.get("sequence") == sequence
-                        and item.get("identity_digest") == digest
-                        and item.get("identity") == identity
-                        and item.get("episode") == episode
-                        and item.get("observation_revision") == pending.get("observation_revision")
-                        and item.get("source_revision") == pending.get("source_revision")
-                    ),
-                    None,
-                )
-                if match is None:
-                    raise _StoreReadError("pending_history_mismatch")
+        if owner_id is None:
+            raise _RepairOwnershipError
+        if result["state"] == "blocked":
+            return
+        if not apply:
+            if candidates or pending or temporaries:
+                result["state"] = "pending"
+            elif result["retained_current"] or result["retained_uncertain"]:
+                result["state"] = "awaiting_observation"
+            return
+        if not pending and candidates and (backed_up or make_backup()):
+            if budget is None:
+                budget = self._new_budget(maintenance=True, mutation_allowed=mutation_allowed)
+            remaining = max(0, retirement_limit - result["retired"])
+            for path, record in candidates[:remaining]:
+                require_owner()
+                budget = _WriteBudget(budget.live_bytes, maintenance=True, mutation_allowed=mutation_allowed)
+                try:
+                    if not self._resolve_finding_locked(
+                        safe_identity=record["identity"],
+                        episode=record["episode"],
+                        observation_revision=record["observation_revision"],
+                        safe_revision=record["source_revision"],
+                        safe_time=datetime.now(timezone.utc).isoformat(),
+                        budget=budget,
+                        disposition="superseded",
+                    ):
+                        raise _StoreReadError("store_corrupt")
+                finally:
+                    if not path.exists():
+                        result["retired"] += 1
+                        result["deferred"] -= 1
+                    pending = _pending_paths(pending_dir)
+                    result["pending_transition"] = bool(pending)
+                drain_pending()
+                if pending:
+                    break
+        if result["state"] == "blocked":
+            return
+        if pending or result["deferred"]:
+            result["state"] = "progressing"
+        elif result["retired"] or result["reconciled_pending"]:
+            result["state"] = "awaiting_observation"
 
-                active_path = self.paths["scheduler_diagnostics_active"] / f"{digest}.json"
-                active_matches = False
-                if _is_regular_file(active_path):
-                    active = self._read_envelope(
-                        active_path,
-                        kind="active",
-                        max_bytes=MAX_FINDING_BYTES,
-                        epoch=metadata["epoch"],
-                    )
-                    active_matches = (
-                        active.get("identity") == identity
-                        and active.get("episode") == episode
-                        and active.get("observation_revision") == pending.get("observation_revision")
-                        and active.get("source_revision") == pending.get("source_revision")
-                    )
-                next_metadata = dict(metadata)
-                next_summary = dict(summary)
-                if active_matches:
-                    self._unlink(active_path, budget)
-                    next_metadata["active_count"] = max(0, next_metadata["active_count"] - 1)
-                    next_summary = _summary_remove_active(next_summary, digest, identity)
-                    recovered += 1
-                elif _is_regular_file(active_path):
+    def recover(self) -> dict[str, int]:
+        """Finish one exact indexed resolution and remove a bounded set of orphan segments."""
+        empty = {"recovered": 0, "discarded": 0}
+        if not _is_regular_file(self.paths["scheduler_diagnostics_metadata"]):
+            return empty
+        if not _has_pending_transition(self.paths["scheduler_diagnostics_pending"]):
+            return empty
+        with self._writer_lock():
+            paths = _pending_paths(self.paths["scheduler_diagnostics_pending"])
+            if not paths:
+                return empty
+            return self._recover_locked(paths[0], self._new_budget())
+
+    def _recover_locked(
+        self,
+        pending_path: Path,
+        budget: _WriteBudget,
+        *,
+        before_remove: Callable[[dict[str, Any], dict[str, Any], Path], None] | None = None,
+    ) -> dict[str, int]:
+        safe_time = utc_now()
+        metadata = self._load_metadata()
+        index = self._load_index(metadata["epoch"])
+        indexed_names = {item["name"] for item in index["segments"]}
+        pending = self._read_envelope(
+            pending_path, kind="pending_resolution", max_bytes=16 * 1024, epoch=metadata["epoch"]
+        )
+        segment_name = pending.get("segment_name")
+        sequence = pending.get("history_sequence")
+        digest = pending.get("identity_digest")
+        episode = pending.get("episode")
+        identity = pending.get("identity")
+        observation_revision = pending.get("observation_revision")
+        source_revision = pending.get("source_revision")
+        entry = pending.get("entry")
+        if (
+            pending.get("transition_id") != pending_path.stem
+            or type(sequence) is not int
+            or sequence < 1
+            or segment_name != f"{sequence}-{sequence}.json"
+            or not isinstance(digest, str)
+            or not _DIGEST_RE.fullmatch(digest)
+            or not isinstance(episode, str)
+            or not _EPOCH_RE.fullmatch(episode)
+            or not isinstance(identity, dict)
+            or diagnostic_identity_digest(identity) != digest
+            or type(observation_revision) is not int
+            or observation_revision < 0
+            or not isinstance(source_revision, dict)
+            or not isinstance(entry, dict)
+            or entry.get("sequence") != sequence
+            or entry.get("identity_digest") != digest
+            or entry.get("identity") != identity
+            or entry.get("episode") != episode
+            or entry.get("observation_revision") != observation_revision
+            or entry.get("source_revision") != source_revision
+        ):
+            raise _StoreReadError("pending_record_invalid")
+        segment_path = self.paths["scheduler_diagnostics_history_segments"] / segment_name
+        indexed = segment_name in indexed_names
+        if indexed or _is_regular_file(segment_path):
+            segment = self._read_envelope(
+                segment_path, kind="history_segment", max_bytes=MAX_SEGMENT_BYTES, epoch=metadata["epoch"]
+            )
+            if segment.get("entries") != [entry]:
+                raise _StoreReadError("pending_history_mismatch")
+        if not indexed:
+            # An ordinary resolution can be interrupted before the index accepts its archive.
+            # Keep its active evidence so maintenance can reconsider it with a fresh read.
+            self._unlink(segment_path, budget)
+            self._unlink(pending_path, budget, final=True)
+            return {"recovered": 0, "discarded": 1}
+
+        summary = self._read_summary_locked(metadata["epoch"])
+        active_path = self.paths["scheduler_diagnostics_active"] / f"{digest}.json"
+        recovered = 0
+        active = None
+        if _is_regular_file(active_path):
+            active = self._read_envelope(
+                active_path, kind="active", max_bytes=MAX_FINDING_BYTES, epoch=metadata["epoch"]
+            )
+        active_matches = (
+            active is not None
+            and active.get("identity") == identity
+            and active.get("episode") == episode
+            and type(active.get("observation_revision")) is int
+            and active["observation_revision"] == observation_revision
+            and active.get("source_revision") == source_revision
+        )
+        next_metadata = dict(metadata)
+        next_summary = dict(summary)
+        if active_matches:
+            if not isinstance(active.get("severity"), str) or not _valid_active_record(active):
+                raise _StoreReadError("store_corrupt")
+            if before_remove is not None:
+                before_remove(active, entry, active_path)
+            self._unlink(active_path, budget)
+            recovered = 1
+        elif active is not None:
+            next_metadata["coverage"] = "incomplete"
+            next_metadata["reason"] = "recovery_active_mismatch"
+        elif metadata["next_history_sequence"] <= sequence:
+            recovered = 1
+
+        if active_matches or summary.get("applied_history_sequence") != sequence:
+            # A subsequent observation can carry an old projection forward with
+            # a new revision. Rebuild once from the bounded live active set.
+            samples = []
+            project_counts: Counter[str] = Counter()
+            active_count = 0
+            for _path, current in self._active_records_locked(metadata, tolerate_malformed=True):
+                active_count += 1
+                if current is None:
                     next_metadata["coverage"] = "incomplete"
                     next_metadata["reason"] = "recovery_active_mismatch"
-                elif metadata["next_history_sequence"] <= sequence:
-                    # The active unlink committed, but metadata/summary did not.
-                    next_metadata["active_count"] = max(0, next_metadata["active_count"] - 1)
-                    next_summary = _summary_remove_active(next_summary, digest, identity)
-                    recovered += 1
-                next_metadata["next_history_sequence"] = max(next_metadata["next_history_sequence"], sequence + 1)
-                next_metadata["eviction_count"] = max(next_metadata["eviction_count"], index["evicted_entries"])
-                _apply_retained_window(next_metadata, index)
-                next_summary["retention"] = _retention_summary(index)
-                self._commit_state(
-                    next_metadata,
-                    next_summary,
-                    budget,
-                    observed_at=safe_time,
-                    coverage=next_metadata["coverage"],
-                    reason=next_metadata["reason"],
-                )
-                orphan_paths = [
-                    path
-                    for path in _segment_paths(self.paths["scheduler_diagnostics_history_segments"])
-                    if path.name not in indexed_names
-                ][:5]
-                for segment_path in orphan_paths[:4]:
-                    self._unlink(segment_path, budget, final=True)
-                    discarded += 1
-                # Keep the transition marker until every segment evicted by the
-                # transition is gone. A later bounded recovery pass can then
-                # continue cleanup without scanning on ordinary empty cycles.
-                if len(orphan_paths) <= 4:
-                    self._unlink(pending_path, budget, final=True)
-        return {"recovered": recovered, "discarded": discarded}
+                    continue
+                samples.append(_summary_active_sample(current))
+                project = current["identity"].get("project_id")
+                if isinstance(project, str):
+                    project_counts[project] += 1
+            next_metadata["active_count"] = active_count
+            next_summary["project_active_counts"] = dict(project_counts)
+            next_summary["active_samples"] = sorted(samples, key=_summary_active_sort_key)[:MAX_SUMMARY_LIMIT]
+            next_summary["applied_history_sequence"] = sequence
+        if entry.get("disposition") == "superseded":
+            if active_matches or summary.get("applied_history_sequence") != sequence:
+                next_metadata["last_retirement_at"] = datetime.now(timezone.utc).isoformat()
+            if next_metadata["reason"] != "recovery_active_mismatch":
+                next_metadata["coverage"] = "incomplete"
+                next_metadata["reason"] = "recovery_pending"
+        next_metadata["next_history_sequence"] = max(next_metadata["next_history_sequence"], sequence + 1)
+        next_metadata["eviction_count"] = max(next_metadata["eviction_count"], index["evicted_entries"])
+        _apply_retained_window(next_metadata, index)
+        next_summary["retention"] = _retention_summary(index)
+        if (
+            next_metadata != metadata
+            or next_summary != summary
+            or summary["snapshot_revision"] != metadata["snapshot_revision"]
+        ):
+            self._commit_state(
+                next_metadata,
+                next_summary,
+                budget,
+                observed_at=safe_time,
+                coverage=next_metadata["coverage"],
+                reason=next_metadata["reason"],
+            )
+        orphan_paths = [
+            path
+            for path in _segment_paths(self.paths["scheduler_diagnostics_history_segments"])
+            if path.name not in indexed_names
+        ][:5]
+        for orphan_path in orphan_paths[:4]:
+            self._unlink(orphan_path, budget, final=True)
+        # A later bounded recovery pass continues this cleanup before another resolution.
+        if len(orphan_paths) <= 4:
+            self._unlink(pending_path, budget, final=True)
+        return {"recovered": recovered, "discarded": min(4, len(orphan_paths))}
+
+
+def _repair_owner(owner: Callable[[], str | None]) -> str | None:
+    try:
+        value = owner()
+    except (OSError, RuntimeError, TypeError, ValueError):
+        return None
+    return _safe_identifier(value)
+
+
+def _complete_active_observation(record: Mapping[str, Any]) -> bool:
+    if (
+        type(record.get("schema_version")) is not int
+        or record.get("identity_incomplete") is not False
+        or type(record.get("count_saturated")) is not bool
+        or not isinstance(record.get("details"), dict)
+        or type(record.get("details_omitted")) is not bool
+    ):
+        return False
+    identity = record["identity"]
+    canonical, incomplete = canonicalize_diagnostic_identity(identity)
+    revision, revision_omitted = _sanitize_revision(record["source_revision"])
+    details, details_omitted = _sanitize_details(record["details"])
+    revisionless_registry = (
+        identity.get("producer") == "enablement_reconciliation"
+        and identity.get("reason_code") == "registry_enablement_unknown"
+    )
+    if (
+        incomplete
+        or identity != canonical
+        or (not revision and not revisionless_registry)
+        or revision_omitted
+        or revision != record["source_revision"]
+        or details_omitted
+        or details != record["details"]
+    ):
+        return False
+    for key in ("first_observed_at", "last_observed_at"):
+        try:
+            if not isinstance(record.get(key), str):
+                return False
+            _validated_timestamp(record[key])
+        except ValueError:
+            return False
+    return True
+
+
+def _repair_target(record: Mapping[str, Any], runtime_id: str) -> str | None:
+    identity = record["identity"]
+    if (
+        identity.get("producer") != "control_plane_health"
+        or identity.get("component") != "control_plane"
+        or identity.get("runtime_id") != runtime_id
+        or not _complete_active_observation(record)
+    ):
+        return None
+    target = _safe_identifier(identity.get("target_id"))
+    reason = identity.get("reason_code")
+    scope = identity.get("scope_type")
+    stage = identity.get("stage")
+    check = identity.get("check")
+    if reason in _HEARTBEAT_REASONS and (scope, stage, check) == ("agent_instance", "heartbeat", "liveness"):
+        return target
+    if (
+        reason == "project_snapshot_overdue"
+        and (scope, stage, check) == ("project_binding", "snapshot_publication", "progress")
+        and identity.get("operation_kind") == "machine_snapshot_publish"
+        and _safe_identifier(identity.get("project_id")) is not None
+        and _safe_identifier(identity.get("registration_generation")) is not None
+    ):
+        return target
+    return None
+
+
+def _covered_bindings(value: object) -> Iterator[tuple[str, str]]:
+    if not isinstance(value, (list, tuple)):
+        return
+    for candidate in value:
+        if isinstance(candidate, Mapping):
+            project_id = _safe_identifier(candidate.get("project_id"))
+            generation = _safe_identifier(candidate.get("registration_generation"))
+            if project_id is not None and generation is not None:
+                yield project_id, generation
 
 
 def _encoded_size(value: object) -> int:
@@ -1749,11 +2271,17 @@ def _sanitize_facts(value: Mapping[str, object] | None) -> tuple[dict[str, Any],
         if not _REVISION_FIELD_RE.fullmatch(key) or len(safe) >= 32:
             omitted = True
             continue
-        if type(raw) is bool:
+        if key in {"request_id", "executor_epoch"}:
+            identifier = _safe_identifier(raw)
+            if identifier is None:
+                omitted = True
+            else:
+                safe[key] = identifier
+        elif type(raw) is bool:
             safe[key] = raw
         elif type(raw) is int and -_MAX_INTEGER <= raw <= _MAX_INTEGER:
             safe[key] = raw
-        elif key == "exception_type" and raw in _EXCEPTION_TYPES:
+        elif key == "exception_type" and isinstance(raw, str) and raw in _EXCEPTION_TYPES:
             safe[key] = raw
         elif key in {"outcome", "probe_state", "coverage", "diagnostic_code", "progress"}:
             token = _safe_token(raw)
@@ -1792,17 +2320,46 @@ def _validated_timestamp(value: str | None) -> str:
     return value
 
 
+def _diagnostic_temporaries(root: Path) -> list[Path]:
+    paths = []
+    for relative in (*_RECOVERY_RECORD_LIMITS, Path(), Path("history")):
+        pattern, max_records, max_record_bytes = _RECOVERY_RECORD_LIMITS.get(relative, (None, 5, 0))
+        for entry, path in enumerate((root / relative).iterdir()):
+            if entry >= max_records + MAX_DIAGNOSTIC_TEMPORARIES:
+                raise _StoreReadError("store_oversized")
+            target = temporary_target(path.name)
+            if target is None:
+                continue
+            limit = FIXED_DIAGNOSTIC_FILES.get(relative / target)
+            if limit is None and pattern is not None and pattern.fullmatch(target):
+                limit = max_record_bytes
+            if limit is None:
+                raise _StoreReadError("store_corrupt")
+            info = path.lstat()
+            if not stat.S_ISREG(info.st_mode) or info.st_size > limit:
+                raise _StoreReadError("store_corrupt")
+            if len(paths) >= MAX_DIAGNOSTIC_TEMPORARIES:
+                raise _StoreReadError("store_oversized")
+            paths.append(path)
+    return paths
+
+
 def _record_paths(directory: Path, pattern: re.Pattern[str], *, max_entries: int) -> list[Path]:
     if not directory.exists():
         return []
     paths: list[Path] = []
-    for path in directory.iterdir():
+    for entry, path in enumerate(directory.iterdir()):
+        if entry >= max_entries + MAX_DIAGNOSTIC_TEMPORARIES:
+            raise _StoreReadError("store_oversized")
         if len(paths) >= max_entries:
             raise _StoreReadError("store_oversized")
         if path.is_symlink():
             raise _StoreReadError("store_corrupt")
         if path.is_file():
             if not pattern.fullmatch(path.name):
+                target = temporary_target(path.name)
+                if target is not None and pattern.fullmatch(target):
+                    continue
                 raise _StoreReadError("store_corrupt")
             paths.append(path)
         else:
@@ -1813,7 +2370,7 @@ def _record_paths(directory: Path, pattern: re.Pattern[str], *, max_entries: int
 def _active_paths(directory: Path) -> list[Path]:
     return _record_paths(
         directory,
-        re.compile(r"^[0-9a-f]{64}\.json$"),
+        _RECORD_NAME_RE,
         max_entries=MAX_ACTIVE_RECORDS + 1,
     )
 
@@ -1821,7 +2378,7 @@ def _active_paths(directory: Path) -> list[Path]:
 def _pending_paths(directory: Path) -> list[Path]:
     return _record_paths(
         directory,
-        re.compile(r"^[0-9a-f]{32}\.json$"),
+        _PENDING_NAME_RE,
         max_entries=MAX_ACTIVE_RECORDS + 1,
     )
 
@@ -1838,7 +2395,7 @@ def _active_usage(directory: Path) -> tuple[int, int]:
 def _decision_usage(directory: Path) -> tuple[int, int]:
     paths = _record_paths(
         directory,
-        re.compile(r"^[0-9a-f]{64}\.json$"),
+        _RECORD_NAME_RE,
         max_entries=MAX_DECISIONS + 1,
     )
     return len(paths), sum(_file_size(path) for path in paths)
@@ -1848,7 +2405,7 @@ def _enumerate_records(directory: Path, *, max_records: int) -> list[tuple[str, 
     records: list[tuple[str, dict[str, Any], Path]] = []
     for path in _record_paths(
         directory,
-        re.compile(r"^[0-9a-f]{64}\.json$"),
+        _RECORD_NAME_RE,
         max_entries=max_records + 1,
     )[:max_records]:
         value = read_json_limited(path, max_bytes=MAX_DECISION_BYTES, record_type="scheduler_diagnostic")

@@ -59,7 +59,12 @@ from .project_io_protocol import (
     ProjectIORequest,
 )
 from .ready_cursor_validation import validate_ready_cursor_transition
-from .snapshot_publication_health import SNAPSHOT_HEALTH_ITEM_LIMIT, SnapshotPublicationHealth
+from .scheduler_diagnostics import ProducerCoverageCheckpoint
+from .snapshot_publication_health import (
+    SNAPSHOT_COVERAGE_FILENAME,
+    SNAPSHOT_HEALTH_ITEM_LIMIT,
+    SnapshotPublicationHealth,
+)
 from .takeover_coordinator import TakeoverCoordinator, takeover_frozen_owner
 from .takeover_intent import TakeoverIntent, read_takeover_intent, takeover_issue_path
 from .working_set import BindingTurn
@@ -359,6 +364,7 @@ class ProjectIOController:
         self._maintenance_descriptor_turns: dict[str, BindingTurn] = {}
         self._ready_index_settled: dict[_ValidationIdentity, None] = {}
         self._ready_index_needed: dict[_ValidationIdentity, None] = {}
+        self._snapshot_coverage_cursor: tuple[str, str] | None = None
         self._snapshot_health = SnapshotPublicationHealth(
             monotonic=monotonic, utc_clock=utc_clock, max_retry_seconds=_MAX_BACKOFF_SECONDS
         )
@@ -4101,6 +4107,7 @@ class ProjectIOController:
         heartbeat_interval_seconds: int | float,
         started_at: str,
         gpu_policy: object,
+        observed_registry_revision: int | None = None,
     ) -> dict[str, Mapping[str, Any]]:
         """Advance one isolated advisory snapshot publication per validated binding."""
         if type(registry_revision) is not int or registry_revision < 0:
@@ -4263,13 +4270,21 @@ class ProjectIOController:
                 completions[binding.project_id] = evidence
                 if evidence.get("outcome") == "published":
                     self._service_backoff.pop(service_key, None)
-                    self._snapshot_health.report_request(
-                        identity,
-                        instance_id,
-                        heartbeat_interval,
-                        request.request_id,
-                        stage="published",
-                    )
+                    if (
+                        request.parameters.get("instance_id") == instance_id
+                        and request.parameters.get("stop_reason") is None
+                        and (observed_registry_revision is None or registry_revision == observed_registry_revision)
+                        and self._snapshot_health.report_request(
+                            identity,
+                            instance_id,
+                            heartbeat_interval,
+                            request.request_id,
+                            stage="published",
+                        )
+                    ):
+                        self._record_snapshot_observation(
+                            identity, instance_id, evidence["snapshot_at"], heartbeat_interval
+                        )
                     self._snapshot_health.record_publication(
                         identity,
                         self._machine_snapshot_signature(request.parameters),
@@ -4373,6 +4388,85 @@ class ProjectIOController:
     def machine_snapshot_health_view(self, *, limit: int = SNAPSHOT_HEALTH_ITEM_LIMIT) -> dict[str, object]:
         """Return a detached worst-first view of current snapshot publication progress."""
         return self._snapshot_health.view(limit=limit)
+
+    def machine_snapshot_latest_success(
+        self, *, runtime_id: str, agent_instance_id: str, project_id: str, registration_generation: str
+    ) -> tuple[int, str] | None:
+        """Read accepted snapshot publication evidence outside the status sample."""
+        return self._snapshot_health.latest_success(
+            runtime_id=runtime_id,
+            agent_instance_id=agent_instance_id,
+            project_id=project_id,
+            registration_generation=registration_generation,
+        )
+
+    def prune_machine_snapshot_observations(self, registered: Sequence[ProjectBinding]) -> None:
+        """Retain publication evidence while an exact registration remains in the registry."""
+        self._snapshot_health.prune_observations(
+            (binding.runtime_instance_id, binding.project_id, binding.registration_generation)
+            for binding in registered
+            if binding.runtime_instance_id is not None and binding.registration_generation is not None
+        )
+
+    def record_scheduler_coverage(self, checkpoint: ProducerCoverageCheckpoint, *, instance_id: str) -> None:
+        """Persist a bounded, rotating slice of covered Project snapshot receipts."""
+        bindings = checkpoint.covered_bindings
+        if not bindings:
+            return
+        cursor = self._snapshot_coverage_cursor
+        start = bisect_right(bindings, cursor) if cursor is not None else 0
+        window = (bindings[start:] + bindings[:start])[:16]
+        self._snapshot_coverage_cursor = window[-1]
+        runtime_id = self.runtime.observe_instance_id()
+        for project_id, generation in window:
+            evidence = self._snapshot_health.snapshot_evidence(
+                project_id=project_id,
+                registration_generation=generation,
+                runtime_id=runtime_id,
+                agent_instance_id=instance_id,
+            )
+            if evidence is None:
+                continue
+            snapshot_at, accepted_at = evidence
+            try:
+                atomic_replace(
+                    self.runtime.project_paths(project_id)["root"] / SNAPSHOT_COVERAGE_FILENAME,
+                    {
+                        "snapshot_coverage": {
+                            "runtime_id": runtime_id,
+                            "agent_instance_id": instance_id,
+                            "registration_generation": generation,
+                            "snapshot_at": snapshot_at,
+                            "accepted_at": accepted_at,
+                            "observed_at": checkpoint.observed_at,
+                        }
+                    },
+                )
+            except (OSError, ValueError):
+                continue
+
+    def _record_snapshot_observation(
+        self, identity: _ValidationIdentity, instance_id: str, snapshot_at: str, heartbeat_interval: float
+    ) -> None:
+        accepted_at = datetime.now(timezone.utc).isoformat()
+        try:
+            committed = atomic_replace(
+                self.runtime.project_paths(identity.project_id)["root"] / "snapshot-observation.json",
+                {
+                    "snapshot_observation": {
+                        "runtime_id": identity.runtime_id,
+                        "agent_instance_id": instance_id,
+                        "registration_generation": identity.registration_generation,
+                        "snapshot_at": snapshot_at,
+                        "accepted_at": accepted_at,
+                        "heartbeat_interval_seconds": heartbeat_interval,
+                    }
+                },
+            )
+        except (OSError, ValueError):
+            return
+        if committed is not None:
+            self._snapshot_health.record_snapshot_evidence(identity, snapshot_at, accepted_at)
 
     def _snapshot_record_failure(
         self,

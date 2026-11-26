@@ -1666,6 +1666,37 @@ finding active; a post-history crash may show both records and incomplete
 coverage until bounded recovery validates and finishes the transition. If
 history capacity is unavailable, retain active evidence and incomplete coverage.
 
+Agent turnover uses the same exact-revision history transition, with additive
+history disposition `superseded`. Eligibility requires a validated current agent
+instance and a known instance-scoped heartbeat or snapshot finding for the same
+MachineRuntime. Records that outlive the agent require their own producer evidence.
+The maintenance writer reuses the diagnostic lock, limits automatic work to four
+retirements per turn, and can rewrite a valid history index larger than the
+ordinary publication byte budget. A maintenance transition admits up to 512 KiB
+and 16 writes or unlinks. Live and peak store limits still apply. Pending indexed
+transitions are replayed before advancing, with exact active revision checks.
+
+Manual apply copies the capped store to a private sibling
+`diagnostics/scheduler-v1-backup-<id>/`, verifies its contents, and durably
+publishes it before any live mutation. It rechecks agent ownership after the
+backup and during repair. Interrupted apply can be retried against the current
+store. An unverified backup leaves live evidence intact. The operation does not
+acquire Project truth locks or change any execution ownership or recovery ledger.
+
+The machine-scoped progress report is bounded and stored separately at
+`agent/scheduler-recovery.json`. Its owner is the current runtime and agent
+instance. It records retirement progress and a next check time when the retry is
+scheduled. The accepted snapshot publisher records the last success for an exact
+binding in that binding's local `snapshot-observation.json`. Project status reads
+only its selected receipt and verifies the runtime, registration generation, and
+agent instance. A complete producer checkpoint in the binding’s local
+`snapshot-coverage.json` identifies the covered registration and the accepted
+snapshot it follows. A bounded rotating window writes these receipts after the
+complete cycle has committed. A fresh checkpoint for the selected
+registration is required after retirement. A later overflow omission needs new
+observations before selected status can report complete coverage. The machine-wide
+overflow marker remains visible in machine diagnostics.
+
 Machine-wide hard limits are 4 KiB per finding/decision, 256 active findings or
 1 MiB, 1,024 resolved entries or 4 MiB or 30 days, 64 decision samples or
 256 KiB, 64 KiB per immutable history segment, 8 MiB live store, and 9 MiB

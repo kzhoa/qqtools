@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import shlex
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -9,16 +10,22 @@ from unittest.mock import patch
 import pytest
 
 from qqtools.plugins.qexp import init_shared_root
+from qqtools.plugins.qexp.agent import scheduler_diagnostics
 from qqtools.plugins.qexp.agent.context import MachineRuntime
 from qqtools.plugins.qexp.agent.lifecycle import get_machine_agent_status
-from qqtools.plugins.qexp.agent.scheduler_diagnostics import SchedulerDiagnosticStore
+from qqtools.plugins.qexp.agent.project_admin import register_project
+from qqtools.plugins.qexp.agent.project_io_controller import ProjectIOController
+from qqtools.plugins.qexp.agent.scheduler_diagnostics import ProducerCoverageCheckpoint, SchedulerDiagnosticStore
 from qqtools.plugins.qexp.agent.setup import initialize_machine
+from qqtools.plugins.qexp.agent.snapshot_publication_health import SNAPSHOT_COVERAGE_FILENAME
 from qqtools.plugins.qexp.cli.errors import CliUsageError
 from qqtools.plugins.qexp.cli.local_handlers import dispatch_local
 from qqtools.plugins.qexp.cli.output import CliOutput, OutputKind, render
 from qqtools.plugins.qexp.cli.parser import build_parser
 from qqtools.plugins.qexp.commands.status import MAX_READ_ATTEMPTS, project_status
 from qqtools.plugins.qexp.layout import project_id as stable_project_id
+from qqtools.plugins.qexp.runtime.store import atomic_replace
+from tests.helpers.qexp.scheduler_recovery import overdue_identity
 
 
 def _finding_identity(project_id: str) -> dict[str, object]:
@@ -177,3 +184,149 @@ def test_diagnostics_output_contract_preserves_json_and_labels_human_history() -
     human = render(output, "human")
     assert "diagnostics history" in human.lower()
     assert "opaque-token" in human
+
+
+def test_project_status_distinguishes_heartbeat_snapshot_and_post_repair_verification(tmp_path, monkeypatch) -> None:
+    runtime = MachineRuntime(tmp_path / "machine runtime")
+    initialize_machine(runtime, "gpu-1", agent_mode="daemon")
+    cfg = init_shared_root(tmp_path / "selected project" / ".qexp", "gpu-1", runtime_root=tmp_path / "partition")
+    binding = register_project(runtime, cfg.shared_root, "gpu-1").binding
+    _publish_finding(runtime, binding.project_id)
+    now = datetime.now(timezone.utc)
+    heartbeat_at = (now - timedelta(seconds=1)).isoformat()
+    stale_at = (now - timedelta(seconds=60)).isoformat()
+
+    atomic_replace(
+        runtime.paths["agent"] / "status.json",
+        {"machine_agent": {"instance_id": "current-agent", "runtime_id": runtime.instance_id, "state": "active"}},
+    )
+    atomic_replace(
+        runtime.root / "control_plane_health.json",
+        {
+            "schema_version": 1,
+            "instance_id": "current-agent",
+            "heartbeat": {"last_success_at": heartbeat_at, "effective_stale_after_seconds": 15},
+        },
+    )
+    report_path = runtime.paths["agent"] / "scheduler-recovery.json"
+    report = {
+        "schema_version": 1,
+        "runtime_id": runtime.instance_id,
+        "agent_instance_id": "current-agent",
+        "state": "awaiting_observation",
+        "last_progress_at": (now - timedelta(seconds=5)).isoformat().replace("+00:00", "Z"),
+        "retired": 256,
+        "pending_transition": False,
+        "reason": None,
+        "eligible": 256,
+        "deferred": 0,
+        "retained_current": 0,
+        "retained_uncertain": 0,
+        "next_check_at": None,
+    }
+    atomic_replace(report_path, report)
+    receipt_path = runtime.project_paths(binding.project_id)["root"] / "snapshot-observation.json"
+    receipt = {
+        "runtime_id": runtime.instance_id,
+        "agent_instance_id": "current-agent",
+        "registration_generation": binding.registration_generation,
+        "snapshot_at": stale_at,
+        "heartbeat_interval_seconds": 5,
+    }
+    atomic_replace(receipt_path, {"snapshot_observation": receipt})
+
+    def status():
+        return project_status(cfg, selection_source="explicit", machine_runtime=runtime)
+
+    pending = status()
+    assert pending["local_agent"]["heartbeat"] == {"observed_at": heartbeat_at, "freshness": "fresh"}
+    assert pending["project_snapshot"] == {"observed_at": stale_at, "freshness": "stale"}
+    assert pending["scheduling_readiness"]["state"] == "unknown"
+    assert "snapshot_stale" in pending["scheduling_readiness"]["reasons"]
+    assert pending["diagnostic_recovery"]["state"] == "awaiting_observation"
+    assert pending["scheduler_diagnostics"]["coverage"] == "incomplete"
+
+    receipt["snapshot_at"] = heartbeat_at
+    atomic_replace(receipt_path, {"snapshot_observation": {**receipt, "registration_generation": "other"}})
+    assert status()["project_snapshot"]["freshness"] == "unknown"
+
+    atomic_replace(receipt_path, {"snapshot_observation": receipt})
+    assert status()["diagnostic_recovery"]["state"] == "awaiting_observation"
+    store = SchedulerDiagnosticStore(runtime)
+
+    controller = object.__new__(ProjectIOController)
+    controller.runtime = runtime
+    controller._snapshot_coverage_cursor = None
+    controller._snapshot_health = SimpleNamespace(snapshot_evidence=lambda **_identity: (heartbeat_at, heartbeat_at))
+
+    def publish(project, observed_at):
+        checkpoint = store.publish_cycle(
+            None,
+            None,
+            (
+                {
+                    "coverage": "complete",
+                    "covered_bindings": [
+                        {"project_id": project, "registration_generation": binding.registration_generation}
+                    ],
+                },
+            ),
+            None,
+            observed_at=observed_at,
+        )
+        assert checkpoint is not None
+        controller.record_scheduler_coverage(checkpoint, instance_id="current-agent")
+
+    publish("other-project", None)
+    assert status()["diagnostic_recovery"]["state"] == "awaiting_observation"
+    publish(binding.project_id, (now - timedelta(seconds=2)).isoformat())
+    assert status()["diagnostic_recovery"]["state"] == "awaiting_observation"
+    publish(binding.project_id, None)
+    before = report_path.read_bytes()
+    verified = status()
+    assert verified["scheduling_readiness"]["state"] == "observed"
+    assert verified["scheduling_readiness"]["diagnostic_coverage"] == {"scope": "project_binding", "state": "complete"}
+    assert verified["diagnostic_recovery"]["state"] == "verified"
+    assert report_path.read_bytes() == before
+
+    receipt["snapshot_at"] = datetime.now(timezone.utc).isoformat()
+    atomic_replace(receipt_path, {"snapshot_observation": receipt})
+    assert status()["diagnostic_recovery"]["state"] == "verified"
+
+    monkeypatch.setattr(scheduler_diagnostics, "MAX_ACTIVE_RECORDS", 1)
+    with pytest.raises(OSError, match="active_overflow"):
+        store.observe_finding(
+            identity={
+                **overdue_identity(runtime, binding.project_id, binding.registration_generation, 1),
+                "target_id": "current-agent",
+            },
+            severity="fault",
+            source_revision={"registry_revision": 1},
+        )
+    after_omission = status()
+    assert after_omission["scheduler_diagnostics"]["coverage"] == "incomplete"
+    assert after_omission["diagnostic_recovery"]["state"] == "awaiting_observation"
+
+
+def test_complete_coverage_services_all_bindings_through_a_bounded_rotating_window(tmp_path):
+    runtime = MachineRuntime(tmp_path / "machine")
+    initialize_machine(runtime, "gpu-1")
+    controller = object.__new__(ProjectIOController)
+    controller.runtime = runtime
+    controller._snapshot_coverage_cursor = None
+    timestamp = datetime.now(timezone.utc).isoformat()
+    controller._snapshot_health = SimpleNamespace(snapshot_evidence=lambda **_identity: (timestamp, timestamp))
+    covered = tuple((f"project-{index:02d}", "generation") for index in range(65))
+
+    def count():
+        return sum(
+            (runtime.project_paths(project)["root"] / SNAPSHOT_COVERAGE_FILENAME).is_file()
+            for project, _generation in covered
+        )
+
+    checkpoint = ProducerCoverageCheckpoint(timestamp, covered)
+    controller.record_scheduler_coverage(checkpoint, instance_id="current")
+    assert count() == 16
+    for _turn in range(4):
+        controller.record_scheduler_coverage(checkpoint, instance_id="current")
+    assert count() == len(covered)

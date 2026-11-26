@@ -3,18 +3,24 @@
 from __future__ import annotations
 
 import json
+import math
 import os
+import re
 import shlex
 import stat
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from ..agent.bindings import ProjectBinding, decode_registry
 from ..agent.config import AgentConfig
 from ..agent.context import MachineRuntime, _effective_runtime_id
+from ..agent.control_plane_health import HEALTH_FILENAME, HEALTH_SCHEMA_VERSION, MAX_HEALTH_BYTES
+from ..agent.diagnostic_recovery import diagnostics_repair_command, read_scheduler_recovery
 from ..agent.identity import decode_identity_record
 from ..agent.inventory import ProjectInventoryEntry, decode_inventory
 from ..agent.scheduler_diagnostics import SchedulerDiagnosticStore, unavailable_summary
+from ..agent.snapshot_publication_health import SNAPSHOT_COVERAGE_FILENAME
 from ..agent.takeover_intent import (
     _CANCELLABLE_PHASES,
     _INTENT_NAME,
@@ -426,6 +432,7 @@ def _follow_up_actions(
     warnings: list[str],
     *,
     upgrade: dict[str, object] | None = None,
+    diagnostic_recovery: dict[str, Any] | None = None,
 ) -> list[str]:
     prefix = ["qexp", "--machine-runtime-root", str(runtime.root)]
     actions: list[str] = []
@@ -443,6 +450,9 @@ def _follow_up_actions(
         # Project list can initialize a missing inventory. Inspect the files directly.
         actions.append(shlex.join(["ls", "-ld", "--", str(runtime.paths["registry"]), str(runtime.paths["inventory"])]))
 
+    repair_blocked = diagnostic_recovery is not None and diagnostic_recovery.get("state") == "blocked"
+    if repair_blocked:
+        actions.append(diagnostics_repair_command(runtime))
     if diagnostics.get("reason") != "project_id_unavailable":
         diagnostic_args = ("agent", "diagnostics", "active", "--project-id", project_id)
         has_reason = False
@@ -452,7 +462,7 @@ def _follow_up_actions(
             if isinstance(reason, str) and reason:
                 has_reason = True
                 suggest(*diagnostic_args, "--reason", reason)
-        if (
+        if not repair_blocked and (
             diagnostics["status"] != "available"
             or diagnostics["coverage"] != "complete"
             or diagnostics["truncated"]
@@ -543,9 +553,8 @@ def project_status(
         inventory_failed=inventory_failed,
     )
     local_agent = _agent_observation(agent_raw, failed=agent_failed, missing=agent_missing)
-    observed_agent_mode = (
-        agent_raw.get("machine_agent", {}).get("observed_agent_mode") if isinstance(agent_raw, dict) else None
-    )
+    agent_record = agent_raw.get("machine_agent") if agent_raw is not None else None
+    observed_agent_mode = agent_record.get("observed_agent_mode") if isinstance(agent_record, dict) else None
     local_agent["configured_mode"] = configured_agent_mode
     local_agent["observed_mode"] = observed_agent_mode if isinstance(observed_agent_mode, str) else None
     task_observation = _task_observation(
@@ -577,6 +586,26 @@ def project_status(
         else None
     )
     takeover = _project_takeover(cfg, selected_project_id, machine_runtime, reader, warnings)
+    heartbeat, project_snapshot, readiness, recovery = _scheduling_observations(
+        machine_runtime,
+        reader,
+        agent_record,
+        binding if binding_observation is not None else None,
+        scheduler_diagnostics,
+    )
+    local_agent["heartbeat"] = heartbeat
+    selected_diagnostics = scheduler_diagnostics
+    selected_coverage = readiness["diagnostic_coverage"]["state"]
+    if scheduler_diagnostics["coverage"] == "complete" and selected_coverage == "incomplete":
+        selected_diagnostics = {**scheduler_diagnostics, "coverage": "incomplete"}
+    elif selected_coverage == "complete" and scheduler_diagnostics["reason"] == "active_overflow":
+        selected_diagnostics = {
+            **scheduler_diagnostics,
+            "coverage": "complete",
+            "machine_coverage": scheduler_diagnostics["coverage"],
+            "reason": None,
+            "truncated": scheduler_diagnostics["active_count"] > len(scheduler_diagnostics["active_findings"]),
+        }
 
     result: dict[str, object] = {
         "schema_version": STATUS_SCHEMA_VERSION,
@@ -596,7 +625,10 @@ def project_status(
         "configured_agent_mode": configured_agent_mode,
         "task_observation": task_observation,
         "upgrade": upgrade,
-        "scheduler_diagnostics": scheduler_diagnostics,
+        "scheduler_diagnostics": selected_diagnostics,
+        "diagnostic_recovery": recovery,
+        "project_snapshot": project_snapshot,
+        "scheduling_readiness": readiness,
         "totals": {"tasks": None, "machines": None, "reason": "not_available"},
         "takeover_preview_help": shlex.join(
             [
@@ -619,6 +651,7 @@ def project_status(
             scheduler_diagnostics,
             warnings,
             upgrade=upgrade,
+            diagnostic_recovery=recovery,
         ),
         "budget": reader.as_dict(),
         "warnings": warnings,
@@ -626,6 +659,198 @@ def project_status(
     if takeover is not None:
         result["takeover"] = takeover
     return result
+
+
+def _scheduling_observations(
+    runtime: MachineRuntime,
+    reader: _ReadBudget,
+    agent: object,
+    binding: ProjectBinding | None,
+    diagnostics: dict[str, Any],
+) -> tuple[dict[str, object], dict[str, object], dict[str, Any], dict[str, Any]]:
+    """Project bounded, independent heartbeat, snapshot and coverage evidence."""
+    now = datetime.now(timezone.utc)
+
+    def read_optional(path: Path, *, max_bytes: int = 4096) -> dict[str, Any]:
+        try:
+            return reader.read_json(path, max_bytes=max_bytes) or {}
+        except (ValueError, RecursionError):
+            return {}
+
+    def timestamp(raw: object) -> datetime | None:
+        if (
+            not isinstance(raw, str)
+            or len(raw) > 64
+            or re.fullmatch(
+                r"[0-9]{4}-[0-9]{2}-[0-9]{2}[Tt][0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]+)?"
+                r"(?:[Zz]|[+-](?:[01][0-9]|2[0-3]):[0-5][0-9])",
+                raw,
+            )
+            is None
+        ):
+            return None
+        try:
+            return datetime.fromisoformat(raw[:-1] + "+00:00" if raw.endswith(("Z", "z")) else raw)
+        except ValueError:
+            return None
+
+    def freshness(seen_at: object, interval: object, *, intervals: int = 1) -> dict[str, object]:
+        observed = timestamp(seen_at)
+        unknown = {"observed_at": None, "freshness": "unknown"}
+        if observed is None or observed > now or type(interval) not in {int, float} or interval <= 0:
+            return unknown
+        try:
+            if not math.isfinite(interval):
+                return unknown
+        except OverflowError:
+            return unknown
+        age = (now - observed).total_seconds()
+        return {"observed_at": seen_at, "freshness": "fresh" if age / intervals <= interval else "stale"}
+
+    active_instance = None
+    runtime_id = binding.runtime_instance_id if binding is not None else None
+    if isinstance(agent, dict) and agent.get("state") == "active":
+        instance = agent.get("instance_id")
+        reported_runtime = agent.get("runtime_id")
+        if isinstance(instance, str) and instance and isinstance(reported_runtime, str) and reported_runtime:
+            if runtime_id is None:
+                try:
+                    identity = decode_identity_record(read_optional(runtime.paths["identity"]))
+                    if identity is not None:
+                        runtime_id = _effective_runtime_id(identity["instance_id"], identity.get("runtime_id"))
+                except (RuntimeError, ValueError):
+                    pass
+            if runtime_id == reported_runtime:
+                active_instance = instance
+
+    heartbeat = {"observed_at": None, "freshness": "unknown"}
+    snapshot = {"observed_at": None, "freshness": "unknown"}
+    heartbeat_coverage_complete = False
+    checkpoint = None
+    if active_instance is not None:
+        health = read_optional(runtime.root / HEALTH_FILENAME, max_bytes=MAX_HEALTH_BYTES)
+        lane = health.get("heartbeat")
+        if (
+            type(health.get("schema_version")) is int
+            and health["schema_version"] == HEALTH_SCHEMA_VERSION
+            and health.get("instance_id") == active_instance
+            and isinstance(lane, dict)
+        ):
+            heartbeat = freshness(lane.get("last_success_at"), lane.get("effective_stale_after_seconds"))
+            heartbeat_coverage_complete = (
+                heartbeat["freshness"] == "fresh"
+                and lane.get("state") == "healthy"
+                and lane.get("diagnostic_coverage_degraded") is False
+            )
+        if binding is not None:
+            binding_root = runtime.project_paths(binding.project_id)["root"]
+            checkpoint = read_optional(binding_root / SNAPSHOT_COVERAGE_FILENAME).get("snapshot_coverage")
+            receipt = read_optional(binding_root / "snapshot-observation.json").get("snapshot_observation")
+            if (
+                isinstance(receipt, dict)
+                and receipt.get("agent_instance_id") == active_instance
+                and receipt.get("runtime_id") == runtime_id
+                and receipt.get("registration_generation") == binding.registration_generation
+            ):
+                snapshot = freshness(receipt.get("snapshot_at"), receipt.get("heartbeat_interval_seconds"), intervals=3)
+
+    recovery = read_scheduler_recovery(runtime, instance_id=active_instance, read_json=read_optional)
+    coverage = diagnostics["coverage"] if binding is not None else "unknown"
+    complete_coverage = diagnostics["status"] == "available" and coverage == "complete"
+    retired_at = timestamp(diagnostics.get("last_retirement_at"))
+    reported_progress_at = timestamp(recovery.get("last_progress_at"))
+    if (
+        recovery["state"] in {"idle", "awaiting_observation"}
+        and active_instance is not None
+        and retired_at is not None
+        and (reported_progress_at is None or retired_at > reported_progress_at)
+    ):
+        recovery = {
+            **recovery,
+            "state": "awaiting_observation",
+            "last_progress_at": diagnostics["last_retirement_at"],
+        }
+
+    if (
+        binding is not None
+        and isinstance(checkpoint, dict)
+        and checkpoint.get("runtime_id") == runtime_id
+        and checkpoint.get("agent_instance_id") == active_instance
+        and checkpoint.get("registration_generation") == binding.registration_generation
+    ):
+        progress_at = timestamp(recovery.get("last_progress_at"))
+        snapshot_at = timestamp(checkpoint.get("snapshot_at"))
+        accepted_at = timestamp(checkpoint.get("accepted_at"))
+        producer_at = timestamp(checkpoint.get("observed_at"))
+        ordered = (
+            snapshot_at is not None
+            and accepted_at is not None
+            and producer_at is not None
+            and snapshot_at <= accepted_at < producer_at <= now
+        )
+        overflow = diagnostics.get("overflow", {})
+        omitted_scopes = overflow.get("omitted_scopes")
+        latest_omission = timestamp(overflow.get("latest_observed_at"))
+        heartbeat_at = timestamp(heartbeat["observed_at"])
+        # Current scoped observations can cover historical control-plane omissions.
+        # Keep the machine-wide overflow marker and its uncertainty.
+        scoped_overflow_rechecked = (
+            ordered
+            and diagnostics["status"] == "available"
+            and diagnostics["reason"] == "active_overflow"
+            and heartbeat_coverage_complete
+            and snapshot["freshness"] == "fresh"
+            and isinstance(omitted_scopes, list)
+            and 0 < len(omitted_scopes) < 16
+            and all(
+                isinstance(scope, dict)
+                and scope.get("producer") == "control_plane_health"
+                and scope.get("scope_type") in {"agent_instance", "project_binding"}
+                for scope in omitted_scopes
+            )
+            and (
+                latest_omission is None
+                or (snapshot_at > latest_omission and heartbeat_at is not None and heartbeat_at > latest_omission)
+            )
+        )
+        if scoped_overflow_rechecked and diagnostics.get("producer_coverage_complete") is True:
+            complete_coverage = True
+            coverage = "complete"
+        if (
+            recovery["state"] == "awaiting_observation"
+            and ordered
+            and progress_at is not None
+            and snapshot_at > progress_at
+            and (diagnostics["reason"] != "active_overflow" or scoped_overflow_rechecked)
+        ):
+            recovery = {
+                **recovery,
+                "state": "verified",
+                "project_id": binding.project_id,
+                "reason": None,
+                "next_action": None,
+            }
+
+    if recovery.get("state") in {"pending", "progressing", "blocked", "awaiting_observation"}:
+        complete_coverage = False
+        coverage = "incomplete"
+
+    reasons = []
+    if binding is None:
+        reasons.append("local_binding_unverified")
+    for name, evidence in (("heartbeat", heartbeat), ("snapshot", snapshot)):
+        if evidence["freshness"] == "stale":
+            reasons.append(f"{name}_stale")
+        elif evidence["freshness"] != "fresh":
+            reasons.append(f"{name}_missing")
+    if not complete_coverage:
+        reasons.append("diagnostic_coverage_incomplete")
+    readiness = {
+        "state": "unknown" if reasons else "observed",
+        "reasons": reasons,
+        "diagnostic_coverage": {"scope": "project_binding", "state": coverage},
+    }
+    return heartbeat, snapshot, readiness, recovery
 
 
 def _machine_state_path(cfg: RootConfig, name: str, state_name: str) -> Path:

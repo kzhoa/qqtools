@@ -584,12 +584,14 @@ def dispatch_machine_cycle_locked(
         try:
             store = SchedulerDiagnosticStore(runtime)
             store.recover()
-            store.publish_cycle(
+            checkpoint = store.publish_cycle(
                 counters=diagnostics.snapshot(),
                 timings=None,
                 probes=runtime.last_scheduler_diagnostic_probes,
                 working_set=runtime.working_set.snapshot(),
             )
+            if checkpoint is not None and project_io_controller is not None:
+                project_io_controller.record_scheduler_coverage(checkpoint, instance_id=instance_id)
             store.reconcile_cycle(runtime.last_scheduler_diagnostic_probes)
             runtime.last_scheduler_diagnostics_publish_ns = now_ns
         except (OSError, RuntimeError, TypeError, ValueError):
@@ -748,8 +750,15 @@ def _advance_machine_snapshot_publications(
     runtime: MachineRuntime,
     controller: ProjectIOController,
     validated_project_ids: Collection[str],
+    *,
+    registry_snapshot: tuple[int, Sequence[ProjectBinding]] | None = None,
 ) -> None:
     """Advance one newest heartbeat snapshot intent on the dispatch thread."""
+    parameters = {}
+    if registry_snapshot is not None:
+        revision, registered = registry_snapshot
+        controller.prune_machine_snapshot_observations(registered)
+        parameters["observed_registry_revision"] = revision
     intent = runtime.machine_snapshot_intent(validated_project_ids=tuple(validated_project_ids))
     if intent is None:
         return
@@ -764,6 +773,7 @@ def _advance_machine_snapshot_publications(
             heartbeat_interval_seconds=intent.heartbeat_interval_seconds,
             started_at=intent.started_at,
             gpu_policy=intent.gpu_policy,
+            **parameters,
         )
     except (OSError, RuntimeError, ValueError):
         # A later heartbeat replaces this intent and retries current state.
@@ -1672,6 +1682,7 @@ def _dispatch_machine_cycle_locked(
         )
         if len(service_bindings) != len(registered):
             service_filter = service_bindings
+    registry_snapshot = (registry_revision, registered)
     runtime.working_set.reconcile(registered if service_filter is None else service_filter, revision=registry_revision)
     if has_isolation_executor:
         try:
@@ -1690,7 +1701,9 @@ def _dispatch_machine_cycle_locked(
         else {}
     )
     if project_io_controller is not None:
-        _advance_machine_snapshot_publications(runtime, project_io_controller, validated_configs)
+        _advance_machine_snapshot_publications(
+            runtime, project_io_controller, validated_configs, registry_snapshot=registry_snapshot
+        )
         _advance_registration_renewals(runtime, project_io_controller, registry_revision, registered)
         _advance_activation_working_set(runtime, project_io_controller, registry_revision, registered)
         project_io_controller.advance_upgrade_work(registered, registry_revision)

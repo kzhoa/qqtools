@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import math
 import re
-from collections.abc import Callable, Collection
-from dataclasses import dataclass
+from collections.abc import Callable, Collection, Iterable
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Literal
 
@@ -13,6 +13,7 @@ if TYPE_CHECKING:
     from .project_io_controller import _ValidationIdentity
 
 SNAPSHOT_HEALTH_ITEM_LIMIT = 8
+SNAPSHOT_COVERAGE_FILENAME = "snapshot-coverage.json"
 _COUNT_LIMIT = (1 << 31) - 1
 _STAGE_ORDER = {
     "backoff": 0,
@@ -35,12 +36,19 @@ class _PublicationProgress:
     attempt_started: float | None = None
     last_attempt_at: str | None = None
     published: float | None = None
-    last_published_at: str | None = None
     consecutive_failures: int = 0
     retry_deadline: float | None = None
     reason_code: str | None = None
     worker_started: float | None = None
     worker_elapsed: float | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _PublicationObservation:
+    freshness_started: float
+    sequence: int = 0
+    last_published_at: str | None = None
+    snapshot_evidence: tuple[str, str] | None = None
 
 
 class SnapshotPublicationHealth:
@@ -59,11 +67,13 @@ class SnapshotPublicationHealth:
         self._instance_id: str | None = None
         self._progress: dict[tuple[_ValidationIdentity, str], _PublicationProgress] = {}
         self._last_publication: dict[_ValidationIdentity, tuple[str, float]] = {}
+        self._observations: dict[tuple[str, str, str], _PublicationObservation] = {}
 
     def reset_instance(self, instance_id: str) -> None:
         if self._instance_id != instance_id:
             self._progress.clear()
             self._last_publication.clear()
+            self._observations.clear()
             self._instance_id = instance_id
 
     def prune(self, current_identities: Collection[_ValidationIdentity]) -> None:
@@ -75,6 +85,36 @@ class SnapshotPublicationHealth:
         self._last_publication = {
             identity: state for identity, state in self._last_publication.items() if identity in current_identities
         }
+
+    def prune_observations(self, registered_owners: Iterable[tuple[str, str, str]]) -> None:
+        """Retire freshness evidence only when the generation leaves the full registry."""
+        if self._observations:
+            registered = set(registered_owners)
+            self._observations = {owner: state for owner, state in self._observations.items() if owner in registered}
+
+    def latest_success(
+        self, *, runtime_id: str, agent_instance_id: str, project_id: str, registration_generation: str
+    ) -> tuple[int, str] | None:
+        """Return the accepted publication serial and timestamp for an exact binding."""
+        if agent_instance_id != self._instance_id:
+            return None
+        observation = self._observations.get((runtime_id, project_id, registration_generation))
+        if observation is None or observation.last_published_at is None:
+            return None
+        return observation.sequence, observation.last_published_at
+
+    def record_snapshot_evidence(self, identity: _ValidationIdentity, snapshot_at: str, accepted_at: str) -> None:
+        owner = identity.request_owner
+        observation = self._observations[owner]
+        self._observations[owner] = replace(observation, snapshot_evidence=(snapshot_at, accepted_at))
+
+    def snapshot_evidence(
+        self, *, runtime_id: str, project_id: str, registration_generation: str, agent_instance_id: str
+    ) -> tuple[str, str] | None:
+        if agent_instance_id != self._instance_id:
+            return None
+        observation = self._observations.get((runtime_id, project_id, registration_generation))
+        return observation.snapshot_evidence if observation is not None else None
 
     def discard_progress(self, identity: _ValidationIdentity, instance_id: str) -> None:
         self._progress.pop((identity, instance_id), None)
@@ -121,7 +161,17 @@ class SnapshotPublicationHealth:
         *,
         stage: _RequestStage,
         reason: object = None,
-    ) -> None:
+    ) -> bool:
+        """Report a request stage and indicate whether the update was accepted."""
+        if stage == "published":
+            entry = self._progress.get((identity, instance_id))
+            if (
+                instance_id != self._instance_id
+                or entry is None
+                or entry.stage != "consumed"
+                or entry.request_id != request_id
+            ):
+                return False
         entry = self._entry(identity, instance_id, heartbeat_interval_seconds)
         self._ensure_attempt_started(entry)
         entry.request_id = request_id
@@ -139,12 +189,16 @@ class SnapshotPublicationHealth:
             self._measure_worker(entry, self._now())
             entry.worker_started = None
         elif stage == "published":
-            entry.last_published_at = self._timestamp()
             entry.published = self._now()
+            owner = identity.request_owner
+            self._observations[owner] = _PublicationObservation(
+                entry.published, self._observations[owner].sequence + 1, self._timestamp()
+            )
             entry.consecutive_failures = 0
             entry.retry_deadline = None
             entry.reason_code = None
             entry.worker_started = None
+        return True
 
     def report_failure(
         self,
@@ -175,8 +229,11 @@ class SnapshotPublicationHealth:
         for (identity, instance_id), entry in self._progress.items():
             if instance_id != self._instance_id:
                 continue
-            elapsed = self._measure_worker(entry, now)
-            is_overdue = elapsed is not None and elapsed >= entry.stale_after
+            observation = self._observations.get(identity.request_owner)
+            if observation is None:
+                continue
+            self._measure_worker(entry, now)
+            is_overdue = now - observation.freshness_started >= entry.stale_after
             order = (
                 not is_overdue,
                 _STAGE_ORDER[entry.stage],
@@ -197,7 +254,8 @@ class SnapshotPublicationHealth:
                         "request_id": entry.request_id,
                         "stage": entry.stage,
                         "last_attempt_at": entry.last_attempt_at,
-                        "last_published_at": entry.last_published_at,
+                        "last_published_at": observation.last_published_at,
+                        "publication_sequence": observation.sequence,
                         "consecutive_failures": entry.consecutive_failures,
                         "retry_at": self._retry_timestamp(entry.retry_deadline, now),
                         "reason_code": entry.reason_code,
@@ -222,6 +280,9 @@ class SnapshotPublicationHealth:
             entry = self._progress[key] = _PublicationProgress(stale_after)
         else:
             entry.stale_after = stale_after
+        owner = identity.request_owner
+        if instance_id == self._instance_id and owner not in self._observations:
+            self._observations[owner] = _PublicationObservation(self._now())
         return entry
 
     def _ensure_attempt_started(self, entry: _PublicationProgress) -> None:

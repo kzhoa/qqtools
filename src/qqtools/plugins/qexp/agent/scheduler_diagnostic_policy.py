@@ -86,6 +86,7 @@ class PublicationProbe:
     coverage_complete: bool
     decision: DecisionObservationIntent | None
     findings: Iterable[FindingObservationIntent | FindingObservationOmission | IgnoredFindingObservation]
+    covered_bindings: object
 
     @property
     def decision_intent(self) -> DecisionObservationIntent | None:
@@ -224,6 +225,7 @@ def _publication_probe(probe: Mapping[str, object]) -> PublicationProbe:
         coverage_complete=probe.get("coverage") == "complete",
         decision=decision,
         findings=_iter_finding_intents(probe.get("findings", ())),
+        covered_bindings=probe.get("covered_bindings"),
     )
 
 

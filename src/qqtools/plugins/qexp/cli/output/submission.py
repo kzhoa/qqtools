@@ -145,40 +145,55 @@ def _render_submission(result: Mapping[str, Any], presentation: Mapping[str, obj
     if outcome == "committed":
         task_ids = list(result.get("task_ids", ()))
         activation = result.get("activation")
-        error = result.get("error")
-        if isinstance(activation, Mapping) and activation.get("outcome") == "failed":
-            error_mapping = error if isinstance(error, Mapping) else {}
-            lines = ["Committed; activation failed.", f"Task IDs: {_value(task_ids)}"]
-            if project_path:
-                lines.append(f"Project: {project_path}")
-            lines.append(f"Error: {_value(error_mapping.get('message'))}")
-            lines.append(f"Next: {_value(activation.get('follow_up_command'))}")
-            return "\n".join(lines)
-        if mode == "command":
-            task = presentation.get("task", {})
-            task_mapping = task if isinstance(task, Mapping) else {}
-            task_id = task_mapping.get("task_id") or (task_ids[0] if task_ids else None)
-            name = task_mapping.get("name")
-            lines = [f"Task ID: {_value(task_id)}", f"Name: {_value(name)}"]
-            if project_path:
-                lines.append(f"Project: {project_path}")
-            lines.append(f"Group: {_value(group_name)}")
-            if project_path and task_id:
-                locator = shlex.join(["qexp", "--project", str(project_path), "task", "show", str(task_id)])
-                logs = shlex.join(["qexp", "--project", str(project_path), "task", "logs", str(task_id)])
-                lines.extend([f"Show: {locator}", f"Logs: {logs}"])
-            return "\n".join(lines)
-        lines = [f"Submitted {len(task_ids)} task{'s' if len(task_ids) != 1 else ''}."]
+        activation = activation if isinstance(activation, Mapping) else {}
+        activation_outcome = activation.get("outcome")
+        lines = [f"Committed {len(task_ids)} task{'s' if len(task_ids) != 1 else ''}."]
+        if activation_outcome == "failed":
+            error = result.get("error")
+            error = error if isinstance(error, Mapping) else {}
+            lines.extend(
+                (
+                    "Agent activation failed.",
+                    f"Task IDs: {_value(task_ids)}",
+                    f"Error: {_value(error.get('message'))}",
+                    f"Next: {_value(activation.get('follow_up_command'))}",
+                )
+            )
+        elif isinstance(activation_outcome, str):
+            lines.append(f"Agent activation: {activation_outcome.replace('_', ' ')}")
         if project_path:
             lines.append(f"Project: {project_path}")
-        if group_name:
-            lines.append(f"Group: {group_name}")
-            if project_path:
-                lines.append(
-                    f"Inspect: {shlex.join(['qexp', '--project', str(project_path), 'group', 'show', str(group_name)])}"
+        if activation_outcome != "failed":
+            if mode == "command":
+                task = presentation.get("task", {})
+                task_mapping = task if isinstance(task, Mapping) else {}
+                task_id = task_mapping.get("task_id") or (task_ids[0] if task_ids else None)
+                name = task_mapping.get("name")
+                lines.extend((f"Task ID: {_value(task_id)}", f"Name: {_value(name)}", f"Group: {_value(group_name)}"))
+                if project_path and task_id:
+                    locator = shlex.join(["qexp", "--project", str(project_path), "task", "show", str(task_id)])
+                    logs = shlex.join(["qexp", "--project", str(project_path), "task", "logs", str(task_id)])
+                    lines.extend([f"Show: {locator}", f"Logs: {logs}"])
+            elif group_name:
+                lines.append(f"Group: {group_name}")
+                if project_path:
+                    lines.append(
+                        f"Inspect: {shlex.join(['qexp', '--project', str(project_path), 'group', 'show', str(group_name)])}"
+                    )
+            else:
+                lines.append(f"Task IDs: {_value(task_ids)}")
+        recovery = result.get("diagnostic_recovery")
+        if isinstance(recovery, Mapping) and recovery.get("state") == "blocked":
+            from ..project_presentation import encode_display_text
+
+            lines.append("")
+            lines.extend(
+                (
+                    f"Machine scheduler diagnostic recovery blocked ({_value(recovery.get('reason'))}).",
+                    f"Machine runtime: {encode_display_text(recovery['machine_runtime_root'])}",
+                    f"Read-only preview: {recovery['next_action']}",
                 )
-        else:
-            lines.append(f"Task IDs: {_value(task_ids)}")
+            )
         return "\n".join(lines)
     error = result.get("error") or {}
     message = error.get("message") if isinstance(error, Mapping) else None
@@ -206,8 +221,8 @@ def _validate_submission(result: Any) -> None:
     )
     for key in required:
         _required(value, key, "submission payload")
-    if set(value) != set(required):
-        unknown = sorted(set(value) - set(required))
+    unknown = sorted(set(value) - {*required, "diagnostic_recovery"})
+    if unknown:
         raise ValueError(f"submission payload has unknown fields: {', '.join(unknown)}")
     if value["schema_version"] != 1:
         raise ValueError("submission payload.schema_version must be 1")
@@ -282,10 +297,26 @@ def _validate_submission(result: Any) -> None:
         activation = _mapping(activation, "submission payload.activation")
         if set(activation) != {"outcome", "follow_up_command"}:
             raise ValueError("submission payload.activation fields are invalid")
-        if activation["outcome"] not in {"started", "already_running", "failed"}:
+        if activation["outcome"] not in {"started", "already_running", "requested", "not_requested", "failed"}:
             raise ValueError("submission payload.activation.outcome is invalid")
-        if not isinstance(activation["follow_up_command"], str):
-            raise ValueError("submission payload.activation.follow_up_command must be a string")
+        follow_up = activation["follow_up_command"]
+        if not isinstance(follow_up, str) and (follow_up is not None or activation["outcome"] == "failed"):
+            raise ValueError("submission payload.activation.follow_up_command is invalid")
+    if "diagnostic_recovery" in value:
+        label = "submission payload.diagnostic_recovery"
+        recovery = _required_mapping(value, "diagnostic_recovery", "submission payload")
+        if (
+            value["outcome"] != "committed"
+            or set(recovery) != {"scope", "machine_runtime_root", "state", "reason", "next_action"}
+            or recovery["scope"] != "machine_runtime"
+            or recovery["state"] != "blocked"
+        ):
+            raise ValueError(f"{label} fields are invalid")
+        for key in ("machine_runtime_root", "next_action"):
+            if not isinstance(recovery[key], str):
+                raise ValueError(f"{label}.{key} must be a string")
+        if recovery["reason"] is not None and not isinstance(recovery["reason"], str):
+            raise ValueError(f"{label}.reason must be a string or null")
 
 
 CONTRACTS = {

@@ -122,6 +122,9 @@ def _sanitize_project_publication(value: object) -> dict[str, object] | None:
     if type(registry_revision) is not int or not 0 <= registry_revision <= MAX_COUNT:
         return None
     result["registry_revision"] = registry_revision
+    publication_sequence = value.get("publication_sequence")
+    if type(publication_sequence) is int and 0 <= publication_sequence < (1 << 63):
+        result["publication_sequence"] = publication_sequence
     if value.get("operation_kind") != "machine_snapshot_publish":
         return None
     result["operation_kind"] = "machine_snapshot_publish"

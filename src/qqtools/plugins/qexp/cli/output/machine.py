@@ -216,6 +216,52 @@ def _render_status(result: Mapping[str, Any], presentation: Mapping[str, object]
     if "takeover" in result:
         sections.append(_render_status_takeover(result["takeover"]))
 
+    readiness = result.get("scheduling_readiness")
+    if isinstance(readiness, Mapping):
+        heartbeat = agent.get("heartbeat", {}) if isinstance(agent, Mapping) else {}
+        snapshot = result.get("project_snapshot", {})
+        coverage = readiness.get("diagnostic_coverage", {})
+        sections.append(
+            _section(
+                "Scheduling observation",
+                (
+                    ("Machine heartbeat", heartbeat.get("freshness")),
+                    ("Heartbeat observed at", heartbeat.get("observed_at")),
+                    ("Project snapshot", snapshot.get("freshness")),
+                    ("Snapshot observed at", snapshot.get("observed_at")),
+                    ("Project-binding diagnostic coverage", coverage.get("state")),
+                    ("Scheduling readiness", readiness.get("state")),
+                    ("Reasons", [_status_reason(reason) for reason in readiness.get("reasons", ())]),
+                ),
+            )
+        )
+
+    recovery = result.get("diagnostic_recovery")
+    repair_preview = None
+    if isinstance(recovery, Mapping) and recovery.get("state") in {
+        "pending",
+        "progressing",
+        "blocked",
+        "awaiting_observation",
+    }:
+        recovery_state = recovery["state"]
+        runtime_root = recovery.get("machine_runtime_root")
+        if recovery_state == "blocked":
+            repair_preview = recovery.get("next_action")
+        sections.append(
+            _section(
+                "Machine scheduler diagnostic recovery",
+                (
+                    ("Machine runtime", encode_display_text(runtime_root) if isinstance(runtime_root, str) else None),
+                    ("State", recovery_state.replace("_", " ")),
+                    ("Reason", _status_reason(recovery.get("reason"))),
+                    ("Last progress", recovery.get("last_progress_at")),
+                    ("Next check", recovery.get("next_check_at")),
+                    ("Read-only preview", repair_preview),
+                ),
+            )
+        )
+
     diagnostic_fields: list[tuple[str, Any]] = []
     scheduler_material = scheduler is not None and (
         scheduler.get("status") != "available"
@@ -258,7 +304,7 @@ def _render_status(result: Mapping[str, Any], presentation: Mapping[str, object]
     if warning_rows:
         sections.append(_section("Warnings", warning_rows))
 
-    actions = result["next_actions"]
+    actions = [action for action in result["next_actions"] if action != repair_preview]
     if actions:
         # Registration is the first canonical action for an unbound Project.
         labels = ["Run"] * len(actions)

@@ -124,6 +124,7 @@ def test_project_snapshot_overdue_finding_resolves_for_exact_publication(tmp_pat
         "stage": "started",
         "last_attempt_at": "2026-10-16T00:00:00Z",
         "last_published_at": None,
+        "publication_sequence": 0,
         "consecutive_failures": 0,
         "retry_at": None,
         "reason_code": None,
@@ -131,23 +132,56 @@ def test_project_snapshot_overdue_finding_resolves_for_exact_publication(tmp_pat
         "overdue": True,
         "effective_stale_after_seconds": 15.0,
     }
-    health.update_project_snapshot_publications({"total": 1, "omitted_count": 0, "items": [publication]})
-    plane._reconcile_scheduler_findings(health.snapshot(heartbeat_thread_alive=True))
+    second = {**publication, "project_id": "project-2", "registration_generation": "registration-2"}
 
+    def reconcile(*items):
+        health.update_project_snapshot_publications({"total": len(items), "omitted_count": 0, "items": list(items)})
+        plane._reconcile_scheduler_findings(health.snapshot(heartbeat_thread_alive=True))
+
+    reconcile(publication, second)
     store = SchedulerDiagnosticStore(plane._runtime)
-    active = store.active_view(producer="control_plane_health")
-    assert active["total"] == 1
-    identity = active["items"][0]["identity"]
-    assert identity["reason_code"] == "project_snapshot_overdue"
-    assert identity["project_id"] == "project-1"
-    assert identity["executor_epoch"] == "a" * 32
-    assert identity["request_id"] == "request-1"
+    first = store.active_view(project_id="project-1")["items"][0]
+    for attempt in range(1, 301):
+        publication = {
+            **publication,
+            "request_id": f"retry-{attempt}",
+            "registry_revision": 7 + attempt,
+            "executor_epoch": "b" * 32,
+            "consecutive_failures": attempt,
+        }
+        reconcile(publication)
 
-    health.update_project_snapshot_publications({"total": 0, "omitted_count": 0, "items": []})
-    plane._reconcile_scheduler_findings(health.snapshot(heartbeat_thread_alive=True))
-    assert store.active_view(producer="control_plane_health")["total"] == 0
-    history = store.history_view(limit=32)
-    assert history["items"][0]["identity"]["reason_code"] == "project_snapshot_overdue"
+    active = store.active_view(producer="control_plane_health")
+    assert active["total"] == 2
+    item = store.active_view(project_id="project-1")["items"][0]
+    assert item["episode"] == first["episode"]
+    assert item["identity"]["reason_code"] == "project_snapshot_overdue"
+    assert item["identity"]["project_id"] == "project-1"
+    assert item["details"]["executor_epoch"] == "b" * 32
+    assert item["details"]["request_id"] == "retry-300"
+    assert item["observation_count"] == 301
+    assert item["first_observed_at"] == first["first_observed_at"]
+
+    success = {
+        **publication,
+        "stage": "published",
+        "overdue": False,
+        "publication_sequence": 1,
+        "last_published_at": "2026-10-16T00:00:20Z",
+    }
+    reconcile(success)
+    assert store.active_view(project_id="project-1")["total"] == 0
+    assert store.active_view(project_id="project-2")["total"] == 1
+    history = store.history_view(project_id="project-1")
+    assert history["items"][0]["episode"] == first["episode"]
+    assert history["items"][0]["observation_count"] == 301
+
+    recent_fault = {**publication, "publication_sequence": 1, "request_id": "next-interval"}
+    reconcile(recent_fault)
+    recurrent = store.active_view(project_id="project-1")["items"][0]
+    assert recurrent["episode"] != first["episode"]
+    reconcile(success)
+    assert store.active_view(project_id="project-1")["items"][0]["episode"] == recurrent["episode"]
 
 
 def test_successor_watchdog_archives_predecessor_finding_without_claiming_recovery(tmp_path, monkeypatch) -> None:
@@ -174,8 +208,14 @@ def test_successor_watchdog_archives_predecessor_finding_without_claiming_recove
     successor.monitor_health()
 
     store = SchedulerDiagnosticStore(runtime)
+    assert store.active_view(producer="control_plane_health")["total"] == 1
+    repaired = store.repair(
+        runtime_id=runtime.instance_id, owner=lambda: "successor-instance", apply=True, automatic=True
+    )
+    assert repaired["retired"] == 1
     assert store.active_view(producer="control_plane_health")["total"] == 0
     history = store.history_view(limit=32)
+    assert history["items"][0]["disposition"] == "superseded"
     assert history["items"][0]["identity"]["target_id"] == "predecessor-instance"
     assert history["items"][0]["identity"]["reason_code"] == "heartbeat_thread_stopped"
 

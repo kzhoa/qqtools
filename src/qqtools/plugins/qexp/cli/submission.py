@@ -12,6 +12,8 @@ from typing import Any
 
 from ..activation import AgentActivationError, ensure_local_agent_active
 from ..agent.context import ExecutionContext
+from ..agent.diagnostic_recovery import diagnostics_repair_command, read_scheduler_recovery
+from ..agent.helpers import _active_machine_identity
 from ..commands import task as task_commands
 from ..layout import load_context
 from ..manifest import UNSET, normalize_command_submission, parse_submission_manifest
@@ -515,53 +517,49 @@ def dispatch_submission(
     # Activation is a post-commit follow-up.  It must never relabel a
     # verified commit or erase the IDs from a quiet/JSON response.
     payload = _submission_result_payload(request, values)
-    if not request.dry_run and payload["outcome"] == "committed" and not request.no_activate:
-        try:
-            ensure_local_agent_active(
-                cfg,
-                reason="submit",
-                machine_runtime=execution_context.machine_runtime,
-            )
-        except AgentActivationError as activation_error:
-            payload["error"] = {"code": "activation_failed", "message": str(activation_error)}
-            follow_up = activation_error.next_action or shlex.join(
-                [
-                    "qexp",
-                    "--machine-runtime-root",
-                    str(execution_context.machine_runtime.root),
-                    "agent",
-                    "start",
-                ]
-            )
-            payload["activation"] = {"outcome": "failed", "follow_up_command": follow_up}
-            if request.quiet:
-                for task_id in payload["task_ids"]:
-                    print(task_id)
-            else:
-                return CommandOutcome(
-                    1,
-                    CliOutput(
-                        OutputKind.SUBMISSION,
-                        payload,
-                        {
-                            "task": {
-                                "task_id": request.normalized_specs[0].get("task_id"),
-                                "name": request.normalized_specs[0].get("name"),
-                            }
-                        },
-                    ),
+    exit_code = 0
+    if payload["outcome"] == "committed":
+        runtime = execution_context.machine_runtime
+        if request.no_activate:
+            payload["activation"] = {"outcome": "not_requested", "follow_up_command": None}
+        else:
+            try:
+                started = ensure_local_agent_active(cfg, reason="submit", machine_runtime=runtime)
+            except AgentActivationError as activation_error:
+                exit_code = 1
+                payload["error"] = {"code": "activation_failed", "message": str(activation_error)}
+                follow_up = activation_error.next_action or shlex.join(
+                    ["qexp", "--machine-runtime-root", str(runtime.root), "agent", "start"]
                 )
-            return CommandOutcome(1)
-    if request.quiet:
-        if payload["outcome"] == "committed":
+                payload["activation"] = {"outcome": "failed", "follow_up_command": follow_up}
+            else:
+                outcome = "started" if started is True else "already_running" if started is False else "requested"
+                payload["activation"] = {"outcome": outcome, "follow_up_command": None}
+
+        if request.quiet:
             for task_id in payload["task_ids"]:
                 print(task_id)
-    else:
-        presentation = {
-            "task": {
-                "task_id": request.normalized_specs[0].get("task_id"),
-                "name": request.normalized_specs[0].get("name"),
+            return CommandOutcome(exit_code)
+
+        try:
+            identity = _active_machine_identity(runtime)
+            recovery = read_scheduler_recovery(runtime, instance_id=identity[1]) if identity is not None else None
+        except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
+            recovery = None
+        if recovery is not None and recovery.get("state") == "blocked":
+            payload["diagnostic_recovery"] = {
+                "scope": "machine_runtime",
+                "machine_runtime_root": str(runtime.root),
+                "state": "blocked",
+                "reason": recovery.get("reason"),
+                "next_action": recovery.get("next_action") or diagnostics_repair_command(runtime),
             }
+
+    presentation = {
+        "task": {
+            "task_id": request.normalized_specs[0].get("task_id"),
+            "name": request.normalized_specs[0].get("name"),
         }
-        return CommandOutcome(0, CliOutput(OutputKind.SUBMISSION, payload, presentation))
-    return CommandOutcome(0)
+    }
+    output = None if request.quiet else CliOutput(OutputKind.SUBMISSION, payload, presentation)
+    return CommandOutcome(exit_code, output)

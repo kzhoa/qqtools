@@ -405,8 +405,15 @@ Upgrade the qqtools package and restart that machine's global agent:
 ```bash
 python -m pip install --upgrade qqtools
 qexp agent restart
-qexp agent diagnostics active --format json
+qexp status
 ```
+
+Run `qexp status` from the Project whose scheduling evidence you want to check.
+The agent retires superseded findings in the background and retains their history.
+When status reports a storage or ownership blocker, use the machine-scoped
+`qexp agent diagnostics repair --dry-run` command it prints. The preview reports
+whether apply is needed and supplies the machine-scoped apply command when
+eligible. Apply reports the verified backup location and can run during training.
 
 There is no Project schema migration, legacy-counter import, Task-history
 backfill, dual write, or old-format adapter. Before the restarted writer produces

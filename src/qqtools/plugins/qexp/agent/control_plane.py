@@ -8,6 +8,7 @@ import time
 import traceback
 from collections.abc import Iterator
 from contextlib import contextmanager
+from datetime import datetime
 from typing import Any, Callable, Mapping
 
 from ..authority import AuthoritySupervisor
@@ -38,7 +39,7 @@ from .deadlines import advance_deadline
 from .helpers import _read_pid
 from .project_io_controller import ProjectIOController
 from .recovery_capture import recovery_owner
-from .scheduler_diagnostics import SchedulerDiagnosticStore
+from .scheduler_diagnostics import MAX_AUTOMATIC_RETIREMENTS, SchedulerDiagnosticStore
 
 STARTUP_AUTHORITY_POLL_SECONDS = 1.0
 _MIN_MACHINE_SNAPSHOT_INTERVAL_SECONDS = 1.0
@@ -50,7 +51,6 @@ _HEARTBEAT_FINDING_REASONS = frozenset(
         "heartbeat_cycle_stalled",
         "heartbeat_repeated_failure",
         "heartbeat_diagnostic_coverage_loss",
-        "project_snapshot_overdue",
     }
 )
 
@@ -608,6 +608,7 @@ class _MachineControlPlane:
                 self._health.record_diagnostic_coverage_loss("health_monitor")
             else:
                 self._health.record_diagnostic_coverage_recovery("health_monitor")
+        has_current_publications = False
         try:
             controller = getattr(self._runtime, "project_io_controller", None)
             publications = (
@@ -616,6 +617,7 @@ class _MachineControlPlane:
                 else {"total": 0, "omitted_count": 0, "items": []}
             )
             self._health.update_project_snapshot_publications(publications)
+            has_current_publications = True
         except Exception:
             self._health.record_diagnostic_coverage_loss("project_snapshot_health")
         else:
@@ -625,6 +627,8 @@ class _MachineControlPlane:
         except Exception:
             self._health.record_diagnostic_coverage_loss("health_monitor_persistence")
         snapshot = self._health.snapshot(heartbeat_thread_alive=heartbeat_thread_alive)
+        if not has_current_publications:
+            snapshot.pop("project_snapshot_publications", None)
         try:
             self._reconcile_scheduler_findings(snapshot)
         except Exception:
@@ -634,34 +638,26 @@ class _MachineControlPlane:
         return self._health.snapshot(heartbeat_thread_alive=heartbeat_thread_alive)
 
     def _reconcile_scheduler_findings(self, snapshot: Mapping[str, object]) -> None:
-        """Publish current control-plane findings and resolve exact stale records."""
+        """Publish current findings and reconcile exact recovery evidence."""
         store = self._scheduler_diagnostics
-        active = store.active_view(producer="control_plane_health", limit=_SCHEDULER_DIAGNOSTIC_READ_LIMIT)
+        pending_snapshots = self._resolve_snapshot_findings(store, snapshot)
+        active = store.active_view(
+            producer="control_plane_health", scope="agent_instance", limit=_SCHEDULER_DIAGNOSTIC_READ_LIMIT
+        )
         self._require_scheduler_diagnostic_read(active)
-        for item in self._scheduler_items(active):
-            identity = item.get("identity")
-            if not isinstance(identity, Mapping):
-                continue
-            if identity.get("runtime_id") != self._runtime.instance_id:
-                continue
-            if identity.get("reason_code") not in _HEARTBEAT_FINDING_REASONS:
-                continue
-            if identity.get("target_id") == self._instance_id:
-                continue
-            self._resolve_scheduler_finding(store, item)
-
         findings = self._current_scheduler_findings(snapshot)
         for finding in findings:
+            identity = finding["identity"]
+            if self._snapshot_finding_binding(identity) in pending_snapshots:
+                continue
             store.observe_finding(
-                identity=finding["identity"],
+                identity=identity,
                 severity="fault",
                 source_revision=finding["source_revision"],
                 details=finding["details"],
                 observed_at=finding["observed_at"],
             )
 
-        active = store.active_view(producer="control_plane_health", limit=_SCHEDULER_DIAGNOSTIC_READ_LIMIT)
-        self._require_scheduler_diagnostic_read(active)
         desired = [finding["identity"] for finding in findings]
         for item in self._scheduler_items(active):
             identity = item.get("identity")
@@ -675,12 +671,105 @@ class _MachineControlPlane:
                 continue
             if any(identity == candidate for candidate in desired):
                 continue
-            self._resolve_scheduler_finding(store, item)
+            self._resolve_scheduler_finding(store, item, maintenance=True)
+
+    def _resolve_snapshot_findings(
+        self, store: SchedulerDiagnosticStore, snapshot: Mapping[str, object]
+    ) -> set[tuple[str, str]]:
+        controller = getattr(self._runtime, "project_io_controller", None)
+        sampled_successes: dict[tuple[str, str], tuple[int | None, str]] = {}
+        if not isinstance(controller, ProjectIOController):
+            for publication in self._snapshot_publication_items(snapshot):
+                if publication.get("stage") != "published":
+                    continue
+                identity = self._project_snapshot_finding_identity(publication)
+                binding = self._snapshot_finding_binding(identity)
+                published_at = publication.get("last_published_at")
+                sequence = self._publication_sequence(publication.get("publication_sequence"))
+                if binding is not None and isinstance(published_at, str) and sequence != 0:
+                    sampled_successes[binding] = (sequence, published_at)
+            if not sampled_successes:
+                return set()
+        active = store.active_findings_for_target(
+            producer="control_plane_health",
+            runtime_id=self._runtime.instance_id,
+            target_id=self._instance_id,
+            reason="project_snapshot_overdue",
+        )
+        self._require_scheduler_diagnostic_read(active)
+        pending: set[tuple[str, str]] = set()
+        resolution_attempts = 0
+        for item in self._scheduler_items(active):
+            identity = item.get("identity")
+            if not isinstance(identity, Mapping):
+                continue
+            binding = self._snapshot_finding_binding(identity)
+            if binding is None:
+                continue
+            if isinstance(controller, ProjectIOController):
+                success = controller.machine_snapshot_latest_success(
+                    runtime_id=self._runtime.instance_id,
+                    agent_instance_id=self._instance_id,
+                    project_id=binding[0],
+                    registration_generation=binding[1],
+                )
+            else:
+                success = sampled_successes.get(binding)
+            if success is None or not self._has_later_snapshot_success(item, *success):
+                continue
+            if resolution_attempts >= MAX_AUTOMATIC_RETIREMENTS:
+                pending.add(binding)
+                continue
+            resolution_attempts += 1
+            if not self._resolve_scheduler_finding(store, item, maintenance=True):
+                pending.add(binding)
+        return pending
+
+    def _snapshot_finding_binding(self, identity: Mapping[str, object]) -> tuple[str, str] | None:
+        project = identity.get("project_id")
+        generation = identity.get("registration_generation")
+        if (
+            identity.get("runtime_id") == self._runtime.instance_id
+            and identity.get("target_id") == self._instance_id
+            and identity.get("scope_type") == "project_binding"
+            and identity.get("operation_kind") == "machine_snapshot_publish"
+            and isinstance(project, str)
+            and isinstance(generation, str)
+        ):
+            return project, generation
+        return None
+
+    @staticmethod
+    def _publication_sequence(value: object) -> int | None:
+        return value if type(value) is int and 0 <= value < (1 << 63) else None
+
+    def _has_later_snapshot_success(self, item: Mapping[str, object], sequence: int | None, published_at: str) -> bool:
+        revision = item.get("source_revision")
+        previous = (
+            self._publication_sequence(revision.get("publication_sequence")) if isinstance(revision, Mapping) else None
+        )
+        if sequence is not None and previous is not None:
+            return sequence > previous
+        last_observed_at = item.get("last_observed_at")
+        if not isinstance(last_observed_at, str):
+            return False
+        try:
+            published = datetime.fromisoformat(published_at.replace("Z", "+00:00"))
+            observed = datetime.fromisoformat(last_observed_at.replace("Z", "+00:00"))
+            return published.tzinfo is not None and observed.tzinfo is not None and published > observed
+        except ValueError:
+            return False
 
     @staticmethod
     def _require_scheduler_diagnostic_read(view: Mapping[str, object]) -> None:
         reason = view.get("reason")
-        if reason is not None and reason != "store_not_initialized":
+        if reason not in {
+            None,
+            "store_not_initialized",
+            "recovery_pending",
+            "active_overflow",
+            "probe_coverage_incomplete",
+        }:
             raise OSError(f"scheduler diagnostic read unavailable: {reason}")
 
     @staticmethod
@@ -690,7 +779,13 @@ class _MachineControlPlane:
             return []
         return [item for item in items if isinstance(item, Mapping)]
 
-    def _resolve_scheduler_finding(self, store: SchedulerDiagnosticStore, item: Mapping[str, object]) -> None:
+    def _snapshot_publication_items(self, snapshot: Mapping[str, object]) -> list[Mapping[str, object]]:
+        publications = snapshot.get("project_snapshot_publications")
+        return self._scheduler_items(publications) if isinstance(publications, Mapping) else []
+
+    def _resolve_scheduler_finding(
+        self, store: SchedulerDiagnosticStore, item: Mapping[str, object], *, maintenance: bool = False
+    ) -> bool:
         identity = item.get("identity")
         episode = item.get("episode")
         observation_revision = item.get("observation_revision")
@@ -701,13 +796,14 @@ class _MachineControlPlane:
             or type(observation_revision) is not int
             or not isinstance(source_revision, Mapping)
         ):
-            return
-        store.resolve_finding(
+            return False
+        return store.resolve_finding(
             identity=identity,
             episode=episode,
             observation_revision=observation_revision,
             source_revision=source_revision,
             resolved_at=utc_now(),
+            maintenance=maintenance,
         )
 
     def _current_scheduler_findings(self, snapshot: Mapping[str, object]) -> list[dict[str, object]]:
@@ -746,29 +842,37 @@ class _MachineControlPlane:
                     "observed_at": observed_at,
                 }
             )
-        publications = snapshot.get("project_snapshot_publications")
-        publication_items = publications.get("items") if isinstance(publications, Mapping) else None
-        if isinstance(publication_items, list):
-            for publication in publication_items:
-                if not isinstance(publication, Mapping) or publication.get("overdue") is not True:
-                    continue
-                registry_revision = publication.get("registry_revision")
-                failures = publication.get("consecutive_failures")
-                stage = publication.get("stage")
-                findings.append(
-                    {
-                        "identity": self._project_snapshot_finding_identity(publication),
-                        "source_revision": {
-                            "registry_revision": registry_revision if type(registry_revision) is int else 0,
-                            "consecutive_failures": failures if type(failures) is int else 0,
-                        },
-                        "details": {"progress": stage if isinstance(stage, str) else "unknown"},
-                        "observed_at": observed_at,
-                    }
-                )
+        for publication in self._snapshot_publication_items(snapshot):
+            if publication.get("overdue") is not True:
+                continue
+            identity = self._project_snapshot_finding_identity(publication)
+            if self._snapshot_finding_binding(identity) is None:
+                continue
+            revision = {
+                "registry_revision": self._bounded_health_fact(publication.get("registry_revision")),
+                "consecutive_failures": self._bounded_health_fact(publication.get("consecutive_failures")),
+            }
+            sequence = self._publication_sequence(publication.get("publication_sequence"))
+            if sequence is not None:
+                revision["publication_sequence"] = sequence
+            stage = publication.get("stage")
+            details = {"progress": stage if isinstance(stage, str) else "unknown"}
+            for key in ("request_id", "executor_epoch"):
+                value = publication.get(key)
+                if isinstance(value, str):
+                    details[key] = value
+            findings.append(
+                {
+                    "identity": identity,
+                    "source_revision": revision,
+                    "details": details,
+                    "observed_at": observed_at,
+                }
+            )
         return findings
 
-    def _project_snapshot_finding_identity(self, publication: Mapping[str, object]) -> dict[str, object]:
+    @staticmethod
+    def _project_snapshot_finding_identity(publication: Mapping[str, object]) -> dict[str, object]:
         return {
             "producer": "control_plane_health",
             "reason_code": "project_snapshot_overdue",
@@ -776,14 +880,11 @@ class _MachineControlPlane:
             "stage": "snapshot_publication",
             "check": "progress",
             "scope_type": "project_binding",
-            "runtime_id": publication.get("runtime_id", self._runtime.instance_id),
-            "target_id": publication.get("agent_instance_id", self._instance_id),
+            "runtime_id": publication.get("runtime_id"),
+            "target_id": publication.get("agent_instance_id"),
             "project_id": publication.get("project_id"),
             "registration_generation": publication.get("registration_generation"),
-            "registry_revision": publication.get("registry_revision"),
-            "executor_epoch": publication.get("executor_epoch"),
             "operation_kind": "machine_snapshot_publish",
-            "request_id": publication.get("request_id") or "not_assigned",
         }
 
     def _scheduler_finding_identity(self, reason: str) -> dict[str, object]:

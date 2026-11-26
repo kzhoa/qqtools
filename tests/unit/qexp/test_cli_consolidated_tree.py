@@ -189,6 +189,11 @@ def test_every_command_leaf_retains_its_frozen_dispatch_contract() -> None:
             "machine",
             "scheduler-diagnostics",
         ),
+        ("agent", "diagnostics", "repair"): (
+            "agent_diagnostics_repair",
+            "machine",
+            "scheduler-diagnostics",
+        ),
         ("agent", "stop"): ("agent_stop", "machine", "agent-operation"),
         ("agent", "name"): ("agent_name", "machine", "agent-config"),
         ("agent", "config", "idle-job", "show"): ("agent_config_idle_job_show", "machine", "idle-job"),
@@ -254,6 +259,7 @@ def test_normalized_leaf_help_matches_the_characterization_baseline() -> None:
     text = "\n".join(
         f"{' '.join(parser.prog.split()[1:])}\n{' '.join(parser.format_help().split())}"
         for parser in _leaf_parsers(build_parser())
+        if parser.get_default("command_spec").handler != "agent_diagnostics_repair"
     )
 
     # argparse produces distinct stable normalized forms on Python 3.12 and the
@@ -262,6 +268,21 @@ def test_normalized_leaf_help_matches_the_characterization_baseline() -> None:
         "ed6e101037917df2a95472174f6a8e5fdf8f4c0887faf795e29c908b47bb62e6",
         "3d9c64a5af1d565caa87fb0916d54230ff5ac182d6de54796e98662e6f6d96f0",
     }
+
+
+def test_scheduler_diagnostics_repair_help_requires_an_explicit_mode(capsys) -> None:
+    parser = build_parser()
+    command = ["agent", "diagnostics", "repair"]
+    with pytest.raises(SystemExit) as help_exit:
+        parser.parse_args([*command, "--help"])
+    assert help_exit.value.code == 0
+    help_text = " ".join(capsys.readouterr().out.split())
+    assert "(--dry-run | --apply)" in help_text
+    assert "Preview recovery without changing the store." in help_text
+    for args in ([], ["--dry-run", "--apply"]):
+        with pytest.raises(SystemExit) as usage_exit:
+            parser.parse_args([*command, *args])
+        assert usage_exit.value.code == 2
 
 
 def test_root_help_has_descriptions_without_suppressed_placeholders(capsys) -> None:
