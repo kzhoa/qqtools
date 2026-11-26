@@ -44,6 +44,7 @@ from .inventory import (
     load_inventory,
     save_inventory_locked,
 )
+from .takeover_intent import TakeoverIntent
 
 INTENT_VERSION = 1
 MAX_INTENT_BYTES = 64 * 1024
@@ -80,11 +81,16 @@ def _read_bounded_json(path: Path) -> dict[str, Any] | None:
     return _read_protocol_record(path)
 
 
-def read_replacement_intent(runtime: Any) -> dict[str, Any] | None:
-    """Read and validate the one machine-local replacement intent."""
+def read_registration_intents(runtime: Any) -> tuple[dict[str, Any] | None, TakeoverIntent | None]:
+    """Decode the single machine-local registration mutation slot."""
     value = _read_bounded_json(_intent_path(runtime))
     if value is None:
-        return None
+        return None, None
+    if "project_takeover" in value:
+        takeover = TakeoverIntent.from_dict(value)
+        if takeover.transition.successor_runtime_root != runtime.root:
+            raise ReplacementOperationalError("Project takeover belongs to a different MachineRuntime.")
+        return None, takeover
     intent = value.get(INTENT_KEY)
     if not isinstance(intent, dict) or type(intent.get("version")) is not int:
         raise ReplacementOperationalError("project registration replacement record is malformed.")
@@ -125,7 +131,13 @@ def read_replacement_intent(runtime: Any) -> dict[str, Any] | None:
         raise ReplacementOperationalError("replacement record has invalid paths.") from exc
     if not root.is_absolute() or root.name != ".qexp" or not runtime_root.is_absolute():
         raise ReplacementOperationalError("replacement record has invalid paths.")
-    return dict(intent)
+    return dict(intent), None
+
+
+def read_replacement_intent(runtime: Any) -> dict[str, Any] | None:
+    """Read a registration-name replacement from the shared local slot."""
+    replacement, _takeover = read_registration_intents(runtime)
+    return replacement
 
 
 def _write_intent(runtime: Any, intent: dict[str, Any], phase: str) -> dict[str, Any]:
@@ -869,7 +881,9 @@ def _replace_locked(
     machine_runtime.require_initialized()
     root = canonical_shared_root(shared_root)
     project_id = _identity(root)
-    intent = read_replacement_intent(machine_runtime)
+    intent, takeover = read_registration_intents(machine_runtime)
+    if takeover is not None:
+        raise ReplacementOperationalError("A pending Project takeover owns this MachineRuntime registration slot.")
     if intent is not None:
         _intent_matches_request(intent, root, project_id, requested_name)
         if intent["runtime_id"] != machine_runtime.instance_id or intent["runtime_root"] != str(machine_runtime.root):

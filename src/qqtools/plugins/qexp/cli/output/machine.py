@@ -5,11 +5,29 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from typing import Any
 
+from ...takeover_contract import TAKEOVER_PHASES, TAKEOVER_PLAN_ID
+from ..project_presentation import encode_display_text
 from .core import OutputContract, OutputKind
-from .primitives import _details, _mapping, _required, _required_mapping, _section, _sequence, _table, _task_summary
+from .primitives import (
+    _details,
+    _mapping,
+    _required,
+    _required_bool,
+    _required_mapping,
+    _section,
+    _sequence,
+    _table,
+    _task_summary,
+)
 
 _STATUS_FINDING_SAMPLE_LIMIT = 16
 _STATUS_WARNING_LIMIT = 16
+_TAKEOVER_DRAIN_TEXT = {
+    "waiting_for_work": "Running or reserved work is draining.",
+    "drain_pending": "Local writer or Attempt obligations remain.",
+    "drain_unavailable": "Drain evidence cannot be verified.",
+    "drained": "Drain evidence verified.",
+}
 
 
 def _machine_values(item: Mapping[str, Any], tasks: Sequence[Mapping[str, Any]] = ()) -> tuple[Any, ...]:
@@ -116,6 +134,30 @@ def _scheduler_finding_text(item: Any) -> str | None:
     return " — ".join(fields)
 
 
+def _render_status_takeover(takeover: Mapping[str, Any]) -> str:
+    departing = takeover["departing_machine"]
+    summary = _section(
+        "Project takeover",
+        (
+            ("Plan ID", takeover["plan_id"]),
+            ("Phase", takeover["phase"]),
+            ("Departing machine", encode_display_text(departing) if departing is not None else "none"),
+            ("Target machine", encode_display_text(takeover["target_machine"])),
+            ("Cancellation requested", takeover["is_cancel_requested"]),
+            ("Drain observation", _TAKEOVER_DRAIN_TEXT.get(takeover["drain_observation"])),
+            ("Current issue", takeover["operation_issue"]),
+        ),
+    )
+    # Keep shell quoting intact for paths with embedded line breaks.
+    commands = _details(
+        (
+            ("  Operation status", takeover["operation_status_command"]),
+            ("  Request cancellation", takeover["cancel_command"]),
+        )
+    )
+    return f"{summary}\n{commands}"
+
+
 def _render_status(result: Mapping[str, Any], presentation: Mapping[str, object]) -> str:
     project = result.get("project", {})
     participation = result.get("local_participation", {})
@@ -146,6 +188,18 @@ def _render_status(result: Mapping[str, Any], presentation: Mapping[str, object]
         "unavailable": "unknown (check the local registry and inventory)",
     }.get(participation_state, participation_state)
     lines = [project_header, f"Local enrollment: {enrollment}"]
+    if participation_state == "registered" and isinstance(participation, Mapping) and "binding" in participation:
+        binding = participation["binding"]
+        if binding is None:
+            lines.append("Local binding: unverified (local identity and shared registration could not be matched)")
+        else:
+            name = encode_display_text(binding["machine_name"])
+            details = []
+            if not binding["enabled"]:
+                details.append("disabled")
+            if binding["write_eligibility"] == "expired":
+                details.append("write eligibility expired")
+            lines.append(f"Local binding: {name}" + (f" ({', '.join(details)})" if details else ""))
     agent_reason = _status_reason(agent.get("reason")) if isinstance(agent, Mapping) else None
     lines.append(f"Local agent: {agent_state}" + (f" ({agent_reason})" if agent_reason else ""))
     if isinstance(agent, Mapping) and agent.get("observed_at"):
@@ -159,6 +213,8 @@ def _render_status(result: Mapping[str, Any], presentation: Mapping[str, object]
         reason = _status_reason(task_reason)
         lines.append(f"Task observation index: {task_state}" + (f" ({reason})" if reason else ""))
     sections = ["\n".join(lines)]
+    if "takeover" in result:
+        sections.append(_render_status_takeover(result["takeover"]))
 
     diagnostic_fields: list[tuple[str, Any]] = []
     scheduler_material = scheduler is not None and (
@@ -209,6 +265,7 @@ def _render_status(result: Mapping[str, Any], presentation: Mapping[str, object]
         if participation_state in {"unregistered", "inventory_only"}:
             labels[0] = "To run Tasks on this machine"
         sections.append(_section("Next actions", tuple(zip(labels, actions, strict=True))))
+    sections.append(_details((("Project takeover preview help", result.get("takeover_preview_help")),)))
     return "\n\n".join(section for section in sections if section)
 
 
@@ -240,12 +297,54 @@ def _render_machine_show(result: Mapping[str, Any], _presentation: Mapping[str, 
     )
 
 
+def _validate_status_takeover(takeover: Mapping[str, Any], label: str) -> None:
+    plan_id = _required(takeover, "plan_id", label)
+    if not isinstance(plan_id, str) or not TAKEOVER_PLAN_ID.fullmatch(plan_id):
+        raise ValueError(f"{label}.plan_id must be 64 lowercase hexadecimal characters")
+    phase = _required(takeover, "phase", label)
+    if not isinstance(phase, str) or phase not in TAKEOVER_PHASES:
+        raise ValueError(f"{label}.phase is invalid")
+    for key in ("target_machine", "operation_status_command"):
+        value = _required(takeover, key, label)
+        if not isinstance(value, str) or not value:
+            raise ValueError(f"{label}.{key} must be a non-empty string")
+    for key in ("departing_machine", "cancel_command", "operation_issue"):
+        value = _required(takeover, key, label)
+        if value is not None and (not isinstance(value, str) or not value):
+            raise ValueError(f"{label}.{key} must be a non-empty string or null")
+    drain = _required(takeover, "drain_observation", label)
+    if drain is not None and (not isinstance(drain, str) or drain not in _TAKEOVER_DRAIN_TEXT):
+        raise ValueError(f"{label}.drain_observation is invalid")
+    _required_bool(takeover, "is_cancel_requested", label)
+
+
 def _validate_status(result: Any) -> None:
     value = _mapping(result, "status payload")
     for key in ("project", "local_participation", "local_agent", "task_observation", "next_actions"):
         _required(value, key, "status payload")
+    participation = value["local_participation"]
+    if isinstance(participation, Mapping):
+        reason = participation.get("binding_reason")
+        if reason is not None and (not isinstance(reason, str) or not reason):
+            raise ValueError("status payload.local_participation.binding_reason must be a non-empty string or null")
+        if participation.get("binding") is not None:
+            label = "status payload.local_participation.binding"
+            binding = _mapping(participation["binding"], label)
+            for key in ("machine_name", "registration_generation"):
+                text = _required(binding, key, label)
+                if not isinstance(text, str) or not text:
+                    raise ValueError(f"{label}.{key} must be a non-empty string")
+            _required_bool(binding, "enabled", label)
+            if _required(binding, "write_eligibility", label) not in ("eligible", "expired"):
+                raise ValueError(f"{label}.write_eligibility must be eligible or expired")
     if "scheduler_diagnostics" in value:
         _mapping(value["scheduler_diagnostics"], "status payload.scheduler_diagnostics")
+    if "takeover" in value:
+        _validate_status_takeover(_required_mapping(value, "takeover", "status payload"), "status payload.takeover")
+    if "takeover_preview_help" in value and (
+        not isinstance(value["takeover_preview_help"], str) or not value["takeover_preview_help"]
+    ):
+        raise ValueError("status payload.takeover_preview_help must be a non-empty string")
 
 
 def _validate_machine_show(result: Any) -> None:

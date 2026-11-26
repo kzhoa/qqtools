@@ -135,6 +135,7 @@ def test_every_command_leaf_retains_its_frozen_dispatch_contract() -> None:
         ("init",): ("init", "machine", "machine-init"),
         ("project", "init"): ("project_init", "setup", "project-operation"),
         ("project", "register"): ("project_register", "machine", "project-register"),
+        ("project", "takeover"): ("project_takeover", "machine", "project-takeover"),
         ("project", "list"): ("project_list", "machine", "project-list"),
         ("project", "enable"): ("project_enable", "machine", "project-operation"),
         ("project", "disable"): ("project_disable", "machine", "project-operation"),
@@ -258,8 +259,8 @@ def test_normalized_leaf_help_matches_the_characterization_baseline() -> None:
     # argparse produces distinct stable normalized forms on Python 3.12 and the
     # standard Python 3.13 toolchain even though the parser definitions match.
     assert hashlib.sha256(text.encode()).hexdigest() in {
-        "afbba38abd432c28966ed69a3b02b95c0da396b7b36dfd7546690e86a8c5a60b",
-        "580726077f3aca3f4786dff175afea1667305226de38115ef0e451ce0cf0766d",
+        "ed6e101037917df2a95472174f6a8e5fdf8f4c0887faf795e29c908b47bb62e6",
+        "3d9c64a5af1d565caa87fb0916d54230ff5ac182d6de54796e98662e6f6d96f0",
     }
 
 

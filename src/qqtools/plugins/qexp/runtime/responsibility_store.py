@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import re
+import stat
 import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -92,15 +93,7 @@ class DurableIO:
     def read(self, path: Path, limit: int) -> dict:
         with path.open("rb") as stream:
             data = stream.read(limit + 1)
-        if len(data) > limit:
-            raise Unavailable(f"record exceeds byte limit: {path}")
-        try:
-            value = json.loads(data)
-        except (ValueError, UnicodeError) as exc:
-            raise Unavailable(f"invalid JSON: {path}") from exc
-        if not isinstance(value, dict):
-            raise Unavailable(f"expected object: {path}")
-        return value
+        return _decode_record(data, path, limit)
 
     def sync(self, fd: int, kind: str, label: str) -> None:
         os.fsync(fd)
@@ -128,7 +121,75 @@ class DurableIO:
             self.sync_directory(path.parent, path.name)
 
 
-def read_ledger_instance(root: Path, *, io: DurableIO | None = None) -> str:
+def _decode_record(data: bytes, path: Path, limit: int) -> dict:
+    if len(data) > limit:
+        raise Unavailable(f"record exceeds byte limit: {path}")
+    try:
+        value = json.loads(data)
+    except (ValueError, UnicodeError) as exc:
+        raise Unavailable(f"invalid JSON: {path}") from exc
+    if not isinstance(value, dict):
+        raise Unavailable(f"expected object: {path}")
+    return value
+
+
+@contextmanager
+def _open_observation_directory(path: Path) -> Iterator[int]:
+    """Open each directory through its parent without following redirects."""
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    parts = path.absolute().parts
+    descriptor = os.open(parts[0], flags)
+    try:
+        for name in parts[1:]:
+            if name == "..":
+                raise Unavailable("observation path is not canonical")
+            child = os.open(name, flags, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = child
+        yield descriptor
+    finally:
+        os.close(descriptor)
+
+
+class _ObservationIO:
+    """Read only regular files through a pinned ledger or bucket directory."""
+
+    def __init__(self, directory: Path, descriptor: int) -> None:
+        self.directory = directory
+        self.descriptor = descriptor
+
+    def _open(self, path: Path) -> int:
+        if path.parent != self.directory:
+            raise Unavailable("observation record is outside its directory")
+        flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+        descriptor = os.open(path.name, flags, dir_fd=self.descriptor)
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            os.close(descriptor)
+            raise Unavailable(f"not a regular observation record: {path}")
+        return descriptor
+
+    def read(self, path: Path, limit: int) -> dict:
+        with os.fdopen(self._open(path), "rb") as stream:
+            return _decode_record(stream.read(limit + 1), path, limit)
+
+    @contextmanager
+    def lock(self, path: Path) -> Iterator[None]:
+        descriptor = self._open(path)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            yield
+        finally:
+            os.close(descriptor)
+
+    def has_entry(self, name: str) -> bool:
+        try:
+            os.stat(name, dir_fd=self.descriptor, follow_symlinks=False)
+        except FileNotFoundError:
+            return False
+        return True
+
+
+def read_ledger_instance(root: Path, *, io: DurableIO | _ObservationIO | None = None) -> str:
     """Validate fixed ledger identity without locks, initialization or mutation."""
     io = io if io is not None else DurableIO()
     try:
@@ -143,6 +204,13 @@ def read_ledger_instance(root: Path, *, io: DurableIO | None = None) -> str:
         raise Unavailable(f"incomplete responsibility initialization: {root}") from exc
 
 
+def _observe_ledger_instance(root: Path, descriptor: int) -> str:
+    io = _ObservationIO(root, descriptor)
+    if io.has_entry("initializing"):
+        raise Unavailable(f"responsibility initialization is pending: {root}")
+    return read_ledger_instance(root, io=io)
+
+
 class Ledger:
     """Paged active/maintenance membership, serialized by one flock per bucket.
 
@@ -153,10 +221,17 @@ class Ledger:
 
     io_type = DurableIO
 
-    def __init__(self, root: Path, io: DurableIO | None = None) -> None:
+    def __init__(self, root: Path, io: DurableIO | None = None, *, is_observation: bool = False) -> None:
         self.root = root
         self.io = io if io is not None else self.io_type()
-        self.instance = read_ledger_instance(root, io=self.io)
+        if is_observation:
+            try:
+                with _open_observation_directory(root) as descriptor:
+                    self.instance = _observe_ledger_instance(root, descriptor)
+            except OSError as exc:
+                raise Unavailable(f"cannot open responsibility storage: {root}") from exc
+        else:
+            self.instance = read_ledger_instance(root, io=self.io)
 
     @classmethod
     def create(cls, root: Path) -> Ledger:
@@ -262,8 +337,8 @@ class Ledger:
             except (OSError, KeyError, TypeError, IndexError) as exc:
                 raise Unavailable(f"incomplete bucket {bucket}: {exc}") from exc
 
-    def _header(self, directory: Path) -> dict:
-        value = self.io.read(directory / "header", HEADER_BYTES)
+    def _header(self, directory: Path, *, io: DurableIO | _ObservationIO | None = None) -> dict:
+        value = (self.io if io is None else io).read(directory / "header", HEADER_BYTES)
         self._validate_header(value)
         return value
 
@@ -286,8 +361,16 @@ class Ledger:
         ):
             raise Unavailable("invalid stage index header")
 
-    def _page(self, directory: Path, number: int, count: int, *, prefix: str = "p") -> list[str]:
-        entries = self.io.read(directory / f"{prefix}{number}", PAGE_BYTES).get("entries")
+    def _page(
+        self,
+        directory: Path,
+        number: int,
+        count: int,
+        *,
+        prefix: str = "p",
+        io: DurableIO | _ObservationIO | None = None,
+    ) -> list[str]:
+        entries = (self.io if io is None else io).read(directory / f"{prefix}{number}", PAGE_BYTES).get("entries")
         expected = min(PAGE_SIZE, count - number * PAGE_SIZE)
         if (
             not isinstance(entries, list)
@@ -299,8 +382,10 @@ class Ledger:
             raise Unavailable("invalid dense page")
         return entries
 
-    def _entry(self, directory: Path, key: str, slot: int | None = None) -> dict:
-        value = self.io.read(directory / f"e{key}", ENTRY_BYTES)
+    def _entry(
+        self, directory: Path, key: str, slot: int | None = None, *, io: DurableIO | _ObservationIO | None = None
+    ) -> dict:
+        value = (self.io if io is None else io).read(directory / f"e{key}", ENTRY_BYTES)
         if (
             not isinstance(value.get("identity"), str)
             or not value["identity"]
@@ -723,30 +808,92 @@ class Ledger:
         A returned cursor must be retried from the bucket start after Conflict.
         This is deliberately not yet a fair scheduling cursor under continuous churn.
         """
+        self._validate_page_limit(limit)
+        with self._locked(bucket) as directory:
+            records, next_cursor, _ = self._read_page(directory, bucket, cursor, limit)
+            return records, next_cursor
+
+    def observe_page(
+        self, bucket: int, cursor: dict | None = None, limit: int = PAGE_SIZE
+    ) -> tuple[list[dict], dict | None, int]:
+        """Observe a page and its bucket's membership count at the same revision.
+
+        Raises:
+            Unavailable: A pending transaction or incomplete storage prevents observation.
+            Conflict: The cursor belongs to a different instance, bucket, or revision.
+        """
+        self._validate_page_limit(limit)
+        with self._observation_bucket(bucket) as (directory, io, header):
+            return self._read_page(directory, bucket, cursor, limit, io=io, header=header)
+
+    def observe_count(self, bucket: int) -> int:
+        """Observe the current healthy bucket count without decoding members."""
+        with self._observation_bucket(bucket) as (_, _, header):
+            return header["count"]
+
+    @contextmanager
+    def _observation_bucket(self, bucket: int) -> Iterator[tuple[Path, _ObservationIO, dict]]:
+        if type(bucket) is not int or not 0 <= bucket < BUCKETS:
+            raise ValueError("invalid bucket")
+        directory = self.root / str(bucket)
+        try:
+            with _open_observation_directory(self.root) as root_descriptor:
+                if _observe_ledger_instance(self.root, root_descriptor) != self.instance:
+                    raise Conflict("responsibility ledger changed during observation")
+                flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+                descriptor = os.open(str(bucket), flags, dir_fd=root_descriptor)
+                try:
+                    io = _ObservationIO(directory, descriptor)
+                    with io.lock(directory / "lock"):
+                        if io.has_entry("pending"):
+                            raise Unavailable(f"pending transaction in bucket {bucket}")
+                        header = self._header(directory, io=io)
+                        if header.get("writer_capture_incomplete"):
+                            raise Unavailable(f"writer capture is incomplete in bucket {bucket}")
+                        yield directory, io, header
+                finally:
+                    os.close(descriptor)
+        except (OSError, KeyError, TypeError, IndexError) as exc:
+            raise Unavailable(f"incomplete bucket {bucket}: {exc}") from exc
+
+    @staticmethod
+    def _validate_page_limit(limit: int) -> None:
         if type(limit) is not int or not 1 <= limit <= PAGE_SIZE:
             raise ValueError("limit must be in 1..64")
-        with self._locked(bucket) as directory:
+
+    def _read_page(
+        self,
+        directory: Path,
+        bucket: int,
+        cursor: dict | None,
+        limit: int,
+        *,
+        io: DurableIO | _ObservationIO | None = None,
+        header: dict | None = None,
+    ) -> tuple[list[dict], dict | None, int]:
+        if header is None:
             header = self._header(directory)
-            slot = 0
-            if cursor is not None:
-                if (
-                    cursor.get("instance") != self.instance
-                    or cursor.get("bucket") != bucket
-                    or cursor.get("revision") != header["revision"]
-                ):
-                    raise Conflict("pagination changed; restart this bucket")
-                slot = cursor.get("slot")
-                if type(slot) is not int or not 0 <= slot < header["count"]:
-                    raise ValueError("invalid cursor slot")
-            if slot == header["count"]:
-                return [], None
-            entries = self._page(directory, slot // PAGE_SIZE, header["count"])
-            end = min(header["count"], slot + limit, (slot // PAGE_SIZE + 1) * PAGE_SIZE)
-            records = [self._entry(directory, entries[index % PAGE_SIZE], index) for index in range(slot, end)]
-            next_cursor = None
-            if end < header["count"]:
-                next_cursor = {"instance": self.instance, "bucket": bucket, "revision": header["revision"], "slot": end}
-            return records, next_cursor
+        count = header["count"]
+        slot = 0
+        if cursor is not None:
+            if (
+                cursor.get("instance") != self.instance
+                or cursor.get("bucket") != bucket
+                or cursor.get("revision") != header["revision"]
+            ):
+                raise Conflict("pagination changed; restart this bucket")
+            slot = cursor.get("slot")
+            if type(slot) is not int or not 0 <= slot < count:
+                raise ValueError("invalid cursor slot")
+        if slot == count:
+            return [], None, count
+        entries = self._page(directory, slot // PAGE_SIZE, count, io=io)
+        end = min(count, slot + limit, (slot // PAGE_SIZE + 1) * PAGE_SIZE)
+        records = [self._entry(directory, entries[index % PAGE_SIZE], index, io=io) for index in range(slot, end)]
+        next_cursor = None
+        if end < count:
+            next_cursor = {"instance": self.instance, "bucket": bucket, "revision": header["revision"], "slot": end}
+        return records, next_cursor, count
 
     def lookup(self, identity: str) -> dict:
         key = identity_key(identity)

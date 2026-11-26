@@ -77,6 +77,9 @@ class _QexpArgumentParser(argparse.ArgumentParser):
         setup_error = _setup_machine_assertion_error(parsed)
         if setup_error is not None:
             self.error(setup_error)
+        takeover_error = _takeover_options_error(parsed)
+        if takeover_error is not None:
+            self.error(takeover_error)
         return _normalize_machine_assertion(parsed)
 
 
@@ -120,6 +123,12 @@ def _common_option_conflict(argv: list[str]) -> str | None:
     values: dict[str, str] = {}
     argv = _cli_arguments(argv)
     stop = len(argv)
+    resource = _root_command_index(argv)
+    takeover_action = stop
+    if argv[resource : resource + 1] == ["project"]:
+        action = _root_command_index(argv, resource + 1)
+        if argv[action : action + 1] == ["takeover"]:
+            takeover_action = action
     index = 0
     while index < stop:
         token = argv[index]
@@ -129,6 +138,7 @@ def _common_option_conflict(argv: list[str]) -> str | None:
         if name not in _COMMON_OPTIONS:
             index += 1
             continue
+        is_takeover_target = index > takeover_action and name == "--machine"
         if "=" in token:
             value = token.split("=", 1)[1]
         elif index + 1 < stop:
@@ -139,6 +149,8 @@ def _common_option_conflict(argv: list[str]) -> str | None:
             continue
         normalized = _normalized_common_value(name, value)
         conflict_name = "--expect-machine" if name in _MACHINE_ASSERTION_OPTIONS else name
+        if is_takeover_target:
+            conflict_name = "project takeover --machine"
         previous = values.get(conflict_name)
         if previous is not None and previous != normalized:
             return f"conflicting values for {conflict_name}: {previous!r} and {value!r}."
@@ -167,6 +179,18 @@ def _setup_machine_assertion_error(args: argparse.Namespace) -> str | None:
     if handler.startswith("admin_migrate_"):
         return "qexp legacy migration accepts --machine NAME for migration identity; assertions are not valid here."
     return "qexp use does not accept a machine identity assertion."
+
+
+def _takeover_options_error(args: argparse.Namespace) -> str | None:
+    command_spec = getattr(args, "command_spec", None)
+    if getattr(command_spec, "handler", None) != "project_takeover":
+        return None
+    if not args.plan:
+        if args.tasks_after is not None or args.recovery_cursor is not None:
+            return "--tasks-after and --recovery-cursor require --plan."
+        if args.apply is None and args.add_primary_worker is not None:
+            return "--add-primary-worker requires --plan or --apply."
+    return None
 
 
 def _normalize_machine_assertion(args: argparse.Namespace) -> argparse.Namespace:
@@ -407,6 +431,47 @@ def build_parser() -> argparse.ArgumentParser:
         context=ContextKind.MACHINE,
         modes=OutputMode.FINITE,
         output_kinds=OutputKind.PROJECT_REGISTER,
+    )
+    project_takeover = project_sub.add_parser(
+        "takeover",
+        help="Plan or manage takeover of an existing Project machine name.",
+        description="Plan, apply, cancel, or inspect a takeover of one explicit Project machine name.",
+    )
+    project_takeover.add_argument("path", metavar="PATH")
+    project_takeover.add_argument(
+        "--machine",
+        dest="project_machine",
+        required=True,
+        metavar="NAME",
+        help="Existing Project registration name to take over.",
+    )
+    project_takeover.add_argument(
+        "--expect-machine",
+        action=_StoreMachineAssertion,
+        metavar="NAME",
+        default=argparse.SUPPRESS,
+        help="Assert the local MachineRuntime name independently of the takeover target.",
+    )
+    takeover_actions = project_takeover.add_mutually_exclusive_group(required=True)
+    takeover_actions.add_argument("--plan", action="store_true", help="Show a read-only preview.")
+    takeover_actions.add_argument("--apply", metavar="PLAN_ID", help="Confirm and accept a previewed takeover.")
+    takeover_actions.add_argument("--cancel", metavar="PLAN_ID", help="Request cancellation before shared commit.")
+    takeover_actions.add_argument("--operation-status", metavar="PLAN_ID", help="Inspect an accepted takeover.")
+    project_takeover.add_argument(
+        "--add-primary-worker",
+        action="append",
+        metavar="GROUP",
+        help="Include a primary worker addition for the target machine in this Group. Repeat for each Group.",
+    )
+    project_takeover.add_argument("--recovery-cursor", help="Continue paging local recovery records.")
+    project_takeover.add_argument("--tasks-after", metavar="TASK_ID", help="Show affected Tasks after this ID.")
+    _add_output_format(project_takeover)
+    bind_command(
+        project_takeover,
+        handler="project_takeover",
+        context=ContextKind.MACHINE,
+        modes=OutputMode.FINITE,
+        output_kinds=OutputKind.PROJECT_TAKEOVER,
     )
     project_list = project_sub.add_parser("list", help="List local Project registrations.")
     _add_output_format(project_list)

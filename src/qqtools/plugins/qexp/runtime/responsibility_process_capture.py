@@ -65,6 +65,105 @@ def _process_stat(path: Path, pid: int) -> tuple[str, int]:
         raise Unavailable("process capture could not classify process stat") from exc
 
 
+def _runner_locator(cfg: RootConfig, legacy_source: Path | None, raw: bytes) -> tuple[str, dict, Path | None] | None:
+    arguments = os.fsdecode(raw).rstrip("\0").split("\0")
+    if arguments[1:3] != ["-m", RUNNER_MODULE] or arguments[3:4] == ["--guardian"]:
+        return None
+    if not raw.endswith(b"\0"):
+        raise Unavailable("runner command is incomplete")
+    options = arguments[3:]
+    if len(options) % 2 or len(set(options[::2])) != len(options[::2]):
+        raise Unavailable("runner command options are ambiguous")
+    fields = dict(zip(options[::2], options[1::2]))
+    if fields.get("--machine") != cfg.machine_name:
+        return None
+    shared = fields.get("--shared-root")
+    if not shared or not Path(shared).is_absolute():
+        raise Unavailable("runner command has no absolute shared root")
+    # Supported runner launches already carry canonical absolute paths.
+    # Resolving a command belonging to another Project here would cross
+    # shared storage while the local capture checkpoint is held.
+    if Path(shared) != cfg.shared_root:
+        return None
+    root = fields.get("--runtime-root")
+    if not root or not Path(root).is_absolute():
+        raise Unavailable("runner command has no absolute runtime root")
+    runtime = Path(root)
+    if runtime not in {cfg.runtime_root, legacy_source}:
+        return None
+    if set(fields) != RUNNER_OPTIONS:
+        raise Unavailable("runner command does not match the supported launch protocol")
+    try:
+        identity = validate_identifier(fields["--attempt-id"], "attempt_id")
+        task_id = validate_identifier(fields["--task-id"], "task_id")
+        validate_identifier(fields["--launch-id"], "launch_id")
+        if int(fields["--fencing-token"]) < 1:
+            raise ValueError("invalid fencing token")
+        payload = recovery_locator(identity, {"task_id": task_id})
+    except ValueError as exc:
+        raise Unavailable("runner command has an invalid recovery identity") from exc
+    source = runtime if runtime != cfg.runtime_root else None
+    return identity, payload, source
+
+
+def _observe_runner(cfg: RootConfig, legacy_source: Path | None, entry: os.DirEntry, scope: dict) -> dict | None:
+    if not entry.name.isascii() or not entry.name.isdecimal() or int(entry.name) < 1:
+        return None
+    pid = int(entry.name)
+    process = Path(entry.path)
+    try:
+        metadata = entry.stat(follow_symlinks=False)
+        if metadata.st_uid != os.getuid():
+            return None
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise Unavailable("process capture encountered a non-directory PID")
+        with (process / "cmdline").open("rb") as stream:
+            raw = stream.read(COMMAND_BYTES + 1)
+        # Most same-user processes are unrelated.  Filter them before strict
+        # identity parsing so a malformed transient /proc stat cannot stall
+        # recovery enrollment for every project on the machine.
+        if len(raw) > COMMAND_BYTES:
+            if os.fsdecode(raw).split("\0")[1:3] == ["-m", RUNNER_MODULE]:
+                raise Unavailable("runner command exceeds its capture byte bound")
+            return None
+        if _runner_locator(cfg, legacy_source, raw) is None:
+            return None
+        before = _process_stat(process / "stat", pid)
+        if before[0] == "Z":
+            return None
+        with (process / "cmdline").open("rb") as stream:
+            raw = stream.read(COMMAND_BYTES + 1)
+        after = _process_stat(process / "stat", pid)
+    except (FileNotFoundError, ProcessLookupError):
+        return None
+    if before[1] != after[1] or after[0] == "Z":
+        return None
+    if len(raw) > COMMAND_BYTES:
+        raise Unavailable("runner command exceeds its capture byte bound")
+    locator = _runner_locator(cfg, legacy_source, raw)
+    if locator is None:
+        return None
+    identity, payload, source = locator
+    record = {
+        "identity": identity,
+        "payload": payload,
+        "writer": {**scope, "pid": pid, "start_time_ticks": after[1]},
+    }
+    if source is not None:
+        record["legacy_source"] = str(source)
+    return record
+
+
+def has_live_runner(cfg: RootConfig) -> bool:
+    """Observe the current PID namespace after the caller has closed runner admission."""
+    scope = _process_scope()
+    with os.scandir(PROC_ROOT) as entries:
+        found = any(_observe_runner(cfg, None, entry, scope) is not None for entry in entries)
+    if _process_scope() != scope:
+        raise Unavailable("runner process observation scope changed")
+    return found
+
+
 @dataclass(frozen=True)
 class ProcessCaptureProgress:
     entries_visited: int
@@ -212,93 +311,6 @@ class RunnerProcessCapture:
             raise Unavailable("process sweep context changed or its progress is invalid")
         return previous
 
-    def _runner_locator(self, raw: bytes) -> tuple[str, dict, Path | None] | None:
-        arguments = os.fsdecode(raw).rstrip("\0").split("\0")
-        if arguments[1:3] != ["-m", RUNNER_MODULE] or arguments[3:4] == ["--guardian"]:
-            return None
-        if not raw.endswith(b"\0"):
-            raise Unavailable("runner command is incomplete")
-        options = arguments[3:]
-        if len(options) % 2 or len(set(options[::2])) != len(options[::2]):
-            raise Unavailable("runner command options are ambiguous")
-        fields = dict(zip(options[::2], options[1::2]))
-        if fields.get("--machine") != self.cfg.machine_name:
-            return None
-        shared = fields.get("--shared-root")
-        if not shared or not Path(shared).is_absolute():
-            raise Unavailable("runner command has no absolute shared root")
-        # Supported runner launches already carry canonical absolute paths.
-        # Resolving a command belonging to another Project here would cross
-        # shared storage while the local capture checkpoint is held.
-        if Path(shared) != self.cfg.shared_root:
-            return None
-        root = fields.get("--runtime-root")
-        if not root or not Path(root).is_absolute():
-            raise Unavailable("runner command has no absolute runtime root")
-        runtime = Path(root)
-        if runtime not in {self.checkpoint.runtime_root, self.checkpoint.legacy_source}:
-            return None
-        if set(fields) != RUNNER_OPTIONS:
-            raise Unavailable("runner command does not match the supported launch protocol")
-        try:
-            identity = validate_identifier(fields["--attempt-id"], "attempt_id")
-            task_id = validate_identifier(fields["--task-id"], "task_id")
-            validate_identifier(fields["--launch-id"], "launch_id")
-            if int(fields["--fencing-token"]) < 1:
-                raise ValueError("invalid fencing token")
-            payload = recovery_locator(identity, {"task_id": task_id})
-        except ValueError as exc:
-            raise Unavailable("runner command has an invalid recovery identity") from exc
-        source = runtime if runtime != self.checkpoint.runtime_root else None
-        return identity, payload, source
-
-    def _observe(self, entry: os.DirEntry, scope: dict) -> dict | None:
-        if not entry.name.isascii() or not entry.name.isdecimal() or int(entry.name) < 1:
-            return None
-        pid = int(entry.name)
-        process = Path(entry.path)
-        try:
-            metadata = entry.stat(follow_symlinks=False)
-            if metadata.st_uid != os.getuid():
-                return None
-            if not stat.S_ISDIR(metadata.st_mode):
-                raise Unavailable("process capture encountered a non-directory PID")
-            with (process / "cmdline").open("rb") as stream:
-                raw = stream.read(COMMAND_BYTES + 1)
-            # Most same-user processes are unrelated.  Filter them before strict
-            # identity parsing so a malformed transient /proc stat cannot stall
-            # recovery enrollment for every project on the machine.
-            if len(raw) > COMMAND_BYTES:
-                if os.fsdecode(raw).split("\0")[1:3] == ["-m", RUNNER_MODULE]:
-                    raise Unavailable("runner command exceeds its capture byte bound")
-                return None
-            if self._runner_locator(raw) is None:
-                return None
-            before = _process_stat(process / "stat", pid)
-            if before[0] == "Z":
-                return None
-            with (process / "cmdline").open("rb") as stream:
-                raw = stream.read(COMMAND_BYTES + 1)
-            after = _process_stat(process / "stat", pid)
-        except (FileNotFoundError, ProcessLookupError):
-            return None
-        if before[1] != after[1] or after[0] == "Z":
-            return None
-        if len(raw) > COMMAND_BYTES:
-            raise Unavailable("runner command exceeds its capture byte bound")
-        locator = self._runner_locator(raw)
-        if locator is None:
-            return None
-        identity, payload, source = locator
-        record = {
-            "identity": identity,
-            "payload": payload,
-            "writer": {**scope, "pid": pid, "start_time_ticks": after[1]},
-        }
-        if source is not None:
-            record["legacy_source"] = str(source)
-        return record
-
     def take(self, limit: int = CAPTURE_BATCH_SIZE) -> ProcessCaptureProgress:
         """Visit at most limit directory entries after replaying durable observations."""
         if type(limit) is not int or not 1 <= limit <= CAPTURE_BATCH_SIZE:
@@ -328,7 +340,7 @@ class RunnerProcessCapture:
                         is_complete = True
                         break
                     visited += 1
-                    observation = self._observe(entry, scope)
+                    observation = _observe_runner(self.cfg, self.checkpoint.legacy_source, entry, scope)
                     if observation is not None:
                         records.append(observation)
                 progress = {**state, "revision": state["revision"] + 1, "is_sweep_complete": is_complete}

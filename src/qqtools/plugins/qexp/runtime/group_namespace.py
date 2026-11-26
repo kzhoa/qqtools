@@ -163,19 +163,21 @@ def read_group_raw(root: Path, name: str) -> dict[str, Any]:
     return value if current == directory else _read_group_record(current, name)
 
 
-def _submission_state(root: Path, operation_id: str) -> str:
+def _submission_state(root: Path, operation_id: str, *, should_request_repair: bool = True) -> str:
     """Read one bounded Submission proof without requiring a RootConfig object."""
     from .submission_control import read_submission_state
 
     try:
-        return read_submission_state(root, operation_id)
+        return read_submission_state(root, operation_id, should_request_repair=should_request_repair)
     except (FileNotFoundError, OSError, ValueError, RuntimeError) as exc:
         raise GroupPublicationUnavailable(
             f"Group publication proof for operation {operation_id!r} is unavailable."
         ) from exc
 
 
-def group_visibility(root: Path, name: str, value: dict[str, Any] | None = None) -> dict[str, Any]:
+def group_visibility(
+    root: Path, name: str, value: dict[str, Any] | None = None, *, should_request_repair: bool = True
+) -> dict[str, Any]:
     """Return the one published Group projection shared by all ordinary readers.
 
     A Group created by a Submission is published only after its exact operation
@@ -194,7 +196,7 @@ def group_visibility(root: Path, name: str, value: dict[str, Any] | None = None)
             validate_identifier(creation_operation_id, "creation_operation_id")
         except (TypeError, ValueError) as exc:
             raise GroupPublicationUnavailable(f"Group {name!r} has invalid creation provenance.") from exc
-        state = _submission_state(root, creation_operation_id)
+        state = _submission_state(root, creation_operation_id, should_request_repair=should_request_repair)
         if state != "committed":
             raise GroupNotPublished(
                 f"Group {name!r} is not published; Submission operation {creation_operation_id!r} is {state}."
@@ -212,7 +214,9 @@ def group_visibility(root: Path, name: str, value: dict[str, Any] | None = None)
             raise GroupPublicationUnavailable(
                 f"Group {name!r} has invalid Worker publication provenance for {machine!r}."
             ) from exc
-        state = states.setdefault(operation_id, _submission_state(root, operation_id))
+        state = states.setdefault(
+            operation_id, _submission_state(root, operation_id, should_request_repair=should_request_repair)
+        )
         if state != "committed":
             del workers[machine]
     return value

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 import uuid
+from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
 from ..runtime.store import atomic_replace, read_json_limited
@@ -58,13 +59,19 @@ class ActivationWakeFence:
             },
         )
 
-    def capture(self, registry_revision: int, bindings: list[ProjectBinding]) -> None:
+    def capture(
+        self,
+        registry_revision: int,
+        bindings: Sequence[ProjectBinding],
+        *,
+        bindings_to_activate: Sequence[ProjectBinding] | None = None,
+    ) -> None:
         """Capture before service work and invalidate all older binding turns."""
         was_captured = self._has_captured
         self._has_captured = False
         generation = self._read()
         if generation != self._generation or (not was_captured and self._registry_revision is not None):
-            for binding in bindings:
+            for binding in bindings if bindings_to_activate is None else bindings_to_activate:
                 self.runtime.working_set.activate(binding, "local_activation")
         self._generation = generation
         self._registry_revision = registry_revision

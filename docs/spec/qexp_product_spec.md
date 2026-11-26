@@ -62,6 +62,77 @@ New Projects use the target protocol directly. Delivery requires released-source
 fixtures, crash/retry tests, and actual stop/upgrade/start verification; this
 contract alone is not evidence that those checks have passed.
 
+## Project takeover after machine loss
+
+To inspect a registration after machine loss, run
+`qexp project takeover PATH --machine NAME --plan`. Ordinary Project status
+links to the preview help with the selected Project and MachineRuntime paths.
+It also reports the Project-local machine name when the local runtime binding
+and the shared registration agree. Status shows disabled or expired bindings
+and reports when it cannot verify the match.
+The operator supplies the target name explicitly. The preview reports the
+current local binding if present and the target owner, registration generation,
+and write-eligibility expiry. It leaves registration, admission, Task history,
+and Group membership untouched. A live target registration blocks takeover.
+Expired eligibility alone provides no evidence that an old training process
+has exited.
+
+The registration preview returns exit code 0 with status `preview` when these
+registration checks pass, and exit code 1 with status `blocked` and scoped
+reasons when a registration check fails. Unreadable or invalid input records
+return an operational error. The preview is an observation and does not grant
+authority to replace a registration.
+
+For an existing local binding, the preview includes the observed count and a
+page of its recovery ledger. Use the returned `--recovery-cursor` to continue.
+A record can identify an Attempt, a known control-plane diagnostic, or an
+unidentified obligation. A recorded cleanup receipt describes evidence in
+the ledger. It cannot authorize retirement from the preview. Records may
+change between pages. If a cursor expires, start a new preview. A pending or
+unreadable ledger is reported as unavailable and is left for normal recovery.
+
+When the target's eligibility has expired or is superseded, the preview counts
+published Tasks whose home or active claim names that target. It reports pages
+of Task state, exact Attempt evidence when available, and queued Task placement.
+Continue from the returned Task ID with `--tasks-after TASK_ID`. If a Group
+lacks the target worker, the preview identifies a possible primary worker
+addition and the affected Tasks on the page. Placement observations do not
+verify capacity or dependencies. Shared Attempt evidence cannot establish the
+old process's current state on an inaccessible machine.
+
+A clear preview provides a fresh plan ID. Confirm it with
+`qexp project takeover PATH --machine NAME --apply PLAN_ID`. Repeat each
+`--add-primary-worker GROUP` selection used in the preview. The plan binds the
+Project and runtime, the departing binding and its enablement, the target's
+observed owner and expiry, and each selected Group's revision and affected
+queued Tasks. Re-preview if those inputs change. Normal lease renewal of the
+departing binding can continue while the target remains ineligible.
+
+After acceptance the agent continues in the background. It closes admission on
+the departing Project binding while existing Attempts finish. The machine-wide
+default and other Project bindings retain their scope. Project status shows the
+active phase, the effective local binding, and any drain evidence that the
+agent could not verify. Use `--operation-status PLAN_ID` on the same takeover
+command to read an active operation or its terminal receipt.
+
+Use `--cancel PLAN_ID` to request cancellation. The agent settles any in-flight
+registration worker and checks the shared grant before resolving the request.
+Before the grant, cancellation restores the departing admission when its
+registration remains current. After the grant, replay publishes the successor.
+Existing training continues independently of takeover and cancellation. Terminal
+local evidence that passes the drain check is retained in a machine-local archive
+under `archives/project-takeovers/PLAN_ID`. Shared Task history and Attempt
+attribution remain queryable. Recovery of interrupted training requires an
+explicit Task recovery decision.
+
+The successor's registration and binding can be effective while Group changes
+are pending. The agent applies only confirmed additions and records the result
+of each. A temporary failure is retried at the same step. Repeating
+`--apply PLAN_ID` resumes the exact operation. If a Group or its confirmed
+placement impact changes, the agent reports a stale Group step and keeps the
+newer state. Inspect the updated Group and affected Tasks before authorizing a
+new Group change.
+
 ## Schema 6 clock capability and local-safe execution
 
 This section supersedes prior statements that every qexp path needs chrony. Qualified clock

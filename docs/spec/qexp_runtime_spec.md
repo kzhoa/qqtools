@@ -149,6 +149,39 @@ validation. Inaccessible roots remain pending and retry. Source interpretation
 is confined to compatibility-marked conversion and journal preparation; malformed
 or unsupported records retain their evidence and block the affected Project.
 
+## Takeover of an existing registration
+
+A takeover confirms the exact target registration witness. It shares the
+machine-local registration mutation slot and the shared target-name reservation
+with existing enrollment and replacement. The journal preallocates one
+successor generation. The agent uses the Project I/O arbiter to reserve, observe,
+commit, and release that exact transition. A failed or ambiguous transport
+result grants no authority. After verified worker exit, a fresh observation
+determines whether the target grant already exists.
+
+The departing binding continues to supervise admitted work with new admission
+disabled. The final drain checks local reservations, in-flight launch handoffs,
+old-generation executor requests, and retained recovery evidence. Terminal
+Attempt truth authorizes retirement only with settled publication, stop, and
+writer evidence. The final proof excludes new old-generation Project I/O.
+Unidentified or unavailable evidence retains the departing partition. The
+controller holds only machine-local guards while changing binding state and
+archiving the partition.
+
+The atomic shared publication of the exact successor registration commits the
+handover. The commit rechecks target write eligibility and both registration
+identities under the registration fence. Replay of a committed grant updates
+the exact successor metadata and departing registration before publishing the
+local successor. Before the grant, an abort verifies the departing registration
+and releases only its own reservation. An abort that observes the successor
+preserves the reservation and continues exact commit replay.
+
+Confirmed Group additions run after binding publication. Each addition rechecks
+the approved Group and Task placement under the Group writer lock. The
+new worker records the plan ID so a retry can repair the ready projection
+without changing the Group or reapplying completed additions. Per-Group
+outcomes are independent of registration completion.
+
 ## Schema 6 clock-capability authority contract
 
 This section supersedes prior chrony-only, single-skew lease, and bare wall-clock offer rules.

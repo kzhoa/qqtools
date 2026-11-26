@@ -238,7 +238,7 @@ def _validate_machine_assertion(args: argparse.Namespace) -> None:
     runtime = MachineRuntime(getattr(args, "machine_runtime_root", None))
     try:
         actual = load_agent_config(runtime).name
-    except RuntimeError as exc:
+    except (OSError, RuntimeError, ValueError, TypeError, KeyError) as exc:
         raise CliOperationalError(str(exc)) from exc
     if assertion != actual:
         raise CliUsageError(
@@ -283,12 +283,14 @@ def _resolve_cfg(
             )
         return execution_context.cfg, execution_context
 
-    # Read-only project commands should use the binding-owned local runtime when one is
-    # available, while remaining usable for observation before local registration.
-    try:
-        execution_context = machine_runtime.verified_execution_context(selection.shared_root)
-    except (ValueError, RuntimeError):
-        execution_context = None
+    # Status verifies enrollment in its bounded observation pass. An identity assertion
+    # still needs the existing verified execution binding.
+    execution_context = None
+    if args.command_spec.handler != "status" or assertion is not None:
+        try:
+            execution_context = machine_runtime.verified_execution_context(selection.shared_root)
+        except (ValueError, RuntimeError):
+            pass
     if execution_context is not None:
         verified_machine = execution_context.cfg.machine_name
         if assertion is not None and assertion != verified_machine:

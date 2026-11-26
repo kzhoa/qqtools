@@ -862,7 +862,10 @@ operations, not an I/O latency guarantee or recovery from arbitrary corruption.
 
 A bucket `flock` is a leaf lock. Store methods never acquire Task, Group,
 reservation, Attempt-control or machine authority locks while holding it.
-Readers finish pending redo under the same bucket fence before returning pages.
+Readers that can recover the store finish pending redo under the same bucket
+fence before returning pages. The read-only `observe_page` path reports a
+pending transaction as unavailable and returns its count and page from the
+same bucket revision when no redo is pending.
 
 Background cleanup first tries the per-Attempt evidence-write guard, then the
 existing Attempt-control lock, without waiting on either. Manifest and intent

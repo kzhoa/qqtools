@@ -40,6 +40,17 @@ def load_identity_record(path: Path) -> dict[str, Any] | None:
             f"machine runtime identity is malformed at {path}; "
             "preserve runtime data and recover the original identity from a verified backup." + _DIAGNOSIS_GUIDANCE
         ) from exc
+    record = decode_identity_record(value)
+    if record is None:
+        raise MachineRuntimeIdentityError(
+            f"machine runtime identity is malformed at {path}; "
+            "preserve runtime data and recover the original identity from a verified backup." + _DIAGNOSIS_GUIDANCE
+        )
+    return record
+
+
+def decode_identity_record(value: dict[str, Any]) -> dict[str, Any] | None:
+    """Return the validated machine runtime record from a decoded identity envelope."""
     record = value.get("machine_runtime")
     if isinstance(record, dict):
         seed = record.get("instance_id")
@@ -57,10 +68,7 @@ def load_identity_record(path: Path) -> dict[str, Any] | None:
             )
         ):
             return record
-    raise MachineRuntimeIdentityError(
-        f"machine runtime identity is malformed at {path}; "
-        "preserve runtime data and recover the original identity from a verified backup." + _DIAGNOSIS_GUIDANCE
-    )
+    return None
 
 
 def require_fresh_runtime(root: Path) -> None:

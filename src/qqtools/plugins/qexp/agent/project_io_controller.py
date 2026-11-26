@@ -37,7 +37,7 @@ from ..runtime.resources.reservations import (
     reserve_admitted,
     retag_if_matches,
 )
-from ..runtime.store import read_json_limited
+from ..runtime.store import atomic_replace, read_json_limited
 from ..runtime.submission_control_continuation import submission_control_continuation
 from .bindings import ProjectBinding
 from .context import MachineRuntime
@@ -60,6 +60,8 @@ from .project_io_protocol import (
 )
 from .ready_cursor_validation import validate_ready_cursor_transition
 from .snapshot_publication_health import SNAPSHOT_HEALTH_ITEM_LIMIT, SnapshotPublicationHealth
+from .takeover_coordinator import TakeoverCoordinator, takeover_frozen_owner
+from .takeover_intent import TakeoverIntent, read_takeover_intent, takeover_issue_path
 from .working_set import BindingTurn
 
 _INITIAL_BACKOFF_SECONDS = 5.0
@@ -130,6 +132,7 @@ _VALIDATION_INDEPENDENT_RECONCILIATION_OPERATION_KINDS = frozenset(
         "maintenance_descriptor_advance",
         "maintenance_flush_event",
         "registration_renew",
+        "takeover_registration",
         "activation_observe",
         "activation_consumer_register",
         "activation_consumer_ack",
@@ -193,6 +196,7 @@ _SERVICE_CLASS_BY_OPERATION_KIND = {
     "recovery_capture_transition": "background",
     "validate_binding": "authority",
     "registration_renew": "authority",
+    "takeover_registration": "background",
     "authority_service": "authority",
     "authority_renewal": "authority",
     "authority_orphan_recovery": "authority",
@@ -323,6 +327,11 @@ class ProjectIOController:
     ) -> None:
         self.runtime = runtime
         self.executor = executor
+        self._takeover = TakeoverCoordinator(runtime)
+        self._takeover_retains_demand = False
+        self._takeover_issue: tuple[str, str, str] | None = None
+        self._takeover_frozen_owner: tuple[str, str, str] | None = None
+        self._takeover_is_publishing = False
         self._admission = ProjectIOAdmission(monotonic=monotonic)
         self._admission_scope_active = False
         self._final_healthy_executor_epoch: str | None = None
@@ -377,6 +386,186 @@ class ProjectIOController:
         self._registration_deadlines: dict[_ValidationIdentity, float] = {}
         self._submission_turns: dict[_ValidationIdentity, BindingTurn] = {}
         self.progress = ProgressObservationCoordinator(runtime, clock=monotonic)
+
+    def advance_takeover(self, registry_revision: int) -> bool:
+        """Run one durable takeover turn before collecting ordinary Project work."""
+        intent = None
+        try:
+            intent = read_takeover_intent(self.runtime.root)
+            self._apply_takeover_fence(intent)
+            retains_demand = self._takeover.advance(self, registry_revision)
+            intent = read_takeover_intent(self.runtime.root)
+            self._apply_takeover_fence(intent)
+        except (OSError, RuntimeError, ValueError, KeyError, TypeError) as exc:
+            if intent is not None:
+                reason = f"{type(exc).__name__}: {exc}"[:512]
+                issue = (intent.plan_id, intent.phase, reason)
+                if issue != self._takeover_issue:
+                    try:
+                        atomic_replace(
+                            takeover_issue_path(self.runtime.root),
+                            {"plan_id": intent.plan_id, "phase": intent.phase, "reason": reason},
+                        )
+                    except (OSError, RuntimeError, ValueError):
+                        pass
+                    else:
+                        self._takeover_issue = issue
+            self._takeover_retains_demand = True
+            return True
+        self._takeover_retains_demand = retains_demand
+        return retains_demand
+
+    def _apply_takeover_fence(self, intent: TakeoverIntent | None) -> None:
+        self._takeover_frozen_owner = takeover_frozen_owner(intent) if intent is not None else None
+        self._takeover_is_publishing = intent is not None and intent.phase == "publishing_binding"
+
+    def is_takeover_binding_retiring(self, binding: ProjectBinding) -> bool:
+        """Keep ordinary local services from recreating a partly archived partition."""
+        return self._takeover_is_publishing and self.is_takeover_binding_frozen(binding)
+
+    def is_takeover_binding_frozen(self, binding: ProjectBinding) -> bool:
+        """Exclude departing-generation local work during final drain proof and publication."""
+        return self._takeover_frozen_owner == (
+            binding.runtime_instance_id,
+            binding.project_id,
+            binding.registration_generation,
+        )
+
+    def _read_active_takeover_intent(self) -> TakeoverIntent | None:
+        try:
+            intent = read_takeover_intent(self.runtime.root)
+        except (OSError, RuntimeError, ValueError, TypeError):
+            return None
+        if intent is not None and (
+            intent.transition.successor_runtime_id == self.executor.runtime_id
+            and intent.transition.successor_runtime_root == self.runtime.root == self.executor.root
+        ):
+            return intent
+        return None
+
+    @_admission_operation
+    def advance_takeover_registration(
+        self, intent: TakeoverIntent, registry_revision: int, step: str | None, *, group_name: str | None = None
+    ) -> tuple[str, str] | None:
+        """Settle an exact shared takeover step or offer the next step for admission."""
+        status, unresolved = self._poll_admission_executor()
+        epoch = status.get("executor_epoch")
+        if not isinstance(epoch, str) or status.get("envelope") == "unknown":
+            return None
+        if self._read_active_takeover_intent() != intent:
+            return None
+
+        transition = intent.transition
+        identity = _ValidationIdentity(
+            transition.successor_runtime_id,
+            epoch,
+            transition.project_id,
+            str(transition.shared_root),
+            transition.target.machine_name,
+            transition.successor_generation,
+            str(transition.successor_runtime_root),
+            registry_revision,
+        )
+        kind = "takeover_registration"
+        service_key = (identity, kind, "takeover", "registration")
+        current_request = None
+        for request in unresolved:
+            if request.operation_kind != kind:
+                continue
+            # The journal owns the transaction across unrelated registry edits.
+            if (
+                self._request_identity(request) == replace(identity, registry_revision=request.registry_revision)
+                and request.parameters["plan_id"] == intent.plan_id
+                and (request.parameters["step"] != "group" or request.parameters.get("group_name") == group_name)
+                and _json_copy(request.parameters["transition"]) == transition.to_dict()
+            ):
+                current_request = request
+            elif self.executor.resolve_stale_request(request.request_id, request):
+                self._started_requests.discard(request.request_id)
+            else:
+                return None
+
+        if current_request is not None:
+            return self._settle_takeover_registration_request(current_request, step, service_key)
+        if step is not None and self._service_retry_is_due(service_key):
+            self._offer_new_request(
+                identity,
+                kind,
+                partial(
+                    self._prepare_takeover_registration_request,
+                    intent,
+                    registry_revision,
+                    step,
+                    service_key,
+                    group_name,
+                ),
+                intent.plan_id,
+                step,
+                group_name or "registration",
+            )
+        return None
+
+    def _settle_takeover_registration_request(
+        self,
+        request: ProjectIORequest,
+        step: str | None,
+        service_key: tuple[_ValidationIdentity, str, str, str],
+    ) -> tuple[str, str] | None:
+        request_id = request.request_id
+        actual_step = request.parameters["step"]
+        pending_result = self.executor.load_result(request_id)
+        if pending_result is not None and pending_result.request != request:
+            raise ProjectIOProtocolError("takeover registration result differs from its exact request.")
+        if pending_result is not None and pending_result.status == "outcome_unknown":
+            if self.executor.resolve_stale_request(request_id, request):
+                self._started_requests.discard(request_id)
+                self._record_service_failure(service_key)
+                return actual_step, "outcome_unknown"
+            return None
+
+        result = self.executor.consume(request_id, request)
+        if result is not None:
+            self._started_requests.discard(request_id)
+            if result.status == "completed":
+                self._service_backoff.pop(service_key, None)
+                return actual_step, result.evidence["outcome"]
+            self._record_service_failure(service_key)
+            return actual_step, "outcome_unknown"
+
+        if step != actual_step:
+            if self.executor.resolve_stale_request(request_id, request):
+                self._started_requests.discard(request_id)
+                return actual_step, "outcome_unknown"
+            return None
+        if (
+            pending_result is None
+            and request_id not in self._started_requests
+            and self._service_retry_is_due(service_key)
+        ):
+            try:
+                self.executor._load_process(request_id)
+            except FileNotFoundError:
+                self._start_observation_request(request, service_key)
+        return None
+
+    def _prepare_takeover_registration_request(
+        self,
+        intent: TakeoverIntent,
+        registry_revision: int,
+        step: str,
+        service_key: tuple[_ValidationIdentity, str, str, str],
+        group_name: str | None,
+    ) -> None:
+        if self._read_active_takeover_intent() != intent:
+            return
+        try:
+            request = self.executor.prepare_takeover_registration(
+                intent, registry_revision, step, group_name=group_name
+            )
+        except (OSError, RuntimeError, ValueError):
+            self._record_service_failure(service_key)
+            return
+        self._start_observation_request(request, service_key)
 
     @_admission_operation
     def advance_upgrade_work(
@@ -539,6 +728,8 @@ class ProjectIOController:
 
     def pending_wait_seconds(self, default: float) -> float:
         """Bound idle waits while admitted work or responsive workers need polling."""
+        if self._takeover_retains_demand:
+            default = min(default, 0.5)
         if self._admission.pending_count or self._pending_claim_offers:
             return min(default, 0.1)
         if self._admission.has_deferred_work or self._needs_successor_turn:
@@ -655,6 +846,10 @@ class ProjectIOController:
             for binding in self.runtime.activation_consumer_retirements.select_pending(bindings, limit=64)
             if isinstance(binding.registration_generation, str) and binding.registration_generation
         )
+        takeover = self._read_active_takeover_intent()
+        if takeover is not None:
+            transition = takeover.transition
+            owners.append((self.executor.runtime_id, transition.project_id, transition.successor_generation))
         self._admission.begin(owners, blocked=blocked, free_slots=free_slots)
         return status, unresolved
 
@@ -666,6 +861,8 @@ class ProjectIOController:
         *parts: str,
         deadline: float | None = None,
     ) -> None:
+        if identity.request_owner == self._takeover_frozen_owner:
+            return
         service_class = _SERVICE_CLASS_BY_OPERATION_KIND.get(kind)
         if service_class is None:
             raise ValueError(f"operation kind {kind!r} has no Project I/O admission class.")
@@ -6022,14 +6219,18 @@ class ProjectIOController:
         )
 
     def _request_identity(self, request: ProjectIORequest) -> _ValidationIdentity:
+        if request.operation_kind == "idle_decision_guard":
+            machine_name = request.project_id
+        elif request.operation_kind == "takeover_registration":
+            machine_name = request.parameters["transition"]["target"]["machine_name"]
+        else:
+            machine_name = request.parameters["machine_name"]
         return _ValidationIdentity(
             request.runtime_id,
             request.executor_epoch,
             request.project_id,
             request.canonical_shared_root,
-            request.project_id
-            if request.operation_kind == "idle_decision_guard"
-            else request.parameters["machine_name"],
+            machine_name,
             request.registration_generation,
             str(self.runtime.root),
             request.registry_revision,

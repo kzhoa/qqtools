@@ -38,6 +38,7 @@ class OutputKind(str, Enum):
     MACHINE_INIT = "machine-init"
     PROJECT_OPERATION = "project-operation"
     PROJECT_REGISTER = "project-register"
+    PROJECT_TAKEOVER = "project-takeover"
     PROJECT_LIST = "project-list"
     CPU_LANE = "cpu-lane"
     GPU_POLICY = "gpu-policy"

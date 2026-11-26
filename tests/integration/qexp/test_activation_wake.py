@@ -216,3 +216,28 @@ def test_isolated_idle_requires_all_service_lanes_to_settle(tmp_path, monkeypatc
 
     monkeypatch.setattr(runtime, "iter_recovery_blockers", forbidden)
     assert not _machine_is_true_idle(runtime, has_consumed_binding=True)
+
+
+def test_wake_does_not_recreate_a_partly_archived_project_partition(tmp_path):
+    runtime = _runtime(tmp_path)
+    departing_cfg = init_shared_root(tmp_path / "departing/.qexp", "gpu-1")
+    peer_cfg = init_shared_root(tmp_path / "peer/.qexp", "gpu-1")
+    departing = runtime.add_binding(departing_cfg.shared_root, departing_cfg.machine_name, enabled=False)
+    peer = runtime.add_binding(peer_cfg.shared_root, peer_cfg.machine_name)
+    revision, bindings = runtime.load_registry_snapshot()
+    runtime.working_set.reconcile(bindings, revision=revision)
+    runtime.activation_wake.capture(revision, bindings)
+    peer_turn = runtime.working_set.begin_turn(peer, "scheduler")
+
+    departing_partition = runtime.project_paths(departing.project_id)["root"]
+    archived = tmp_path / "archived"
+    departing_partition.rename(archived)
+    with runtime.agent_lifecycle_guard():
+        runtime.activation_wake.publish_locked()
+
+    runtime.activation_wake.capture(revision, bindings, bindings_to_activate=(peer,))
+
+    assert not departing_partition.exists()
+    assert archived.is_dir()
+    assert not runtime.working_set.is_current_turn(peer_turn)
+    assert runtime.activation_wake.is_current()

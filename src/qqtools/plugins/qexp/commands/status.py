@@ -11,14 +11,26 @@ from typing import Any
 
 from ..agent.bindings import ProjectBinding, decode_registry
 from ..agent.config import AgentConfig
-from ..agent.context import MachineRuntime
+from ..agent.context import MachineRuntime, _effective_runtime_id
+from ..agent.identity import decode_identity_record
 from ..agent.inventory import ProjectInventoryEntry, decode_inventory
-from ..agent.scheduler_diagnostics import SchedulerDiagnosticStore
+from ..agent.scheduler_diagnostics import SchedulerDiagnosticStore, unavailable_summary
+from ..agent.takeover_intent import (
+    _CANCELLABLE_PHASES,
+    _INTENT_NAME,
+    _LEGACY_KEY,
+    TakeoverIntent,
+    decode_takeover_issue,
+    takeover_issue_path,
+)
 from ..config_types import RootConfig
 from ..layout import machine_path, project_id
+from ..runtime.authority_scan import validate_evidence_path
 from ..runtime.observation.projection import _validate_state, observation_path
-from ..runtime.paths import shared_paths
+from ..runtime.paths import machine_registration_path, shared_paths
 from ..runtime.records import validate_identifier
+from ..runtime.registration_authority import registration_state
+from ..runtime.registration_protocol import MAX_REGISTRATION_RECORD_BYTES, validate_registration
 from ..upgrade_diagnostics import summarize_upgrade_journal
 
 STATUS_SCHEMA_VERSION = 1
@@ -53,8 +65,9 @@ class _ReadBudget:
         self.read_attempts = 0
         self.bytes_read = 0
 
-    def read_json(self, path: Path) -> dict[str, Any] | None:
+    def read_json(self, path: Path, *, max_bytes: int | None = None) -> dict[str, Any] | None:
         """Read one regular JSON file, returning ``None`` only when absent."""
+        record_limit = self.max_record_bytes if max_bytes is None else min(self.max_record_bytes, max_bytes)
         if self.read_attempts >= self.max_read_attempts:
             raise _BoundedReadFailure("read_budget_exhausted", path)
         self.read_attempts += 1
@@ -66,14 +79,14 @@ class _ReadBudget:
             raise _BoundedReadFailure(f"lstat_failed:{type(exc).__name__}", path) from exc
         if not stat.S_ISREG(metadata.st_mode):
             raise _BoundedReadFailure("not_a_regular_file", path)
-        if metadata.st_size > self.max_record_bytes:
+        if metadata.st_size > record_limit:
             raise _BoundedReadFailure("record_oversized", path)
         if self.bytes_read + metadata.st_size > self.max_total_bytes:
             raise _BoundedReadFailure("total_read_budget_exhausted", path)
         try:
             with path.open("rb") as handle:
                 remaining = self.max_total_bytes - self.bytes_read
-                encoded = handle.read(min(self.max_record_bytes + 1, remaining))
+                encoded = handle.read(min(record_limit + 1, remaining))
                 self.bytes_read += len(encoded)
                 if len(encoded) == remaining and os.fstat(handle.fileno()).st_size > remaining:
                     raise _BoundedReadFailure("total_read_budget_exhausted", path)
@@ -81,7 +94,7 @@ class _ReadBudget:
             return None
         except OSError as exc:
             raise _BoundedReadFailure(f"read_failed:{type(exc).__name__}", path) from exc
-        if len(encoded) > self.max_record_bytes:
+        if len(encoded) > record_limit:
             raise _BoundedReadFailure("record_oversized", path)
         try:
             value = json.loads(encoded.decode("utf-8"))
@@ -130,15 +143,16 @@ def _project_identity(cfg: RootConfig, reader: _ReadBudget) -> str:
     if identity is None:
         raise ValueError(f"Project identity is missing: {identity_path}.")
     project = identity.get("project")
-    expected = project_id(cfg.shared_root)
+    stable_id = project.get("project_id") if isinstance(project, dict) else None
     if (
-        not isinstance(project, dict)
-        or project.get("project_id") != expected
-        or not isinstance(project.get("shared_root"), str)
-        or Path(project["shared_root"]).expanduser().resolve() != cfg.shared_root
+        not isinstance(stable_id, str)
+        or not stable_id
+        or stable_id == "."
+        or any(token in stable_id for token in ("/", "\\", "..", "\x00"))
+        or project.get("shared_root") != str(cfg.shared_root)
     ):
         raise ValueError("Project identity is malformed or does not match the selected Project.")
-    return expected
+    return stable_id
 
 
 def _matching_participation(
@@ -149,21 +163,73 @@ def _matching_participation(
     *,
     registry_failed: bool,
     inventory_failed: bool,
-) -> tuple[str, str | None]:
-    registered = any(
-        binding.project_id == selected_project_id and binding.shared_root == cfg.shared_root
-        for binding in registry or []
-    )
-    if registered:
-        return "registered", None
+) -> tuple[str, str | None, ProjectBinding | None]:
+    matches = [
+        binding
+        for binding in registry or ()
+        if binding.project_id == selected_project_id or binding.shared_root == cfg.shared_root
+    ]
+    if any(binding.project_id == selected_project_id and binding.shared_root == cfg.shared_root for binding in matches):
+        return "registered", None, matches[0] if len(matches) == 1 else None
     inventoried = any(
         entry.project_id == selected_project_id and entry.shared_root == cfg.shared_root for entry in inventory or []
     )
     if inventoried and not registry_failed:
-        return "inventory_only", "inventory_entry_without_binding"
+        return "inventory_only", "inventory_entry_without_binding", None
     if registry_failed or inventory_failed:
-        return "unavailable", "local_registry_or_inventory_unavailable"
-    return "unregistered", "no_local_binding_or_inventory"
+        return "unavailable", "local_registry_or_inventory_unavailable", None
+    return "unregistered", "no_local_binding_or_inventory", None
+
+
+def _verified_local_binding(
+    cfg: RootConfig, runtime: MachineRuntime, binding: ProjectBinding, reader: _ReadBudget
+) -> dict[str, object] | None:
+    """Observe the selected binding against its exact shared registration."""
+    runtime_root = runtime.paths["root"]
+    machine_name = binding.machine_name
+    if (
+        binding.runtime_root not in {None, str(runtime_root)}
+        or not binding.registration_generation
+        or machine_name == "."
+        or "\x00" in machine_name
+    ):
+        return None
+    try:
+        identity = reader.read_json(runtime.paths["identity"])
+        record = decode_identity_record(identity) if identity is not None else None
+        if record is None:
+            return None
+        runtime_id = _effective_runtime_id(record["instance_id"], record.get("runtime_id"))
+        if binding.runtime_instance_id != runtime_id:
+            return None
+
+        registration_path = machine_registration_path(cfg.shared_root, machine_name)
+        if not validate_evidence_path(registration_path, cfg.shared_root):
+            return None
+        registration_raw = reader.read_json(registration_path, max_bytes=MAX_REGISTRATION_RECORD_BYTES)
+        if registration_raw is None:
+            return None
+        registration = registration_raw.get("registration")
+        registration_cfg = RootConfig.from_canonical_paths(
+            cfg.shared_root, cfg.project_root, machine_name, runtime_root
+        )
+        validate_registration(registration, binding.project_id, registration_cfg, allow_source=True)
+        write_eligibility = registration_state(registration)
+    except (OSError, RuntimeError, TypeError, ValueError, OverflowError):
+        return None
+    if (
+        registration["generation"] != binding.registration_generation
+        or registration["runtime_instance_id"] != runtime_id
+        or registration["runtime_root"] != str(runtime_root)
+        or write_eligibility not in {"eligible", "expired"}
+    ):
+        return None
+    return {
+        "machine_name": machine_name,
+        "registration_generation": binding.registration_generation,
+        "enabled": binding.enabled,
+        "write_eligibility": write_eligibility,
+    }
 
 
 def _agent_observation(
@@ -265,6 +331,90 @@ def _project_upgrade(
     return upgrade
 
 
+def _project_takeover(
+    cfg: RootConfig,
+    selected_project_id: str,
+    runtime: MachineRuntime,
+    reader: _ReadBudget,
+    warnings: list[str],
+) -> dict[str, object] | None:
+    """Observe the active local slot only for the selected Project and runtime."""
+    path = runtime.root / _INTENT_NAME
+    component = "Project takeover"
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        warnings.append(f"{component} unavailable (lstat_failed:{type(exc).__name__}).")
+        return None
+    if metadata.st_size > MAX_REGISTRATION_RECORD_BYTES:
+        warnings.append(f"{component} unavailable (record_oversized).")
+        return None
+
+    warning_count = len(warnings)
+    try:
+        value = _optional_read(reader, path, component, warnings)
+        if value is None:
+            if len(warnings) == warning_count:
+                warnings.append(f"{component} unavailable (record_missing).")
+            return None
+        if value.keys() == {_LEGACY_KEY} and isinstance(value[_LEGACY_KEY], dict):
+            return None
+        intent = TakeoverIntent.from_dict(value)
+    except (TypeError, ValueError, OverflowError, RecursionError):
+        warnings.append(f"{component} unavailable (record_malformed).")
+        return None
+
+    transition = intent.transition
+    if transition.project_id != selected_project_id or transition.shared_root != cfg.shared_root:
+        return None
+    if transition.successor_runtime_root != runtime.root:
+        warnings.append(f"{component} unavailable (runtime_root_mismatch).")
+        return None
+
+    try:
+        identity = reader.read_json(runtime.paths["identity"])
+        record = decode_identity_record(identity) if identity is not None else None
+        runtime_id = _effective_runtime_id(record["instance_id"], record.get("runtime_id")) if record else None
+    except _BoundedReadFailure as exc:
+        warnings.append(_warning(f"{component} runtime identity", exc))
+        return None
+    except (OSError, RuntimeError, ValueError):
+        runtime_id = None
+    if runtime_id is None:
+        warnings.append(f"{component} unavailable (runtime_identity_unverified).")
+        return None
+    if transition.successor_runtime_id != runtime_id:
+        warnings.append(f"{component} unavailable (runtime_identity_mismatch).")
+        return None
+
+    target = transition.target.machine_name
+    command = [
+        "qexp",
+        "--machine-runtime-root",
+        str(runtime.root),
+        "project",
+        "takeover",
+        str(transition.shared_root),
+        f"--machine={target}",
+    ]
+    can_cancel = intent.phase in _CANCELLABLE_PHASES or intent.phase == "cancelling"
+    return {
+        "plan_id": intent.plan_id,
+        "phase": intent.phase,
+        "departing_machine": transition.departing.machine_name if transition.departing is not None else None,
+        "target_machine": target,
+        "is_cancel_requested": intent.is_cancel_requested,
+        "drain_observation": intent.drain_observation,
+        "operation_issue": decode_takeover_issue(
+            _optional_read(reader, takeover_issue_path(runtime.root), "Project takeover issue", warnings), intent
+        ),
+        "operation_status_command": shlex.join([*command, f"--operation-status={intent.plan_id}"]),
+        "cancel_command": shlex.join([*command, f"--cancel={intent.plan_id}"]) if can_cancel else None,
+    }
+
+
 def _follow_up_actions(
     project: Path,
     project_id: str,
@@ -293,22 +443,22 @@ def _follow_up_actions(
         # Project list can initialize a missing inventory. Inspect the files directly.
         actions.append(shlex.join(["ls", "-ld", "--", str(runtime.paths["registry"]), str(runtime.paths["inventory"])]))
 
-    diagnostic_args = ("agent", "diagnostics", "active", "--project-id", project_id)
-    has_reason = False
-    for sample in diagnostics["active_findings"]:
-        identity = sample.get("identity")
-        reason = identity.get("reason_code") if isinstance(identity, dict) else None
-        if isinstance(reason, str) and reason:
-            has_reason = True
-            suggest(*diagnostic_args, "--reason", reason)
-    if (
-        diagnostics["status"] != "available"
-        or diagnostics["coverage"] != "complete"
-        or diagnostics["truncated"]
-        or (diagnostics["active_count"] and not has_reason)
-    ):
-        suggest(*diagnostic_args)
-
+    if diagnostics.get("reason") != "project_id_unavailable":
+        diagnostic_args = ("agent", "diagnostics", "active", "--project-id", project_id)
+        has_reason = False
+        for sample in diagnostics["active_findings"]:
+            identity = sample.get("identity")
+            reason = identity.get("reason_code") if isinstance(identity, dict) else None
+            if isinstance(reason, str) and reason:
+                has_reason = True
+                suggest(*diagnostic_args, "--reason", reason)
+        if (
+            diagnostics["status"] != "available"
+            or diagnostics["coverage"] != "complete"
+            or diagnostics["truncated"]
+            or (diagnostics["active_count"] and not has_reason)
+        ):
+            suggest(*diagnostic_args)
     if observation["state"] != "active" or observation["reason"] == "projection_dirty":
         suggest("--project", str(project), "task", "list")
     modes_conflict = (
@@ -384,7 +534,7 @@ def project_status(
             inventory_failed = True
             warnings.append(f"local inventory unavailable (malformed_record:{type(exc).__name__}).")
 
-    participation_state, participation_reason = _matching_participation(
+    participation_state, participation_reason, binding = _matching_participation(
         cfg,
         selected_project_id,
         registry,
@@ -410,13 +560,25 @@ def project_status(
         warnings.append("local agent status unavailable (record_malformed).")
 
     upgrade = _project_upgrade(cfg, selected_project_id, reader, warnings)
-    scheduler_diagnostics = SchedulerDiagnosticStore(machine_runtime).summary_view(
-        project_id=selected_project_id,
-        limit=8,
-        read_json=reader.read_json,
+    try:
+        scheduler_diagnostics = SchedulerDiagnosticStore(machine_runtime).summary_view(
+            project_id=selected_project_id,
+            limit=8,
+            read_json=reader.read_json,
+        )
+    except ValueError:
+        scheduler_diagnostics = unavailable_summary(machine_runtime.root, "project_id_unavailable")
+    binding_observation = (
+        _verified_local_binding(cfg, machine_runtime, binding, reader) if binding is not None else None
     )
+    binding_reason = (
+        "local_binding_identity_unavailable"
+        if participation_state == "registered" and binding_observation is None
+        else None
+    )
+    takeover = _project_takeover(cfg, selected_project_id, machine_runtime, reader, warnings)
 
-    return {
+    result: dict[str, object] = {
         "schema_version": STATUS_SCHEMA_VERSION,
         "status": "partial" if warnings else "complete",
         "project": {
@@ -424,13 +586,29 @@ def project_status(
             "project_id": selected_project_id,
             "selection_source": selection_source,
         },
-        "local_participation": {"state": participation_state, "reason": participation_reason},
+        "local_participation": {
+            "state": participation_state,
+            "reason": participation_reason,
+            "binding": binding_observation,
+            "binding_reason": binding_reason,
+        },
         "local_agent": local_agent,
         "configured_agent_mode": configured_agent_mode,
         "task_observation": task_observation,
         "upgrade": upgrade,
         "scheduler_diagnostics": scheduler_diagnostics,
         "totals": {"tasks": None, "machines": None, "reason": "not_available"},
+        "takeover_preview_help": shlex.join(
+            [
+                "qexp",
+                "--machine-runtime-root",
+                str(machine_runtime.root),
+                "project",
+                "takeover",
+                str(cfg.project_root),
+                "--help",
+            ]
+        ),
         "next_actions": _follow_up_actions(
             cfg.project_root,
             selected_project_id,
@@ -445,6 +623,9 @@ def project_status(
         "budget": reader.as_dict(),
         "warnings": warnings,
     }
+    if takeover is not None:
+        result["takeover"] = takeover
+    return result
 
 
 def _machine_state_path(cfg: RootConfig, name: str, state_name: str) -> Path:

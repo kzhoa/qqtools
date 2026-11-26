@@ -38,6 +38,7 @@ from .recovery_transport import (
     source_hold_evidence,
     source_hold_parameters,
 )
+from .takeover_transport import takeover_registration_evidence, takeover_registration_parameters
 
 PROJECT_IO_PROTOCOL_VERSION = 1
 PROJECT_IO_CAPACITY = 4
@@ -80,6 +81,7 @@ PROJECT_IO_OPERATIONS = frozenset(
         "maintenance_flush_event",
         "machine_snapshot_publish",
         "registration_renew",
+        "takeover_registration",
         "activation_observe",
         "activation_consumer_register",
         "activation_consumer_ack",
@@ -788,6 +790,8 @@ def _request_parameters(operation_kind: str, value: object) -> dict[str, Any]:
     parameters = dict(_require_mapping(value, f"{operation_kind} parameters"))
     if operation_kind == "idle_decision_guard":
         _require_exact_keys(parameters, frozenset(), "idle_decision_guard parameters")
+    elif operation_kind == "takeover_registration":
+        return takeover_registration_parameters(parameters)
     elif operation_kind == "validate_binding":
         _require_exact_keys(parameters, frozenset({"machine_name"}), "validate_binding parameters")
         parameters["machine_name"] = _require_identifier(parameters["machine_name"], "machine_name")
@@ -1462,6 +1466,8 @@ def _request_fields(value: object) -> dict[str, Any]:
         if payload["project_id"] != IDLE_DECISION_GUARD_PROJECT_ID:
             raise ValueError("idle_decision_guard requires the reserved machine-scoped identity.")
         project_id = IDLE_DECISION_GUARD_PROJECT_ID
+    elif operation_kind == "takeover_registration":
+        project_id = _require_text(payload["project_id"], "project_id", maximum=128)
     else:
         project_id = _require_identifier(payload["project_id"], "project_id")
     canonical_root = _require_text(payload["canonical_shared_root"], "canonical_shared_root", maximum=4096)
@@ -1577,6 +1583,18 @@ def _request_fields(value: object) -> dict[str, Any]:
         _require_exact_keys(revisions, frozenset(), "idle_decision_guard source_revisions")
         if registration_generation != runtime_id or offer_id is not None:
             raise ValueError("idle_decision_guard has an invalid machine-scoped identity.")
+    if operation_kind == "takeover_registration":
+        _require_exact_keys(revisions, frozenset(), "takeover_registration source_revisions")
+        if offer_id is not None:
+            raise ValueError("takeover_registration cannot name a provisional offer.")
+        transition = parameters["transition"]
+        if (runtime_id, project_id, canonical_root, registration_generation) != (
+            transition["successor_runtime_id"],
+            transition["project_id"],
+            transition["shared_root"],
+            transition["successor_generation"],
+        ):
+            raise ValueError("takeover_registration transition differs from its request identity.")
     if operation_kind in {"group_service_probe", "group_service_advance"}:
         _require_exact_keys(revisions, frozenset(), f"{operation_kind} source_revisions")
         if offer_id is not None:
@@ -1945,6 +1963,12 @@ def _validate_terminal_lifecycle_event(value: object, label: str) -> dict[str, A
 
 def _validate_evidence(request: ProjectIORequest, status: str, value: Mapping[str, Any]) -> dict[str, Any]:
     evidence = dict(value)
+    if request.operation_kind == "takeover_registration":
+        if status == "completed":
+            return takeover_registration_evidence(request.parameters["step"], evidence)
+        if status == "retryable_error" or evidence:
+            raise ValueError("takeover_registration failures must be fenced or unknown with empty evidence.")
+        return evidence
     if status == "completed":
         if request.operation_kind == "validate_binding":
             expected = {"project_id", "shared_root", "schema_version", "required_capabilities"}

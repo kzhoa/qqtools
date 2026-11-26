@@ -288,7 +288,14 @@ class RecoveryEnrollment:
             capture.transition = None
             self._prepare(capture)
 
-    def advance(self, controller: Any, bindings: Sequence[ProjectBinding], registry_revision: int) -> None:
+    def advance(
+        self,
+        controller: Any,
+        bindings: Sequence[ProjectBinding],
+        registry_revision: int,
+        *,
+        frozen_binding: ProjectBinding | None = None,
+    ) -> None:
         """Offer bounded recovery intents inside the dispatch admission turn."""
         if self._is_stopped or self.runtime._scheduler_authority_pid != os.getpid():
             return
@@ -301,7 +308,7 @@ class RecoveryEnrollment:
         count = len(bindings)
         for offset in range(min(_PROJECTS_PER_SLICE, count)):
             binding = bindings[(self._cursor + offset) % count]
-            if binding in self._settled:
+            if binding in self._settled or binding == frozen_binding:
                 continue
             capture = self._captures.get(binding)
             if capture is None:

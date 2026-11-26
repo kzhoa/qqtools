@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Callable
+from contextlib import nullcontext
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from ..config_types import RootConfig
 from ..layout import is_group_ready_members_root
@@ -14,11 +16,18 @@ from ..lifecycle import (
     commit_terminal_transition_locked,
     dispatch_task_lifecycle_hooks_noexcept,
 )
+from ..runtime.authority_scan import validate_evidence_path
 from ..runtime.claims import archive_claim
 from ..runtime.directory_capture import read_directory_entry
 from ..runtime.group_activity import record_group_activity, require_activity_writer, wake_group
 from ..runtime.group_discovery.changes import record_task_change
-from ..runtime.group_namespace import has_group_authority_cutover, is_group_authority_isolated, read_group
+from ..runtime.group_namespace import (
+    GroupNotPublished,
+    group_visibility,
+    has_group_authority_cutover,
+    is_group_authority_isolated,
+    read_group,
+)
 from ..runtime.locks import group_record_writer_lock, task_lock
 from ..runtime.operation_store import (
     active_operation_path,
@@ -37,6 +46,7 @@ from ..runtime.ready import (
 )
 from ..runtime.ready.group_members import assert_group_ready_members_writable
 from ..runtime.records import (
+    GROUP_DISPATCH_STATES,
     SCHEMA_VERSION,
     AttemptRecord,
     TaskRecord,
@@ -49,7 +59,8 @@ from ..runtime.records import (
     validate_group_name,
     validate_identifier,
 )
-from ..runtime.store import atomic_replace, iter_json, read_json
+from ..runtime.responsibility_store import DurableIO
+from ..runtime.store import atomic_replace, check_mutation_fence, iter_json, read_json
 from ..runtime.submission import finalize_submission_group, reconcile_submission
 from ..runtime.tasks import load_task, save_task
 from .group_cancel import advance_indexed_cancel, initialize_cancel_discovery
@@ -1144,6 +1155,95 @@ def change_worker(
             atomic_replace(path, data)
             sync_primary_ready_group(cfg, group_name, previous_workers=previous_workers)
         return data
+
+
+def add_confirmed_primary_worker(
+    cfg: RootConfig,
+    group_name: str,
+    machine: str,
+    plan_id: str,
+    *,
+    approval_is_current: Callable[[], bool],
+) -> Literal["applied", "stale"]:
+    """Add a worker from current approval or replay the plan's ready projection."""
+    validate_group_name(group_name)
+    validate_identifier(machine, "worker_machine")
+    validate_identifier(plan_id, "takeover_plan_id")
+    root = cfg.shared_root
+    with group_record_writer_lock(cfg, group_name):
+        if is_group_ready_members_root(cfg):
+            assert_group_ready_members_writable(cfg)
+        path = group_path(root, group_name)
+        if not validate_evidence_path(path, root):
+            return "stale"
+        original_stat = path.lstat()
+        data = read_json(path)
+        try:
+            visible = group_visibility(root, group_name, data, should_request_repair=False)
+        except GroupNotPublished:
+            return "stale"
+        group = data["group"]
+        meta = data.get("meta")
+        dispatch_state = group.get("dispatch_state")
+        worker_set_epoch = group.get("worker_set_epoch")
+        revision = meta.get("revision") if isinstance(meta, dict) else None
+        if (
+            group.get("name") != group_name
+            or dispatch_state not in GROUP_DISPATCH_STATES
+            or type(worker_set_epoch) is not int
+            or worker_set_epoch < 0
+            or type(revision) is not int
+            or revision < 0
+        ):
+            raise RuntimeError(f"Group {group_name!r} has malformed takeover evidence.")
+        pending = group.get("pending_submission_commit")
+        if pending is not None:
+            if not isinstance(pending, dict):
+                raise RuntimeError(f"Group {group_name!r} has malformed pending Submission evidence.")
+            validate_identifier(pending.get("operation_id"), "pending Submission operation ID")
+
+        workers = group["worker_set"]
+        existing = workers.get(machine)
+        if existing is not None:
+            if existing.get("takeover_plan_id") != plan_id:
+                return "stale"
+        elif pending is not None or dispatch_state == "paused" or not approval_is_current():
+            return "stale"
+
+        def require_current_group_path() -> None:
+            if (
+                group_path(root, group_name) != path
+                or not validate_evidence_path(path, root)
+                or not os.path.samestat(path.lstat(), original_stat)
+            ):
+                raise RuntimeError(f"Group {group_name!r} changed during the confirmed worker addition.")
+
+        # Ready-members synchronization adds candidates for newly visible primary
+        # workers. On replay the target is already in truth, but its candidates may be missing.
+        previous_workers = {name: worker for name, worker in visible["group"]["worker_set"].items() if name != machine}
+        projection_routes = primary_projection_routes_for_group(cfg, group_name)
+        routes = sorted(set(projection_routes + [("shared", machine), ("home", machine)]))
+        if existing is None:
+            worker = new_worker_member(scheduling_role="primary")
+            worker.update(takeover_plan_id=plan_id, state_epoch=worker_set_epoch + 1)
+            workers[machine] = worker
+            group["worker_set_epoch"] = worker_set_epoch + 1
+            meta["revision"] = revision + 1
+            meta["updated_at"] = utc_now()
+
+        require_current_group_path()
+        check_mutation_fence(path)
+        activity = record_group_activity(cfg, data, worker=machine) if existing is None else nullcontext()
+        with primary_route_update_transaction(cfg, routes), activity:
+            if existing is None:
+                written = atomic_replace(path, data, before_replace=lambda _stat: require_current_group_path())
+                if written is None or not os.path.samestat(path.lstat(), written):
+                    raise RuntimeError(f"Group {group_name!r} worker addition could not be verified.")
+            else:
+                require_current_group_path()
+                DurableIO().sync_directory(path.parent, "takeover_group_replay")
+            sync_primary_ready_group(cfg, group_name, previous_workers=previous_workers)
+        return "applied"
 
 
 def group_retry_failed(cfg: RootConfig, name: str) -> dict[str, Any]:

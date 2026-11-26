@@ -22,6 +22,7 @@ from ..agent.lifecycle import (
     stop_machine_agent,
 )
 from ..agent.project_admin import migrate_project, project_migration_state
+from ..agent.project_takeover import TakeoverUsageError, preview_project_takeover
 from ..agent.readiness import (
     allows_machine_only_start,
     capture_readiness_snapshot,
@@ -39,6 +40,12 @@ from ..agent.setup import (
     register_projects,
     remove_project,
     set_project_enablement,
+)
+from ..agent.takeover_intent import _TERMINAL_PHASES, read_takeover_issue
+from ..agent.takeover_requests import (
+    accept_project_takeover,
+    read_project_takeover_operation,
+    request_takeover_cancellation,
 )
 from ..commands import configuration as configuration_commands
 from ..commands import context as context_commands
@@ -71,6 +78,7 @@ LOCAL_HANDLERS = frozenset(
         "init",
         "project_init",
         "project_register",
+        "project_takeover",
         "project_list",
         "project_enable",
         "project_disable",
@@ -492,6 +500,75 @@ def dispatch_local(
             raise CliOperationalError(str(exc)) from exc
         return CommandOutcome(0, CliOutput(OutputKind.MACHINE_INIT, result))
     if handler.startswith("project_"):
+        if handler == "project_takeover":
+            selected_groups = tuple(args.add_primary_worker or ())
+            retry_option = None
+            try:
+                runtime = MachineRuntime(args.machine_runtime_root)
+                if args.plan:
+                    result = preview_project_takeover(
+                        runtime,
+                        args.path,
+                        args.project_machine,
+                        recovery_cursor=args.recovery_cursor,
+                        after_task_id=args.tasks_after,
+                        selected_groups=selected_groups,
+                    )
+                    exit_code = 1 if result["status"] == "blocked" else 0
+                    return CommandOutcome(
+                        exit_code,
+                        CliOutput(OutputKind.PROJECT_TAKEOVER, result, {"selected_groups": selected_groups}),
+                    )
+                if args.apply is not None:
+                    intent = accept_project_takeover(
+                        runtime, args.path, args.project_machine, args.apply, selected_groups=selected_groups
+                    )
+                    retry_option = "--apply"
+                elif args.cancel is not None:
+                    intent = request_takeover_cancellation(runtime, args.path, args.project_machine, args.cancel)
+                    retry_option = "--cancel"
+                else:
+                    intent = read_project_takeover_operation(
+                        runtime, args.path, args.project_machine, args.operation_status
+                    )
+            except TakeoverUsageError as exc:
+                raise CliUsageError(str(exc)) from exc
+            except (OSError, RuntimeError, ValueError) as exc:
+                raise CliOperationalError(str(exc)) from exc
+
+            agent_start_error = None
+            if retry_option is not None and intent.phase not in _TERMINAL_PHASES:
+                try:
+                    ensure_machine_agent_started(runtime)
+                except (OSError, RuntimeError, ValueError) as exc:
+                    agent_start_error = str(exc) or type(exc).__name__
+
+            transition = intent.transition
+            result = {
+                "action": "project_takeover_operation",
+                "plan_id": intent.plan_id,
+                "phase": intent.phase,
+                "is_cancel_requested": intent.is_cancel_requested,
+                "project_id": transition.project_id,
+                "shared_root": str(transition.shared_root),
+                "machine_runtime_root": str(transition.successor_runtime_root),
+                "target_machine": transition.target.machine_name,
+                "departing_machine": transition.departing.machine_name if transition.departing is not None else None,
+                "group_approvals": [
+                    {
+                        **approval.to_dict(),
+                        "outcome": intent.group_outcomes[index] if index < len(intent.group_outcomes) else None,
+                    }
+                    for index, approval in enumerate(intent.group_approvals)
+                ],
+                "agent_start_error": agent_start_error,
+                "operation_issue": read_takeover_issue(runtime.root, intent),
+                "drain_observation": intent.drain_observation,
+            }
+            exit_code = 1 if intent.phase == "stale" or agent_start_error is not None else 0
+            return CommandOutcome(
+                exit_code, CliOutput(OutputKind.PROJECT_TAKEOVER, result, {"retry_option": retry_option})
+            )
         runtime = MachineRuntime(args.machine_runtime_root)
         if handler == "project_init":
             try:

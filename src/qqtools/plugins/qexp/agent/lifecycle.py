@@ -362,13 +362,13 @@ def run_machine_agent_loop(
     if machine_runtime.paths["replacement_transaction"].exists():
         raise MachineAgentStartBlockedError("machine agent activation is blocked by a pending machine replacement.")
     machine_runtime.ensure_layout(create_identity=False)
-    from .registration_replacement import read_replacement_intent
+    from .registration_replacement import read_registration_intents
 
-    pending_replacement = read_replacement_intent(machine_runtime)
     with machine_runtime.inventory_guard():
         with machine_runtime.registry_guard():
+            pending_replacement, pending_takeover = read_registration_intents(machine_runtime)
             machine_runtime.registration.prepare_registry_locked()
-            if pending_replacement is None:
+            if pending_replacement is None and pending_takeover is None:
                 machine_runtime.registration.rollback_pending_locked()
     agent_config = load_agent_config(machine_runtime)
     instance_id = instance_id or uuid.uuid4().hex

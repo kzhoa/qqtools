@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from ..config_types import RootConfig
+from .authority_scan import validate_evidence_path
 from .locks import exclusive
 from .paths import submission_path
 from .records import validate_identifier
@@ -308,13 +309,15 @@ def _require_same_source(path: Path, expected: os.stat_result) -> os.stat_result
     return current
 
 
-def _submission_state(value: dict[str, Any]) -> str:
+def _submission_state(value: dict[str, Any], *, expected_operation_id: str | None = None) -> str:
     try:
         submission = value["submission"]
     except KeyError as exc:
         raise ValueError("Submission record has no submission object.") from exc
     if not isinstance(submission, dict):
         raise ValueError("Submission record has an invalid submission object.")
+    if expected_operation_id is not None and submission.get("operation_id") != expected_operation_id:
+        raise ValueError("Submission source does not match the requested operation ID.")
     state = submission.get("state")
     if type(state) is not str or state not in _SUBMISSION_STATES:
         raise ValueError("Submission state is invalid.")
@@ -350,27 +353,37 @@ def _read_receipt_state(cfg: RootConfig, operation_id: str, expected: os.stat_re
     return receipt_state
 
 
-def _read_source_state_bounded(path: Path, expected: os.stat_result) -> str:
+def _read_source_state_bounded(
+    path: Path, expected: os.stat_result, *, expected_operation_id: str | None = None
+) -> str:
     value = read_control_record(path, max_bytes=SUBMISSION_SOURCE_LIMIT)
-    state = _submission_state(value)
+    state = _submission_state(value, expected_operation_id=expected_operation_id)
     _require_same_source(path, expected)
     return state
 
 
-def _read_source_state_legacy(path: Path, expected: os.stat_result) -> str:
+def _read_source_state_legacy(path: Path, expected: os.stat_result, *, expected_operation_id: str | None = None) -> str:
     value = read_json(path)
-    state = _submission_state(value)
+    state = _submission_state(value, expected_operation_id=expected_operation_id)
     _require_same_source(path, expected)
     return state
 
 
-def read_submission_state(cfg: RootConfig, operation_id: str) -> str:
-    """Read one Submission state with a revision-bound derived-proof fast path."""
+def read_submission_state(cfg: RootConfig, operation_id: str, *, should_request_repair: bool = True) -> str:
+    """Read one Submission state, optionally requesting repair for a missing proof."""
     operation_id = _checked_operation_id(operation_id)
-    path = submission_path(_root(cfg), operation_id)
+    root = _root(cfg)
+    path = submission_path(root, operation_id)
+    expected_operation_id = None
+    if not should_request_repair:
+        validate_evidence_path(path, root)
+        expected_operation_id = operation_id
     source_before = _source_lstat(path)
     if source_before.st_size <= SUBMISSION_SOURCE_LIMIT:
-        return _read_source_state_bounded(path, source_before)
+        return _read_source_state_bounded(path, source_before, expected_operation_id=expected_operation_id)
+    if not should_request_repair:
+        validate_evidence_path(control_paths(cfg)["state"], root)
+        validate_evidence_path(record_path(cfg, operation_id), root)
     control_state = read_control_state(cfg)
     receipt_state = _read_receipt_state(cfg, operation_id, source_before)
     if receipt_state is not None:
@@ -378,12 +391,13 @@ def read_submission_state(cfg: RootConfig, operation_id: str) -> str:
 
     source_before = _source_lstat(path)
     if source_before.st_size <= SUBMISSION_SOURCE_LIMIT:
-        return _read_source_state_bounded(path, source_before)
+        return _read_source_state_bounded(path, source_before, expected_operation_id=expected_operation_id)
 
     if control_state is None or control_state["state"] == "building":
-        return _read_source_state_legacy(path, source_before)
+        return _read_source_state_legacy(path, source_before, expected_operation_id=expected_operation_id)
 
-    request_repair(cfg, operation_id)
+    if should_request_repair:
+        request_repair(cfg, operation_id)
     raise SubmissionControlUnavailable(f"large Submission source requires repair: {operation_id}")
 
 

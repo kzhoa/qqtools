@@ -134,6 +134,50 @@ def test_stale_cursor_generation_and_exact_retry(tmp_path):
         other.page(0, cursor)
 
 
+def test_ledger_observation_pages_match_current_revision_without_recovery(tmp_path):
+    ledger = Ledger.create(tmp_path / "ledger")
+    names = identities(3)
+    for name in names:
+        ledger.publish(name, {"task_id": "task", "attempt_number": 1})
+    records, cursor = ledger.page(0, limit=2)
+    assert cursor is not None
+    bucket = ledger.root / "0"
+    scratch = bucket / "scratch"
+    scratch.write_bytes(b"abandoned before commit")
+    io = DurableIO()
+    observer = Ledger(ledger.root, io)
+
+    assert observer.observe_page(0, limit=2) == (records, cursor, 3)
+    final_records, continuation, total = observer.observe_page(0, cursor, limit=2)
+    assert [record["identity"] for record in final_records] == [names[-1]]
+    assert continuation is None and total == 3
+    assert observer.observe_page(1) == ([], None, 0)
+    assert scratch.read_bytes() == b"abandoned before commit"
+
+    pending = bucket / "pending"
+    pending.write_bytes(b'{"interrupted": true}')
+    before = {path.name: path.read_bytes() for path in bucket.iterdir()}
+    with pytest.raises(Unavailable):
+        observer.observe_page(0, cursor, limit=2)
+    assert {path.name: path.read_bytes() for path in bucket.iterdir()} == before
+    assert io.counts["writes"] == io.counts["directory_fsync"] == 0
+
+
+def test_ledger_observation_rejects_stale_cursor(tmp_path):
+    ledger = Ledger.create(tmp_path / "ledger")
+    names = identities(2)
+    for name in names:
+        ledger.publish(name, {"task_id": "task", "attempt_number": 1})
+    _, cursor, _ = ledger.observe_page(0, limit=1)
+    assert cursor is not None
+
+    generation = ledger.lookup(names[0])["generation"]
+    ledger.handoff(names[0], generation)
+
+    with pytest.raises(Conflict):
+        ledger.observe_page(0, cursor)
+
+
 @pytest.mark.parametrize(
     "count,reuse_rounds",
     [

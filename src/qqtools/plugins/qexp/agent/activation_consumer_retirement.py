@@ -14,6 +14,7 @@ from pathlib import Path
 from threading import Lock, RLock
 from typing import TYPE_CHECKING, Any
 
+from ..runtime.records import validate_identifier
 from ..runtime.store import atomic_replace
 from .bindings import ProjectBinding
 
@@ -51,6 +52,10 @@ class ActivationConsumerRetirements:
         self._pending_paths: deque[Path] = deque()
         self._pending_set: set[Path] = set()
 
+    def validate_retirement(self, binding: ProjectBinding) -> None:
+        """Check that the exact binding has a representable local retirement record."""
+        _bounded_intent_record(_intent_for_binding(binding))
+
     def prepare(self, binding: ProjectBinding) -> None:
         """Durably record the exact consumer before local binding state is deleted."""
         intent = _intent_for_binding(binding)
@@ -60,10 +65,7 @@ class ActivationConsumerRetirements:
         existing = _read_intent(self.root, path)
         if existing is not None and existing != intent:
             raise RuntimeError(f"activation consumer retirement intent conflicts with its identity path: {path}")
-        encoded = _intent_record(intent)
-        size = len(json.dumps(encoded, ensure_ascii=False, sort_keys=True, indent=2).encode("utf-8"))
-        if size > _MAX_INTENT_BYTES:
-            raise ValueError(f"activation consumer retirement intent exceeds {_MAX_INTENT_BYTES} bytes.")
+        encoded = _bounded_intent_record(intent)
         replaced = atomic_replace(path, encoded)
         if replaced is None or not stat.S_ISREG(replaced.st_mode) or replaced.st_size > _MAX_INTENT_BYTES:
             raise RuntimeError(f"activation consumer retirement intent could not be durably replaced: {path}")
@@ -132,7 +134,7 @@ class ActivationConsumerRetirements:
             _validate_identifier(project_id, "project_id"),
             _validate_identifier(registration_generation, "registration_generation"),
             _validate_shared_root(str(shared_root)),
-            _validate_identifier(machine_name, "machine_name"),
+            _validate_machine_name(machine_name),
         )
         path = _intent_path(self.root, intent)
         stored = _read_intent(self.root, path)
@@ -191,7 +193,7 @@ class ActivationConsumerRetirements:
             _validate_identifier(project_id, "project_id"),
             _validate_identifier(registration_generation, "registration_generation"),
             _validate_shared_root(str(shared_root)),
-            _validate_identifier(machine_name, "machine_name"),
+            _validate_machine_name(machine_name),
         )
         path = _intent_path(self.root, intent)
         stored = _read_intent(self.root, path)
@@ -278,11 +280,9 @@ def _intent_for_binding(binding: ProjectBinding) -> _RetirementIntent:
     runtime_id = _validate_identifier(binding.runtime_instance_id, "runtime_id")
     project_id = _validate_identifier(binding.project_id, "project_id")
     generation = _validate_identifier(binding.registration_generation, "registration_generation")
-    shared_root = Path(binding.shared_root)
-    if not shared_root.is_absolute() or shared_root != shared_root.resolve():
-        raise ValueError("Project binding shared_root must be an absolute canonical path.")
-    machine_name = _validate_identifier(binding.machine_name, "machine_name")
-    return _RetirementIntent(runtime_id, project_id, generation, str(shared_root), machine_name)
+    shared_root = _validate_shared_root(str(binding.shared_root))
+    machine_name = _validate_machine_name(binding.machine_name)
+    return _RetirementIntent(runtime_id, project_id, generation, shared_root, machine_name)
 
 
 def _intent_record(intent: _RetirementIntent) -> dict[str, Any]:
@@ -296,6 +296,13 @@ def _intent_record(intent: _RetirementIntent) -> dict[str, Any]:
             "machine_name": intent.machine_name,
         }
     }
+
+
+def _bounded_intent_record(intent: _RetirementIntent) -> dict[str, Any]:
+    record = _intent_record(intent)
+    if len(json.dumps(record, ensure_ascii=False, sort_keys=True, indent=2).encode("utf-8")) > _MAX_INTENT_BYTES:
+        raise ValueError(f"activation consumer retirement intent exceeds {_MAX_INTENT_BYTES} bytes.")
+    return record
 
 
 def _intent_base(root: Path) -> Path:
@@ -318,15 +325,19 @@ def _validate_identifier(value: object, label: str) -> str:
     return value
 
 
+def _validate_machine_name(value: object) -> str:
+    if type(value) is not str or len(value) > 128:
+        raise ValueError("machine_name must be a bounded Project I/O identifier.")
+    return validate_identifier(value, "machine_name")
+
+
 def _validate_shared_root(value: object) -> str:
     if type(value) is not str or not value:
         raise ValueError("activation consumer retirement shared_root must be an absolute canonical path.")
     path = Path(value)
-    try:
-        canonical = path.resolve()
-    except (OSError, RuntimeError) as exc:
-        raise ValueError("activation consumer retirement shared_root must be an absolute canonical path.") from exc
-    if not path.is_absolute() or path != canonical or str(path) != value:
+    # Local retirement records are also read when the Project is inaccessible.
+    # The isolated retirement worker checks physical canonicality before mutation.
+    if path.anchor != "/" or ".." in path.parts or "\x00" in value or str(path) != value:
         raise ValueError("activation consumer retirement shared_root must be an absolute canonical path.")
     return value
 
@@ -344,7 +355,7 @@ def _validate_record(value: object, root: Path, path: Path) -> _RetirementIntent
         _validate_identifier(record["project_id"], "project_id"),
         _validate_identifier(record["registration_generation"], "registration_generation"),
         _validate_shared_root(record["shared_root"]),
-        _validate_identifier(record["machine_name"], "machine_name"),
+        _validate_machine_name(record["machine_name"]),
     )
     if path != _intent_path(root, intent):
         raise ValueError("activation consumer retirement intent path does not match its identity.")

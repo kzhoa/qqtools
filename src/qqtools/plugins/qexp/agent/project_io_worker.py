@@ -77,6 +77,7 @@ from .recovery_worker import (
     RecoveryWorkerIdentity,
     handle_recovery_request,
 )
+from .takeover_transport import run_takeover_step
 
 _REQUEST_ID = re.compile(r"^[0-9a-f]{32}$")
 _HANDSHAKE_SECONDS = 2.0
@@ -260,6 +261,8 @@ def _validate_binding(
         shared_root,
         request.parameters["machine_name"],
     )
+    if request.operation_kind == "activation_consumer_retire" and cfg.shared_root != shared_root:
+        raise ValueError("Project shared root was redirected before activation consumer retirement.")
     validate_root_contract(cfg)
     project_identity = read_json_limited(
         shared_paths(shared_root)["project"] / "identity.json",
@@ -2633,6 +2636,7 @@ def _publish_result(
                 "maintenance_flush_event",
                 "machine_snapshot_publish",
                 "registration_renew",
+                "takeover_registration",
                 "activation_consumer_register",
                 "activation_consumer_ack",
                 "activation_consumer_retire",
@@ -2726,6 +2730,36 @@ def _run_idle_decision_guard(
         )
     else:
         published = _publish_result(root, paths, request, process, "completed", None, {"closed": True})
+    return 0 if published else 1
+
+
+def _run_takeover_registration(
+    root: Path, paths: dict[str, Path], request: ProjectIORequest, process: ProjectIOProcess
+) -> int:
+    def require_current_epoch() -> None:
+        epoch = _read_epoch(paths)
+        if not epoch.active or epoch.runtime_id != request.runtime_id or epoch.executor_epoch != request.executor_epoch:
+            raise _ExecutorEpochFenced
+
+    try:
+        with _bounded_project_reads(Path(request.canonical_shared_root)):
+            evidence = run_takeover_step(root, request.parameters, before_mutation=require_current_epoch)
+    except _ExecutorEpochFenced:
+        status, reason_code, evidence = "fenced", "project_io_executor_epoch_fenced", {}
+    except Exception:
+        status, reason_code, evidence = "outcome_unknown", "project_io_outcome_unknown", {}
+    else:
+        status, reason_code = "completed", None
+    published = _publish_result(
+        root,
+        paths,
+        request,
+        process,
+        status,
+        reason_code,
+        evidence,
+        shared_write_possible=request.parameters["step"] != "observe",
+    )
     return 0 if published else 1
 
 
@@ -2857,6 +2891,8 @@ def _run(
         )
     if request.operation_kind == "idle_decision_guard":
         return _run_idle_decision_guard(root, paths, request, process, idle_guard_fd)
+    if request.operation_kind == "takeover_registration":
+        return _run_takeover_registration(root, paths, request, process)
     fenced = False
     cursor_write_possible = [False]
     claim_cursor_commit_started = [False]

@@ -1662,16 +1662,27 @@ def _dispatch_machine_cycle_locked(
             runtime.last_cycle_had_demand = True
     with diagnostic_span("machine.registry.load"):
         registry_revision, registered = runtime.load_registry_snapshot()
-    runtime.working_set.reconcile(registered, revision=registry_revision)
+    project_io_controller = _project_io_controller(runtime)
+    service_filter: tuple[ProjectBinding, ...] | None = None
+    if project_io_controller is not None and project_io_controller.advance_takeover(registry_revision):
+        runtime.last_cycle_had_demand = True
+        registry_revision, registered = runtime.load_registry_snapshot()
+        service_bindings = tuple(
+            binding for binding in registered if not project_io_controller.is_takeover_binding_retiring(binding)
+        )
+        if len(service_bindings) != len(registered):
+            service_filter = service_bindings
+    runtime.working_set.reconcile(registered if service_filter is None else service_filter, revision=registry_revision)
     if has_isolation_executor:
         try:
-            runtime.activation_wake.capture(registry_revision, registered)
+            runtime.activation_wake.capture(registry_revision, registered, bindings_to_activate=service_filter)
         except (OSError, RuntimeError, ValueError, KeyError, TypeError):
             runtime.last_cycle_had_demand = True
     runtime.working_set.poll_dormant(limit=4)
+    if service_filter is not None:
+        registered = service_filter
     _activate_due_maintenance_retries(runtime, registered)
-    resident_bindings = runtime.working_set.resident_bindings()
-    project_io_controller = _project_io_controller(runtime)
+    resident_bindings = runtime.working_set.resident_bindings(service_filter)
     isolated_mode = project_io_controller is not None
     validated_configs = (
         project_io_controller.advance_binding_validation(resident_bindings, registry_revision)
@@ -1683,13 +1694,18 @@ def _dispatch_machine_cycle_locked(
         _advance_registration_renewals(runtime, project_io_controller, registry_revision, registered)
         _advance_activation_working_set(runtime, project_io_controller, registry_revision, registered)
         project_io_controller.advance_upgrade_work(registered, registry_revision)
-        resident_bindings = runtime.working_set.resident_bindings()
+        resident_bindings = runtime.working_set.resident_bindings(service_filter)
         project_io_controller.advance_submission_control(resident_bindings, registry_revision)
         project_io_controller.advance_observation_maintenance(resident_bindings, registry_revision)
         project_io_controller.advance_progress_work(registered, registry_revision)
         recovery_enrollment = getattr(runtime, "recovery_enrollment", None)
         if recovery_enrollment is not None:
-            recovery_enrollment.advance(project_io_controller, registered, registry_revision)
+            frozen_binding = next(
+                (binding for binding in registered if project_io_controller.is_takeover_binding_frozen(binding)), None
+            )
+            recovery_enrollment.advance(
+                project_io_controller, registered, registry_revision, frozen_binding=frozen_binding
+            )
         project_io_controller.advance_group_service_probes(resident_bindings, registry_revision)
         launch_batch.poll(isolated=True)
         if getattr(runtime, "pending_launch_handoffs", {}):

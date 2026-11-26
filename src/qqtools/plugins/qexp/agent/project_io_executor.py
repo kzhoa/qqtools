@@ -57,6 +57,8 @@ from .project_io_transport_support import (
     _resolve_runtime_id,
     inspect_process_identity,
 )
+from .takeover_intent import TakeoverIntent
+from .takeover_transport import takeover_registration_parameters
 
 _RECORD_ID = re.compile(r"^[0-9a-f]{32}$")
 _RECORD_NAME = re.compile(r"([0-9a-f]{32})\.json")
@@ -91,6 +93,7 @@ _OUTCOME_UNKNOWN_ON_WORKER_EXIT = frozenset(
         "maintenance_flush_event",
         "machine_snapshot_publish",
         "registration_renew",
+        "takeover_registration",
         "activation_consumer_register",
         "activation_consumer_ack",
         "activation_consumer_retire",
@@ -893,6 +896,21 @@ class ProjectIOExecutor:
                 "renewal_horizon_seconds": renewal_horizon_seconds,
             },
             source_revisions=source_revisions,
+        )
+
+    def prepare_takeover_registration(
+        self, intent: TakeoverIntent, registry_revision: int, step: str, *, group_name: str | None = None
+    ) -> ProjectIORequest:
+        """Persist one shared step for a durable takeover intent."""
+        parameters: dict[str, Any] = {
+            "plan_id": intent.plan_id,
+            "step": step,
+            "transition": intent.transition.to_dict(),
+        }
+        if group_name is not None:
+            parameters["group_name"] = group_name
+        return self._prepare_request(
+            None, registry_revision, "takeover_registration", parameters, source_revisions=None
         )
 
     def prepare_upgrade_service(self, binding: object, registry_revision: int) -> ProjectIORequest:
@@ -1991,6 +2009,14 @@ class ProjectIOExecutor:
             project_id = IDLE_DECISION_GUARD_PROJECT_ID
             shared_root = self.root
             registration_generation = self.runtime_id
+        elif operation_kind == "takeover_registration":
+            parameters = takeover_registration_parameters(parameters)
+            transition = parameters["transition"]
+            if transition["successor_runtime_root"] != str(self.root):
+                raise ProjectIOProtocolError("takeover registration belongs to a different runtime root.")
+            project_id = transition["project_id"]
+            shared_root = transition["shared_root"]
+            registration_generation = transition["successor_generation"]
         else:
             project_id = getattr(binding, "project_id", None)
             shared_root = getattr(binding, "shared_root", None)

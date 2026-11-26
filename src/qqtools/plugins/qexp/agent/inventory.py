@@ -204,10 +204,12 @@ def reconcile_live_bindings_locked(runtime: Any, *, repair: bool = True) -> Inve
         raise RuntimeError("Project inventory reconciliation requires inventory and registry guards.")
     inventory_revision, entries = load_inventory(machine_runtime)
     registry_revision, bindings = machine_runtime.load_registry_uncached()
-    from .registration_replacement import read_replacement_intent
+    from .registration_replacement import read_registration_intents
 
-    pending = read_replacement_intent(machine_runtime)
+    pending, takeover = read_registration_intents(machine_runtime)
     pending_project = pending["project_id"] if pending is not None else None
+    if takeover is not None:
+        pending_project = takeover.transition.project_id
     next_entries = list(entries)
     blockers: list[str] = []
     runtime_id = machine_runtime.instance_id

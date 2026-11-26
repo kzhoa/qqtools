@@ -75,6 +75,18 @@ def default_machine_runtime_root() -> Path:
     return (Path.home() / ".qqtools" / "qexp-machine").resolve()
 
 
+def _effective_runtime_id(seed: str, effective_id: object) -> str:
+    # Compatibility imports preserve an already-effective ID. New identities
+    # retain the random seed and derive the public value on the current host.
+    if (
+        isinstance(effective_id, str)
+        and len(effective_id) == 64
+        and all(char in "0123456789abcdef" for char in effective_id)
+    ):
+        return effective_id
+    return sha256(f"{seed}\0{_host_instance_id()}".encode()).hexdigest()
+
+
 @dataclass(frozen=True, slots=True)
 class ExecutionContext:
     """Private pairing of project authority and its local resource backend."""
@@ -349,17 +361,16 @@ class MachineRuntime:
             instance_id = uuid.uuid4().hex
             atomic_replace(self.paths["identity"], {"machine_runtime": {"instance_id": instance_id}})
             effective_id = None
-        # A compatibility import can only preserve an already-effective ID;
-        # it has no way to reverse the host-bound digest into the old random
-        # seed.  New identities retain the random seed and derive the public
-        # 64-hex value on the current host.
-        if (
-            isinstance(effective_id, str)
-            and len(effective_id) == 64
-            and all(char in "0123456789abcdef" for char in effective_id)
-        ):
-            return effective_id
-        return sha256(f"{instance_id}\0{_host_instance_id()}".encode()).hexdigest()
+        return _effective_runtime_id(instance_id, effective_id)
+
+    def observe_instance_id(self) -> str:
+        """Read the current host-bound runtime identity without creating it."""
+        record = load_identity_record(self.paths["identity"])
+        if record is None:
+            self.require_identity()
+            # Initialization may have completed between the two reads.
+            raise RuntimeError(f"machine runtime identity changed while observing {self.root}; retry.")
+        return _effective_runtime_id(record["instance_id"], record.get("runtime_id"))
 
     @property
     def has_identity(self) -> bool:

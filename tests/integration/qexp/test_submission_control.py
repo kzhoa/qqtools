@@ -98,6 +98,42 @@ def test_external_replacement_invalidates_old_committed_receipt(submitted, state
     assert control.pending_path(cfg, task.submission_operation_id).exists()
 
 
+def test_read_only_visibility_leaves_stale_proof_for_normal_recovery(submitted):
+    cfg, task, operation = submitted
+    operation = large_operation(operation)
+    control.publish_submission(cfg, operation)
+    operation["submission"]["state"] = "aborted"
+    atomic_replace(source_path(cfg, operation), operation)
+    pending = control.pending_path(cfg, task.submission_operation_id)
+    assert not pending.exists()
+
+    with pytest.raises(control.SubmissionControlUnavailable):
+        control.read_submission_state(cfg, task.submission_operation_id, should_request_repair=False)
+
+    assert not pending.exists()
+    with pytest.raises(control.SubmissionControlUnavailable):
+        control.read_submission_state(cfg, task.submission_operation_id)
+    assert pending.exists()
+
+
+@pytest.mark.parametrize("is_redirected", [False, True])
+def test_read_only_visibility_checks_exact_submission_source(submitted, tmp_path, is_redirected):
+    cfg, task, operation = submitted
+    path = source_path(cfg, operation)
+    if is_redirected:
+        foreign = tmp_path / "foreign-submissions"
+        path.parent.rename(foreign)
+        path.parent.symlink_to(foreign, target_is_directory=True)
+    else:
+        operation["submission"]["operation_id"] = "different-operation"
+        atomic_replace(path, operation)
+
+    with pytest.raises((OSError, ValueError)):
+        control.read_submission_state(cfg, task.submission_operation_id, should_request_repair=False)
+
+    assert not control.pending_path(cfg, task.submission_operation_id).exists()
+
+
 def test_small_unindexed_source_has_bounded_truth_fallback(submitted):
     cfg, task, operation = submitted
     operation["submission"]["state"] = "aborted"

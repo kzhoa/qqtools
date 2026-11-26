@@ -31,6 +31,7 @@ from ..runtime.work_budget import diagnostic_increment, diagnostic_span
 from ..scheduler import fail_attempt, resume_starting_attempt
 from .config import load_agent_config
 from .context import MachineRuntime, ProjectBinding
+from .takeover_intent import read_takeover_intent
 
 
 def _pid_alive(pid: int) -> bool:
@@ -67,7 +68,7 @@ def _machine_is_true_idle(runtime: MachineRuntime, *, has_consumed_binding: bool
     project_io_executor = getattr(runtime, "project_io_executor", None)
     if project_io_executor is not None:
         try:
-            if project_io_executor.has_unfinished_work():
+            if read_takeover_intent(runtime.root) is not None or project_io_executor.has_unfinished_work():
                 return False
         except (OSError, RuntimeError, ValueError, KeyError, TypeError):
             return False
