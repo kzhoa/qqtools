@@ -18,7 +18,7 @@ from ..runtime.registration_protocol import (
     read_registration_document,
     validate_registration,
 )
-from ..runtime.takeover_registration import RegistrationWitness
+from ..runtime.takeover_registration import RegistrationWitness, TakeoverRegistrationConflict, has_takeover_capability
 from .bindings import ProjectBinding
 from .config import validate_agent_name
 from .context import MachineRuntime
@@ -164,6 +164,19 @@ def _inspect_project_takeover(
     except (OSError, RuntimeError, ValueError) as exc:
         blockers.append({"code": "takeover_inventory_unavailable", "message": str(exc)})
         inventory = None
+
+    try:
+        has_capability = has_takeover_capability(root)
+    except TakeoverRegistrationConflict as exc:
+        blockers.append({"code": "takeover_schema_unsupported", "message": str(exc)})
+    else:
+        if not has_capability:
+            blockers.append(
+                {
+                    "code": "registration_replacement_inactive",
+                    "message": "Upgrade the Project to enable the registration replacement capability before takeover.",
+                }
+            )
 
     current_binding = None
     departing = None

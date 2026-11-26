@@ -92,15 +92,18 @@ change between pages. If a cursor expires, start a new preview. A pending or
 unreadable ledger is reported as unavailable and is left for normal recovery.
 
 When the target's eligibility has expired or is superseded, the preview counts
-published Tasks whose home or active claim names that target. It reports pages
-of Task state, exact Attempt evidence when available, and queued Task placement.
+published Tasks whose home or active claim names that target. It also counts
+unclaimed queued Group Tasks from other homes when their current fallback
+policy permits the target. Each page reports Task state, exact Attempt evidence
+when available, and queued Task placement.
 Continue from the returned Task ID with `--tasks-after TASK_ID`. If a Group
 lacks the target worker, the preview identifies a possible primary worker
 addition and the affected Tasks on the page. Placement observations do not
 verify capacity or dependencies. Shared Attempt evidence cannot establish the
 old process's current state on an inaccessible machine.
 
-A clear preview provides a fresh plan ID. Confirm it with
+A clear preview on a Project that supports registration replacement provides a
+fresh plan ID. Confirm it with
 `qexp project takeover PATH --machine NAME --apply PLAN_ID`. Repeat each
 `--add-primary-worker GROUP` selection used in the preview. The plan binds the
 Project and runtime, the departing binding and its enablement, the target's

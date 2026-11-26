@@ -289,3 +289,29 @@ def test_confirmed_group_selection_covers_tasks_beyond_current_page(project, cap
     atomic_replace(off_page, malformed)
     with pytest.raises(RuntimeError, match="zz-green.*malformed control"):
         preview_project_takeover(runtime, root, "g2", selected_groups=("green",))
+
+
+def test_group_confirmation_includes_offered_tasks_from_another_home(project):
+    root, runtime, previous = project
+    target = config(previous, root)
+    other = config(runtime, root)
+    create_group(target, "training", ["g2", "g3"])
+    submit(target, ["true"], task_id="private", group="training", working_dir=root)
+    submit(other, ["true"], task_id="away", group="training", sharing_mode="spillover", working_dir=root)
+    path = group_path(target.shared_root, "training")
+    document = read_json(path)
+    document["group"]["worker_set"].pop("g2")
+    atomic_replace(path, document)
+    expire_registration(target)
+
+    def preview():
+        return preview_project_takeover(runtime, root, "g2", selected_groups=("training",))
+
+    initial = preview()
+    assert initial["selected_group_changes"][0]["affected_task_count"] == 1
+    offer(other, "away")
+    current = preview()
+    assert current["selected_group_changes"][0]["affected_task_count"] == 2
+    assert [task["task_id"] for task in current["task_impact"]["tasks"]] == ["away", "private"]
+    with pytest.raises(TakeoverUsageError, match="fresh --plan"):
+        confirm_project_takeover(runtime, root, "g2", initial["plan_id"], selected_groups=("training",))

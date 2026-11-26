@@ -797,3 +797,64 @@ def test_drain_requires_durable_legacy_source_release_before_retirement(transiti
 
     assert takeover_drain.observe_takeover_drain(request) == "drained"
     assert (root / SOURCE_RELEASE_FILE).is_file()
+
+
+def test_missing_capability_blocks_confirmation_and_allows_unreserved_abort(transition):
+    from qqtools.plugins.qexp.agent.project_takeover import TakeoverUsageError, preview_project_takeover
+    from qqtools.plugins.qexp.agent.takeover_requests import accept_project_takeover
+    from qqtools.plugins.qexp.runtime.paths import shared_paths
+    from qqtools.plugins.qexp.runtime.store import read_json
+
+    request, _, _, target, _ = transition
+    runtime = MachineRuntime(request.successor_runtime_root)
+    root = request.shared_root
+    plan_id = preview_project_takeover(runtime, root, "g2")["plan_id"]
+    path = shared_paths(root)["schema"] / "version.json"
+    schema = read_json(path)
+    schema["schema"]["required_capabilities"].remove(takeover.REGISTRATION_REPLACEMENT_CAPABILITY)
+    atomic_replace(path, schema)
+
+    blocked = preview_project_takeover(runtime, root, "g2")
+    assert blocked["status"] == "blocked" and blocked["plan_id"] is None
+    assert [item["code"] for item in blocked["blockers"]] == ["registration_replacement_inactive"]
+    with pytest.raises(TakeoverUsageError, match="registration replacement capability"):
+        accept_project_takeover(runtime, root, "g2", plan_id)
+    # A previously accepted request still owns the local slot. Exercise the
+    # worker steps that let the coordinator settle it after capability loss.
+    intent = TakeoverIntent(plan_id=plan_id, transition=request, original_enabled=True)
+    save_takeover_intent(runtime.root, intent, expected=None)
+    params = {"plan_id": plan_id, "transition": request.to_dict()}
+    assert run_takeover_step(runtime.root, {**params, "step": "reserve"}, before_mutation=do_not_fence) == {
+        "outcome": "stale"
+    }
+    requested = replace(intent, is_cancel_requested=True)
+    save_takeover_intent(runtime.root, requested, expected=intent)
+    save_takeover_intent(runtime.root, replace(requested, phase="cancelling"), expected=requested)
+    assert run_takeover_step(runtime.root, {**params, "step": "abort"}, before_mutation=do_not_fence) == {
+        "outcome": "departing_current"
+    }
+    assert not reservation_path(target).exists()
+
+
+def test_expired_successor_cannot_write_groups_until_renewal(transition, monkeypatch):
+    from qqtools.plugins.qexp.runtime.store import check_mutation_fence
+
+    request, _, _, target, _ = transition
+    takeover.reserve_takeover_registration(request, before_mutation=do_not_fence)
+    takeover.commit_takeover_registration(request, before_mutation=do_not_fence)
+    path = machine_registration_path(request.shared_root, "g2")
+    current = load_machine_registration(target)
+    expired = {"registration": {**current["registration"], "eligibility_expires_at": "2000-01-01T00:00:00Z"}}
+    atomic_replace(path, expired)
+    assert takeover.observe_takeover_registration(request) == "committed"
+    with pytest.raises(takeover.TakeoverRegistrationConflict, match="must renew"):
+        with takeover.takeover_successor_guard(request, before_mutation=do_not_fence):
+            pytest.fail("Expired successor acquired Group write authority")
+
+    atomic_replace(path, current)
+    with takeover.takeover_successor_guard(request, before_mutation=do_not_fence) as owns_registration:
+        assert owns_registration
+        check_mutation_fence(path)
+        monkeypatch.setattr(takeover, "registration_state", lambda record: "expired")
+        with pytest.raises(takeover.TakeoverRegistrationConflict, match="must renew"):
+            check_mutation_fence(path)

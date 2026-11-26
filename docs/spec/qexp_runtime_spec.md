@@ -173,12 +173,16 @@ handover. The commit rechecks target write eligibility and both registration
 identities under the registration fence. Replay of a committed grant updates
 the exact successor metadata and departing registration before publishing the
 local successor. Before the grant, an abort verifies the departing registration
-and releases only its own reservation. An abort that observes the successor
+and releases only its own reservation. If the registration replacement capability
+is absent, the agent can still settle an unreserved operation after verifying
+Project identity and both registrations. An abort that observes the successor
 preserves the reservation and continues exact commit replay.
 
 Confirmed Group additions run after binding publication. Each addition rechecks
-the approved Group and Task placement under the Group writer lock. The
-new worker records the plan ID so a retry can repair the ready projection
+the approved Group and Task placement under the Group writer lock, including
+offered Tasks from other homes. Shared Group writes require a current successor
+lease. The agent retries after renewal. The new worker records the plan ID
+so a retry can repair the ready projection
 without changing the Group or reapplying completed additions. Per-Group
 outcomes are independent of registration completion.
 

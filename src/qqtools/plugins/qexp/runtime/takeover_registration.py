@@ -184,7 +184,7 @@ class TakeoverRegistration:
         )
 
 
-def _validate_shared_project(transition: TakeoverRegistration) -> None:
+def _validate_shared_project(transition: TakeoverRegistration, *, requires_capability: bool) -> None:
     paths = shared_paths(transition.shared_root)
     identity = _read_protocol_record(paths["project"] / "identity.json")
     project = identity.get("project") if identity is not None else None
@@ -198,15 +198,21 @@ def _validate_shared_project(transition: TakeoverRegistration) -> None:
     ):
         raise TakeoverRegistrationConflict("Project identity changed during takeover.")
 
-    schema_document = _read_protocol_record(paths["schema"] / "version.json")
+    has_capability = has_takeover_capability(transition.shared_root)
+    if requires_capability and not has_capability:
+        raise TakeoverRegistrationConflict("Project registration replacement capability is inactive.")
+
+
+def has_takeover_capability(root: Path) -> bool:
+    """Check the Project schema and its registration replacement capability."""
+    schema_document = _read_protocol_record(shared_paths(root)["schema"] / "version.json")
     schema = schema_document.get("schema") if schema_document is not None else {}
     if not isinstance(schema, dict) or type(schema.get("version")) is not int or schema["version"] != SCHEMA_VERSION:
         raise TakeoverRegistrationConflict("Project schema version is unsupported during takeover.")
     capabilities = schema.get("required_capabilities", [])
     if not isinstance(capabilities, list) or not all(isinstance(item, str) for item in capabilities):
         raise RuntimeError("Project schema capability state is malformed during takeover.")
-    if REGISTRATION_REPLACEMENT_CAPABILITY not in capabilities:
-        raise TakeoverRegistrationConflict("Project registration replacement capability is inactive.")
+    return REGISTRATION_REPLACEMENT_CAPABILITY in capabilities
 
 
 def _directory_identity(path: Path) -> tuple[int, int] | None:
@@ -295,6 +301,8 @@ def _require_mutation_fence(before_mutation: Callable[[], None]) -> None:
 @contextmanager
 def _registration_locks(
     transition: TakeoverRegistration,
+    *,
+    requires_capability: bool = True,
 ) -> Iterator[tuple[RootConfig, RootConfig | None, _RegistrationScope]]:
     root = transition.shared_root
     partition = machine_project_paths(transition.successor_runtime_root, transition.project_id)["root"]
@@ -309,7 +317,7 @@ def _registration_locks(
         key=lambda cfg: cfg.machine_name,
     )
     scope = _RegistrationScope(root, configs, reservation_path(target_cfg).parent)
-    _validate_shared_project(transition)
+    _validate_shared_project(transition, requires_capability=requires_capability)
     with (
         schema_writer_lock(target_cfg),
         exclusive(shared_paths(root)["locks"] / "registrations.lock"),
@@ -319,7 +327,7 @@ def _registration_locks(
             stack.enter_context(machine_lock(root, cfg.machine_name))
         scope.record_acquired_locks()
         scope.check_current()
-        _validate_shared_project(transition)
+        _validate_shared_project(transition, requires_capability=requires_capability)
         yield target_cfg, departing_cfg, scope
 
 
@@ -578,6 +586,10 @@ def _release_locked_reservation(
         return False
     if current != _reservation_document(transition):
         return False
+    # Observation and abort can prove an unreserved operation on an older
+    # Project. Removing a reservation still requires the writer capability.
+    if not has_takeover_capability(transition.shared_root):
+        raise TakeoverRegistrationConflict("Project registration replacement capability is inactive.")
     with fenced_mutations(transition.shared_root, scope.mutation_fence(before_mutation)):
         check_mutation_fence(path)
         path.unlink()
@@ -600,7 +612,7 @@ def abort_takeover_registration(
     A committed result preserves the reservation so commit replay can finish.
     """
     _require_mutation_fence(before_mutation)
-    with _registration_locks(transition) as (target_cfg, departing_cfg, scope):
+    with _registration_locks(transition, requires_capability=False) as (target_cfg, departing_cfg, scope):
         document = _read_registration(target_cfg, transition.project_id)
         if document is not None:
             record = document["registration"]
@@ -625,7 +637,7 @@ def observe_takeover_registration(
     transition: TakeoverRegistration,
 ) -> Literal["committed", "unchanged", "changed"]:
     """Classify the shared target identity under the registration fence."""
-    with _registration_locks(transition) as (target_cfg, _departing_cfg, _scope):
+    with _registration_locks(transition, requires_capability=False) as (target_cfg, _departing_cfg, _scope):
         document = _read_registration(target_cfg, transition.project_id)
         if document is None:
             return "changed"
@@ -648,5 +660,12 @@ def takeover_successor_guard(
         if document is None or not _is_successor(document["registration"], transition):
             yield False
             return
-        with fenced_mutations(transition.shared_root, scope.mutation_fence(before_mutation)):
+
+        def require_current_lease() -> None:
+            before_mutation()
+            if registration_state(document["registration"]) != "eligible":
+                raise TakeoverRegistrationConflict("Successor registration must renew before a Group write.")
+
+        require_current_lease()
+        with fenced_mutations(transition.shared_root, scope.mutation_fence(require_current_lease)):
             yield True

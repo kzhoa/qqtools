@@ -51,7 +51,14 @@ def _published_target_tasks(cfg: RootConfig, directory: Path) -> Iterator[TaskRe
             if home_machine != cfg.machine_name and claim_machine != cfg.machine_name:
                 if claim is not None and (not isinstance(claim_machine, str) or not claim_machine):
                     raise ValueError("Task active claim machine is invalid.")
-                continue
+                # A new primary worker can also admit offered Tasks from another home.
+                if (
+                    claim is not None
+                    or task.group_name is None
+                    or task.state["projection"] != "queued"
+                    or not task_machine_matches(task, cfg.machine_name)
+                ):
+                    continue
             operation_id = task.submission_operation_id
             if operation_id is not None:
                 state = read_submission_state(cfg, operation_id, should_request_repair=False)
