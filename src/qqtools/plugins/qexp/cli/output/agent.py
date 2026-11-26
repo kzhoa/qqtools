@@ -355,6 +355,14 @@ def _readiness_card(result: Mapping[str, Any], *, restarting: bool = False) -> t
             "Inspect the Project inventory and registry paths.",
             shlex.join(("ls", "-ld", "--", str(root / "inventory.json"), str(root / "registry.json"))),
         )
+    if reason == "project_sample_limited" and (path := readiness.get("first_unchecked_project")):
+        lines.extend(
+            _next_step(
+                "Inspect the first Project outside this sample.", _machine_command(result, "--project", path, "status")
+            )
+        )
+        if not affected:
+            return lines, None
     if restarting or not affected:
         return lines, ("Recheck process and Project readiness.", _machine_command(result, "agent", "status"))
     project = affected[0]

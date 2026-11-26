@@ -2628,7 +2628,8 @@ when the roster is unknown. `checked_count` counts sampled roster entries.
 when the roster or active process is unverified. `affected_projects` lists
 sampled paths and their blocker or missing evidence. `reason` describes a
 machine-level limitation when present. The sample checks at most eight entries
-and leaves unsampled Projects unverified. Verified machine-only startup
+and leaves unsampled Projects unverified. For a limited sample,
+`first_unchecked_project` identifies the first omitted Project for scoped status inspection. Verified machine-only startup
 requires a known empty enabled roster and current daemon readiness. An
 observation describes the current runtime, agent and binding, while Task
 execution has its own evidence. Existing lifecycle result fields retain

@@ -118,7 +118,8 @@ def machine_project_readiness(
 
     project_reports = {(report.get("project_id"), report.get("shared_root")): report for report in projects}
     now = datetime.now(timezone.utc)
-    sample = sorted(enabled)[:_PROJECT_STATUS_SAMPLE]
+    roster = sorted(enabled)
+    sample = roster[:_PROJECT_STATUS_SAMPLE]
     fresh = 0
     affected = []
     for project_id, shared_root in sample:
@@ -155,6 +156,8 @@ def machine_project_readiness(
     ):
         view.update(state="observed", reason=None)
     elif len(enabled) > len(sample):
+        next_root = roster[len(sample)][1]
+        view["first_unchecked_project"] = str(next_root.parent if next_root.name == ".qexp" else next_root)
         view["reason"] = "project_sample_limited"
     elif affected:
         view["reason"] = "project_observations_incomplete"

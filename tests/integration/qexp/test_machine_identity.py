@@ -57,9 +57,12 @@ def test_init_human_guides_fresh_setup_without_enrolling(tmp_path, monkeypatch, 
         str(runtime.root),
         "project",
         "register",
-        str(project) if known_project else ".",
+        str(project) if known_project else "PROJECT_PATH",
     ]
     assert ("qexp project init" in output) is not known_project
+    if not known_project:
+        assert "Replace PROJECT_PATH" in output
+        assert "qexp project init PROJECT_PATH" in output
     assert _snapshot(project) == before
     assert runtime.load_registry()[1] == []
     assert not runtime.paths["pid"].exists()

@@ -278,6 +278,12 @@ def test_restart_cli_reports_only_fresh_observations_for_the_replaced_agent(tmp_
     assert "0/0" not in human
     assert "do not repeat" not in human.lower()
 
+    monkeypatch.setattr(readiness, "_PROJECT_STATUS_SAMPLE", 2)
+    omitted = sorted(bindings, key=lambda binding: binding.project_id)[2].shared_root.parent
+    assert main([*prefix[:-1], "status"]) == 0
+    commands = [shlex.split(line) for line in capsys.readouterr().out.splitlines() if line.lstrip().startswith("qexp ")]
+    assert ["qexp", *prefix[:2], "--project", str(omitted), "status"] in commands
+
 
 @pytest.mark.parametrize("missing", ["inventory", "registry"])
 def test_agent_status_leaves_missing_roster_unknown_and_does_not_repair(tmp_path, capsys, missing):

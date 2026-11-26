@@ -48,12 +48,13 @@ def _render_machine_init(result: Mapping[str, Any], presentation: Mapping[str, o
     if isinstance(project, str):
         lines.extend((f"Project: {encode_display_text(project)}", "Next, register this Project on the new runtime."))
     else:
-        project = "."
+        project = "PROJECT_PATH"
         lines.extend(
             (
-                "Enter the intended Project directory. For a new Project, initialize it first.",
-                "  qexp project init",
-                "Then register the Project on the new runtime.",
+                "Replace PROJECT_PATH with the intended Project directory.",
+                "For a new Project, initialize it first:",
+                "  qexp project init PROJECT_PATH",
+                "Register the initialized Project on this runtime:",
             )
         )
     command = shlex.join(("qexp", "--machine-runtime-root", root, "project", "register", project))
