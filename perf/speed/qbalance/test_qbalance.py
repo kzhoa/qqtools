@@ -1,12 +1,11 @@
 """Benchmark public LPT tiers, asserting monotonic quality on identical inputs.
 
-PYTHONPATH=src python exps/test_balance_v3/compare_lpt_tiers.py --large
+PYTHONPATH=src python perf/speed/qbalance/test_qbalance.py
 Reports median planning time over seeds 7/13/29 and seed-7 quality metrics.
 Timing excludes metric computation; all runs use static plans without traversal
 shuffle. This measures CPU planning and additive costs, not GPU training speed.
 """
 
-import argparse
 from time import perf_counter
 
 import numpy as np
@@ -33,8 +32,12 @@ def _benchmark_case(total, distribution, batch_size=16, world_size=4):
         for strategy in strategies:
             start = perf_counter()
             plan = _plan_rank_batches(
-                costs, batch_size=batch_size, world_size=world_size, seed=seed,
-                strategy=strategy, should_shuffle=False,
+                costs,
+                batch_size=batch_size,
+                world_size=world_size,
+                seed=seed,
+                strategy=strategy,
+                should_shuffle=False,
             )
             timings[strategy].append((perf_counter() - start) * 1000)
             np.testing.assert_array_equal(np.sort(plan.ravel()), np.arange(total))
@@ -43,26 +46,22 @@ def _benchmark_case(total, distribution, batch_size=16, world_size=4):
             if seed == 7:
                 metrics[strategy] = (*scores[strategy], np.ptp(loads, axis=1).mean())
         # Step sums remain diagnostics, not the grouping objective.
-        assert scores["lpt_best"][:2] <= scores["lpt"][:2] <= scores["lpt_fast"][:2]
+        assert scores["lpt_best"][:2] <= scores["lpt_medium"][:2] <= scores["lpt_fast"][:2]
     for strategy in _LPT_STRATEGIES:
         row = (np.median(timings[strategy]), *metrics[strategy])
-        print(f"{total},{distribution},{batch_size},{world_size},{strategy},"
-              + ",".join(f"{value:.2f}" for value in row), flush=True)
+        print(
+            f"{total},{distribution},{batch_size},{world_size},{strategy}," + ",".join(f"{value:.2f}" for value in row),
+            flush=True,
+        )
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--large", action="store_true", dest="should_measure_large")
-    args = parser.parse_args()
-    print("N,distribution,B,R,strategy,median_ms,peak_seed7,p99_seed7,"
-          "sum_step_max_seed7,mean_span_seed7", flush=True)
+    print("N,distribution,B,R,strategy,median_ms,peak_seed7,p99_seed7,sum_step_max_seed7,mean_span_seed7", flush=True)
     _benchmark_case(256, "uniform")
     for distribution in ("uniform", "lognormal", "bimodal", "outlier"):
         _benchmark_case(16384, distribution)
     for batch_size, world_size in ((1, 4), (4, 4), (64, 4), (16, 1)):
         _benchmark_case(16384, "lognormal", batch_size, world_size)
-    if args.should_measure_large:
-        _benchmark_case(1_000_000, "lognormal")
 
 
 if __name__ == "__main__":

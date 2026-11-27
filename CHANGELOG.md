@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- breaking: rename the balanced sampler and batch grouping strategy
+  `lpt-medium` to `lpt_medium`. The existing short alias `lpt` still selects
+  the medium tier.
+
 ## v1.3.31
 
 - feat: show recorded Project upgrade repairs in qexp status and explain the

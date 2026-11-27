@@ -160,12 +160,12 @@ def compute_global_even_sort_order(
     return _validate_permutation(order, int(costs.shape[0]))
 
 
-_LPT_STRATEGIES = ("lpt_fast", "lpt-medium", "lpt_best")
+_LPT_STRATEGIES = ("lpt_fast", "lpt_medium", "lpt_best")
 
 
 def _normalize_lpt_strategy(strategy: str) -> str:
     """Resolve the permanent short alias before planning or caching."""
-    return "lpt-medium" if strategy == "lpt" else strategy
+    return "lpt_medium" if strategy == "lpt" else strategy
 
 
 _LPT_REFINEMENT_PASSES = 4
@@ -542,7 +542,7 @@ def _partition_rank_batches(
     *,
     batch_size: int,
     seed: int = 0,
-    strategy: str = "lpt-medium",
+    strategy: str = "lpt_medium",
 ) -> _RankBatchPartition:
     """Partition every index exactly once, with no rank count, padding or dropping."""
     strategy = _normalize_lpt_strategy(strategy)
@@ -579,7 +579,7 @@ def compute_balanced_batch_indices(
         batch_size: Positive integer number of samples per complete batch.
         seed: Nonnegative random seed. Identical inputs reproduce the partition within
             an algorithm version, not necessarily across versions.
-        strategy: "lpt_fast", "lpt-medium" (alias "lpt"), or "lpt_best".
+        strategy: "lpt_fast", "lpt_medium" (alias "lpt"), or "lpt_best".
 
     Returns:
         A plain tuple (batch_indices, remaining_indices) of read-only, contiguous int64
@@ -709,7 +709,7 @@ def _plan_rank_batches(
     seed: int = 0,
     should_drop_last: bool = False,
     should_shuffle: bool = True,
-    strategy: str = "lpt-medium",
+    strategy: str = "lpt_medium",
 ) -> np.ndarray:
     """Group independently of R, repair the small DDP tail, then compose steps.
 
@@ -776,7 +776,7 @@ def _plan_rank_batches(
             seed=seed,
             should_drop_last=should_drop_last,
             should_shuffle=False,
-            strategy="lpt-medium" if strategy == "lpt_best" else "lpt_fast",
+            strategy="lpt_medium" if strategy == "lpt_best" else "lpt_fast",
         ).reshape(-1, batch_size)
         if _rank_batch_quality(_rank_batch_loads(costs, middle), world_size) < (
             _rank_batch_quality(_rank_batch_loads(costs, batches), world_size)

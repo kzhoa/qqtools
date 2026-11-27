@@ -6,7 +6,7 @@ import pytest
 from qqtools.data import compute_balanced_batch_indices
 
 
-@pytest.mark.parametrize("strategy", ["lpt_fast", "lpt", "lpt-medium", "lpt_best"])
+@pytest.mark.parametrize("strategy", ["lpt_fast", "lpt", "lpt_medium", "lpt_best"])
 @pytest.mark.parametrize("total", [0, 1, 3, 4, 5, 32, 35])
 def test_public_partition_covers_input_once(strategy, total):
     costs = np.random.default_rng(42).lognormal(size=total)
@@ -35,7 +35,7 @@ def test_public_partition_covers_input_once(strategy, total):
 def test_default_and_medium_alias_agree():
     costs = np.arange(35)
     expected = compute_balanced_batch_indices(costs, batch_size=4)
-    for strategy in ("lpt", "lpt-medium"):
+    for strategy in ("lpt", "lpt_medium"):
         actual = compute_balanced_batch_indices(costs, batch_size=4, strategy=strategy)
         for left, right in zip(actual, expected):
             np.testing.assert_array_equal(left, right)

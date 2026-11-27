@@ -56,7 +56,7 @@ is silently padded or dropped. Call `.copy()` if mutable output is needed.
 
 Costs must be one-dimensional, finite and nonnegative; calculations use float64 and
 reject non-finite accumulated batch loads. `batch_size` is a positive integer.
-The strategies are `lpt_fast`, `lpt-medium` (permanent alias/default `lpt`), and
+The strategies are `lpt_fast`, `lpt_medium` (permanent alias/default `lpt`), and
 `lpt_best`. Identical input, strategy and seed reproduce the partition within an
 algorithm version; exact grouping is not guaranteed across versions.
 
@@ -74,10 +74,10 @@ sampler's V-strategy deprecation does not retire these independent APIs.
 ## LPT Strategies
 
 `BalancedDistributedSampler` and `BalancedBatchSampler` accept `strategy="lpt_fast"`,
-`"lpt-medium"`, and `"lpt_best"`. `"lpt"` is a permanent input alias for
-`"lpt-medium"`; initialization normalizes it before planning and in-memory caching.
+`"lpt_medium"`, and `"lpt_best"`. `"lpt"` is a permanent input alias for
+`"lpt_medium"`; initialization normalizes it before planning and in-memory caching.
 Historical benchmark tables use `lpt` for this same medium tier.
-The default is `"lpt"` (normalized to `"lpt-medium"`). LPT is not supported by
+The default is `"lpt"` (normalized to `"lpt_medium"`). LPT is not supported by
 `compute_global_even_sort_order()`
 or the dataset-level `balance_strategy` setting used for LMDB artifacts.
 
@@ -90,9 +90,9 @@ tail rules: padding is enabled by default. Its `pad` argument defaults to True u
 ### Upgrading to 1.3.30
 
 Both samplers now accept the LPT planning tiers exclusively. Replace an explicit
-`v1`, `v2`, or `v3` sampler strategy with `lpt_fast`, `lpt-medium` (alias
+`v1`, `v2`, or `v3` sampler strategy with `lpt_fast`, `lpt_medium` (alias
 `lpt`), or `lpt_best`, and remove the sampler's `sample_order` argument.
-Default construction continues to select `lpt-medium`. Migrating an explicit
+Default construction continues to select `lpt_medium`. Migrating an explicit
 V strategy changes batch membership and traversal. Dataset-level
 `balance_strategy` and `compute_global_even_sort_order` still accept V strategies.
 
@@ -218,7 +218,7 @@ change memberships for divisible inputs because the third quality key changed.
 
 The fast tier actively balances costs; it does not promise to beat random sampling on all inputs.
 The middle tier now evaluates the fast candidate too, so its sample order can differ from the
-initial capacity-only `lpt` implementation. The default tier is `lpt-medium`.
+initial capacity-only `lpt` implementation. The default tier is `lpt_medium`.
 
 The sampler snapshots costs and caches the complete static plan once per instance in memory.
 Base seed controls tail selection and equal-cost tie-breaking. Epoch is not part of static
@@ -428,20 +428,23 @@ collective desynchronization.
   the certified three-batch counterexample, exact local assignment enumeration, preservation
   of unselected slots and occurrences, conservative bounds, overflow, determinism and laziness.
   It imports production code only and contains no timing assertions.
-- `exps/test_balance_v3/test_layered_numpy.py` preserves the experimental implementation's
-  scalar-equivalence and boundary checks. Run it explicitly; it is outside the default
-  `testpaths = tests` collection. The former unit-test path is no longer used.
-- Planning-time measurements and large-scale comparisons remain in the `compare_*.py`
-  experimental scripts, not the unit suite.
+- [`perf/speed/qbalance/`](../../perf/speed/qbalance) contains the CPU planning
+  benchmark for the three production strategies. See the
+  [performance results](../../perf/speed/qbalance/performance.md). Default pytest
+  collection covers `tests/`.
 
-The placement-only change collected 214 checks and passed both sets independently (99 production
-checks and 115 experimental checks). No production algorithm or sampler API changed. Commands:
+From the repository root:
 
 ```bash
-PYTHONPATH=src python -m pytest tests/unit/data_utils/test_lpt_fast.py exps/test_balance_v3/test_layered_numpy.py --collect-only -q
-PYTHONPATH=src python -m pytest tests/unit/data_utils/test_lpt_fast.py -q
-PYTHONPATH=src python -m pytest exps/test_balance_v3/test_layered_numpy.py -q
+PYTHONPATH=src python perf/speed/qbalance/test_qbalance.py
 ```
+
+The benchmark measures CPU planning latency and estimated load metrics.
+
+Historical commands using `exps/test_balance_v3/` throughout this document refer
+to the experiment sources preserved at commit
+`4173cc002fd5868c96a234904996f7452a148ec0`. Timing tables retain their original
+measurement context.
 
 ## Initial Tier Verification (2026-09-05, Before Bounded Repair)
 

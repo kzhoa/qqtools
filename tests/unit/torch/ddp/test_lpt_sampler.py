@@ -35,7 +35,7 @@ def test_lpt_builds_once_and_epoch_changes_only_step_and_rank_traversal(monkeypa
     assert [list(sampler) for sampler in samplers] != before
     assert len(calls) == 4
     assert all(call["should_shuffle"] is False for call in calls)
-    expected_strategy = "lpt-medium" if strategy == "lpt" else strategy
+    expected_strategy = "lpt_medium" if strategy == "lpt" else strategy
     assert all(call["strategy"] == expected_strategy for call in calls)
 
 
@@ -141,7 +141,7 @@ def test_medium_alias_normalizes_cache_and_matches_epochs(sampler_type, shuffle)
             seed=7,
             strategy=strategy,
         )
-        for strategy in ("lpt", "lpt-medium")
+        for strategy in ("lpt", "lpt_medium")
     ]
     samplers.append(
         sampler_type(
@@ -156,15 +156,15 @@ def test_medium_alias_normalizes_cache_and_matches_epochs(sampler_type, shuffle)
     for epoch in (0, 1, 9):
         for sampler in samplers:
             sampler.set_epoch(epoch)
-            assert sampler._plan_cache.strategy == "lpt-medium"
+            assert sampler._plan_cache.strategy == "lpt_medium"
         assert list(samplers[0]) == list(samplers[1]) == list(samplers[2])
 
 
 @pytest.mark.parametrize("size", [0, 48, 51])
 def test_low_level_medium_alias_matches_base_and_derived_plans(size):
     costs = np.arange(size)
-    base = [qbalance._partition_rank_batches(costs, batch_size=4, strategy=s) for s in ("lpt", "lpt-medium")]
+    base = [qbalance._partition_rank_batches(costs, batch_size=4, strategy=s) for s in ("lpt", "lpt_medium")]
     np.testing.assert_array_equal(base[0].full_batches, base[1].full_batches)
     np.testing.assert_array_equal(base[0].remainder, base[1].remainder)
-    plans = [qbalance._plan_rank_batches(costs, batch_size=4, world_size=2, strategy=s) for s in ("lpt", "lpt-medium")]
+    plans = [qbalance._plan_rank_batches(costs, batch_size=4, world_size=2, strategy=s) for s in ("lpt", "lpt_medium")]
     np.testing.assert_array_equal(*plans)

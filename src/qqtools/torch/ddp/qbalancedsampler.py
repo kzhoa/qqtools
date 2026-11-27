@@ -138,14 +138,14 @@ class BalancedDistributedSampler(Sampler[int]):
             Dropped or repeated sample occurrences stay fixed across epochs.
         pad: Boolean. Repeat deterministic tail occurrences when True. ``pad=True`` and
             ``drop_last=True`` are mutually exclusive.
-        strategy: Planning tier: lpt_fast, lpt-medium (alias/default lpt), or lpt_best.
+        strategy: Planning tier: lpt_fast, lpt_medium (alias/default lpt), or lpt_best.
 
     Raises:
         TypeError: Boolean or integer settings have unsupported types.
         ValueError: Costs, settings, rank configuration, or parameter combinations
             are invalid, or accumulated batch costs are not finite.
 
-    ``lpt_fast``, ``lpt-medium`` (alias ``lpt``) and ``lpt_best`` trade planning work for
+    ``lpt_fast``, ``lpt_medium`` (alias ``lpt``) and ``lpt_best`` trade planning work for
     lexicographic
     base-group quality (peak batch cost, P99, squared loads); higher tiers retain lower
     base candidates and may tie. DDP tail repair is separate and does not guarantee
@@ -163,7 +163,7 @@ class BalancedDistributedSampler(Sampler[int]):
     optimization can touch other batches in the derived plan). Changing epochs does
     not change those occurrences. ``pad=False`` preserves non-divisible input without tail
     duplicates; rank-local plans may end with an incomplete batch.
-    The default is ``lpt``, normalized internally to ``lpt-medium``.
+    The default is ``lpt``, normalized internally to ``lpt_medium``.
     """
 
     def __init__(
@@ -239,7 +239,7 @@ class BalancedBatchSampler(BatchSampler):
             Dropped/repeated occurrences remain fixed across epochs for LPT.
         pad: Boolean. Repeat deterministic tail occurrences when True. ``pad=True`` and
             ``drop_last=True`` are mutually exclusive.
-        strategy: lpt_fast, lpt-medium (alias/default lpt), or lpt_best.
+        strategy: lpt_fast, lpt_medium (alias/default lpt), or lpt_best.
 
     Raises:
         TypeError: Boolean or integer settings have unsupported types.
