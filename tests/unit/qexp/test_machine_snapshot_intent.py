@@ -404,3 +404,92 @@ def test_unfinished_project_io_uses_a_short_controller_poll_interval(tmp_path: P
         has_ready_result=lambda: True,
     )
     assert runtime.pending_launch_wait_seconds(5.0) == 0.05
+
+
+def test_renewal_prepare_backoff_retires_each_batch_until_deadline(tmp_path, monkeypatch):
+    from collections import Counter
+
+    from qqtools.plugins.qexp.agent.control_plane import _MachineControlPlane
+    from qqtools.plugins.qexp.agent.control_plane_health import read_control_plane_health
+    from qqtools.plugins.qexp.agent.project_io_controller import ProjectIOController
+
+    runtime = MachineRuntime(tmp_path / "machine")
+    bindings = tuple(
+        ProjectBinding(
+            f"project-{i}",
+            tmp_path / str(i) / ".qexp",
+            "gpu",
+            registration_generation=f"generation-{i}",
+            runtime_instance_id=runtime.instance_id,
+            runtime_root=str(runtime.root),
+        )
+        for i in range(65)
+    )
+    runtime.working_set.reconcile(bindings, revision=1)
+    monkeypatch.setattr(runtime, "load_registry_snapshot", lambda: (1, bindings))
+    selected, horizon = runtime.working_set.select_registration_renewals()
+    failed = selected[0]
+    prepares = []
+
+    def prepare(binding, *args, **kwargs):
+        prepares.append(binding)
+        raise OSError("test failure\n" + "x" * 500)
+
+    executor = SimpleNamespace(
+        runtime_id=runtime.instance_id,
+        unresolved_requests=lambda: (),
+        admission_snapshot=lambda **kwargs: (
+            {
+                "executor_epoch": "epoch",
+                "envelope": "healthy",
+                "capacity": 4,
+                "overdue_worker_count": 0,
+                "supported_hang_limit": 2,
+            },
+            (),
+        ),
+        prepare_registration_renew=prepare,
+    )
+    now = [100.0]
+    controller = ProjectIOController(
+        runtime, executor, monotonic=lambda: now[0], utc_clock=lambda: "2026-11-26T00:00:00Z"
+    )
+    for binding in bindings:
+        if binding != failed:
+            controller._registration_due[controller._binding_identity(binding, 1, "epoch")] = 1000.0
+    runtime.publish_registration_renewal_intent(
+        bindings=selected, registry_revision=1, renewal_horizon_seconds=horizon, heartbeat_interval_seconds=5.0
+    )
+    with controller.admission_turn():
+        dispatch_loop._advance_registration_renewals(runtime, controller, 1, bindings)
+        assert runtime.registration_renewal_intent().bindings == (failed,)
+        assert prepares == []
+    assert prepares == [failed]
+    retry_at = next(iter(controller._service_backoff.values())).retry_at
+    turns = Counter()
+    for _ in range(131):
+        batch = runtime.registration_renewal_intent().bindings
+        turns.update(binding.project_id for binding in batch)
+        dispatch_loop._advance_registration_renewals(runtime, controller, 1, bindings)
+        assert len(runtime.registration_renewal_intent().bindings) == 64
+        assert next(iter(controller._service_backoff.values())).retry_at == retry_at
+        assert prepares == [failed]
+    assert all(turns[binding.project_id] >= 2 for binding in bindings)
+    item = controller.registration_renewal_health_view()["items"][0]
+    assert (item["project_id"], item["registration_generation"]) == (failed.project_id, failed.registration_generation)
+    assert item["blocking_reason"] == item["last_outcome"] == "request_prepare_failed"
+    assert item["cause"] == "OSError"
+    assert item["next_retry_at"] == "2026-11-26T00:00:05Z"
+    runtime.project_io_controller = controller
+    plane = _MachineControlPlane(
+        runtime, instance_id="agent-instance", loop_interval=5, started_at="2026-11-26T00:00:00Z", available_gpus=[]
+    )
+    live = plane.monitor_health()
+    persisted = read_control_plane_health(runtime.root, instance_id="agent-instance", thread_alive=None)
+    for view in (live, persisted):
+        assert view["project_registration_renewals"]["items"][0] == item
+        assert "snapshot_batch_error" not in view
+    now[0] = retry_at
+    for _ in range(2):
+        dispatch_loop._advance_registration_renewals(runtime, controller, 1, bindings)
+    assert prepares == [failed, failed]

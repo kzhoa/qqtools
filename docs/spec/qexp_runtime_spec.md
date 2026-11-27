@@ -1,7 +1,7 @@
 ---
 doc_type: spec
 status: active
-updated_at: 2026-11-24
+updated_at: 2026-11-27
 archived_at:
 ---
 
@@ -2420,6 +2420,19 @@ Registration renewal is an authority-class service for every enabled binding, wh
 or dormant. Bounded fair selection and its renewal horizon do not depend on background snapshot
 publication or on a Project reaching idle; short registration leases must remain serviceable
 while the Project is active. Disabled bindings are excluded from new registration renewal.
+
+When preparation fails before request creation, each visit during that exact service
+identity's backoff retires its current batch member and preserves its retry deadline.
+An offer awaiting admission remains pending. With available executor capacity and
+accessible peer storage, repeated preparation failures for one enabled binding must
+allow healthy peers to be selected again and renew across successive lease intervals.
+Only the isolated worker can establish registration eligibility on this renewal path.
+
+Status reports renewal outcome, blocker and scheduled retry for the observed generation
+separately from snapshot publication. A failure collecting a snapshot batch is reported
+at batch scope. Read-only recovery inspection reports expired eligibility and missing
+recovery protocol independently.
+
 The shared registration's `client_version` is the package version of the current process that most
 recently established or renewed write eligibility for that exact owner, rather than immutable
 registration-creation history. A same-runtime agent replacement retains the registration generation

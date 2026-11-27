@@ -63,6 +63,7 @@ from ..runtime.work_budget import (
 from ..scheduler import _BorrowAdmissionGrant, _BorrowAdmissionRevision, resume_starting_attempt, run_dispatch_cycle
 from . import helpers as _helpers
 from .context import MachineRuntime, ProjectBinding, default_machine_runtime_root
+from .control_plane_health import snapshot_batch_error_code
 from .helpers import (
     _publish_project_snapshots,
     _read_pid,
@@ -755,30 +756,30 @@ def _advance_machine_snapshot_publications(
     registry_snapshot: tuple[int, Sequence[ProjectBinding]] | None = None,
 ) -> None:
     """Advance one newest heartbeat snapshot intent on the dispatch thread."""
-    parameters = {}
-    if registry_snapshot is not None:
-        revision, registered = registry_snapshot
-        controller.prune_machine_snapshot_observations(registered)
-        parameters["observed_registry_revision"] = revision
-    intent = runtime.machine_snapshot_intent(validated_project_ids=tuple(validated_project_ids))
-    if intent is None:
-        return
     try:
-        controller.advance_machine_snapshot_publications(
-            intent.bindings,
-            intent.registry_revision,
-            instance_id=intent.instance_id,
-            pid=intent.pid,
-            visible_gpu_ids=intent.visible_gpu_ids,
-            reservations=intent.reservations,
-            heartbeat_interval_seconds=intent.heartbeat_interval_seconds,
-            started_at=intent.started_at,
-            gpu_policy=intent.gpu_policy,
-            **parameters,
-        )
-    except (OSError, RuntimeError, ValueError):
-        # A later heartbeat replaces this intent and retries current state.
-        return
+        parameters = {}
+        if registry_snapshot is not None:
+            revision, registered = registry_snapshot
+            controller.prune_machine_snapshot_observations(registered)
+            parameters["observed_registry_revision"] = revision
+        intent = runtime.machine_snapshot_intent(validated_project_ids=tuple(validated_project_ids))
+        if intent is not None:
+            controller.advance_machine_snapshot_publications(
+                intent.bindings,
+                intent.registry_revision,
+                instance_id=intent.instance_id,
+                pid=intent.pid,
+                visible_gpu_ids=intent.visible_gpu_ids,
+                reservations=intent.reservations,
+                heartbeat_interval_seconds=intent.heartbeat_interval_seconds,
+                started_at=intent.started_at,
+                gpu_policy=intent.gpu_policy,
+                **parameters,
+            )
+    except Exception as exc:
+        runtime.snapshot_batch_error = snapshot_batch_error_code(exc)
+    else:
+        runtime.snapshot_batch_error = None
 
 
 def _advance_registration_renewals(

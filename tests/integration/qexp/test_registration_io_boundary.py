@@ -284,3 +284,190 @@ def test_registration_reactivation_requires_exact_nonsuperseded_ownership(tmp_pa
         assert task_path(cfg.shared_root, task.task_id).read_bytes() == before_task
     finally:
         executor.shutdown()
+
+
+def test_prepare_failure_isolated_across_registration_leases(tmp_path, monkeypatch):
+    from qqtools.plugins.qexp.agent import dispatch_loop
+    from qqtools.plugins.qexp.executor import LaunchHandoff
+
+    runtime, cfg, affected, _, executor = _case(tmp_path)
+    try:
+        peer_cfg = init_shared_root(tmp_path / "peer/.qexp", cfg.machine_name)
+        peer = runtime.add_binding(peer_cfg.shared_root, cfg.machine_name)
+        revision, bindings = runtime.load_registry()
+        task = submit(cfg, ["true"], working_dir=tmp_path)
+        controller = ProjectIOController(runtime, executor)
+        runtime.project_io_executor = executor
+        runtime.project_io_controller = controller
+        prepare = executor.prepare_registration_renew
+        consume = executor.consume
+        completed = {}
+        fault = True
+
+        def prepare_except_affected(binding, *args, **kwargs):
+            if fault and binding == affected:
+                raise OSError("unavailable preparation")
+            return prepare(binding, *args, **kwargs)
+
+        def observe_completion(request_id, request):
+            result = consume(request_id, request)
+            if (
+                result
+                and request.operation_kind == "registration_renew"
+                and result.status == "completed"
+                and result.evidence["renewed"]
+            ):
+                assert result.request == request
+                completed.setdefault((request.project_id, request.registration_generation), []).append(
+                    result.evidence["eligibility_expires_at"]
+                )
+            return result
+
+        monkeypatch.setattr(executor, "prepare_registration_renew", prepare_except_affected)
+        monkeypatch.setattr(executor, "consume", observe_completion)
+        runtime.working_set.reconcile(bindings, revision=revision)
+        batch, horizon = runtime.working_set.select_registration_renewals()
+        runtime.publish_registration_renewal_intent(
+            bindings=batch, registry_revision=revision, renewal_horizon_seconds=horizon, heartbeat_interval_seconds=5
+        )
+        ttl = 4
+        policy = LeasePolicy(
+            ttl_seconds=ttl,
+            renew_interval_seconds=0.5,
+            max_clock_skew_seconds=0.1,
+            renewal_commit_margin_seconds=0.1,
+            retry_initial_seconds=0.1,
+            retry_max_seconds=0.2,
+        )
+        initial = (datetime.now(timezone.utc) + timedelta(seconds=ttl / 2)).isoformat()
+        for project in (cfg, peer_cfg):
+            save_lease_policy(project, policy)
+            envelope = load_machine_registration(project)
+            envelope["registration"]["eligibility_expires_at"] = initial
+            save_machine_registration(project, envelope)
+
+        def advance():
+            with controller.admission_turn():
+                dispatch_loop._advance_registration_renewals(runtime, controller, revision, bindings)
+            time.sleep(0.02)
+
+        peer_key = peer.project_id, peer.registration_generation
+        last_verified_expiry = datetime.fromisoformat(initial)
+        extensions = []
+        until = time.monotonic() + 2 * ttl
+        while time.monotonic() < until:
+            advance()
+            record = load_machine_registration(peer_cfg)["registration"]
+            assert record["generation"] == peer.registration_generation
+            assert runtime.registration_status(peer)["write_eligible"], f"peer expired after {extensions}"
+            expiry = record["eligibility_expires_at"]
+            if expiry in completed.get(peer_key, ()) and datetime.fromisoformat(expiry) > last_verified_expiry:
+                last_verified_expiry = datetime.fromisoformat(expiry)
+                extensions.append(expiry)
+        assert len(extensions) >= 2
+        assert runtime.registration_status(affected)["state"] == "expired"
+        fault = False
+        deadline = time.monotonic() + 10
+        while (
+            not completed.get((affected.project_id, affected.registration_generation)) and time.monotonic() < deadline
+        ):
+            advance()
+        assert load_machine_registration(cfg)["registration"]["eligibility_expires_at"] in completed.get(
+            (affected.project_id, affected.registration_generation), ()
+        )
+        assert runtime.registration_status(affected)["write_eligible"]
+        launched = []
+
+        class TicketExecutor:
+            def initiate_authorized_attempt(
+                self, launch_cfg, *, claim_identity, launch_id, launch_handoff_timeout_seconds
+            ):
+                assert launch_cfg.shared_root == cfg.shared_root
+                launched.append(claim_identity["task_id"])
+                attempt_id = claim_identity["attempt_id"]
+                return None, LaunchHandoff(
+                    attempt_id, tmp_path / attempt_id, time.monotonic() + launch_handoff_timeout_seconds
+                )
+
+        launcher = TicketExecutor()
+        deadline = time.monotonic() + 30
+        while not launched and time.monotonic() < deadline:
+            dispatch_loop.dispatch_machine_cycle_locked(
+                runtime, available_gpus=[0], executor=launcher, publish_snapshots=False
+            )
+            time.sleep(0.02)
+        assert launched == [task.task_id]
+    finally:
+        coordinator = getattr(runtime, "attempt_supervision_coordinator", None)
+        if coordinator is not None:
+            coordinator.close()
+        executor.shutdown()
+
+
+def test_disable_during_prepare_backoff_fences_retry(tmp_path, monkeypatch):
+    from qqtools.plugins.qexp.agent import dispatch_loop
+
+    runtime, cfg, binding, revision, executor = _case(tmp_path)
+    now = [1.0]
+    controller = ProjectIOController(runtime, executor, monotonic=lambda: now[0])
+    try:
+        task = submit(cfg, ["true"], working_dir=tmp_path)
+        attempts = []
+
+        def fail(binding, *_args, **_kwargs):
+            attempts.append(binding)
+            raise OSError("injected")
+
+        monkeypatch.setattr(executor, "prepare_registration_renew", fail)
+        runtime.working_set.reconcile([binding], revision=revision)
+        runtime.publish_registration_renewal_intent(
+            bindings=[binding], registry_revision=revision, renewal_horizon_seconds=5.0, heartbeat_interval_seconds=1.0
+        )
+        dispatch_loop._advance_registration_renewals(runtime, controller, revision, [binding])
+        assert attempts == [binding]
+        runtime.set_enabled(binding.project_id, False)
+        revision, bindings = runtime.load_registry()
+        runtime.working_set.reconcile(bindings, revision=revision)
+        registration = load_machine_registration(cfg)
+        snapshot_path = machine_state_path(cfg, "agent.json")
+        snapshot = snapshot_path.read_bytes() if snapshot_path.exists() else None
+        task_file = task_path(cfg.shared_root, task.task_id)
+        before_task = task_file.read_bytes()
+        now[0] = next(iter(controller._service_backoff.values())).retry_at
+        dispatch_loop._advance_registration_renewals(runtime, controller, revision, bindings)
+        assert runtime.working_set.select_registration_renewals()[0] == ()
+        assert attempts == [binding]
+        assert executor.unresolved_requests() == ()
+        assert load_machine_registration(cfg) == registration
+        assert (snapshot_path.read_bytes() if snapshot_path.exists() else None) == snapshot
+        assert task_file.read_bytes() == before_task
+        assert not runtime.claim_permitted(binding)
+    finally:
+        executor.shutdown()
+
+
+def test_worker_failure_status_retains_generation_outcome_after_roster_edit(tmp_path):
+    runtime, cfg, binding, revision, executor = _case(tmp_path)
+    controller = ProjectIOController(runtime, executor)
+    try:
+        # Preparation needs only the local binding. The isolated worker has to open the Project.
+        cfg.shared_root.rename(tmp_path / "inaccessible-project")
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            controller.advance_registration_renewals([binding], revision, renewal_horizon_seconds=10)
+            item = controller.registration_renewal_health_view()["items"][0]
+            if item["last_outcome"] == "retryable_error":
+                break
+            time.sleep(0.02)
+        assert item["last_outcome"] == "retryable_error"
+        assert item["blocking_reason"] == "project_io_registration_renew_failed"
+        assert item["cause"] and item["next_retry_at"]
+
+        peer = init_shared_root(tmp_path / "peer/.qexp", cfg.machine_name)
+        runtime.add_binding(peer.shared_root, cfg.machine_name)
+        revision, _ = runtime.load_registry()
+        controller.advance_registration_renewals([], revision, renewal_horizon_seconds=10)
+        carried = controller.registration_renewal_health_view()["items"][0]
+        assert carried == {**item, "blocking_reason": None, "cause": None, "next_retry_at": None}
+    finally:
+        executor.shutdown()

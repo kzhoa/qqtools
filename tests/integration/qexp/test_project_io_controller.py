@@ -3892,7 +3892,12 @@ def test_controller_replays_ambiguous_version_refresh_without_replacing_generati
     monkeypatch.setattr(executor, "start", real_start)
 
     controller.advance_registration_renewals(bindings, revision, renewal_horizon_seconds=0.0)
+    ambiguous = controller.registration_renewal_health_view()["items"][0]
+    assert ambiguous["last_outcome"] == "outcome_unknown"
+    assert ambiguous["blocking_reason"] == "request_outcome_unknown"
     now[0] += 20.0
+    controller.advance_registration_renewals(bindings, revision, renewal_horizon_seconds=0.0)
+    assert controller.registration_renewal_health_view()["items"][0]["last_outcome"] == "outcome_unknown"
     deadline = time.monotonic() + 5.0
     while time.monotonic() < deadline:
         completions = controller.advance_registration_renewals(
@@ -3911,13 +3916,14 @@ def test_controller_replays_ambiguous_version_refresh_without_replacing_generati
         )
 
     assert completions[binding.project_id]["outcome"] == "eligible"
+    assert controller.registration_renewal_health_view()["items"][0]["last_outcome"] == "renewed"
     refreshed = load_machine_registration(cfg)["registration"]
     assert refreshed["generation"] == generation
     assert refreshed["client_version"] == __version__
     assert executor.unresolved_requests() == ()
 
 
-def test_blocked_registration_renewal_does_not_delay_healthy_peer(tmp_path: Path) -> None:
+def test_blocked_registration_renewal_does_not_delay_healthy_peer(tmp_path: Path, monkeypatch) -> None:
     from qqtools.plugins.qexp.runtime.locks import exclusive
 
     runtime = MachineRuntime(tmp_path / "machine")
@@ -3950,6 +3956,14 @@ def test_blocked_registration_renewal_does_not_delay_healthy_peer(tmp_path: Path
                 healthy.registration_generation
             )
             assert executor.status_view()["active_worker_count"] == 1
+            monkeypatch.setattr(executor, "_overdue_since", lambda req, *_args, **_kwargs: req.prepared_at)
+            controller.advance_registration_renewals(bindings, revision, renewal_horizon_seconds=120.0)
+            item = controller.registration_renewal_health_view()["items"][0]
+            assert (item["project_id"], item["registration_generation"]) == (
+                blocked.project_id,
+                blocked.registration_generation,
+            )
+            assert item["blocking_reason"] == "worker_blocked"
     finally:
         executor.shutdown()
 

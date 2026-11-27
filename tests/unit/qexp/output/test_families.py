@@ -364,6 +364,21 @@ def test_agent_status_groups_diagnostics_for_human_scanning() -> None:
                 "effective_stale_after_seconds": 15.0,
             },
             "authority": {"state": "healthy"},
+            "snapshot_batch_error": "ValueError",
+            "project_registration_renewals": {
+                "total": 1,
+                "omitted_count": 0,
+                "items": [
+                    {
+                        "project_id": "project-b",
+                        "registration_generation": "generation-b",
+                        "last_outcome": "request_prepare_failed",
+                        "blocking_reason": "request_prepare_failed",
+                        "cause": "OSError",
+                        "next_retry_at": "2026-10-05T01:42:22Z",
+                    }
+                ],
+            },
             "project_snapshot_publications": {
                 "total": 1,
                 "omitted_count": 0,
@@ -399,6 +414,8 @@ def test_agent_status_groups_diagnostics_for_human_scanning() -> None:
     assert "Registry unavailable." in rendered
     assert "Project snapshot publication is overdue." in rendered
     assert "project-a: backoff (worker_start_failed)" in rendered
+    for field in ("project-b", "generation-b", "OSError", "2026-10-05T01:42:22Z", "ValueError"):
+        assert field in rendered
     assert "Scheduler diagnostic coverage is incomplete." in rendered
     assert "Probe data unavailable." in rendered
     assert rendered.count("qexp --machine-runtime-root /machine-runtime agent diagnostics active") == 1

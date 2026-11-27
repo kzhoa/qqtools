@@ -29,7 +29,7 @@ _PROJECT_PUBLICATION_STAGES = frozenset(
 )
 _SAFE_IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9._-]{1,160}$")
 _SAFE_REASON_RE = re.compile(r"^[a-z][a-z0-9_]{0,95}$")
-_MAX_PROJECT_PUBLICATIONS = 8
+_MAX_PROJECT_HEALTH_ITEMS = 8
 _LANE_FIELDS = (
     "state",
     "thread_alive",
@@ -89,6 +89,11 @@ def _reason_code(value: object, *, fallback: str) -> str:
 
 def _safe_identifier(value: object) -> str | None:
     return value if isinstance(value, str) and _SAFE_IDENTIFIER_RE.fullmatch(value) else None
+
+
+def snapshot_batch_error_code(exc: Exception) -> str:
+    """Return only the bounded exception class for a snapshot collection failure."""
+    return _safe_identifier(type(exc).__name__[:MAX_TEXT_LENGTH]) or "Exception"
 
 
 def _safe_timestamp(value: object) -> str | None:
@@ -168,15 +173,46 @@ def _sanitize_project_publication(value: object) -> dict[str, object] | None:
     return result
 
 
+def _sanitize_registration_renewal(value: object) -> dict[str, object] | None:
+    if not isinstance(value, Mapping):
+        return None
+    project_id = _safe_identifier(value.get("project_id"))
+    generation = _safe_identifier(value.get("registration_generation"))
+    if project_id is None or generation is None:
+        return None
+    item: dict[str, object] = {"project_id": project_id, "registration_generation": generation}
+    for key in ("last_outcome", "blocking_reason"):
+        reason = value.get(key)
+        if reason is not None and (not isinstance(reason, str) or _SAFE_REASON_RE.fullmatch(reason) is None):
+            return None
+        item[key] = reason
+    item["cause"] = _safe_identifier(value.get("cause"))
+    retry_at = value.get("next_retry_at")
+    if retry_at is not None:
+        if not isinstance(retry_at, str) or not retry_at.isprintable():
+            return None
+        retry_at = _safe_timestamp(retry_at)
+        if retry_at is None:
+            return None
+    item["next_retry_at"] = retry_at
+    return item
+
+
 def _sanitize_project_publications(value: object) -> dict[str, object] | None:
+    return _sanitize_project_health_sample(value, _sanitize_project_publication)
+
+
+def _sanitize_project_health_sample(
+    value: object, sanitize_item: Callable[[object], dict[str, object] | None]
+) -> dict[str, object] | None:
     if not isinstance(value, Mapping):
         return None
     raw_items = value.get("items")
     if not isinstance(raw_items, list):
         return None
     items: list[dict[str, object]] = []
-    for raw in raw_items[:_MAX_PROJECT_PUBLICATIONS]:
-        item = _sanitize_project_publication(raw)
+    for raw in raw_items[:_MAX_PROJECT_HEALTH_ITEMS]:
+        item = sanitize_item(raw)
         if item is not None:
             items.append(item)
     total = _bounded_count(value.get("total"), default=len(items))
@@ -257,6 +293,8 @@ class ControlPlaneHealth:
         self._heartbeat = _new_lane(self._stale_after_seconds)
         self._authority = _new_lane(self._stale_after_seconds)
         self._project_snapshot_publications: dict[str, object] = {"total": 0, "omitted_count": 0, "items": []}
+        self._project_registration_renewals: dict[str, object] | None = None
+        self._snapshot_batch_error: str | None = None
         self._coverage_loss_count = 0
         self._coverage_loss_channels: set[str] = set()
         self._pending_evidence_generation = 0
@@ -455,7 +493,7 @@ class ControlPlaneHealth:
                 item.get("overdue") is True for item in self._project_snapshot_publications["items"]
             ):
                 state = "degraded"
-            return {
+            snapshot = {
                 "instance_id": self._instance_id,
                 "state": state,
                 "heartbeat": heartbeat,
@@ -466,6 +504,15 @@ class ControlPlaneHealth:
                     "items": [dict(item) for item in self._project_snapshot_publications["items"]],
                 },
             }
+            if (renewals := self._project_registration_renewals) is not None:
+                snapshot["project_registration_renewals"] = {
+                    "total": renewals["total"],
+                    "omitted_count": renewals["omitted_count"],
+                    "items": [dict(item) for item in renewals["items"]],
+                }
+            if self._snapshot_batch_error is not None:
+                snapshot["snapshot_batch_error"] = self._snapshot_batch_error
+            return snapshot
 
     def update_project_snapshot_publications(self, value: Mapping[str, object]) -> None:
         """Replace the bounded controller-owned Project publication view."""
@@ -488,6 +535,19 @@ class ControlPlaneHealth:
             self._log_project_publication_transition("project_snapshot_overdue", current[key])
         for key in previous.keys() - current.keys():
             self._log_project_publication_transition("project_snapshot_resolved", previous[key])
+
+    def update_project_registration_renewals(self, value: Mapping[str, object] | None) -> None:
+        """Replace the optional bounded controller-owned registration renewal view."""
+        sanitized = _sanitize_project_health_sample(value, _sanitize_registration_renewal)
+        if value is not None and sanitized is None:
+            raise ValueError("project registration renewal health is invalid")
+        with self._lock:
+            self._project_registration_renewals = sanitized
+
+    def update_snapshot_batch_error(self, value: object) -> None:
+        """Replace the diagnostic for collection of one machine snapshot batch."""
+        with self._lock:
+            self._snapshot_batch_error = _safe_identifier(value)
 
     @staticmethod
     def _project_publication_key(item: Mapping[str, object]) -> tuple[object, ...]:
@@ -1132,13 +1192,21 @@ def read_control_plane_health(
         aggregate = "unknown"
     if aggregate not in {"stopped", "stalled"} and any(item.get("overdue") is True for item in publications["items"]):
         aggregate = "degraded"
-    return {
+    snapshot = {
         "instance_id": instance_id,
         "state": aggregate,
         "heartbeat": heartbeat,
         "authority": authority,
         "project_snapshot_publications": publications,
     }
+    renewals = _sanitize_project_health_sample(
+        value.get("project_registration_renewals"), _sanitize_registration_renewal
+    )
+    if renewals is not None:
+        snapshot["project_registration_renewals"] = renewals
+    if (batch_error := _safe_identifier(value.get("snapshot_batch_error"))) is not None:
+        snapshot["snapshot_batch_error"] = batch_error
+    return snapshot
 
 
-__all__ = ["ControlPlaneHealth", "read_control_plane_health"]
+__all__ = ["ControlPlaneHealth", "read_control_plane_health", "snapshot_batch_error_code"]

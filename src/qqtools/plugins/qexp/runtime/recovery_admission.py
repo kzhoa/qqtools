@@ -255,9 +255,16 @@ def inspect_recovery_admission(
         )
         if status["state"] == "superseded":
             return {"state": "superseded", "blockers": [], "diagnostic_only": True}
-        if not status["write_eligible"] or status["recovery_protocol"] != RECOVERY_PROTOCOL:
-            blockers = ["local_registration_not_prepared"]
-        elif (
+        blockers = []
+        if status["state"] == "expired":
+            blockers.append("registration_expired")
+        elif not status["write_eligible"]:
+            blockers.append("registration_ineligible")
+        if status["recovery_protocol"] != RECOVERY_PROTOCOL:
+            blockers.append("local_registration_not_prepared")
+        if blockers:
+            return {"state": "waiting", "blockers": sorted(blockers), "diagnostic_only": True}
+        if (
             LOCAL_RECOVERY_CAPABILITY
             in read_json(shared_paths(cfg.shared_root)["schema"] / "version.json")["schema"]["required_capabilities"]
         ):

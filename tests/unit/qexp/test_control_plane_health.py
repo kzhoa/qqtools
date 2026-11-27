@@ -405,3 +405,25 @@ def test_deadline_loop_does_not_swallow_base_exception(tmp_path) -> None:
 
     with pytest.raises(KeyboardInterrupt):
         plane._run_deadline_loop(stop_now)
+
+
+def test_snapshot_collection_error_reaches_status_at_batch_scope(tmp_path, monkeypatch):
+    from qqtools.plugins.qexp.agent import dispatch_loop
+
+    runtime = MachineRuntime(tmp_path / "machine")
+    initialize_machine(runtime, "gpu-1")
+    plane = _MachineControlPlane(
+        runtime, instance_id="agent-instance", loop_interval=5, started_at="2026-11-26T00:00:00Z", available_gpus=[]
+    )
+
+    def fail(**kwargs):
+        raise OSError("private path and credentials")
+
+    monkeypatch.setattr(runtime, "machine_snapshot_intent", fail)
+    dispatch_loop._advance_machine_snapshot_publications(runtime, None, ())
+    live = plane.monitor_health()
+    stored = read_control_plane_health(runtime.root, instance_id="agent-instance", thread_alive=None)
+    for view in (live, stored):
+        assert view["snapshot_batch_error"] == "OSError"
+        assert view["project_snapshot_publications"]["items"] == []
+        assert "private path" not in json.dumps(view)

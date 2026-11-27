@@ -622,6 +622,20 @@ class _MachineControlPlane:
             self._health.record_diagnostic_coverage_loss("project_snapshot_health")
         else:
             self._health.record_diagnostic_coverage_recovery("project_snapshot_health")
+        self._health.update_snapshot_batch_error(getattr(self._runtime, "snapshot_batch_error", None))
+        try:
+            controller = getattr(self._runtime, "project_io_controller", None)
+            renewals = (
+                controller.registration_renewal_health_view(limit=8)
+                if isinstance(controller, ProjectIOController)
+                else None
+            )
+            self._health.update_project_registration_renewals(renewals)
+        except Exception:
+            self._health.update_project_registration_renewals(None)
+            self._health.record_diagnostic_coverage_loss("project_registration_renewal_health")
+        else:
+            self._health.record_diagnostic_coverage_recovery("project_registration_renewal_health")
         try:
             self._health.persist(heartbeat_thread_alive=heartbeat_thread_alive)
         except Exception:

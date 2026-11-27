@@ -29,6 +29,8 @@ from .primitives import (
 )
 
 CpuLanePayload = Mapping[str, Any]
+_HEALTH_IDENTIFIER_RE = re.compile(r"[A-Za-z0-9._-]{1,160}")
+_HEALTH_REASON_RE = re.compile(r"[a-z][a-z0-9_]{0,95}")
 
 
 def _status_section(title: str, fields: Sequence[tuple[str, Any]]) -> str:
@@ -75,6 +77,32 @@ def _render_affected_projects(value: object) -> str:
     if lines and type(omitted) is int and omitted > 0:
         lines.append(f"  … {omitted} additional publication entries omitted")
     return "Affected Projects\n" + "\n".join(lines) if lines else ""
+
+
+def _render_registration_renewals(value: object) -> list[str]:
+    if not isinstance(value, Mapping):
+        return []
+    lines = []
+    for item in value["items"]:
+        blocker = item["blocking_reason"]
+        cause = item["cause"]
+        if blocker is None and cause is None:
+            continue
+        details = [f"registration {item['registration_generation']}"]
+        if (outcome := item["last_outcome"]) is not None:
+            details.append(outcome)
+        if blocker is not None:
+            details.append(blocker)
+        if cause is not None:
+            details.append(f"cause {cause}")
+        if (retry_at := item["next_retry_at"]) is not None:
+            details.append(f"next retry {retry_at}")
+        lines.append(f"  {item['project_id']}: {', '.join(details)}")
+    if not lines:
+        return []
+    if omitted := value["omitted_count"]:
+        lines.append(f"  … {omitted} additional renewal entries omitted")
+    return ["Project registration renewals", *lines]
 
 
 def _project_readiness(project: Mapping[str, Any]) -> tuple[bool, Any, Any]:
@@ -460,6 +488,9 @@ def _render_agent_status(result: Mapping[str, Any], _presentation: Mapping[str, 
         elif not control_step and control.get("state") in {"degraded", "stalled", "stopped"} and active:
             lines.append(f"Control plane is {control['state']}.")
             control_step = diagnostics_step
+        if batch_error := control.get("snapshot_batch_error"):
+            lines.append(f"Project snapshot batch error: {batch_error}")
+        lines.extend(_render_registration_renewals(control.get("project_registration_renewals")))
 
     recovery, recovery_step = _diagnostic_recovery_card(result)
     lines.extend(recovery)
@@ -936,6 +967,12 @@ def _validate_control_plane_health(value: Any) -> None:
         raise TypeError(f"{label}.instance_id must be a string or null")
     if "project_snapshot_publications" in health:
         _validate_project_snapshot_publications(health["project_snapshot_publications"], label)
+    if "project_registration_renewals" in health:
+        _validate_project_registration_renewals(health["project_registration_renewals"], label)
+    if "snapshot_batch_error" in health:
+        error = health["snapshot_batch_error"]
+        if not isinstance(error, str) or _HEALTH_IDENTIFIER_RE.fullmatch(error) is None:
+            raise ValueError(f"{label}.snapshot_batch_error must be a bounded exception class")
     for lane_name in ("heartbeat", "authority"):
         if lane_name not in health:
             continue
@@ -1000,16 +1037,49 @@ def _validate_control_plane_health(value: Any) -> None:
                 raise TypeError(f"{failure_label}.thread_alive must be a boolean")
 
 
-def _validate_project_snapshot_publications(value: Any, health_label: str) -> None:
-    label = f"{health_label}.project_snapshot_publications"
-    publications = _mapping(value, label)
+def _project_health_items(value: Any, label: str) -> Sequence[Any]:
+    sample = _mapping(value, label)
     for key in ("total", "omitted_count"):
-        item = _required(publications, key, label)
+        item = _required(sample, key, label)
         if type(item) is not int or item < 0:
             raise TypeError(f"{label}.{key} must be a nonnegative integer")
-    items = _required_sequence(publications, "items", label)
+    items = _required_sequence(sample, "items", label)
     if len(items) > 8:
         raise ValueError(f"{label}.items must contain at most 8 entries")
+    return items
+
+
+def _validate_project_registration_renewals(value: Any, health_label: str) -> None:
+    label = f"{health_label}.project_registration_renewals"
+    for index, raw in enumerate(_project_health_items(value, label)):
+        item_label = f"{label}.items[{index}]"
+        item = _mapping(raw, item_label)
+        for key in ("project_id", "registration_generation"):
+            field = _required(item, key, item_label)
+            if not isinstance(field, str) or _HEALTH_IDENTIFIER_RE.fullmatch(field) is None:
+                raise ValueError(f"{item_label}.{key} must be a bounded identifier")
+        for key in ("last_outcome", "blocking_reason"):
+            field = _required(item, key, item_label)
+            if field is not None and (not isinstance(field, str) or _HEALTH_REASON_RE.fullmatch(field) is None):
+                raise ValueError(f"{item_label}.{key} must be a bounded reason code or null")
+        cause = _required(item, "cause", item_label)
+        if cause is not None and (not isinstance(cause, str) or _HEALTH_IDENTIFIER_RE.fullmatch(cause) is None):
+            raise ValueError(f"{item_label}.cause must be a bounded exception class or null")
+        retry_at = _required(item, "next_retry_at", item_label)
+        if retry_at is not None:
+            if not isinstance(retry_at, str) or not 0 < len(retry_at) <= 64 or not retry_at.isprintable():
+                raise ValueError(f"{item_label}.next_retry_at must be a bounded timestamp or null")
+            try:
+                timestamp = datetime.fromisoformat(retry_at.replace("Z", "+00:00"))
+            except ValueError as exc:
+                raise ValueError(f"{item_label}.next_retry_at must be an ISO-8601 timestamp") from exc
+            if timestamp.utcoffset() is None:
+                raise ValueError(f"{item_label}.next_retry_at must include a timezone")
+
+
+def _validate_project_snapshot_publications(value: Any, health_label: str) -> None:
+    label = f"{health_label}.project_snapshot_publications"
+    items = _project_health_items(value, label)
     for index, raw in enumerate(items):
         item_label = f"{label}.items[{index}]"
         item = _mapping(raw, item_label)

@@ -341,3 +341,18 @@ def test_pending_upgrade_phase_defers_root_fence_even_after_metadata_activation(
     assert fence(runtime, binding).blockers == ("upgrade_coordinator_pending",)
     assert coordinator.advance()["state"] == "completed"
     assert fence(runtime, binding).is_fenced
+
+
+@pytest.mark.parametrize("prepared", [False, True])
+def test_expired_recovery_inspection_reports_independent_blockers(project, prepared):
+    runtime, binding, cfg = project
+    if prepared:
+        prepare(runtime, binding)
+    path = registration_path(cfg)
+    envelope = read_json(path)
+    envelope["registration"]["eligibility_expires_at"] = "2000-01-01T00:00:00Z"
+    atomic_replace(path, envelope)
+    view = recovery_admission.inspect_recovery_admission(runtime, binding)
+    blockers = ["registration_expired"] if prepared else ["local_registration_not_prepared", "registration_expired"]
+    assert view == {"state": "waiting", "blockers": blockers, "diagnostic_only": True}
+    assert read_json(path) == envelope

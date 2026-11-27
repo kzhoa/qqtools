@@ -59,6 +59,7 @@ from .project_io_protocol import (
     ProjectIORequest,
 )
 from .ready_cursor_validation import validate_ready_cursor_transition
+from .registration_renewal_health import REGISTRATION_RENEWAL_HEALTH_ITEM_LIMIT, RegistrationRenewalHealth
 from .scheduler_diagnostics import ProducerCoverageCheckpoint
 from .snapshot_publication_health import (
     SNAPSHOT_COVERAGE_FILENAME,
@@ -392,6 +393,8 @@ class ProjectIOController:
         self._observation_turns: dict[_ValidationIdentity, BindingTurn] = {}
         self._registration_due: dict[_ValidationIdentity, float] = {}
         self._registration_deadlines: dict[_ValidationIdentity, float] = {}
+        self._registration_renewal_health = RegistrationRenewalHealth(monotonic=monotonic, utc_clock=utc_clock)
+        self._registration_health_registry: tuple[str, int, tuple[ProjectBinding, ...]] | None = None
         self._submission_turns: dict[_ValidationIdentity, BindingTurn] = {}
         self.progress = ProgressObservationCoordinator(runtime, clock=monotonic)
 
@@ -818,12 +821,15 @@ class ProjectIOController:
         if status["envelope"] == "unknown" or status["overdue_worker_count"] > status["supported_hang_limit"]:
             free_slots = 0
         if self._admission.active:
+            if isinstance(epoch := status["executor_epoch"], str) and status["envelope"] != "unknown":
+                self._registration_renewal_health.reconcile(epoch, blocked)
             self._admission.refresh_capacity(blocked=blocked, free_slots=free_slots)
             return status, unresolved
         if status["executor_epoch"] is None:
             # A later producer still needs to perform the opening archive replay.
             return status, unresolved
         _registry_revision, bindings = self.runtime.load_registry_snapshot()
+        self._reconcile_registration_renewal_health(status["executor_epoch"], _registry_revision, bindings, blocked)
         retained_request_identities = {self._request_identity(request) for request in unresolved}
         # Only observed registry/epoch changes invalidate retry state. A busy
         # worker lock yields an unknown epoch, not evidence of a new epoch.
@@ -4570,7 +4576,31 @@ class ProjectIOController:
             )
         self._start_machine_snapshot_request(request, service_key)
 
-    @_admission_operation
+    def _reconcile_registration_renewal_health(
+        self,
+        executor_epoch: str,
+        registry_revision: int,
+        bindings: tuple[ProjectBinding, ...],
+        occupied_owners: set[tuple[str, str, str]],
+    ) -> None:
+        previous = self._registration_health_registry
+        current = None
+        if previous is None or previous[:2] != (executor_epoch, registry_revision) or previous[2] is not bindings:
+            current = frozenset(
+                identity
+                for binding in bindings
+                if binding.enabled is True
+                and (identity := self._binding_identity(binding, registry_revision, executor_epoch)) is not None
+            )
+            self._registration_health_registry = (executor_epoch, registry_revision, bindings)
+        self._registration_renewal_health.reconcile(executor_epoch, occupied_owners, current)
+
+    def registration_renewal_health_view(
+        self, *, limit: int = REGISTRATION_RENEWAL_HEALTH_ITEM_LIMIT
+    ) -> dict[str, object]:
+        """Return bounded observations of renewal progress for current bindings."""
+        return self._registration_renewal_health.view(limit=limit)
+
     def advance_registration_renewals(
         self,
         bindings: Sequence[ProjectBinding],
@@ -4589,6 +4619,23 @@ class ProjectIOController:
         ):
             raise ValueError("renewal_horizon_seconds is invalid.")
 
+        should_acknowledge_prepare_failure = not self._admission_scope_active
+        with self.admission_turn():
+            return self._collect_registration_renewals(
+                bindings,
+                registry_revision,
+                renewal_horizon_seconds,
+                should_acknowledge_prepare_failure=should_acknowledge_prepare_failure,
+            )
+
+    def _collect_registration_renewals(
+        self,
+        bindings: Sequence[ProjectBinding],
+        registry_revision: int,
+        renewal_horizon_seconds: int | float,
+        *,
+        should_acknowledge_prepare_failure: bool,
+    ) -> dict[str, Mapping[str, Any]]:
         executor_status, unresolved = self._poll_admission_executor()
         executor_epoch = executor_status.get("executor_epoch")
         if executor_status.get("envelope") == "unknown" or not isinstance(executor_epoch, str):
@@ -4637,14 +4684,20 @@ class ProjectIOController:
                 self._started_requests.discard(request.request_id)
             else:
                 self._started_requests.add(request.request_id)
+                blocker = (
+                    "worker_blocked" if binding.project_id in executor_status.get("blocking_project_ids", ()) else None
+                )
+                self._registration_renewal_health.record(identity, blocking_reason=blocker)
                 continue
 
             result = self.executor.load_result(request.request_id)
             if result is None:
-                if self._service_retry_is_due(service_key) and executor_status.get(
-                    "overdue_worker_count", 0
-                ) < executor_status.get("supported_hang_limit", 0):
+                if not self._service_retry_is_due(service_key):
+                    continue
+                if executor_status.get("overdue_worker_count", 0) < executor_status.get("supported_hang_limit", 0):
                     self._start_registration_renew_request(request, service_key)
+                else:
+                    self._registration_renewal_health.record(identity, blocking_reason="executor_overdue")
                 continue
             if result.request != request:
                 raise ProjectIOProtocolError("registration renewal result changed request identity.")
@@ -4657,7 +4710,13 @@ class ProjectIOController:
                 except (OSError, RuntimeError, ValueError):
                     reset_for_retry = False
                 if reset_for_retry:
-                    self._record_service_failure(service_key)
+                    self._record_registration_renewal_failure(
+                        service_key, outcome=result.status, blocking_reason="request_outcome_unknown"
+                    )
+                else:
+                    self._registration_renewal_health.record(
+                        identity, outcome=result.status, blocking_reason="request_outcome_unknown"
+                    )
                 continue
 
             consumed = self.executor.consume(request.request_id, request)
@@ -4680,30 +4739,51 @@ class ProjectIOController:
                     self._registration_deadlines[identity] = self._monotonic() + max(
                         0.0, remaining - min(2.0, remaining * 3 / 4)
                     )
+                    outcome = "renewed" if evidence["renewed"] else "eligible"
+                    self._registration_renewal_health.record(identity, outcome=outcome)
                 else:
                     self._validated.discard(identity)
-                    self._record_service_failure(service_key)
+                    self._record_registration_renewal_failure(
+                        service_key, outcome="stale", blocking_reason="request_result_stale"
+                    )
             else:
                 if consumed.status == "fenced":
                     self._validated.discard(identity)
-                self._record_service_failure(service_key)
+                self._record_registration_renewal_failure(
+                    service_key,
+                    outcome=consumed.status,
+                    blocking_reason=consumed.reason_code,
+                    cause=consumed.evidence.get("exception_type"),
+                )
 
         can_start = executor_status.get("envelope") != "unknown" and executor_status.get(
             "overdue_worker_count", 0
         ) <= executor_status.get("supported_hang_limit", 0)
-        if not can_start:
-            return completions
         for identity, binding in current.items():
             if binding.project_id in processed_projects:
                 continue
             service_key = self._registration_renew_service_key(identity)
+            if not self._service_retry_is_due(service_key):
+                completions[binding.project_id] = {"outcome": "backoff"}
+                continue
+            if not can_start:
+                self._registration_renewal_health.record(identity, blocking_reason="executor_overdue")
+                continue
             if self._registration_due.get(identity, 0.0) > self._monotonic():
                 # Local scheduling acknowledgement only, not fresh shared
                 # eligibility evidence or a reusable authority grant.
                 completions[binding.project_id] = {"outcome": "not_due"}
+                self._registration_renewal_health.record(identity)
                 continue
-            if not self._service_retry_is_due(service_key):
-                continue
+            if identity.request_owner == self._takeover_frozen_owner:
+                self._registration_renewal_health.record(identity, blocking_reason="takeover_frozen")
+            else:
+                self._registration_renewal_health.record(
+                    identity,
+                    blocking_reason="owner_occupied"
+                    if identity.request_owner in unresolved_owners
+                    else "awaiting_admission",
+                )
             self._offer_new_request(
                 identity,
                 "registration_renew",
@@ -4713,6 +4793,7 @@ class ProjectIOController:
                     registry_revision,
                     renewal_horizon_seconds,
                     service_key,
+                    immediate_completions=completions if should_acknowledge_prepare_failure else None,
                 ),
                 deadline=self._registration_deadlines.get(identity, self._monotonic()),
             )
@@ -4724,6 +4805,8 @@ class ProjectIOController:
         registry_revision: int,
         renewal_horizon_seconds: int | float,
         service_key: tuple[_ValidationIdentity, str, str, str],
+        *,
+        immediate_completions: dict[str, Mapping[str, Any]] | None,
     ) -> None:
         try:
             request = self.executor.prepare_registration_renew(
@@ -4731,10 +4814,34 @@ class ProjectIOController:
                 registry_revision,
                 renewal_horizon_seconds=renewal_horizon_seconds,
             )
-        except (OSError, RuntimeError, ValueError):
-            self._record_service_failure(service_key)
+        except (OSError, RuntimeError, ValueError) as exc:
+            self._record_registration_renewal_failure(
+                service_key,
+                outcome="request_prepare_failed",
+                blocking_reason="request_prepare_failed",
+                cause=type(exc).__name__,
+            )
+            if immediate_completions is not None:
+                immediate_completions[binding.project_id] = {"outcome": "backoff"}
             return
         self._start_registration_renew_request(request, service_key)
+
+    def _record_registration_renewal_failure(
+        self,
+        service_key: tuple[_ValidationIdentity, str, str, str],
+        *,
+        blocking_reason: str,
+        outcome: str | None = None,
+        cause: object = None,
+    ) -> None:
+        self._record_service_failure(service_key)
+        self._registration_renewal_health.record(
+            service_key[0],
+            outcome=outcome,
+            blocking_reason=blocking_reason,
+            cause=cause,
+            retry_at=self._service_backoff[service_key].retry_at,
+        )
 
     def advance_activation_observations(
         self,
@@ -6049,18 +6156,21 @@ class ProjectIOController:
         service_key: tuple[_ValidationIdentity, str, str, str],
     ) -> None:
         if request.executor_epoch != self._observed_executor_epoch:
-            self._record_service_failure(service_key)
+            self._record_registration_renewal_failure(service_key, blocking_reason="request_epoch_changed")
             return
         try:
             process = self.executor.start(request.request_id)
-        except (OSError, RuntimeError, ValueError):
-            self._record_service_failure(service_key)
+        except (OSError, RuntimeError, ValueError) as exc:
+            self._record_registration_renewal_failure(
+                service_key, blocking_reason="request_start_failed", cause=type(exc).__name__
+            )
             return
         if process is None:
-            self._record_service_failure(service_key)
+            self._record_registration_renewal_failure(service_key, blocking_reason="request_start_failed")
             return
         self._started_requests.add(request.request_id)
         self._service_backoff.pop(service_key, None)
+        self._registration_renewal_health.record(service_key[0])
 
     def _next_local_event(self, project_id: str) -> tuple[str, str, str, str] | None:
         root = local_paths(self.runtime.project_paths(project_id)["root"])["events"]
