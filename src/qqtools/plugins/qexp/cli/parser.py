@@ -586,6 +586,25 @@ def build_parser() -> argparse.ArgumentParser:
         modes=OutputMode.FINITE,
         output_kinds=OutputKind.TASK_CANCEL,
     )
+    recover_prelaunch = task_sub.add_parser(
+        "recover-prelaunch",
+        help="Recover an exact expired pre-launch claim or finish its reservation cleanup.",
+    )
+    recover_prelaunch.add_argument("task_id", metavar="TASK")
+    recover_prelaunch.add_argument(
+        "--expected-target",
+        metavar="TOKEN",
+        required=True,
+        help="Copy the observed target from qexp status.",
+    )
+    _add_output_format(recover_prelaunch)
+    bind_command(
+        recover_prelaunch,
+        handler="task_recover_prelaunch",
+        context=ContextKind.PROJECT_WRITE,
+        modes=OutputMode.FINITE,
+        output_kinds=OutputKind.TASK_RECOVER_PRELAUNCH,
+    )
     retry = task_sub.add_parser(
         "retry",
         help="Queue the next Attempt, or explicitly abandon one active Attempt without stopping it.",

@@ -1902,9 +1902,13 @@ def test_scheduler_launch_authorize_commits_exact_gate_and_replays_launch_id(tmp
         dead_reconciliation.to_dict(),
     )
     executor.poll()
-    retryable = executor.load_result(reconciliation.request_id)
-    assert retryable is not None and retryable.status == "retryable_error"
-    assert executor.consume(reconciliation.request_id, reconciliation) == retryable
+    interrupted = executor.load_result(reconciliation.request_id)
+    assert interrupted is not None and interrupted.status == "outcome_unknown"
+    assert executor.reset_ambiguous_scheduler_reservation_reconcile_for_retry(reconciliation.request_id, reconciliation)
+    executor.start(reconciliation.request_id)
+    replayed = _wait_for_consumed(executor, reconciliation)
+    assert replayed.status == "completed"
+    assert replayed.evidence["outcome"] == "prelaunch_retained"
 
     request = executor.prepare_scheduler_launch_authorize(
         binding,

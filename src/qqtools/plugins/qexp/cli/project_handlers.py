@@ -364,6 +364,16 @@ def dispatch_project(
                 },
             )
             return CommandOutcome(1 if is_blocked else 0, output)
+        elif handler == "task_recover_prelaunch":
+            try:
+                result = task_commands.recover_prelaunch(
+                    execution_context,
+                    args.task_id,
+                    expected_target=args.expected_target,
+                )
+            except (OSError, ValueError, RuntimeError) as exc:
+                raise CliOperationalError(str(exc), code="prelaunch_recovery_unavailable") from exc
+            return CommandOutcome(0, CliOutput(OutputKind.TASK_RECOVER_PRELAUNCH, result))
         elif handler == "task_retry":
             if args.quiet and args.format == "json":
                 raise CliUsageError("--quiet cannot be combined with --format json.")
@@ -435,6 +445,7 @@ def dispatch_project(
             # gives it the same cursor/filter integrity guarantees as a page query.
             is_paginated = args.page_size is not None or args.cursor is not None or args.name is not None
             task_fields = getattr(args, "task_fields", None)
+            should_observe_reservations = args.format == "json" or "location" in (task_fields or ())
             if is_paginated:
                 if args.limit is not None:
                     raise ObservationError(
@@ -452,21 +463,33 @@ def dispatch_project(
                     cursor=args.cursor,
                     **({"fields": task_fields} if isinstance(task_fields, tuple) else {}),
                 )
+                if should_observe_reservations:
+                    observer.annotate_prelaunch_rows(
+                        cfg,
+                        page["items"],
+                        machine_runtime=execution_context.machine_runtime,
+                        binding=execution_context.binding,
+                    )
                 return CommandOutcome(0, _task_page_output(cfg, args, page, page_size))
             else:
                 limit = 50 if args.limit is None else args.limit
                 list_kwargs = {"phase": args.phase, "group": args.group, "limit": limit}
                 if isinstance(task_fields, tuple):
                     list_kwargs["fields"] = task_fields
+                rows = [
+                    item
+                    for item in observer.list_tasks(cfg, **list_kwargs)
+                    if args.name is None or item.get("name") == args.name
+                ]
+                if should_observe_reservations:
+                    observer.annotate_prelaunch_rows(
+                        cfg, rows, machine_runtime=execution_context.machine_runtime, binding=execution_context.binding
+                    )
                 return CommandOutcome(
                     0,
                     CliOutput(
                         OutputKind.TASK_LIST,
-                        [
-                            item
-                            for item in observer.list_tasks(cfg, **list_kwargs)
-                            if args.name is None or item.get("name") == args.name
-                        ],
+                        rows,
                         _task_list_presentation(cfg, args, task_fields) if isinstance(task_fields, tuple) else {},
                     ),
                 )
@@ -494,7 +517,12 @@ def dispatch_project(
                 0,
                 CliOutput(
                     OutputKind.TASK_SHOW,
-                    observer.inspect_task(cfg, args.task_id),
+                    observer.inspect_task(
+                        cfg,
+                        args.task_id,
+                        machine_runtime=execution_context.machine_runtime,
+                        binding=execution_context.binding,
+                    ),
                     {"details": args.details},
                 ),
             )

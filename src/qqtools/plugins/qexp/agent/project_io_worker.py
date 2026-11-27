@@ -417,6 +417,7 @@ def _registry_binding_is_current(request: ProjectIORequest, runtime_root: Path) 
             "legacy_capture_read",
             "legacy_capture_scan",
             *RECOVERY_OPERATION_KINDS,
+            "scheduler_reservation_reconcile",
             "authority_service",
             "authority_renewal",
             "authority_orphan_recovery",
@@ -1202,7 +1203,12 @@ def _scheduler_launch_authorize(
     )
 
 
-def _scheduler_reservation_reconcile(request: ProjectIORequest) -> dict[str, Any]:
+def _scheduler_reservation_reconcile(
+    request: ProjectIORequest,
+    runtime_root: Path,
+    paths: dict[str, Path],
+    write_possible: list[bool],
+) -> dict[str, Any]:
     parameters = request.parameters
     value = parameters["reservation_identity"]
     identity = ReservationIdentity(
@@ -1220,9 +1226,29 @@ def _scheduler_reservation_reconcile(request: ProjectIORequest) -> dict[str, Any
         executor_request_id=value["executor_request_id"],
     )
     cfg = load_root_config(Path(request.canonical_shared_root), parameters["machine_name"])
-    from ..project_maintenance import classify_reservation
+    cfg = replace(cfg, runtime_root=machine_project_paths(runtime_root, request.project_id)["root"])
+    from ..project_maintenance import advance_reservation_reconciliation
 
-    result = classify_reservation(cfg, identity)
+    def require_current_authority() -> None:
+        epoch = _read_epoch(paths)
+        if not epoch.active or epoch.runtime_id != request.runtime_id or epoch.executor_epoch != request.executor_epoch:
+            raise _ExecutorEpochFenced
+        if not _claim_binding_is_current(request, runtime_root, cfg):
+            raise _BindingAuthorityChanged
+
+    def before_mutation() -> None:
+        require_current_authority()
+        write_possible[0] = True
+
+    require_current_authority()
+    result = advance_reservation_reconciliation(
+        cfg,
+        identity,
+        reservation_runtime_root=runtime_root,
+        runtime_id=request.runtime_id,
+        before_mutation=before_mutation,
+    )
+    require_current_authority()
     return {
         "outcome": result.outcome,
         "reservation_identity": dict(value),
@@ -2632,6 +2658,7 @@ def _publish_result(
                 "observation_service",
                 "progress_projection",
                 *RECOVERY_OPERATION_KINDS,
+                "scheduler_reservation_reconcile",
                 "maintenance_descriptor_advance",
                 "maintenance_flush_event",
                 "machine_snapshot_publish",
@@ -2897,6 +2924,7 @@ def _run(
     cursor_write_possible = [False]
     claim_cursor_commit_started = [False]
     launch_authorization_write_possible = [False]
+    reservation_reconcile_write_possible = [False]
     due_offer_write_possible = [False]
     ready_index_write_possible = [False]
     descriptor_write_possible = [False]
@@ -3044,7 +3072,7 @@ def _run(
                 evidence = _scheduler_launch_authorize(request, root, before_launch_shared_write)
                 require_current_launch_authority()
             elif request.operation_kind == "scheduler_reservation_reconcile":
-                evidence = _scheduler_reservation_reconcile(request)
+                evidence = _scheduler_reservation_reconcile(request, root, paths, reservation_reconcile_write_possible)
             elif request.operation_kind == "scheduler_due_offer":
                 evidence = _scheduler_due_offer(request, root, paths, due_offer_write_possible)
             elif request.operation_kind == "scheduler_ready_index_build":
@@ -3228,6 +3256,18 @@ def _run(
             )
             return 0 if published else 1
         if request.operation_kind == "maintenance_flush_event" and event_write_possible[0]:
+            published = _publish_result(
+                root,
+                paths,
+                request,
+                process,
+                "outcome_unknown",
+                "project_io_outcome_unknown",
+                {},
+                shared_write_possible=True,
+            )
+            return 0 if published else 1
+        if request.operation_kind == "scheduler_reservation_reconcile" and reservation_reconcile_write_possible[0]:
             published = _publish_result(
                 root,
                 paths,
@@ -3475,6 +3515,19 @@ def _run(
                 shared_write_possible=event_write_possible[0],
             )
             return 0 if published else 1
+        if request.operation_kind == "scheduler_reservation_reconcile":
+            write_possible = reservation_reconcile_write_possible[0]
+            published = _publish_result(
+                root,
+                paths,
+                request,
+                process,
+                "outcome_unknown" if write_possible else "retryable_error",
+                "project_io_outcome_unknown" if write_possible else "project_io_scheduler_reservation_reconcile_failed",
+                {} if write_possible else {"exception_type": _safe_exception_type(exc)},
+                shared_write_possible=write_possible,
+            )
+            return 0 if published else 1
         if request.operation_kind == "scheduler_due_offer":
             write_possible = due_offer_write_possible[0]
             published = _publish_result(
@@ -3626,7 +3679,6 @@ def _run(
             "scheduler_quiescence_probe": "project_io_scheduler_observation_failed",
             "idle_job_probe": "project_io_idle_job_probe_failed",
             "scheduler_claim": "project_io_scheduler_claim_failed_before_commit",
-            "scheduler_reservation_reconcile": "project_io_scheduler_reservation_reconcile_failed",
             "scheduler_due_offer": "project_io_scheduler_due_offer_failed",
             "scheduler_ready_index_build": "project_io_scheduler_ready_index_build_failed",
             "machine_snapshot_publish": "project_io_machine_snapshot_publish_failed",
@@ -3681,6 +3733,7 @@ def _run(
                 or snapshot_write_possible[0]
                 or registration_write_possible[0]
                 or activation_consumer_write_possible[0]
+                or reservation_reconcile_write_possible[0]
                 or authority_renewal_write_possible[0]
                 or authority_orphan_recovery_write_possible[0]
                 or authority_termination_write_possible[0]

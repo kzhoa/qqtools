@@ -431,6 +431,15 @@ def main(argv: list[str] | None = None) -> int:
     try:
         _validate_machine_assertion(args)
         _validate_task_list_options(args)
+        if handler == "task_recover_prelaunch":
+            from ..prelaunch_observation import parse_prelaunch_target
+            from ..runtime.records import validate_identifier
+
+            try:
+                validate_identifier(args.task_id, "task_id")
+                parse_prelaunch_target(args.expected_target)
+            except ValueError as exc:
+                raise CliUsageError(str(exc)) from exc
         explicit_format = any(token == "--format" or token.startswith("--format=") for token in raw_argv)
         if explicit_format and handler == "agent_run":
             raise CliUsageError("agent run is foreground debugging and does not support --format.")

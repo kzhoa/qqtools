@@ -73,6 +73,7 @@ _INITIAL_BACKOFF_SECONDS = 5.0
 _MAX_BACKOFF_SECONDS = 300.0
 _RECOVERY_WAIT_RETRY_SECONDS = 1.0
 _SCHEDULER_DUE_OFFER_IDLE_RETRY_SECONDS = 1.0
+_PRELAUNCH_RESERVATION_RECHECK_SECONDS = 15.0
 _MAX_RETAINED_SCHEDULER_INTENTS = 64
 _MAX_RETAINED_RESERVATION_RECONCILIATIONS = 256
 _EVENT_FILENAME = re.compile(r"(?:[0-9a-f]{16}|[0-9a-f]{32})\.json\Z")
@@ -100,6 +101,7 @@ _VALIDATION_OPERATION_KINDS = frozenset({"validate_binding"})
 _PREVALIDATION_RECONCILIATION_OPERATION_KINDS = frozenset(
     {
         "scheduler_launch_authorize",
+        "scheduler_reservation_reconcile",
         "machine_snapshot_publish",
         "authority_terminal_observe",
         "authority_renewal",
@@ -131,7 +133,6 @@ _VALIDATION_INDEPENDENT_RECONCILIATION_OPERATION_KINDS = frozenset(
         "idle_decision_guard",
         "scheduler_claim",
         "scheduler_cursor_commit",
-        "scheduler_reservation_reconcile",
         "scheduler_due_offer",
         "scheduler_ready_index_build",
         "maintenance_descriptor_advance",
@@ -147,6 +148,7 @@ _VALIDATION_INDEPENDENT_RECONCILIATION_OPERATION_KINDS = frozenset(
 )
 _PREVALIDATION_RESOLVER_NAMES = {
     "scheduler_launch_authorize": "resolve_stale_scheduler_launch_authorize",
+    "scheduler_reservation_reconcile": "resolve_stale_scheduler_reservation_reconcile",
     "machine_snapshot_publish": "resolve_stale_machine_snapshot",
     "authority_terminal_observe": "resolve_stale_authority_terminal_observe",
     "authority_renewal": "resolve_stale_authority_renewal",
@@ -353,7 +355,7 @@ class ProjectIOController:
         self._observation_offsets: dict[tuple[str, str], int] = {}
         self._started_requests: set[str] = set()
         self._authorized_reservations: set[ReservationIdentity] = set()
-        self._trusted_reservations: dict[ReservationIdentity, None] = {}
+        self._trusted_reservations: dict[ReservationIdentity, float | None] = {}
         self._reservation_reconcile_binding_cursor: tuple[str, str] | None = None
         self._reservation_reconcile_cursors: dict[tuple[str, str], str] = {}
         self._due_offer_binding_cursor: tuple[str, str] | None = None
@@ -1047,6 +1049,8 @@ class ProjectIOController:
             try:
                 if operation_kind == "scheduler_launch_authorize":
                     resolved = self.executor.resolve_stale_scheduler_launch_authorize(request.request_id, request)
+                elif operation_kind == "scheduler_reservation_reconcile":
+                    resolved = self.executor.resolve_stale_scheduler_reservation_reconcile(request.request_id, request)
                 elif operation_kind == "machine_snapshot_publish":
                     resolved = self.executor.resolve_stale_machine_snapshot(request.request_id, request)
                 elif operation_kind == "authority_terminal_observe":
@@ -2981,7 +2985,7 @@ class ProjectIOController:
         *,
         reservations: Sequence[ReservationIdentity],
     ) -> tuple[ReservationIdentity, ...]:
-        """Classify shared ownership, then apply only exact local reservation effects."""
+        """Advance exact pre-launch recovery and reconcile other local reservations."""
         if not isinstance(bindings, Sequence) or isinstance(bindings, str | bytes):
             raise ValueError("bindings must be a sequence.")
         if any(not isinstance(binding, ProjectBinding) for binding in bindings):
@@ -2996,7 +3000,9 @@ class ProjectIOController:
         if len(reservation_by_id) != len(reservations):
             raise ValueError("reservations must have unique reservation IDs.")
         current_reservations = set(reservations)
-        self._trusted_reservations = {item: None for item in self._trusted_reservations if item in current_reservations}
+        self._trusted_reservations = {
+            item: recheck_at for item, recheck_at in self._trusted_reservations.items() if item in current_reservations
+        }
 
         executor_status, unresolved = self._poll_admission_executor()
         executor_epoch = executor_status["executor_epoch"]
@@ -3023,11 +3029,8 @@ class ProjectIOController:
             for key, state in self._reservation_reconcile_backoff.items()
             if key[0] in retained_reconcile_identities
         }
-        unresolved_by_id = {request.request_id: request for request in unresolved}
-        self._started_requests.intersection_update(unresolved_by_id)
-        unresolved_owners = {
-            (request.runtime_id, request.project_id, request.registration_generation) for request in unresolved
-        }
+        self._started_requests.intersection_update(request.request_id for request in unresolved)
+        can_start = executor_status["overdue_worker_count"] <= executor_status["supported_hang_limit"]
         processed_reservations: set[str] = set()
         for request in unresolved:
             if request.operation_kind != "scheduler_reservation_reconcile":
@@ -3047,24 +3050,38 @@ class ProjectIOController:
                 self._started_requests.add(request.request_id)
                 continue
             result = self.executor.load_result(request.request_id)
+            if result is not None and result.request != request:
+                raise ProjectIOProtocolError("reservation reconciliation result changed request identity.")
+            if result is not None and result.status == "outcome_unknown":
+                if binding is None or current != requested:
+                    if self.executor.resolve_stale_scheduler_reservation_reconcile(request.request_id, request):
+                        self._trusted_reservations.pop(requested, None)
+                elif self.executor.reset_ambiguous_scheduler_reservation_reconcile_for_retry(
+                    request.request_id, request
+                ):
+                    self._trusted_reservations.pop(requested, None)
+                    self._record_reservation_reconcile_failure(service_key)
+                continue
             if result is None:
                 if binding is not None and current == requested:
                     if was_started or service_key not in self._reservation_reconcile_backoff:
                         self._record_reservation_reconcile_failure(service_key)
-                    if self._reservation_reconcile_retry_is_due(service_key):
+                    if can_start and self._reservation_reconcile_retry_is_due(service_key):
                         self._start_reservation_reconcile_request(request, service_key)
+                elif self.executor.resolve_stale_scheduler_reservation_reconcile(request.request_id, request):
+                    self._trusted_reservations.pop(requested, None)
                 continue
-            if result.request != request:
-                raise ProjectIOProtocolError("reservation reconciliation result changed request identity.")
             applied = True
             trusted: ReservationIdentity | None = None
+            should_recheck = True
             if result.status == "completed" and binding is not None:
                 outcome = result.evidence.get("outcome")
                 try:
                     local_state = classify_exact_reservation(self.runtime.root, requested)
-                    if outcome == "retained":
+                    if outcome in {"retained", "prelaunch_retained"}:
                         if local_state == "matching_active" and current == requested:
                             trusted = requested
+                            should_recheck = outcome == "prelaunch_retained"
                     elif outcome == "retag":
                         token = result.evidence.get("target_fencing_token")
                         attempt_id = result.evidence.get("target_attempt_id")
@@ -3095,7 +3112,7 @@ class ProjectIOController:
                                 "conflict",
                             }:
                                 applied = False
-                    elif outcome != "isolated":
+                    elif outcome not in {"isolated", "recovered"}:
                         applied = False
                 except (OSError, RuntimeError, ValueError, KeyError, TypeError):
                     applied = False
@@ -3105,8 +3122,6 @@ class ProjectIOController:
             consumed = self.executor.consume(request.request_id, request)
             if consumed is None:
                 continue
-            unresolved_by_id.pop(request.request_id, None)
-            unresolved_owners.discard(identity.request_owner)
             self._started_requests.discard(request.request_id)
             if consumed.status == "completed" and consumed.evidence.get("outcome") != "isolated":
                 self._reservation_reconcile_backoff.pop(service_key, None)
@@ -3117,12 +3132,8 @@ class ProjectIOController:
                 requested.reservation_id
             )
             if trusted is not None:
-                self._trust_reservation(trusted)
+                self._trust_reservation(trusted, should_recheck=should_recheck)
 
-        can_start = (
-            executor_status["envelope"] != "unknown"
-            and executor_status["overdue_worker_count"] <= executor_status["supported_hang_limit"]
-        )
         current_cursor_owners = {
             (identity.project_id, identity.registration_generation) for identity in current_bindings
         }
@@ -3132,9 +3143,15 @@ class ProjectIOController:
             if owner in current_cursor_owners
         }
         reservations_by_project: dict[str, list[ReservationIdentity]] = {}
+        now = self._monotonic()
         for reservation in reservations:
-            if reservation.project_id is not None:
-                reservations_by_project.setdefault(reservation.project_id, []).append(reservation)
+            if reservation.project_id is None or reservation.reservation_id in processed_reservations:
+                continue
+            if reservation in self._trusted_reservations:
+                recheck_at = self._trusted_reservations[reservation]
+                if reservation in self._authorized_reservations or recheck_at is None or recheck_at > now:
+                    continue
+            reservations_by_project.setdefault(reservation.project_id, []).append(reservation)
         for owned in reservations_by_project.values():
             owned.sort(key=lambda item: item.reservation_id)
 
@@ -3169,8 +3186,6 @@ class ProjectIOController:
                     candidate_index = 0
                 reservation = owned[candidate_index]
                 self._reservation_reconcile_cursors[owner] = reservation.reservation_id
-                if reservation in self._trusted_reservations or reservation.reservation_id in processed_reservations:
-                    continue
                 service_key = self._reservation_reconcile_service_key(identity, reservation.reservation_id)
                 if not self._reservation_reconcile_retry_is_due(service_key):
                     continue
@@ -6170,7 +6185,10 @@ class ProjectIOController:
             reservation.reservation_id
         )
         try:
-            if classify_exact_reservation(self.runtime.root, reservation) != "matching_active":
+            if classify_exact_reservation(self.runtime.root, reservation) not in {
+                "matching_active",
+                "matching_release_pair",
+            }:
                 return
             request = self.executor.prepare_scheduler_reservation_reconcile(
                 binding,
@@ -6397,9 +6415,11 @@ class ProjectIOController:
             self._monotonic() + delay,
         )
 
-    def _trust_reservation(self, reservation: ReservationIdentity) -> None:
+    def _trust_reservation(self, reservation: ReservationIdentity, *, should_recheck: bool = True) -> None:
         self._trusted_reservations.pop(reservation, None)
-        self._trusted_reservations[reservation] = None
+        self._trusted_reservations[reservation] = (
+            self._monotonic() + _PRELAUNCH_RESERVATION_RECHECK_SECONDS if should_recheck else None
+        )
         self._trim_trusted_reservations()
 
     def _trim_trusted_reservations(self) -> None:

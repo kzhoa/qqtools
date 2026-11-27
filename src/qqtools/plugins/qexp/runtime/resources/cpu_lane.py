@@ -563,6 +563,10 @@ def release_cpu_if_matches(runtime_root: Path, identity: Any, reason: str) -> bo
             released_reservation = read_json(released).get("reservation", {})
             if released_reservation.get("state") != "released" or not identity.exactly_matches(released_reservation):
                 return False
+            if released_reservation.get("release_reason") != reason:
+                return False
+            source.unlink()
+            return True
         reservation.update({"state": "released", "released_at": utc_now(), "release_reason": reason})
         atomic_replace(released, value)
         source.unlink(missing_ok=True)

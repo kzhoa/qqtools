@@ -29,6 +29,12 @@ _TAKEOVER_DRAIN_TEXT = {
     "drain_unavailable": "Drain evidence cannot be verified.",
     "drained": "Drain evidence verified.",
 }
+_PRELAUNCH_RESERVATION_TEXT = {
+    "waiting_for_launch": "reserved, waiting for launch",
+    "clock_safety_window": "reserved after lease expiry until the clock safety window closes",
+    "eligible_for_recovery": "reserved, awaiting expired claim recovery",
+    "cleanup_pending": "reserved, awaiting local cleanup",
+}
 
 
 def _machine_values(item: Mapping[str, Any], tasks: Sequence[Mapping[str, Any]] = ()) -> tuple[Any, ...]:
@@ -159,6 +165,74 @@ def _render_status_takeover(takeover: Mapping[str, Any]) -> str:
     return f"{summary}\n{commands}"
 
 
+def _status_age(seconds: object) -> str | None:
+    return f"{seconds:.0f} seconds" if type(seconds) in {int, float} else None
+
+
+def _render_prelaunch_claim(claim: Mapping[str, Any], primary_command: str | None) -> str:
+    gpu_ids = claim.get("gpu_ids") or []
+    if gpu_ids:
+        capacity = "GPU" if len(gpu_ids) == 1 else "GPUs"
+        capacity += " " + ", ".join(str(gpu_id) for gpu_id in gpu_ids)
+    else:
+        capacity = "Capacity"
+    reason = claim.get("reason")
+    reservation = _PRELAUNCH_RESERVATION_TEXT.get(reason, "reserved")
+    owner = claim.get("owner_state")
+    guidance = None
+    if reason == "cleanup_pending" and owner == "unavailable":
+        guidance = "Capacity remains unavailable until the owning MachineRuntime commits release."
+    elif reason == "eligible_for_recovery" and owner == "unavailable":
+        guidance = "Recovery is waiting for the owning MachineRuntime."
+    project_outcome = _status_reason(claim.get("project_outcome"))
+    machine_outcome = _status_reason(claim.get("machine_outcome"))
+    evidence = _section(
+        f"{capacity} {reservation}",
+        (
+            ("Task", claim.get("task_id")),
+            ("Attempt", claim.get("attempt_id")),
+            ("Attempt phase", _status_reason(claim.get("attempt_phase"))),
+            ("Reservation", claim.get("reservation_id")),
+            ("Owning MachineRuntime", claim.get("runtime_id")),
+            ("Owner", _status_reason(owner)),
+            ("Claim age", _status_age(claim.get("age_seconds"))),
+            ("Safe reconciliation time", claim.get("safe_at")),
+            ("Time past safe reconciliation", _status_age(claim.get("overdue_seconds"))),
+            ("Launch evidence", _status_reason(claim.get("launch_evidence")) or claim.get("launch_evidence")),
+            ("Project outcome", project_outcome),
+            ("Machine outcome", machine_outcome),
+            ("Reason", _status_reason(reason)),
+            ("Guidance", guidance),
+        ),
+    )
+    action = claim.get("recovery_action")
+    if action is not None and action["command"] != primary_command:
+        evidence += f"\nNext: {action['command']}\n{action['explanation']}"
+    return evidence
+
+
+def _render_snapshot_warning(warning: Mapping[str, Any]) -> str:
+    machine = encode_display_text(warning["machine_name"])
+    failures = warning.get("consecutive_failures")
+    failure_reason = _status_reason(warning.get("publication_failure_reason"))
+    details = _section(
+        "Project snapshot publication overdue",
+        (
+            ("Binding", f"{machine}, generation {warning['registration_generation']}"),
+            ("Last successful publication", warning.get("last_success_at") or "unknown"),
+            ("Publication age", _status_age(warning.get("age_seconds"))),
+            ("Publication stage", _status_reason(warning.get("publication_stage"))),
+            ("Consecutive publication failures", failures),
+            ("Publication failure", failure_reason if failures else None),
+            ("Scheduling impact", warning.get("scheduling_impact")),
+        ),
+    )
+    command = warning.get("diagnostics_command")
+    if isinstance(command, str):
+        details += f"\nOptional diagnostics (read-only): {command}"
+    return details
+
+
 def _render_status(result: Mapping[str, Any], presentation: Mapping[str, object]) -> str:
     project = result.get("project", {})
     participation = result.get("local_participation", {})
@@ -177,6 +251,7 @@ def _render_status(result: Mapping[str, Any], presentation: Mapping[str, object]
     readiness = result.get("scheduling_readiness")
     heartbeat = agent.get("heartbeat", {}) if isinstance(agent, Mapping) else {}
     snapshot = result.get("project_snapshot", {})
+    snapshot_warning = result.get("project_snapshot_warning")
     coverage = readiness.get("diagnostic_coverage", {}) if isinstance(readiness, Mapping) else {}
     takeover = result.get("takeover")
     recovery = result.get("diagnostic_recovery")
@@ -249,7 +324,7 @@ def _render_status(result: Mapping[str, Any], presentation: Mapping[str, object]
             impact = "Current local agent scheduling could not be verified."
         elif isinstance(recovery, Mapping) and recovery.get("state") == "blocked":
             impact = "Blocked diagnostic recovery leaves local scheduling evidence incomplete."
-        elif snapshot.get("freshness") in {"stale", "unknown"}:
+        elif snapshot_warning is None and snapshot.get("freshness") in {"stale", "unknown"}:
             impact = "A current Project scheduling snapshot is unavailable."
         elif coverage.get("state") in {"incomplete", "unknown"} or (
             scheduler is not None and scheduler.get("status") == "unavailable"
@@ -287,7 +362,12 @@ def _render_status(result: Mapping[str, Any], presentation: Mapping[str, object]
                     heartbeat.get("observed_at") if heartbeat.get("freshness") == "stale" else None,
                 ),
                 ("Project snapshot", snapshot.get("freshness")),
-                ("Snapshot observed at", snapshot.get("observed_at") if snapshot.get("freshness") == "stale" else None),
+                (
+                    "Snapshot observed at",
+                    snapshot.get("observed_at")
+                    if snapshot_warning is None and snapshot.get("freshness") == "stale"
+                    else None,
+                ),
                 ("Diagnostic coverage", f"{coverage_state} (Project binding)" if coverage_state else None),
                 ("Scheduling evidence", readiness.get("state")),
             )
@@ -303,6 +383,9 @@ def _render_status(result: Mapping[str, Any], presentation: Mapping[str, object]
         if takeover["operation_status_command"] == primary_command:
             takeover = {**takeover, "operation_status_command": None}
         sections.append(_render_status_takeover(takeover))
+    sections.extend(_render_prelaunch_claim(claim, primary_command) for claim in result.get("prelaunch_claims", ()))
+    if snapshot_warning is not None:
+        sections.append(_render_snapshot_warning(snapshot_warning))
 
     repair_preview = None
     if isinstance(recovery, Mapping) and recovery.get("state") in {
@@ -458,6 +541,18 @@ def _validate_status(result: Any) -> None:
                 raise ValueError(f"{label}.write_eligibility must be eligible or expired")
     if "scheduler_diagnostics" in value:
         _mapping(value["scheduler_diagnostics"], "status payload.scheduler_diagnostics")
+    if "prelaunch_claims" in value:
+        label = "status payload.prelaunch_claims"
+        for index, item in enumerate(_sequence(value["prelaunch_claims"], label)):
+            item_label = f"{label}[{index}]"
+            _required_bool(_mapping(item, item_label), "actionable", item_label)
+    if value.get("project_snapshot_warning") is not None:
+        label = "status payload.project_snapshot_warning"
+        warning = _mapping(value["project_snapshot_warning"], label)
+        for key in ("machine_name", "registration_generation", "scheduling_impact", "diagnostics_command"):
+            text = _required(warning, key, label)
+            if not isinstance(text, str) or not text:
+                raise ValueError(f"{label}.{key} must be a non-empty string")
     if value.get("primary_action") is not None:
         label = "status payload.primary_action"
         primary = _mapping(value["primary_action"], label)

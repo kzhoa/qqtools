@@ -9,7 +9,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from .agent.bindings import ProjectBinding
+from .agent.context import MachineRuntime
 from .config_types import RootConfig
+from .prelaunch_observation import observe_prelaunch, observe_task_prelaunch
 from .progress_selection import select_progress_protocol, selected_progress_observation
 from .runtime import group_working_set, group_working_set_migration
 from .runtime.dependencies import dependency_gate
@@ -503,7 +506,34 @@ def list_tasks_page(
     )
 
 
-def inspect_task(cfg: RootConfig, task_id: str) -> dict[str, Any]:
+def annotate_prelaunch_rows(
+    cfg: RootConfig,
+    rows: list[dict[str, Any]],
+    *,
+    machine_runtime: MachineRuntime,
+    binding: ProjectBinding | None,
+) -> None:
+    """Add bounded reservation evidence for the returned Task rows."""
+    selected = {
+        row["task_id"]: row
+        for row in rows
+        if row.get("claim_machine") or row.get("reason") == "lease_expired_before_launch"
+    }
+    for task_id, reservation in observe_task_prelaunch(cfg, machine_runtime, binding, selected):
+        row = selected[task_id]
+        if row.get("current_attempt_id") == reservation["attempt_id"] or (
+            row.get("current_attempt_id") is None and reservation["project_outcome"] == "already_requeued"
+        ):
+            row["prelaunch"] = [reservation]
+
+
+def inspect_task(
+    cfg: RootConfig,
+    task_id: str,
+    *,
+    machine_runtime: MachineRuntime | None = None,
+    binding: ProjectBinding | None = None,
+) -> dict[str, Any]:
     task = load_task(cfg, task_id)
     result = task.to_dict()
     result["observation"] = {"tmux_override": task_tmux_observation_label(cfg, task_id)}
@@ -523,6 +553,10 @@ def inspect_task(cfg: RootConfig, task_id: str) -> dict[str, Any]:
     result["reporting_policy"] = policy
     gate = dependency_gate(cfg, task)
     result["dependency_gate"] = {"state": gate.state, "reasons": list(gate.reasons)}
+    if machine_runtime is not None:
+        prelaunch = observe_prelaunch(cfg, machine_runtime, binding, task_id=task_id)
+        if prelaunch:
+            result["prelaunch"] = prelaunch
     attempts_dir = shared_paths(cfg.shared_root)["attempts"] / task_id
     result["attempts"] = [read_json(path) for path in iter_json(attempts_dir)]
     operation_id = task.submission_operation_id

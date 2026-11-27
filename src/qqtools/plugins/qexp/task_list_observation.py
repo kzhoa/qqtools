@@ -261,11 +261,12 @@ def _read_attempt(cfg: Any, task: TaskRecord) -> tuple[AttemptRecord | None, str
         claim = task.claim_control.get("active_claim") or {}
         if (
             current_id is None
-            or attempt.phase not in {"starting", "running"}
+            or attempt.phase not in {"claimed", "starting", "running"}
             or claim.get("attempt_id") != attempt.attempt_id
             or claim.get("attempt_number") != attempt.attempt_number
             or claim.get("fencing_token") != attempt.current_fencing_token
             or claim.get("machine_name") != attempt.machine_name
+            or (attempt.phase == "claimed" and claim.get("reservation_id") != attempt.reservation_id)
         ):
             return None, "identity_mismatch"
     elif projection in _TERMINAL_PHASES:
@@ -303,6 +304,8 @@ def _location(task: TaskRecord, attempt: AttemptRecord | None, selection_reason:
         return _observation("absent", None)
     if attempt.phase not in {"claimed", "starting", "running", "orphaned"}:
         return _observation("unavailable", "identity_mismatch")
+    if attempt.phase == "claimed":
+        return _observation("unavailable", "reservation_unverified")
     if attempt.phase == "orphaned" and projection != "blocked":
         return _observation("unavailable", "identity_mismatch")
     gpus = attempt.assigned_gpus
@@ -395,6 +398,9 @@ def _progress_observations(
         return unavailable, dict(unavailable), dict(unavailable), None
 
     projection = task.state.get("projection")
+    if projection == "running" and attempt.phase == "claimed":
+        pending = _observation("pending", "not_started")
+        return pending, dict(pending), dict(pending), None
     terminal = projection in _TERMINAL_PHASES
     process = attempt.process if isinstance(attempt.process, Mapping) else {}
     if not terminal and (

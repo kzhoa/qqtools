@@ -18,6 +18,7 @@ class OutputKind(str, Enum):
     TASK_WATCH = "task-watch"
     TASK_CANCEL = "task-cancel"
     TASK_RETRY = "task-retry"
+    TASK_RECOVER_PRELAUNCH = "task-recover-prelaunch"
     DEPENDENCIES = "dependencies"
     AVAILABILITY = "availability"
     GROUP_LIST = "group-list"

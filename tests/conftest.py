@@ -310,10 +310,6 @@ def qexp_healthy_clock(monkeypatch):
         "doctor",
     ):
         monkeypatch.setattr(f"qqtools.plugins.qexp.{module}.clock_capability", lambda *_args: capability)
-    monkeypatch.setattr(
-        "qqtools.plugins.qexp.scheduler.reclaim_allowed_at",
-        lambda *_args: datetime.now(timezone.utc) - timedelta(seconds=1),
-    )
 
 
 @pytest.fixture

@@ -37,7 +37,6 @@ from .lease import (
     lease_expiry,
     load_lease_policy,
     persist_clock_observation,
-    reclaim_allowed_at,
 )
 from .lifecycle import TerminalTransition, commit_terminal_transition_locked, dispatch_task_lifecycle_hooks_noexcept
 from .runtime.authority_lock import authority_locks
@@ -2926,72 +2925,17 @@ def expire_claim(
     reservation_runtime_root: Path | None = None,
 ) -> bool:
     """Converge an expired claim without creating replacement execution authority."""
-    reservation_runtime_root = _reservation_root(cfg, reservation_runtime_root)
-    policy = load_lease_policy(cfg)
-    capability = clock_capability(cfg, policy)
-    if not capability.is_healthy or capability.observation is None:
-        return False
-    task = load_task(cfg, task_id)
-    with authority_locks(cfg, task):
-        task = load_task(cfg, task_id)
-        claim = task.claim_control.get("active_claim") or {}
-        if claim.get("attempt_id") != attempt_id or claim.get("fencing_token") != fencing_token:
-            return False
-        if claim.get("launch_state") != "claimed":
-            return False
-        if claim.get("authority_mode") != "bounded_lease":
-            return False
-        holder_bound = claim.get("clock_error_bound_seconds")
-        expires = claim.get("lease_expires_at")
-        if not isinstance(holder_bound, (int, float)) or not isinstance(expires, str):
-            with record_task_change(
-                cfg,
-                task,
-                "claim_loss",
-                details={
-                    "expected_attempt_id": attempt_id,
-                    "expected_fencing_token": fencing_token,
-                    "is_invalid_evidence": True,
-                },
-            ):
-                task.state.update({"projection": "blocked", "reason": "authority_mode_evidence_invalid"})
-                task.meta["revision"] += 1
-                task.meta["updated_at"] = utc_now()
-                save_task(cfg, task)
-                return False
-        reclaimer_bound = capability.observation.bound_at(time.monotonic())
-        if datetime.now(timezone.utc) < reclaim_allowed_at(expires, holder_bound, reclaimer_bound):
-            return False
-        path = attempt_path(cfg.shared_root, task_id, task.attempt_control["current_attempt_number"])
-        attempt = AttemptRecord.from_dict(read_json(path))
-        with record_task_change(
-            cfg,
-            task,
-            "claim_loss",
-            details={
-                "expected_attempt_id": attempt_id,
-                "expected_fencing_token": fencing_token,
-                "reserved_generation": task.ready_generation + 1,
-            },
-        ):
-            task.state.update({"projection": "queued", "reason": "lease_expired_before_launch"})
-            old_ready_generation, _ = prepare_ready_transition(cfg, task, "prelaunch_expiry")
-            attempt.phase = "cancelled"
-            attempt.result["reason"] = "lease_expired_before_launch"
-            _release_task_reservation(
-                task, reservation_runtime_root, claim["reservation_id"], "lease_expired_before_launch"
-            )
-            attempt.timestamps["finished_at"] = utc_now()
-            atomic_replace(path, attempt.to_dict())
-            archive_claim(cfg, task_id, claim, "lease_expired")
-            task.claim_control["active_claim"] = None
-            task.attempt_control["current_attempt_id"] = None
-            task.meta["revision"] += 1
-            task.meta["updated_at"] = utc_now()
-            save_task(cfg, task)
-            commit_ready_publication(cfg, task)
-            retire_previous_ready_generation(cfg, old_ready_generation, task)
-            return True
+    from .prelaunch_recovery import expire_standalone_claim
+
+    return expire_standalone_claim(
+        cfg,
+        task_id,
+        attempt_id,
+        fencing_token,
+        _reservation_root(cfg, reservation_runtime_root),
+        acquire_clock=clock_capability,
+        task_writer=save_task,
+    )
 
 
 def fail_attempt(

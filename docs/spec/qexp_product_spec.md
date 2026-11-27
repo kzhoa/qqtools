@@ -1876,6 +1876,18 @@ as a separate entry point for users who intend to select a target by name.
 Scheduler finding details are limited to the bounded samples returned by the
 Project summary. These follow-ups require no additional status reads.
 
+For a GPU reserved before launch, Task detail and placement identify its Attempt phase,
+reservation owner and launch evidence. Project status reports the safe reconciliation time when
+clock evidence permits it. If discovery has stalled and the local owner can advance recovery,
+status gives a copyable `task recover-prelaunch TASK --expected-target TOKEN` command. It
+rechecks the observed claim, returns the Task to its queue after proven expiry and reports
+Project requeue and local reservation release separately. A saved command remains scoped to
+its original reservation across retries. Pending local cleanup keeps the GPU occupied.
+
+A delayed Project snapshot reports the binding, age of the last successful publication and
+unknown scheduling impact. The heartbeat has its own freshness. Read-only diagnostics are
+available as optional detail. Snapshot age alone never prompts claim recovery.
+
 Project JSON includes `upgrade` with `state`, `migration`, `phase`,
 `admission_blocked`, and `reason`. The overview reads the selected root's canonical
 upgrade journal once within the same total budget. It validates journal version,

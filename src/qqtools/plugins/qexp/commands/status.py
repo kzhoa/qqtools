@@ -6,7 +6,7 @@ import json
 import os
 import shlex
 import stat
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -14,7 +14,12 @@ from typing import Any
 from ..agent.bindings import ProjectBinding, decode_registry
 from ..agent.config import AgentConfig
 from ..agent.context import MachineRuntime, _effective_runtime_id
-from ..agent.control_plane_health import HEALTH_FILENAME, HEALTH_SCHEMA_VERSION, MAX_HEALTH_BYTES
+from ..agent.control_plane_health import (
+    HEALTH_FILENAME,
+    HEALTH_SCHEMA_VERSION,
+    MAX_HEALTH_BYTES,
+    _sanitize_project_publications,
+)
 from ..agent.diagnostic_recovery import diagnostics_repair_command, read_scheduler_recovery
 from ..agent.identity import decode_identity_record
 from ..agent.inventory import ProjectInventoryEntry, decode_inventory
@@ -30,6 +35,7 @@ from ..agent.takeover_intent import (
 )
 from ..config_types import RootConfig
 from ..layout import machine_path, project_id
+from ..prelaunch_observation import observe_prelaunch
 from ..runtime.authority_scan import validate_evidence_path
 from ..runtime.observation.projection import _validate_state, observation_path
 from ..runtime.paths import machine_registration_path, shared_paths
@@ -43,6 +49,8 @@ MAX_READ_ATTEMPTS = 32
 MAX_RECORD_BYTES = 256 * 1024
 MAX_TOTAL_BYTES = 2 * 1024 * 1024
 MACHINE_DETAIL_MAX_READ_ATTEMPTS = 8
+_SNAPSHOT_OVERDUE = "project_snapshot_overdue"
+_PRELAUNCH_DISCOVERY_GRACE_SECONDS = 15
 
 
 class _BoundedReadFailure(ValueError):
@@ -69,16 +77,23 @@ class _ReadBudget:
         self.max_total_bytes = max_total_bytes
         self.read_attempts = 0
         self.bytes_read = 0
+        self._cache: dict[Path, tuple[int, dict[str, Any] | None]] = {}
 
     def read_json(self, path: Path, *, max_bytes: int | None = None) -> dict[str, Any] | None:
         """Read one regular JSON file, returning ``None`` only when absent."""
         record_limit = self.max_record_bytes if max_bytes is None else min(self.max_record_bytes, max_bytes)
+        if path in self._cache:
+            size, cached = self._cache[path]
+            if size > record_limit:
+                raise _BoundedReadFailure("record_oversized", path)
+            return cached
         if self.read_attempts >= self.max_read_attempts:
             raise _BoundedReadFailure("read_budget_exhausted", path)
         self.read_attempts += 1
         try:
             metadata = path.lstat()
         except FileNotFoundError:
+            self._cache[path] = (0, None)
             return None
         except OSError as exc:
             raise _BoundedReadFailure(f"lstat_failed:{type(exc).__name__}", path) from exc
@@ -96,6 +111,7 @@ class _ReadBudget:
                 if len(encoded) == remaining and os.fstat(handle.fileno()).st_size > remaining:
                     raise _BoundedReadFailure("total_read_budget_exhausted", path)
         except FileNotFoundError:
+            self._cache[path] = (0, None)
             return None
         except OSError as exc:
             raise _BoundedReadFailure(f"read_failed:{type(exc).__name__}", path) from exc
@@ -107,6 +123,7 @@ class _ReadBudget:
             raise _BoundedReadFailure("malformed_json", path) from exc
         if not isinstance(value, dict):
             raise _BoundedReadFailure("json_object_required", path)
+        self._cache[path] = (len(encoded), value)
         return value
 
     def as_dict(self) -> dict[str, int]:
@@ -420,6 +437,69 @@ def _project_takeover(
     }
 
 
+def _finding_reason(sample: Mapping[str, Any]) -> str | None:
+    identity = sample.get("identity")
+    reason = identity.get("reason_code") if isinstance(identity, Mapping) else None
+    return reason if isinstance(reason, str) and reason else None
+
+
+def _project_diagnostics_args(project_id: str) -> tuple[str, ...]:
+    scope = (f"--project-id={project_id}",) if project_id.startswith("-") else ("--project-id", project_id)
+    return ("agent", "diagnostics", "active", *scope)
+
+
+def _prelaunch_status_actions(
+    claims: list[dict[str, Any]],
+    runtime: MachineRuntime,
+    project: Path,
+    runtime_id: str | None,
+    *,
+    is_owner_active: bool,
+) -> list[dict[str, str]]:
+    actions: list[dict[str, str]] = []
+    prefix = [
+        "qexp",
+        "--machine-runtime-root",
+        str(runtime.root),
+        "--project",
+        str(project),
+        "task",
+        "recover-prelaunch",
+    ]
+    for claim in claims:
+        is_owner_available = is_owner_active and claim["runtime_id"] == runtime_id
+        task_id = claim["task_id"]
+        target = claim["expected_target"]
+        overdue = claim["overdue_seconds"]
+        claim["owner_state"] = "active" if is_owner_available else "unavailable"
+        claim["actionable"] = (
+            claim["actionable"] is True
+            and is_owner_available
+            and claim["reason"] in {"eligible_for_recovery", "cleanup_pending"}
+            and type(overdue) in {int, float}
+            and overdue >= _PRELAUNCH_DISCOVERY_GRACE_SECONDS
+            and isinstance(task_id, str)
+            and bool(task_id)
+            and isinstance(target, str)
+            and bool(target)
+        )
+        if not claim["actionable"]:
+            continue
+        if task_id.startswith("-"):
+            command = shlex.join([*prefix, "--expected-target", target, "--", task_id])
+        else:
+            command = shlex.join([*prefix, task_id, "--expected-target", target])
+        explanation = (
+            "Release the original reservation if the owning MachineRuntime confirms cleanup is safe."
+            if claim["reason"] == "cleanup_pending"
+            else "Requeue this Task and release its reservation if the observed pre-launch claim still matches."
+        )
+        action = {"command": command, "explanation": explanation}
+        claim["recovery_action"] = action
+        actions.append(action)
+    return actions
+
+
 def _follow_up_actions(
     project: Path,
     project_id: str,
@@ -432,6 +512,8 @@ def _follow_up_actions(
     *,
     upgrade: dict[str, object] | None = None,
     diagnostic_recovery: dict[str, Any] | None = None,
+    prelaunch_actions: Sequence[dict[str, str]] = (),
+    has_snapshot_warning: bool = False,
 ) -> list[str]:
     prefix = ["qexp", "--machine-runtime-root", str(runtime.root)]
     actions: list[str] = []
@@ -449,23 +531,26 @@ def _follow_up_actions(
         # Project list can initialize a missing inventory. Inspect the files directly.
         actions.append(shlex.join(["ls", "-ld", "--", str(runtime.paths["registry"]), str(runtime.paths["inventory"])]))
 
+    actions.extend(action["command"] for action in prelaunch_actions)
     repair_blocked = diagnostic_recovery is not None and diagnostic_recovery.get("state") == "blocked"
     if repair_blocked:
         actions.append(diagnostics_repair_command(runtime))
     if diagnostics.get("reason") != "project_id_unavailable":
-        diagnostic_args = ("agent", "diagnostics", "active", "--project-id", project_id)
+        diagnostic_args = _project_diagnostics_args(project_id)
         has_reason = False
         for sample in diagnostics["active_findings"]:
-            identity = sample.get("identity")
-            reason = identity.get("reason_code") if isinstance(identity, dict) else None
-            if isinstance(reason, str) and reason:
+            if (reason := _finding_reason(sample)) is not None and reason != _SNAPSHOT_OVERDUE:
                 has_reason = True
                 suggest(*diagnostic_args, "--reason", reason)
-        if not repair_blocked and (
-            diagnostics["status"] != "available"
-            or diagnostics["coverage"] != "complete"
-            or diagnostics["truncated"]
-            or (diagnostics["active_count"] and not has_reason)
+        if (
+            not repair_blocked
+            and not has_snapshot_warning
+            and (
+                diagnostics["status"] != "available"
+                or diagnostics["coverage"] != "complete"
+                or diagnostics["truncated"]
+                or (diagnostics["active_count"] and not has_reason)
+            )
         ):
             suggest(*diagnostic_args)
     if observation["state"] != "active" or observation["reason"] == "projection_dirty":
@@ -480,7 +565,11 @@ def _follow_up_actions(
     return actions
 
 
-def _primary_status_action(runtime: MachineRuntime, result: Mapping[str, Any]) -> dict[str, str] | None:
+def _primary_status_action(
+    runtime: MachineRuntime,
+    result: Mapping[str, Any],
+    prelaunch_actions: list[dict[str, str]],
+) -> dict[str, str] | None:
     """Prioritize one action from the bounded status evidence."""
     participation = result["local_participation"]["state"]
     binding = result["local_participation"]["binding"]
@@ -514,27 +603,20 @@ def _primary_status_action(runtime: MachineRuntime, result: Mapping[str, Any]) -
     if agent["heartbeat"]["freshness"] != "fresh":
         return {"command": agent_status, "explanation": "Inspect the local agent's heartbeat health."}
 
+    if prelaunch_actions:
+        return prelaunch_actions[0]
     recovery = result["diagnostic_recovery"]
     if recovery["state"] == "blocked":
         return {"command": recovery["next_action"], "explanation": "Preview the diagnostic recovery blocker."}
 
     diagnostics = result["scheduler_diagnostics"]
-    readiness = result["scheduling_readiness"]
-    if (
-        result["project_snapshot"]["freshness"] != "fresh"
-        or readiness["diagnostic_coverage"]["state"] != "complete"
-        or diagnostics["status"] != "available"
-        or diagnostics["active_count"]
-        or diagnostics["active_findings"]
+    diagnostic_args = _project_diagnostics_args(project_id)
+    diagnostic_command = shlex.join([*prefix, *diagnostic_args])
+    if diagnostic_command in actions or any(
+        _finding_reason(sample) not in {None, _SNAPSHOT_OVERDUE} for sample in diagnostics["active_findings"]
     ):
-        if diagnostics["reason"] == "project_id_unavailable":
-            return {
-                "command": agent_status,
-                "explanation": "Inspect machine-wide status. A Project diagnostic filter is unavailable.",
-            }
-        project_filter = [f"--project-id={project_id}"] if project_id.startswith("-") else ["--project-id", project_id]
         return {
-            "command": shlex.join([*prefix, "agent", "diagnostics", "active", *project_filter]),
+            "command": diagnostic_command,
             "explanation": "Inspect reported scheduling findings. This check leaves dispatch unverified.",
         }
 
@@ -658,7 +740,7 @@ def project_status(
         else None
     )
     takeover = _project_takeover(cfg, selected_project_id, machine_runtime, reader, warnings)
-    heartbeat, project_snapshot, readiness, recovery = _scheduling_observations(
+    heartbeat, project_snapshot, readiness, recovery, snapshot_warning = _scheduling_observations(
         machine_runtime,
         reader,
         agent_record,
@@ -666,6 +748,28 @@ def project_status(
         scheduler_diagnostics,
     )
     local_agent["heartbeat"] = heartbeat
+    prelaunch_claims: list[dict[str, Any]] = []
+    prelaunch_actions: list[dict[str, str]] = []
+    if binding is not None and binding_observation is not None:
+        local_cfg = RootConfig.from_canonical_paths(
+            cfg.shared_root,
+            cfg.project_root,
+            binding.machine_name,
+            machine_runtime.project_paths(binding.project_id)["root"],
+        )
+        prelaunch_claims = observe_prelaunch(local_cfg, machine_runtime, binding, read_json=reader.read_json)
+        prelaunch_actions = _prelaunch_status_actions(
+            prelaunch_claims,
+            machine_runtime,
+            cfg.project_root,
+            binding.runtime_instance_id,
+            is_owner_active=(
+                local_agent["state"] == "active"
+                and heartbeat["freshness"] == "fresh"
+                and binding.enabled
+                and binding_observation["write_eligibility"] == "eligible"
+            ),
+        )
     selected_diagnostics = scheduler_diagnostics
     selected_coverage = readiness["diagnostic_coverage"]["state"]
     if scheduler_diagnostics["coverage"] == "complete" and selected_coverage == "incomplete":
@@ -700,6 +804,8 @@ def project_status(
         "scheduler_diagnostics": selected_diagnostics,
         "diagnostic_recovery": recovery,
         "project_snapshot": project_snapshot,
+        "project_snapshot_warning": snapshot_warning,
+        "prelaunch_claims": prelaunch_claims,
         "scheduling_readiness": readiness,
         "totals": {"tasks": None, "machines": None, "reason": "not_available"},
         "takeover_preview_help": shlex.join(
@@ -724,14 +830,97 @@ def project_status(
             warnings,
             upgrade=upgrade,
             diagnostic_recovery=recovery,
+            prelaunch_actions=prelaunch_actions,
+            has_snapshot_warning=(
+                snapshot_warning is not None
+                or any(_finding_reason(item) == _SNAPSHOT_OVERDUE for item in scheduler_diagnostics["active_findings"])
+            ),
         ),
         "budget": reader.as_dict(),
         "warnings": warnings,
     }
     if takeover is not None:
         result["takeover"] = takeover
-    result["primary_action"] = _primary_status_action(machine_runtime, result)
+    result["primary_action"] = _primary_status_action(machine_runtime, result, prelaunch_actions)
     return result
+
+
+def _project_snapshot_warning(
+    runtime: MachineRuntime,
+    binding: ProjectBinding,
+    agent_instance: str,
+    health: Mapping[str, Any],
+    snapshot: Mapping[str, object],
+    diagnostics: Mapping[str, Any],
+    now: datetime,
+) -> dict[str, object] | None:
+    if snapshot["freshness"] == "fresh":
+        return None
+    binding_identity = {
+        "project_id": binding.project_id,
+        "runtime_id": binding.runtime_instance_id,
+        "registration_generation": binding.registration_generation,
+    }
+    try:
+        publications = _sanitize_project_publications(health.get("project_snapshot_publications"))
+    except TypeError:
+        publications = None
+    publication = (
+        next(
+            (
+                item
+                for item in publications["items"]
+                if item.get("agent_instance_id") == agent_instance
+                and all(item.get(key) == value for key, value in binding_identity.items())
+            ),
+            {},
+        )
+        if publications is not None
+        else {}
+    )
+    snapshot_finding = next(
+        (
+            item
+            for item in diagnostics["active_findings"]
+            if _finding_reason(item) == _SNAPSHOT_OVERDUE
+            and item["identity"].get("target_id") == agent_instance
+            and all(item["identity"].get(key) == value for key, value in binding_identity.items())
+        ),
+        None,
+    )
+    if snapshot["freshness"] != "stale" and publication.get("overdue") is not True and snapshot_finding is None:
+        return None
+    last_success_at = None
+    last_success = None
+    for timestamp in (snapshot["observed_at"], publication.get("last_published_at")):
+        parsed = observation_timestamp(timestamp)
+        if parsed is not None and parsed <= now and (last_success is None or parsed > last_success):
+            last_success_at, last_success = timestamp, parsed
+    details = snapshot_finding.get("details") if snapshot_finding is not None else None
+    stage = publication.get("stage")
+    if stage is None and isinstance(details, Mapping) and isinstance(details.get("progress"), str):
+        stage = details["progress"]
+    return {
+        "reason": _SNAPSHOT_OVERDUE,
+        **binding_identity,
+        "machine_name": binding.machine_name,
+        "last_success_at": last_success_at,
+        "age_seconds": (now - last_success).total_seconds() if last_success is not None else None,
+        "scheduling_impact": "unknown",
+        "publication_stage": stage,
+        "consecutive_failures": publication.get("consecutive_failures"),
+        "publication_failure_reason": publication.get("reason_code"),
+        "diagnostics_command": shlex.join(
+            [
+                "qexp",
+                "--machine-runtime-root",
+                str(runtime.root),
+                *_project_diagnostics_args(binding.project_id),
+                "--reason",
+                _SNAPSHOT_OVERDUE,
+            ]
+        ),
+    }
 
 
 def _scheduling_observations(
@@ -740,7 +929,7 @@ def _scheduling_observations(
     agent: object,
     binding: ProjectBinding | None,
     diagnostics: dict[str, Any],
-) -> tuple[dict[str, object], dict[str, object], dict[str, Any], dict[str, Any]]:
+) -> tuple[dict[str, object], dict[str, object], dict[str, Any], dict[str, Any], dict[str, object] | None]:
     """Project bounded, independent heartbeat, snapshot and coverage evidence."""
     now = datetime.now(timezone.utc)
 
@@ -774,15 +963,16 @@ def _scheduling_observations(
     snapshot = {"observed_at": None, "freshness": "unknown"}
     heartbeat_coverage_complete = False
     checkpoint = None
+    snapshot_warning = None
     if active_instance is not None:
         health = read_optional(runtime.root / HEALTH_FILENAME, max_bytes=MAX_HEALTH_BYTES)
         lane = health.get("heartbeat")
-        if (
+        has_matching_health = (
             type(health.get("schema_version")) is int
             and health["schema_version"] == HEALTH_SCHEMA_VERSION
             and health.get("instance_id") == active_instance
-            and isinstance(lane, dict)
-        ):
+        )
+        if has_matching_health and isinstance(lane, dict):
             heartbeat = freshness(lane.get("last_success_at"), lane.get("effective_stale_after_seconds"))
             heartbeat_coverage_complete = (
                 heartbeat["freshness"] == "fresh"
@@ -800,6 +990,9 @@ def _scheduling_observations(
                 and receipt.get("registration_generation") == binding.registration_generation
             ):
                 snapshot = freshness(receipt.get("snapshot_at"), receipt.get("heartbeat_interval_seconds"), intervals=3)
+            snapshot_warning = _project_snapshot_warning(
+                runtime, binding, active_instance, health if has_matching_health else {}, snapshot, diagnostics, now
+            )
 
     recovery = read_scheduler_recovery(runtime, instance_id=active_instance, read_json=read_optional)
     coverage = diagnostics["coverage"] if binding is not None else "unknown"
@@ -897,7 +1090,7 @@ def _scheduling_observations(
         "reasons": reasons,
         "diagnostic_coverage": {"scope": "project_binding", "state": coverage},
     }
-    return heartbeat, snapshot, readiness, recovery
+    return heartbeat, snapshot, readiness, recovery, snapshot_warning
 
 
 def _machine_state_path(cfg: RootConfig, name: str, state_name: str) -> Path:

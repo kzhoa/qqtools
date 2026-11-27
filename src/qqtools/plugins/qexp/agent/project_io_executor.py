@@ -87,6 +87,7 @@ _OUTCOME_UNKNOWN_ON_WORKER_EXIT = frozenset(
         "scheduler_claim",
         "scheduler_cursor_commit",
         "scheduler_launch_authorize",
+        "scheduler_reservation_reconcile",
         "scheduler_due_offer",
         "scheduler_ready_index_build",
         "maintenance_descriptor_advance",
@@ -115,7 +116,6 @@ _RETRYABLE_ON_WORKER_EXIT = frozenset(
         "scheduler_quiescence_probe",
         "idle_job_probe",
         "idle_decision_guard",
-        "scheduler_reservation_reconcile",
         "activation_observe",
         "authority_service",
         "authority_terminal_observe",
@@ -672,7 +672,7 @@ class ProjectIOExecutor:
         *,
         reservation_identity: ReservationIdentity,
     ) -> ProjectIORequest:
-        """Persist one shared-only classification request for an active reservation."""
+        """Persist one exact reconciliation request for an active reservation."""
         if not isinstance(reservation_identity, ReservationIdentity):
             raise ValueError("reservation reconciliation requires an exact ReservationIdentity.")
         shared_root = str(getattr(binding, "shared_root", None))
@@ -685,7 +685,7 @@ class ProjectIOExecutor:
             state = classify_exact_reservation(self.runtime.root, reservation_identity)
         except (OSError, RuntimeError, ValueError) as exc:
             raise ProjectIOProtocolError("reservation reconciliation could not validate local identity.") from exc
-        if state != "matching_active":
+        if state not in {"matching_active", "matching_release_pair"}:
             raise ProjectIOProtocolError("reservation reconciliation requires the exact active local reservation.")
         identity = {
             "reservation_id": reservation_identity.reservation_id,
@@ -2558,6 +2558,24 @@ class ProjectIOExecutor:
             current_request,
             operation_kind="scheduler_launch_authorize",
         )
+
+    def reset_ambiguous_scheduler_reservation_reconcile_for_retry(
+        self,
+        request_id: str,
+        current_request: ProjectIORequest,
+    ) -> bool:
+        """Replay one exact reservation after its prior worker is known absent."""
+        return self._reset_ambiguous_request_for_retry(
+            request_id,
+            current_request,
+            operation_kind="scheduler_reservation_reconcile",
+        )
+
+    def resolve_stale_scheduler_reservation_reconcile(self, request_id: str, current_request: ProjectIORequest) -> bool:
+        """Leave recovery to the next current binding with the same durable reservation."""
+        if current_request.operation_kind != "scheduler_reservation_reconcile":
+            raise ValueError("stale resolution requires scheduler_reservation_reconcile.")
+        return self._resolve_stale_request(request_id, current_request)
 
     def _reset_ambiguous_request_for_retry(
         self,

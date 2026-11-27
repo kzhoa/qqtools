@@ -32,10 +32,10 @@ from .runtime.work_budget import diagnostic_span
 
 @dataclass(frozen=True, slots=True)
 class ReservationReconciliation:
-    """Shared-truth classification for one exact machine reservation."""
+    """Outcome of inspecting or reconciling one exact machine reservation."""
 
-    outcome: Literal["retained", "retag", "release", "isolated"]
-    reason: Literal["task_missing", "claim_missing"] | None = None
+    outcome: Literal["retained", "prelaunch_retained", "recovered", "retag", "release", "isolated"]
+    reason: Literal["task_missing", "claim_missing", "lease_expired_before_launch"] | None = None
     attempt_id: str | None = None
     fencing_token: int | None = None
 
@@ -129,6 +129,47 @@ def classify_reservation(
     return ReservationReconciliation("release", reason="claim_missing")
 
 
+def advance_reservation_reconciliation(
+    cfg: RootConfig,
+    identity: ReservationIdentity,
+    *,
+    reservation_runtime_root: Path,
+    runtime_id: str,
+    before_mutation: Callable[[], None] | None = None,
+) -> ReservationReconciliation:
+    """Advance pre-launch expiry and return any legacy reservation classification."""
+    from .prelaunch_recovery import reconcile_prelaunch
+
+    # Observe generic cleanup first. A claim that expires concurrently can
+    # then only be cleaned up through its recorded pre-launch transition.
+    classification = classify_reservation(cfg, identity)
+    result = reconcile_prelaunch(
+        cfg,
+        identity,
+        runtime_root=reservation_runtime_root,
+        runtime_id=runtime_id,
+        apply=True,
+        before_shared_mutation=before_mutation,
+        defer_machine_release=True,
+    )
+    reason = result["reason"]
+    if result["project_outcome"] in {"requeued", "already_requeued"}:
+        if result["machine_outcome"] == "release_pending":
+            return ReservationReconciliation("release", reason="lease_expired_before_launch")
+        if result["machine_outcome"] == "already_released":
+            return ReservationReconciliation("recovered")
+        return ReservationReconciliation("isolated")
+    if reason == "not_prelaunch":
+        if classification.outcome == "retained":
+            return ReservationReconciliation("prelaunch_retained")
+        return classification
+    if reason == "launch_authorized":
+        return ReservationReconciliation("retained")
+    if result["project_outcome"] == "retained" and classification.outcome == "retained":
+        return ReservationReconciliation("prelaunch_retained")
+    return ReservationReconciliation("isolated")
+
+
 def maintain_project(
     cfg: RootConfig,
     *,
@@ -175,17 +216,32 @@ def reconcile_reservation(
     reservation: dict[str, object],
     *,
     reservation_runtime_root: Path,
+    runtime_id: str | None = None,
+    before_mutation: Callable[[], None] | None = None,
 ) -> str:
     """Reconcile one snapshotted reservation through an identity-fenced mutation."""
     try:
         identity = ReservationIdentity.from_record(reservation)
     except ValueError:
         return "isolated"
-    result = classify_reservation(cfg, identity)
-    if result.outcome == "retained":
+    if runtime_id is None:
+        result = classify_reservation(cfg, identity)
+    else:
+        result = advance_reservation_reconciliation(
+            cfg,
+            identity,
+            reservation_runtime_root=reservation_runtime_root,
+            runtime_id=runtime_id,
+            before_mutation=before_mutation,
+        )
+    if result.outcome in {"retained", "prelaunch_retained"}:
         return "retained"
+    if result.outcome == "recovered":
+        return "released"
     if result.outcome == "isolated":
         return "isolated"
+    if before_mutation is not None:
+        before_mutation()
     if result.outcome == "retag":
         assert result.attempt_id is not None
         assert result.fencing_token is not None

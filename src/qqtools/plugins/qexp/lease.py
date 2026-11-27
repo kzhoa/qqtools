@@ -183,6 +183,11 @@ def _read_lease_policy(cfg: RootConfig) -> LeasePolicy:
         document = read_json(path)
     except FileNotFoundError:
         return LeasePolicy()
+    return decode_lease_policy(document)
+
+
+def decode_lease_policy(document: dict[str, Any]) -> LeasePolicy:
+    """Decode a policy read through either the authority or bounded observation reader."""
     value = document.get("lease_policy")
     if not isinstance(value, dict):
         raise RuntimeError("qexp lease policy is malformed.")
@@ -441,7 +446,7 @@ def clock_capability(cfg: RootConfig, policy: LeasePolicy | None = None) -> Cloc
         if (
             cached.get("status") == "healthy"
             and observation.boot_id == _boot_id()
-            and now_mono - observation.monotonic_observed_at <= policy.clock_observation_max_age_seconds
+            and 0 <= now_mono - observation.monotonic_observed_at <= policy.clock_observation_max_age_seconds
             and observation.bound_at(now_mono) <= policy.max_clock_skew_seconds
         ):
             return ClockCapability("healthy", "healthy", observation, tuple(cached.get("providers", [])))

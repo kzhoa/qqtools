@@ -25,8 +25,22 @@ _UNAVAILABLE_EXPLANATIONS = {
     "read_failed": "Could not read observation",
     "invalid_snapshot": "Invalid report",
     "identity_mismatch": "Could not verify current Attempt",
+    "reservation_unverified": "Could not verify the pre-launch reservation",
     "changed_during_read": "Task changed; rerun this command",
     "concurrent_transition": "Task changed; rerun this command",
+}
+_PRELAUNCH_EXPLANATIONS = {
+    "waiting_for_launch": "waiting for launch",
+    "clock_safety_window": "lease expired, waiting for the safe reconciliation time",
+    "eligible_for_recovery": "ready for pre-launch reconciliation",
+    "lease_expired_before_launch": "ready for pre-launch reconciliation",
+    "cleanup_pending": "owner cleanup pending",
+    "owner_runtime_unavailable": "owner runtime unavailable",
+    "runtime_binding_changed": "owner binding changed",
+    "clock_evidence_invalid": "clock evidence invalid",
+    "clock_evidence_unavailable": "clock evidence unavailable",
+    "launch_authorized": "launch authorized",
+    "launch_evidence_conflict": "launch evidence conflicts",
 }
 
 
@@ -246,7 +260,38 @@ def _gpu_numbers(value: object) -> list[tuple[int | None, str]]:
     return result
 
 
+def _prelaunch_summary(reservation: Mapping[str, object]) -> str:
+    gpus = ", ".join(text for _number, text in _gpu_numbers(reservation.get("gpu_ids")))
+    resource = f"GPU {gpus}" if gpus else "Capacity"
+    occupancy = "reservation reported" if reservation.get("reservation_verified") is False else "reserved"
+    reason = _bounded_reason(reservation.get("reason"))
+    explanation = _PRELAUNCH_EXPLANATIONS.get(reason, reason.replace("_", " "))
+    return f"{resource} {occupancy}, {explanation}"
+
+
 def _location_value(row: Mapping[str, object], context: _RenderContext) -> str:
+    reservations = row.get("prelaunch")
+    if isinstance(reservations, list) and reservations and isinstance(reservations[0], Mapping):
+        reservation = reservations[0]
+        parts = [_prelaunch_summary(reservation)]
+        if phase := reservation.get("attempt_phase"):
+            parts.append(_sanitize(phase))
+        if machine := reservation.get("machine_name"):
+            parts.append(_sanitize(machine))
+        if runtime_id := reservation.get("runtime_id"):
+            parts.append(f"runtime {_sanitize(runtime_id)[:12]}")
+        age = reservation.get("age_seconds")
+        if type(age) in {int, float}:
+            parts.append(f"{age:.0f}s old")
+        if safe_at := reservation.get("safe_at"):
+            parts.append(f"safe at {_sanitize(safe_at)}")
+        evidence = reservation.get("launch_evidence")
+        if isinstance(evidence, Mapping):
+            if evidence.get("launch_id") or evidence.get("ownership_transition"):
+                parts.append("launch authorization recorded")
+            elif evidence.get("claim_launch_state") == "claimed":
+                parts.append("no launch authorization recorded")
+        return " · ".join(parts)
     location = row.get("location")
     if not isinstance(location, Mapping):
         return _EM_DASH

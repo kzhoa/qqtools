@@ -544,6 +544,8 @@ def test_expired_prelaunch_claim_requeues_without_creating_an_orphan(tmp_path: P
     assert attempt is not None
     current = load_task(cfg, task.task_id)
     current.claim_control["active_claim"]["lease_expires_at"] = "2000-01-01T00:00:00Z"
+    attempt.lease["expires_at"] = current.claim_control["active_claim"]["lease_expires_at"]
+    atomic_replace(attempt_path(cfg.shared_root, task.task_id, attempt.attempt_number), attempt.to_dict())
     save_task(cfg, current)
 
     assert expire_claim(cfg, task.task_id, attempt.attempt_id, attempt.current_fencing_token)

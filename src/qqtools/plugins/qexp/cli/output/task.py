@@ -24,6 +24,7 @@ from .primitives import (
     _task_summary,
     _value,
 )
+from .task_list import _prelaunch_summary
 from .task_list import render_task_list as _render_selected_task_list
 from .task_list import render_task_page as _render_selected_task_page
 
@@ -253,6 +254,27 @@ def _render_task_show(result: Mapping[str, Any], presentation: Mapping[str, obje
         _section("Progress diagnostics", diagnostics),
         f"Command\n  {command}" if command else "",
     ]
+    for reservation in result.get("prelaunch", ()):
+        age = reservation.get("age_seconds")
+        sections.insert(
+            2,
+            _section(
+                "Pre-launch reservation",
+                (
+                    ("Capacity", _prelaunch_summary(reservation)),
+                    ("Reservation ID", reservation.get("reservation_id")),
+                    ("Attempt ID", reservation.get("attempt_id")),
+                    ("Attempt phase", reservation.get("attempt_phase")),
+                    ("Owning machine", reservation.get("machine_name")),
+                    ("Owning MachineRuntime", reservation.get("runtime_id")),
+                    ("Claim age", f"{age:.0f}s" if type(age) in {int, float} else None),
+                    ("Safe reconciliation time", reservation.get("safe_at")),
+                    ("Launch evidence", reservation.get("launch_evidence")),
+                    ("Project outcome", reservation.get("project_outcome")),
+                    ("Machine outcome", reservation.get("machine_outcome")),
+                ),
+            ),
+        )
     return "\n\n".join(section for section in sections if section)
 
 
@@ -335,6 +357,23 @@ def _render_task_retry(result: Mapping[str, Any], _presentation: Mapping[str, ob
             ("Duplicate execution risk", result.get("duplicate_execution_risk")),
             ("Warning", result.get("warning")),
             ("Next", result.get("follow_up_command")),
+        ),
+    )
+
+
+def _render_prelaunch_recovery(result: Mapping[str, Any], _presentation: Mapping[str, object]) -> str:
+    return _operation(
+        result["action"],
+        result["outcome"].replace("_", " "),
+        (
+            ("Task ID", result["task_id"]),
+            ("Attempt ID", result.get("attempt_id")),
+            ("Reservation ID", result.get("reservation_id")),
+            ("GPUs", result.get("gpu_ids")),
+            ("Project outcome", result["project_outcome"]),
+            ("Machine outcome", result["machine_outcome"]),
+            ("Reason", result["reason"]),
+            ("Safe reconciliation time", result.get("safe_at")),
         ),
     )
 
@@ -537,6 +576,13 @@ def _validate_task_retry(result: Any) -> None:
         raise TypeError("task-retry payload.warning must be a string or null")
 
 
+def _validate_prelaunch_recovery(result: Any) -> None:
+    value = _mapping(result, "pre-launch recovery payload")
+    for key in ("action", "outcome", "task_id", "reason", "project_outcome", "machine_outcome", "expected_target"):
+        if not isinstance(_required(value, key, "pre-launch recovery payload"), str):
+            raise TypeError(f"pre-launch recovery payload.{key} must be a string")
+
+
 def _validate_dependencies(result: Any) -> None:
     value = _mapping(result, "dependencies payload")
     _required(value, "task_id", "dependencies payload")
@@ -564,6 +610,7 @@ CONTRACTS = {
     OutputKind.TASK_WATCH: OutputContract(_validate_task_watch, _render_task_watch),
     OutputKind.TASK_CANCEL: OutputContract(_validate_task_operation, _render_task_operation),
     OutputKind.TASK_RETRY: OutputContract(_validate_task_retry, _render_task_retry),
+    OutputKind.TASK_RECOVER_PRELAUNCH: OutputContract(_validate_prelaunch_recovery, _render_prelaunch_recovery),
     OutputKind.DEPENDENCIES: OutputContract(_validate_dependencies, _render_dependencies),
     OutputKind.AVAILABILITY: OutputContract(_validate_availability, _render_availability),
     OutputKind.TASK_WAIT: OutputContract(_validate_task_wait, _render_task_wait),

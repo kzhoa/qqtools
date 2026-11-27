@@ -502,17 +502,36 @@ def _reconcile_machine_reservations(
     with diagnostic_span("recovery.reservation_reconciliation"):
         snapshot = reconcile_snapshot(runtime.root)
         diagnostic_increment("recovery.reservations.snapshotted", len(snapshot.active))
+        if not snapshot.active:
+            return snapshot
+        revision, bindings = runtime.load_registry_snapshot()
+        binding_by_project = {binding.project_id: binding for binding in bindings}
+        runtime_id = runtime.observe_instance_id()
         for reservation in snapshot.active:
             project_id = reservation.get("project_id")
             cfg = readable.get(project_id) if isinstance(project_id, str) else None
-            if cfg is None:
+            binding = binding_by_project.get(project_id) if isinstance(project_id, str) else None
+            if cfg is None or binding is None or cfg.shared_root != binding.shared_root:
                 diagnostic_increment("recovery.reservations.isolated")
                 continue
+
+            def require_current_binding() -> None:
+                current_revision, current_bindings = runtime.load_registry_snapshot()
+                if (
+                    current_revision != revision
+                    or binding not in current_bindings
+                    or runtime.observe_instance_id() != runtime_id
+                    or not runtime.registration_status(binding, runtime_id=runtime_id)["write_eligible"]
+                ):
+                    raise RuntimeError("reservation reconciliation lost its current binding.")
+
             try:
                 action = reconcile_reservation(
                     cfg,
                     reservation,
                     reservation_runtime_root=runtime.root,
+                    runtime_id=runtime_id,
+                    before_mutation=require_current_binding,
                 )
             except (KeyError, OSError, RuntimeError, ValueError):
                 diagnostic_increment("recovery.reservations.errors")

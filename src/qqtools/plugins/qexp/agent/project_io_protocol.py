@@ -2274,12 +2274,12 @@ def _validate_evidence(request: ProjectIORequest, status: str, value: Mapping[st
             reason = evidence["reason"]
             target_attempt_id = evidence["target_attempt_id"]
             target_fencing_token = evidence["target_fencing_token"]
-            if outcome in {"retained", "isolated"}:
+            if outcome in {"retained", "prelaunch_retained", "recovered", "isolated"}:
                 if reason is not None or target_attempt_id is not None or target_fencing_token is not None:
                     raise ValueError("reservation reconciliation outcome contains invalid authority.")
             elif outcome == "release":
                 if (
-                    reason not in {"task_missing", "claim_missing"}
+                    reason not in {"task_missing", "claim_missing", "lease_expired_before_launch"}
                     or target_attempt_id is not None
                     or target_fencing_token is not None
                 ):

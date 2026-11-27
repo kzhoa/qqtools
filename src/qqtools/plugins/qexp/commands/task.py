@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any, Callable
 
 from ..config_types import RootConfig
 from ..layout import (
@@ -54,6 +54,9 @@ from ..runtime.submission import submit_specs
 from ..runtime.tasks import load_task, save_task
 from ..submission_contracts import SubmissionRequest
 from ..task_observation import validate_tmux_override
+
+if TYPE_CHECKING:
+    from ..agent.context import ExecutionContext
 
 
 def is_cleanup_blocked(task: TaskRecord) -> bool:
@@ -190,6 +193,84 @@ def cancel(
         terminate_running=terminate_running,
         reservation_runtime_root=reservation_runtime_root,
     )
+
+
+def recover_prelaunch(
+    context: ExecutionContext,
+    task_id: str,
+    *,
+    expected_target: str,
+) -> dict[str, Any]:
+    """Apply recovery only to the exact live owner record addressed by the token."""
+    from ..prelaunch_observation import recovery_owner_available, resolve_prelaunch_target
+    from ..prelaunch_recovery import BindingEligibilityChanged, reconcile_prelaunch
+
+    cfg = context.local_cfg
+    runtime = context.machine_runtime
+    binding = context.binding
+    result: dict[str, Any] = {
+        "action": "recover-prelaunch",
+        "outcome": "changed_target",
+        "reason": "changed_target",
+        "task_id": task_id,
+        "project_outcome": "no_change",
+        "machine_outcome": "no_change",
+        "expected_target": expected_target,
+    }
+    identity = resolve_prelaunch_target(cfg, runtime, binding, task_id, expected_target)
+    if identity is None or binding is None:
+        return result
+    with runtime.binding_commit_guard(binding, blocking=False) as acquired:
+        if not acquired:
+            result.update(outcome="deferred", reason="binding_commit_busy", machine_outcome="retained")
+            return result
+        _, current_bindings = runtime.load_registry_snapshot()
+        if binding not in current_bindings:
+            return result
+        is_owner_available = recovery_owner_available(runtime, binding)
+
+        def before_mutation() -> None:
+            if not runtime.binding_write_eligible(binding):
+                raise BindingEligibilityChanged("runtime binding eligibility changed")
+
+        try:
+            recovery = reconcile_prelaunch(
+                cfg,
+                identity,
+                runtime_root=runtime.root,
+                runtime_id=binding.runtime_instance_id,
+                apply=is_owner_available,
+                before_shared_mutation=before_mutation,
+            )
+        except BindingEligibilityChanged:
+            recovery = reconcile_prelaunch(
+                cfg, identity, runtime_root=runtime.root, runtime_id=binding.runtime_instance_id, apply=False
+            )
+            recovery.update(reason="runtime_binding_changed", actionable=False)
+    if not is_owner_available:
+        return {
+            **result,
+            **recovery,
+            "outcome": "deferred",
+            "reason": "owner_runtime_unavailable",
+            "actionable": False,
+            "expected_target": expected_target,
+        }
+    if recovery["machine_outcome"] in {"released", "already_released"}:
+        outcome = "completed"
+    elif recovery["machine_outcome"] == "cleanup_pending":
+        outcome = "cleanup_pending"
+    elif recovery["reason"] in {
+        "changed_target",
+        "not_prelaunch",
+        "reservation_identity_changed",
+        "reservation_missing",
+    }:
+        outcome = "changed_target"
+    else:
+        outcome = "deferred"
+    result.update(recovery, outcome=outcome, expected_target=expected_target)
+    return result
 
 
 SUPERSESSION_WARNING = (

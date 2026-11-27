@@ -86,6 +86,9 @@ def _detailed_help(parser: argparse.ArgumentParser, spec: CommandSpec) -> str:
     elif explicit_project:
         scope = "One explicitly selected Project."
         prerequisite = "Pass --project PATH; cwd, environment, and saved-context fallback are not accepted."
+    elif spec.handler == "task_recover_prelaunch":
+        scope = "One observed Task reservation on the owning local MachineRuntime."
+        prerequisite = "Copy the recovery command from qexp status for the selected Project."
     elif spec.context in {ContextKind.PROJECT_READ, ContextKind.PROJECT_WRITE, ContextKind.SECTION}:
         scope = "The selected Project."
         prerequisite = "Select a Project with --project, QEXP_SHARED_ROOT, saved context, or cwd discovery."

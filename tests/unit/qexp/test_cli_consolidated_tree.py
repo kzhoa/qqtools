@@ -146,6 +146,7 @@ def test_every_command_leaf_retains_its_frozen_dispatch_contract() -> None:
         ("task", "cancel"): ("task_cancel", "project-write", "task-operation"),
         ("task", "attach"): ("task_attach", "project-read", "raw-logs"),
         ("task", "retry"): ("task_retry", "project-write", "task-operation"),
+        ("task", "recover-prelaunch"): ("task_recover_prelaunch", "project-write", "task-recover-prelaunch"),
         ("task", "share"): ("task_share", "project-write", "availability"),
         ("task", "unshare"): ("task_unshare", "project-write", "availability"),
         ("task", "offer"): ("task_offer", "project-write", "availability"),
@@ -265,8 +266,8 @@ def test_normalized_leaf_help_matches_the_characterization_baseline() -> None:
     # argparse produces distinct stable normalized forms on Python 3.12 and the
     # standard Python 3.13 toolchain even though the parser definitions match.
     assert hashlib.sha256(text.encode()).hexdigest() in {
-        "ed6e101037917df2a95472174f6a8e5fdf8f4c0887faf795e29c908b47bb62e6",
-        "3d9c64a5af1d565caa87fb0916d54230ff5ac182d6de54796e98662e6f6d96f0",
+        "13486f14439a1c3a7671f41b4a01ee2ce31f9855507a53b92d3c12989625d56c",
+        "abf006d8cf84bf80a9236304549ab0a6b6f292799ae07bb79812eee579ef9f02",
     }
 
 

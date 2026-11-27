@@ -74,6 +74,7 @@ from qqtools.plugins.qexp.runtime.tasks import load_task, save_task
 from qqtools.plugins.qexp.scheduler import claim_task, renew_project_io_attempt_lease
 from qqtools.version import __version__
 from tests.fixtures.qexp_legacy_ownership import persist_legacy_renewal
+from tests.helpers.qexp.lifecycle import wait_until
 from tests.helpers.qexp.worker_diagnostics import describe_project_io_workers
 
 pytestmark = [pytest.mark.integration, pytest.mark.qexp_fast_io]
@@ -8417,5 +8418,47 @@ def test_idle_job_census_waits_for_every_enabled_project(tmp_path):
             )
             == "unknown"
         )
+    finally:
+        executor.shutdown()
+
+
+def test_trusted_prelaunch_reservation_is_revisited_after_healthy_discovery_interval(tmp_path, monkeypatch):
+    runtime = MachineRuntime(tmp_path / "machine")
+    initialize_machine(runtime, "gpu-1")
+    cfg, binding, revision, bindings = _registered(tmp_path, "project", runtime)
+    task = submit(cfg, ["true"])
+    first = claim_task(cfg, task.task_id, [1], project_id=binding.project_id, reservation_runtime_root=runtime.root)
+    assert first is not None
+    identity = ReservationIdentity.from_record(active_reservations(runtime.root)[0])
+    executor = ProjectIOExecutor(runtime)
+    executor.begin_epoch()
+    controller = ProjectIOController(runtime, executor)
+    try:
+        _advance_until_validated(controller, bindings, revision, binding.project_id)
+
+        def trusted():
+            result = controller.advance_scheduler_reservation_reconciliations(
+                bindings, revision, reservations=[identity]
+            )
+            return identity in result
+
+        wait_until("first pre-launch check", trusted)
+        now = time.monotonic()
+        monkeypatch.setattr(controller, "_monotonic", lambda: now + 15)
+        expiry = "2020-01-01T00:00:00Z"
+        stored = load_task(cfg, task.task_id)
+        stored.claim_control["active_claim"]["lease_expires_at"] = expiry
+        save_task(cfg, stored)
+        path = attempt_path(cfg.shared_root, task.task_id, 1)
+        first.lease["expires_at"] = expiry
+        atomic_replace(path, first.to_dict())
+
+        def released():
+            controller.advance_scheduler_reservation_reconciliations(bindings, revision, reservations=[identity])
+            return not active_reservations(runtime.root)
+
+        wait_until("previously trusted reservation expires", released)
+        assert load_task(cfg, task.task_id).state["projection"] == "queued"
+        assert read_json(path)["attempt"]["result"]["reason"] == "lease_expired_before_launch"
     finally:
         executor.shutdown()

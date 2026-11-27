@@ -225,10 +225,18 @@ def test_retry_uncertain_task_commit_retains_ready_generation_for_settlement(tmp
 
 def test_prelaunch_expiry_settles_ready_publication_after_process_death(tmp_path):
     from qqtools.plugins.qexp import scheduler
+    from qqtools.plugins.qexp.project_maintenance import reconcile_project_reservations
+    from qqtools.plugins.qexp.runtime.resources.reservations import reserved_gpu_ids
 
     cfg = isolated_group(tmp_path, tail=0)
     task = submit(cfg, ["true"], group="experiment")
     attempt = claim_task(cfg, task.task_id, [0])
+    current = load_task(cfg, task.task_id)
+    deadline = "2000-01-01T00:00:00Z"
+    current.claim_control["active_claim"]["lease_expires_at"] = deadline
+    attempt.lease["expires_at"] = deadline
+    scheduler.save_task(cfg, current)
+    scheduler.atomic_replace(scheduler.attempt_path(cfg.shared_root, task.task_id, 1), attempt.to_dict())
     journal = GroupRechecks(cfg.shared_root, "experiment")
     with authority_locks(cfg, task):
         journal.snapshot(initialize=True)
@@ -260,6 +268,10 @@ def test_prelaunch_expiry_settles_ready_publication_after_process_death(tmp_path
     assert event["state"] == "in_flight"
     with authority_locks(cfg, current):
         assert settle_task_change(cfg, event) == (True, [])
+    # The interruption left the local owner between Project commit and release.
+    assert reserved_gpu_ids(cfg.runtime_root) == {0}
+    reconcile_project_reservations(cfg)
+    assert reserved_gpu_ids(cfg.runtime_root) == set()
     # Real scheduling checks publication, not merely the retained marker file.
     assert claim_task(cfg, task.task_id, [0]) is not None
 

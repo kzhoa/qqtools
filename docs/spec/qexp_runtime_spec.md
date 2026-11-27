@@ -4121,8 +4121,13 @@ Machine heartbeat and Attempt lease are distinct:
 
 ### 15.2 Pre-Launch Expiry
 
-If `launch_state = claimed` expires, the protocol proves that no process was authorized to
-start. Reconciliation may therefore:
+A bounded claim becomes eligible for reconciliation at the lease deadline plus the holder and
+reclaimer clock-error bounds. The reservation owner checks the Project, Task, Attempt, fencing
+token, reservation, MachineRuntime and absence of launch authorization under authority locks.
+A committed Task launch receipt already owns execution if the Attempt write is interrupted.
+A conflicting receipt or incomplete clock evidence keeps the reservation occupied.
+
+For an expired claim that passes these checks, reconciliation can:
 
 - archive the claim and token
 - cancel the incomplete Attempt with a pre-launch expiry reason
@@ -4130,6 +4135,14 @@ start. Reconciliation may therefore:
 - restore its previous home or shared queue scope
 - release the local reservation when the owning machine is reachable, or mark it for local
   reservation cleanup
+
+Ordinary machine cycles revisit active GPU reservations. In a healthy two-GPU Project, a
+retained pre-launch claim comes due for another check within 15 seconds, followed by its turn
+in the reservation round-robin and Project I/O service. Service can be delayed by unavailable
+storage, a busy executor or clock uncertainty. Expiry records `lease_expired_before_launch` in
+the cancelled Attempt. The owning runtime commits release against the original reservation
+identity after the Project requeue. A restart can finish that release while a successor exists.
+Dispatch continues to exclude the GPU until local release commits.
 
 ### 15.3 Post-Authorization Expiry
 
