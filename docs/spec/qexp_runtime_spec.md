@@ -5254,16 +5254,22 @@ registration alone proves preparation. A v2 running report additionally
 requires a command-start witness. Closing the permit channel or restarting the
 controller cannot recreate launch authority from durable ownership.
 
-The executor observations, final guard exchange, and physical registry check
-share one 50 ms monotonic deadline per idle decision. The controller fences
+The executor observations, final guard exchange, physical registry check, and
+the bounded local ownership, configuration, demand revision, and CPU policy
+reads share one 50 ms monotonic deadline per idle decision. The controller fences
 registry writers through its deadline-bound local observer, which acquires the
 registry lock and checks the full revision and roster,
 then verifies the executor epoch under the executor lock. A stalled registry
 read leaves the executor lock available to training. Short executor lock contention
 can resolve within the same turn. A timeout releases received locks, rejects
-late results and ends the interval. The single outstanding local read performs
-no reconciliation. The supervisor loads configuration outside the machine
-admission lock and attempts the lock without waiting when reconciling a stop.
+late results and ends the interval. The supervisor loads its initial
+configuration outside the machine admission lock. It uses one background read
+slot for ownership and process evidence, final configuration and demand revision,
+and CPU lane policy. The decision thread holds the applicable local locks and
+releases them on timeout. A pending read cannot update supervisor state or
+persisted ownership, and stop retries defer while that slot remains occupied.
+Reconciliation writes remain on the supervisor thread under the ownership fence.
+The supervisor attempts the admission lock without waiting when reconciling a stop.
 If it is occupied, the supervisor invalidates the interval immediately. On the
 next available turn it reconciles ownership before accepting fresh idle evidence.
 Probe scheduling runs after training admission in dispatch.

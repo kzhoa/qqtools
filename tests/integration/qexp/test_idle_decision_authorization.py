@@ -701,20 +701,23 @@ def test_remote_submit_completes_while_final_local_read_is_stalled(decision, tmp
     while supervisor._preparation is None:
         tick()
         assert time.monotonic() < deadline
-    observed = []
+    observed = threading.Event()
+    writer_done = threading.Event()
+    writer_result = []
 
     def stall():
-        if observed:
+        if observed.is_set():
             return
-        observed.append(True)
-        writer.start()
+        observed.set()
         try:
+            writer.start()
             writer.join(5)
-            assert writer.exitcode == 0, "training commit waited for the local read"
+            writer_result.append(writer.exitcode)
         finally:
             if writer.is_alive():
                 writer.kill()
                 writer.join(3)
+            writer_done.set()
 
     target, name = {
         "intent": (idle_job._PreparedIdleJob, "intent_matches"),
@@ -724,7 +727,7 @@ def test_remote_submit_completes_while_final_local_read_is_stalled(decision, tmp
         "demand": (idle_job, "read_idle_job_demand"),
         "reservation": (idle_job, "reservation_snapshot"),
         "gpu_policy": (supervisor, "_policy_mapping"),
-        "cpu_policy": (idle_job, "get_cpu_lane_policy"),
+        "cpu_policy": (idle_job, "read_cpu_lane_policy_locked"),
     }[read]
     original = getattr(target, name)
 
@@ -743,9 +746,11 @@ def test_remote_submit_completes_while_final_local_read_is_stalled(decision, tmp
                 return observe(*args, **kwargs)
 
         monkeypatch.setattr(supervisor, "_observe_local_idle_locked", observe_with_delay)
-    while not observed:
+    while not observed.is_set():
         status = tick()
         assert time.monotonic() < deadline, status
+    assert writer_done.wait(8)
+    assert writer_result == [0], "training commit waited for the local read"
     assert supervisor._idle_since is None
     assert not (tmp_path / "command-ran").exists()
 
@@ -1122,3 +1127,138 @@ def test_training_arrival_stops_locally_without_a_project_slot(decision, tmp_pat
     finally:
         for process in stopped:
             process.send_signal(signal.SIGCONT)
+
+
+@pytest.mark.parametrize("source", ["config", "demand", "ownership", "cpu_policy"])
+def test_stalled_final_machine_read_releases_training_and_ignores_late_result(decision, monkeypatch, source):
+    from qqtools.plugins.qexp.agent import idle_job
+    from qqtools.plugins.qexp.runtime.locks import exclusive
+    from qqtools.plugins.qexp.runtime.resources.idle_job import idle_job_guard
+
+    runtime, executor, supervisor, now, tick = decision
+    now[0] = 60
+    started, release, finished = threading.Event(), threading.Event(), threading.Event()
+    target, name = {
+        "config": (supervisor, "_load_config"),
+        "demand": (idle_job, "read_idle_job_demand"),
+        "ownership": (idle_job, "read_idle_job_ownership"),
+        "cpu_policy": (idle_job, "read_cpu_lane_policy_locked"),
+    }[source]
+    read = getattr(target, name)
+    calls = 0
+
+    def delayed(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == (2 if source == "config" else 1):
+            started.set()
+            try:
+                release.wait(1)
+                return read(*args, **kwargs)
+            finally:
+                finished.set()
+        return read(*args, **kwargs)
+
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(target, name, delayed)
+            before = time.monotonic()
+            status = tick()
+            assert started.is_set()
+            assert time.monotonic() - before < 0.15
+            assert status["reason"] == "unknown_demand"
+            assert supervisor._idle_since is None
+            assert not finished.is_set()
+            with idle_job_guard(runtime.root, blocking=False) as training:
+                assert training
+            with exclusive(executor.paths["project_io_lock"], blocking=False) as available:
+                assert available
+            with exclusive(runtime.paths["locks"] / "cpu-lane.lock", blocking=False) as available:
+                assert available
+    finally:
+        release.set()
+    assert finished.wait(2)
+    end = time.monotonic() + 2
+    while tick()["reason"] != "idle_delay":
+        assert time.monotonic() < end
+        time.sleep(0.01)
+
+
+@pytest.mark.parametrize("failure", ["read_idle_job_ownership", "request_idle_job_stop"])
+def test_deferred_stop_survives_transient_failure_on_idle_retry(decision, monkeypatch, failure):
+    from qqtools.plugins.qexp.agent import idle_job
+    from qqtools.plugins.qexp.runtime.resources.idle_job import idle_job_guard, idle_job_instance_path
+
+    runtime, _, supervisor, now, tick = decision
+    now[0] = 60
+    end = time.monotonic() + 10
+    while tick()["state"] != "running":
+        assert time.monotonic() < end
+        time.sleep(0.02)
+    instance = idle_job_instance_path(runtime.root, supervisor._instance_id)
+    with idle_job_guard(runtime.root):
+        assert supervisor.tick(demand="busy")["state"] == "blocked"
+
+    def fail(*args):
+        raise OSError("transient failure")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(idle_job, failure, fail)
+        assert tick()["state"] == "blocked"
+        assert supervisor._idle_since is None
+        assert not (instance / "stop.json").exists()
+    status = tick()
+    assert (status["state"], status["reason"]) == ("stopping", "busy")
+    assert idle_job._read_stop_reason(instance) == "busy"
+    assert supervisor._idle_since is None
+
+
+@pytest.mark.parametrize("source", ["read_idle_job_ownership", "read_idle_job_process", "idle_job_processes_exited"])
+def test_stalled_running_ownership_read_defers_stop_without_late_mutation(decision, monkeypatch, source):
+    from qqtools.plugins.qexp.agent import idle_job
+    from qqtools.plugins.qexp.runtime.resources.idle_job import idle_job_guard, idle_job_instance_path
+
+    runtime, _, supervisor, now, tick = decision
+    now[0] = 60
+    end = time.monotonic() + 10
+    while tick()["state"] != "running":
+        assert time.monotonic() < end
+        time.sleep(0.02)
+    instance = idle_job_instance_path(runtime.root, supervisor._instance_id)
+    started, release, finished = threading.Event(), threading.Event(), threading.Event()
+    original = getattr(idle_job, source)
+
+    def delayed(*args, **kwargs):
+        started.set()
+        try:
+            assert release.wait(2)
+            return original(*args, **kwargs)
+        finally:
+            finished.set()
+
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(idle_job, source, delayed)
+            before = time.monotonic()
+            assert tick()["state"] == "blocked"
+            assert started.is_set()
+            assert time.monotonic() - before < 0.15
+            assert supervisor._idle_since is None
+            # A second turn must not wait for the outstanding read or lose the stop.
+            before = time.monotonic()
+            assert tick()["state"] == "blocked"
+            assert time.monotonic() - before < 0.15
+            with idle_job_guard(runtime.root, blocking=False) as acquired:
+                assert acquired
+            assert not (instance / "stop.json").exists()
+            release.set()
+            assert finished.wait(2)
+            assert not (instance / "stop.json").exists()
+            assert supervisor._idle_since is None
+    finally:
+        release.set()
+    end = time.monotonic() + 2
+    while tick()["state"] != "stopping":
+        assert time.monotonic() < end
+        time.sleep(0.01)
+    assert idle_job._read_stop_reason(instance) == "unknown_demand"

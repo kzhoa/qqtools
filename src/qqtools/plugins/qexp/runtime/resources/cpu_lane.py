@@ -130,6 +130,15 @@ def _policy(paths: dict[str, Path]) -> CpuLanePolicy:
     return CpuLanePolicy(value["capacity"], value["revision"])
 
 
+def read_cpu_lane_policy_locked(runtime_root: Path | Any) -> CpuLanePolicy:
+    """Read policy while the caller holds cpu-lane.lock; perform no writes.
+
+    A deadline-bound caller may release its lock before this read completes,
+    provided it discards the late result.
+    """
+    return _policy(local_paths(_runtime_root(runtime_root)))
+
+
 def get_cpu_lane_policy(runtime_root: Path | Any, *, blocking: bool = True) -> CpuLanePolicy:
     """Return the current machine-global CPU-only lane policy."""
     paths = local_paths(_runtime_root(runtime_root))

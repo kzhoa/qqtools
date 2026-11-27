@@ -621,8 +621,11 @@ def _pause_controller_for_crash(root, stage, reached):
     else:
         idle.send_idle_launch_permit = pause
     while True:
-        supervisor.tick(gpu_policy=POLICY)
-        clock[0] = 90
+        status = supervisor.tick(gpu_policy=POLICY)
+        # A missed authorization deadline resets the interval. Allow a fresh
+        # interval to mature so this test can still reach the crash boundary.
+        if status["reason"] == "idle_delay":
+            clock[0] += 90
         time.sleep(0.01)
 
 

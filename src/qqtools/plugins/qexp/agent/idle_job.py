@@ -24,14 +24,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 from socket import socket
 from subprocess import Popen
-from typing import Any
+from typing import Any, TypeVar
+from weakref import finalize
 
 from ..gpu_policy import GpuReservationPolicy, resolve_gpu_policy, validate_gpu_reservation
 from ..infrastructure.process import process_start_time_ticks
 from ..runtime.locks import exclusive
 from ..runtime.paths import machine_runtime_paths
 from ..runtime.records import utc_now
-from ..runtime.resources.cpu_lane import get_cpu_lane_policy
+from ..runtime.resources.cpu_lane import read_cpu_lane_policy_locked
 from ..runtime.resources.idle_job import (
     clear_idle_job_ownership,
     idle_job_guard,
@@ -63,6 +64,7 @@ from .idle_job_diagnostics import (
     validate_demand_detail,
     validate_interval_detail,
 )
+from .idle_job_interval_history import IdleJobIntervalHistory
 from .idle_job_process import (
     current_boot_id,
     idle_job_intent_matches_owner,
@@ -72,7 +74,10 @@ from .idle_job_process import (
     spawn_idle_job,
 )
 from .idle_launch_permit import create_idle_launch_permit, poll_idle_launch_ready, send_idle_launch_permit
+from .idle_local_reader import IdleLocalReader
 from .launch_handoff_state import LaunchHandoffState
+
+_T = TypeVar("_T")
 
 IDLE_JOB_STATUS_VERSION = 1
 IDLE_JOB_STATE_VERSION = 1
@@ -426,35 +431,6 @@ def _reports_unknown_demand(payload: Mapping[str, Any]) -> bool:
     return payload["reason"] == "unknown_demand" and payload["state"] in {"waiting", "stopping"}
 
 
-def _observation_reset_check(previous: str | None, current: str) -> str:
-    if previous is None:
-        return "observation_changed"
-    try:
-        before, after = json.loads(previous), json.loads(current)
-        if (
-            not isinstance(before, dict)
-            or before.keys() != after.keys()
-            or before["demand"] != "idle"
-            or any(
-                type(before[field]) is not int or before[field] < 0 for field in ("demand_revision", "config_revision")
-            )
-        ):
-            return "observation_changed"
-        previous_policy = json.loads(before["policy"])
-        if not isinstance(previous_policy, dict) or "resolved_gpu_ids" not in previous_policy:
-            return "observation_changed"
-    except (TypeError, ValueError, RecursionError):
-        return "observation_changed"
-    for field, check in (
-        ("demand_revision", "demand_revision_changed"),
-        ("config_revision", "config_revision_changed"),
-        ("policy", "gpu_policy_changed"),
-    ):
-        if before[field] != after[field]:
-            return check
-    return "observation_changed"
-
-
 def _ownership_file_exists(root: Path) -> bool:
     try:
         root.joinpath("idle-job", "ownership.json").lstat()
@@ -648,10 +624,8 @@ class IdleJobSupervisor:
         self._pending_demand_detail: dict[str, Any] | None = None
         self._pending_agent_instance_id: str | None = None
         self._last_demand_detail: dict[str, Any] | None = None
-        self._interval_observed = False
-        self._last_interval_reset: dict[str, Any] | None = None
-        self._last_stop: dict[str, Any] | None = None
-        self._last_stop_instance_id: str | None = None
+        self._local_reader: IdleLocalReader | None = None
+        self._interval_history = IdleJobIntervalHistory(self._now, self._wall_now)
         self._state_corrupt = False
         self._children = []
         self._preparation: _PreparedIdleJob | None = None
@@ -730,9 +704,6 @@ class IdleJobSupervisor:
         self._status_state = "waiting" if state == "launching" else state
         self._status_reason = reason
         payload = self._payload(state=state, reason=reason)
-        # Only a completed decision establishes an interval for reset reporting.
-        # A timer can start and clear within one tick while validating reservations.
-        self._interval_observed = self._idle_since is not None
         base = {"idle_job_status": payload}
         detail, self._pending_demand_detail = self._pending_demand_detail, None
         self._pending_demand_check = None
@@ -741,7 +712,7 @@ class IdleJobSupervisor:
         if not _reports_unknown_demand(payload):
             detail = None
         try:
-            interval = self._interval_detail()
+            interval = self._interval_history.at_publication(self._idle_since)
         except Exception:
             interval = None
         enriched = base
@@ -890,7 +861,13 @@ class IdleJobSupervisor:
         changed = key != self._observation_key
         if changed:
             interval_start = self._now()
-            self._record_interval_reset("observation_changed", replacement_key=key, now=interval_start)
+            self._interval_history.record_reset(
+                self._idle_since,
+                "observation_changed",
+                previous_key=self._observation_key,
+                replacement_key=key,
+                now=interval_start,
+            )
             self._observation_key = key
             self._idle_since = interval_start
             self._retry_at = None
@@ -901,61 +878,17 @@ class IdleJobSupervisor:
             self._persist_state()
         return changed
 
-    def _diagnostic_timestamp(self) -> str:
-        return datetime.fromtimestamp(self._wall_now(), timezone.utc).isoformat().replace("+00:00", "Z")
-
-    def _record_interval_reset(
-        self, check: str, *, replacement_key: str | None = None, now: float | None = None
-    ) -> None:
-        if self._idle_since is None or not self._interval_observed:
-            return
-        self._interval_observed = False
-        self._last_interval_reset = None
-        try:
-            if replacement_key is not None:
-                check = _observation_reset_check(self._observation_key, replacement_key)
-            elif check == "unknown_demand":
-                check = self._pending_demand_check or check
-            observed = self._now() if now is None else now
-            elapsed = max(0.0, observed - self._idle_since)
-            if math.isfinite(elapsed):
-                self._last_interval_reset = {
-                    "check": check,
-                    "elapsed_seconds": elapsed,
-                    "reset_at": self._diagnostic_timestamp(),
-                }
-        except Exception:
-            # Optional evidence cannot interrupt interval invalidation.
-            pass
-
     def _clear_idle_interval(self, check: str, *, replacement_key: str | None = None) -> None:
-        self._record_interval_reset(check, replacement_key=replacement_key)
+        if check == "unknown_demand" and self._pending_demand_check:
+            check = self._pending_demand_check
+        self._interval_history.record_reset(
+            self._idle_since,
+            check,
+            previous_key=self._observation_key,
+            replacement_key=replacement_key,
+        )
         self._idle_since = None
         self._last_decision_evidence = None
-
-    def _record_stop_request(self, instance_id: str, reason: str) -> None:
-        if self._last_stop_instance_id == instance_id:
-            return
-        self._last_stop_instance_id = instance_id
-        self._last_stop = None
-        try:
-            check = self._pending_demand_check if reason == "unknown_demand" else None
-            self._last_stop = {
-                "check": check or reason,
-                "instance_id": instance_id,
-                "stopped_at": self._diagnostic_timestamp(),
-            }
-        except Exception:
-            # The persisted stop request remains authoritative.
-            pass
-
-    def _interval_detail(self) -> dict[str, Any] | None:
-        if self._idle_since is None and self._last_interval_reset is None and self._last_stop is None:
-            return None
-        elapsed = max(0.0, self._now() - self._idle_since) if self._idle_since is not None else 0.0
-        return validate_interval_detail(
-            {"idle_elapsed_seconds": elapsed, "last_reset": self._last_interval_reset, "last_stop": self._last_stop}
-        )
 
     def _close_prepared_permit(self) -> None:
         if self._preparation is not None:
@@ -1035,50 +968,80 @@ class IdleJobSupervisor:
             pass
         return True
 
-    def _reconcile_locked(self, boot_id: str) -> tuple[dict[str, Any] | None, str | None]:
+    def _read_ownership_observation(
+        self, expected_owner: object
+    ) -> tuple[dict[str, Any] | None, dict[str, Any] | None, bool, str | None]:
+        """Read ownership without mutating supervisor or persisted state."""
         try:
             owner = read_idle_job_ownership(self.root)
         except (OSError, RuntimeError, TypeError, ValueError, KeyError):
-            return None, "malformed_ownership"
-        preparation = self._preparation
-        if preparation is not None and (owner is None or not preparation.matches(owner)):
-            preparation.close_permit()
-            self._preparation = preparation = None
+            return None, None, False, "malformed_ownership"
+        if expected_owner is not _UNOBSERVED_OWNER and not _same_owner(owner, expected_owner):
+            return owner, None, False, "ownership_changed"
         if owner is None:
-            self._instance_id = None
-            self._process = None
-            return None, None
+            return None, None, False, None
         if owner["runtime_id"] != self.runtime_id:
-            self._set_owner_fields(owner, None)
-            return owner, "foreign_ownership"
+            return owner, None, False, "foreign_ownership"
         instance_dir = idle_job_instance_path(self.root, owner["instance_id"])
         try:
             metadata = instance_dir.lstat()
         except FileNotFoundError:
-            self._set_owner_fields(owner, None)
-            return owner, "cleanup_uncertain"
+            return owner, None, False, "cleanup_uncertain"
         except OSError:
-            self._set_owner_fields(owner, None)
-            return owner, "cleanup_uncertain"
+            return owner, None, False, "cleanup_uncertain"
         if not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
-            self._set_owner_fields(owner, None)
-            return owner, "foreign_instance"
+            return owner, None, False, "foreign_instance"
         try:
             if not idle_job_intent_matches_owner(instance_dir, owner):
-                return owner, "foreign_instance"
+                return owner, None, False, "foreign_intent"
             process = read_idle_job_process(instance_dir)
         except (OSError, RuntimeError, TypeError, ValueError, KeyError):
-            self._set_owner_fields(owner, None)
-            return owner, "malformed_process"
+            return owner, None, False, "malformed_process"
         if process is not None and (
             process.get("runtime_id") != self.runtime_id
             or process.get("instance_id") != owner["instance_id"]
             or process.get("boot_id") != owner["boot_id"]
         ):
-            self._set_owner_fields(owner, process)
-            return owner, "foreign_process"
+            return owner, process, False, "foreign_process"
         try:
             exited = idle_job_processes_exited(instance_dir)
+        except (OSError, RuntimeError, TypeError, ValueError, KeyError):
+            return owner, process, False, "cleanup_uncertain"
+        return owner, process, exited, None
+
+    def _read_local_before(self, read: Callable[[], _T], deadline: float) -> _T:
+        if self._local_reader is None:
+            self._local_reader = IdleLocalReader()
+            finalize(self, self._local_reader.close)
+        # Box the result so a valid None is distinct from a missed deadline.
+        result = self._local_reader.read_before(lambda: (read(),), deadline=deadline)
+        if result is None:
+            raise _IdleDecisionRejected("demand_census_unknown")
+        return result[0]
+
+    def _reconcile_locked(
+        self, *, deadline: float | None = None, expected_owner: object = _UNOBSERVED_OWNER
+    ) -> tuple[dict[str, Any] | None, str | None]:
+        if deadline is None:
+            deadline = time.monotonic() + IDLE_DECISION_SECONDS
+        owner, process, exited, error = self._read_local_before(
+            lambda: self._read_ownership_observation(expected_owner), deadline
+        )
+        if error in {"malformed_ownership", "ownership_changed"}:
+            return owner, error
+        preparation = self._preparation
+        if preparation is not None and (owner is None or not preparation.matches(owner)):
+            preparation.close_permit()
+            self._preparation = preparation = None
+        if error is not None:
+            if owner is not None and error != "foreign_intent":
+                self._set_owner_fields(owner, process)
+            return owner, "foreign_instance" if error == "foreign_intent" else error
+        if owner is None:
+            self._instance_id = None
+            self._process = None
+            return None, None
+        try:
             if (
                 not exited
                 and preparation is not None
@@ -1114,18 +1077,11 @@ class IdleJobSupervisor:
         self._set_owner_fields(owner, process if command_started else None)
         return owner, None
 
-    def _stop_locked(
-        self, reason: str, owner: dict[str, Any] | None = None
-    ) -> tuple[dict[str, Any] | None, str | None]:
+    def _stop_locked(self, reason: str, owner: dict[str, Any] | None) -> tuple[dict[str, Any] | None, str | None]:
         self._close_prepared_permit()
         self._clear_idle_interval(reason)
         self._observation_key = None
         current = owner
-        if current is None:
-            try:
-                current = read_idle_job_ownership(self.root)
-            except (OSError, RuntimeError, TypeError, ValueError, KeyError):
-                return None, "malformed_ownership"
         if current is None:
             self._deferred_stop = None
             return None, None
@@ -1147,7 +1103,8 @@ class IdleJobSupervisor:
             try:
                 request_idle_job_stop(instance_dir, reason)
                 if first_request:
-                    self._record_stop_request(current["instance_id"], reason)
+                    check = (self._pending_demand_check or reason) if reason == "unknown_demand" else reason
+                    self._interval_history.record_stop(current["instance_id"], check)
                 stopping = dict(current)
                 stopping["phase"] = "stopping"
                 write_idle_job_ownership(self.root, stopping)
@@ -1407,15 +1364,13 @@ class IdleJobSupervisor:
             with idle_job_guard(self.root, blocking=False) as acquired:
                 if not acquired:
                     return self._defer_stop(reason, expected_owner)
-                if expected_owner is not _UNOBSERVED_OWNER and not _same_owner(
-                    read_idle_job_ownership(self.root), expected_owner
-                ):
+                owner, error = self._reconcile_locked(expected_owner=expected_owner)
+                if error == "ownership_changed":
                     self._deferred_stop = None
                     self._clear_idle_interval(reason)
                     self._observation_key = None
                     self._last_handoff_revision = None
-                    return self._blocked("ownership_changed")
-                owner, error = self._reconcile_locked(boot_id)
+                    return self._blocked(error)
                 if error is not None:
                     return self._blocked(error)
                 if resume_if_unowned and owner is None:
@@ -1442,6 +1397,8 @@ class IdleJobSupervisor:
                 return self._status_after_no_owner(
                     config, state="disabled" if reason == "disabled" else "waiting", reason=reason
                 )
+        except _IdleDecisionRejected:
+            return self._defer_stop(reason, expected_owner)
         except (OSError, RuntimeError, TypeError, ValueError, KeyError):
             return self._blocked("supervision_failed")
 
@@ -1463,14 +1420,16 @@ class IdleJobSupervisor:
         resolved: tuple[int, ...],
         reservation_policy: GpuReservationPolicy | None,
         evidence: IdleDecisionEvidence | None,
+        deadline: float,
     ) -> tuple[dict[str, Any] | None, str, int, str | None]:
         """Inspect local fences without publishing state or reconciling ownership."""
-        current_owner = read_idle_job_ownership(self.root)
+        current_owner = self._read_local_before(lambda: read_idle_job_ownership(self.root), deadline)
         if not _same_owner(current_owner, owner):
             raise _IdleDecisionRejected("demand_census_unknown")
         owner = current_owner
-        current = self._load_config()
-        demand_revision = read_idle_job_demand(self.root)
+        current, demand_revision = self._read_local_before(
+            lambda: (self._load_config(), read_idle_job_demand(self.root)), deadline
+        )
         key = self._observation_key_for("idle", demand_revision, current.config, policy_key)
         if current.config != observation.config or current.agent_mode != observation.agent_mode:
             return owner, key, demand_revision, "config_changed"
@@ -1484,7 +1443,11 @@ class IdleJobSupervisor:
             if self._idle_since is not None and self._observation_key != key:
                 raise _IdleDecisionRejected("demand_census_unknown")
         if evidence is not None:
-            cpu_policy = get_cpu_lane_policy(self.root, blocking=False)
+            paths = machine_runtime_paths(self.root)
+            with exclusive(paths["locks"] / "cpu-lane.lock", blocking=False) as acquired:
+                if not acquired:
+                    raise _IdleDecisionRejected("demand_census_unknown")
+                cpu_policy = self._read_local_before(lambda: read_cpu_lane_policy_locked(self.root), deadline)
             if (
                 cpu_policy.revision != evidence.cpu_policy_revision
                 or cpu_policy.capacity != evidence.cpu_capacity
@@ -1626,9 +1589,11 @@ class IdleJobSupervisor:
             with idle_job_guard(self.root, blocking=False) as acquired:
                 if not acquired:
                     return self._defer_stop("unknown_demand")
-                owner, error = self._reconcile_locked(boot_id)
+                owner, error = self._reconcile_locked(deadline=decision_deadline if guarded else None)
                 if error is not None:
                     return self._blocked(error)
+        except _IdleDecisionRejected:
+            return self._defer_stop("unknown_demand")
         except (OSError, RuntimeError, TypeError, ValueError, KeyError):
             return self._blocked("ownership_reconciliation_failed")
 
@@ -1694,7 +1659,7 @@ class IdleJobSupervisor:
                         ):
                             raise _IdleDecisionRejected("launch_handoff_pending")
                     owner, key, demand_revision, reason = self._observe_local_idle_locked(
-                        owner, observation, policy_key, resolved, reservation_policy, decision_evidence
+                        owner, observation, policy_key, resolved, reservation_policy, decision_evidence, deadline
                     )
                     endpoint = None
                     ready_until = None
@@ -1752,7 +1717,12 @@ class IdleJobSupervisor:
                 with idle_job_guard(self.root, blocking=False) as acquired:
                     if not acquired:
                         return self._defer_stop("unknown_demand", result.owner)
-                    if read_idle_job_ownership(self.root) != result.owner:
+                    if (
+                        self._read_local_before(
+                            lambda: read_idle_job_ownership(self.root), time.monotonic() + IDLE_DECISION_SECONDS
+                        )
+                        != result.owner
+                    ):
                         return self._blocked("ownership_changed")
                     self._retry_at = None
                     return self._publish(state="waiting", reason="preparing")
@@ -1794,7 +1764,7 @@ class IdleJobSupervisor:
         self._close_prepared_permit()
         self._clear_idle_interval("agent_stop")
         try:
-            boot_id = current_boot_id()
+            current_boot_id()
         except (OSError, RuntimeError, TypeError, ValueError):
             return False
         deadline = self._now() + timeout
@@ -1802,18 +1772,23 @@ class IdleJobSupervisor:
             try:
                 self._children = [child for child in self._children if child.poll() is None]
                 with idle_job_guard(self.root):
-                    owner, error = self._reconcile_locked(boot_id)
+                    owner, error = self._reconcile_locked()
                     if error is not None:
                         return False
                     owner, error = self._stop_locked("agent_stop", owner)
                     if error is not None:
                         return False
                     if owner is None:
+                        if self._local_reader is not None:
+                            self._local_reader.close()
+                            self._local_reader = None
                         self._supervision_active = False
                         for child in self._children:
                             child.poll()
                         self._publish(state="disabled", reason="agent_stop")
                         return True
+            except _IdleDecisionRejected:
+                pass
             except (OSError, RuntimeError, TypeError, ValueError, KeyError):
                 return False
             now = self._now()
