@@ -179,7 +179,7 @@ def _start_case(
     return _create_case(tmp_path, exit_code=exit_code, seconds=seconds, should_wait=should_wait)
 
 
-def _wait_running(cfg, task_id: str, marker: Path | None = None) -> None:
+def _wait_running(cfg, task_id: str, marker: Path | None = None, *, on_timeout=None) -> None:
     def is_running_and_observed() -> bool:
         if load_task(cfg, task_id).state["projection"] != "running":
             return False
@@ -210,6 +210,7 @@ def _wait_running(cfg, task_id: str, marker: Path | None = None) -> None:
                 )
                 pane_output[line] = captured.stdout[-4000:]
             return {
+                "agent_diagnostics": on_timeout() if on_timeout is not None else None,
                 "tmux_panes": pane_output,
                 "task_state": task.state,
                 "claim": task.claim_control,
@@ -1153,7 +1154,12 @@ def test_li03_real_peer_cannot_expire_durable_execution(tmp_path: Path, is_finis
     peer = None
     observed = tmp_path / "peer-observed"
     try:
-        _wait_running(cfg, task.task_id, marker)
+        _wait_running(
+            cfg,
+            task.task_id,
+            marker,
+            on_timeout=lambda: _li03_timeout_diagnostics(cfg, runtime, task.task_id, process, observed=marker),
+        )
         claim = load_task(cfg, task.task_id).claim_control["active_claim"]
         assert claim["authority_mode"] == "holder_bound"
         assert claim["lease_expires_at"] is None

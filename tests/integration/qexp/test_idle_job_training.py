@@ -8,11 +8,12 @@ import pytest
 
 from qqtools.plugins.qexp.agent.context import MachineRuntime
 from qqtools.plugins.qexp.agent.idle_job_config import set_idle_job_config
-from qqtools.plugins.qexp.agent.idle_job_process import idle_job_processes_exited
+from qqtools.plugins.qexp.agent.idle_job_process import read_idle_job_process
 from qqtools.plugins.qexp.agent.lifecycle import get_machine_agent_status, start_machine_agent, stop_machine_agent
 from qqtools.plugins.qexp.agent.readiness import capture_readiness_snapshot, wait_for_readiness
 from qqtools.plugins.qexp.agent.setup import initialize_machine, initialize_project, register_projects
 from qqtools.plugins.qexp.commands.task import submit
+from qqtools.plugins.qexp.infrastructure.process import read_process_presence
 from qqtools.plugins.qexp.runtime.resources.cpu_lane import set_cpu_lane_capacity
 from qqtools.plugins.qexp.runtime.resources.idle_job import idle_job_instance_path, read_idle_job_ownership
 
@@ -45,6 +46,8 @@ def test_later_registered_projects_preempt_idle_job_through_dispatch(tmp_path, l
     try:
         first_owner = _running_owner(runtime)
         first_directory = idle_job_instance_path(runtime.root, first_owner["instance_id"])
+        first_process = read_idle_job_process(first_directory)
+        assert first_process is not None and first_process["instance_id"] == first_owner["instance_id"]
         projects = [tmp_path / "first", tmp_path / "second"]
         for project in projects:
             initialize_project(project)
@@ -54,12 +57,16 @@ def test_later_registered_projects_preempt_idle_job_through_dispatch(tmp_path, l
         assert ready["ready"], ready
         owner = _running_owner(runtime)
         directory = idle_job_instance_path(runtime.root, owner["instance_id"])
+        process_record = read_idle_job_process(directory)
+        assert process_record is not None and process_record["instance_id"] == owner["instance_id"]
+        # Terminal instance directories can be pruned before training starts.
+        groups = {first_process["process_group_id"], process_record["process_group_id"]}
         cfg = runtime.load_registry()[1][1].root_config()
         marker = tmp_path / "training-started"
         script = (
             "from pathlib import Path;"
-            "from qqtools.plugins.qexp.agent.idle_job_process import idle_job_processes_exited;"
-            f"assert idle_job_processes_exited(Path({str(directory)!r}));"
+            "from qqtools.plugins.qexp.infrastructure.process import read_process_presence;"
+            f"assert all(read_process_presence(g, is_group=True).state == 'absent' for g in {groups!r});"
             f"Path({str(marker)!r}).write_text('reclaimed');"
         )
         task = submit(
@@ -75,8 +82,7 @@ def test_later_registered_projects_preempt_idle_job_through_dispatch(tmp_path, l
             time.sleep(0.05)
         assert marker.exists(), f"Training {task.task_id} failed to start: {get_machine_agent_status(runtime)}"
         assert marker.read_text() == "reclaimed"
-        assert idle_job_processes_exited(directory)
-        assert idle_job_processes_exited(first_directory)
+        assert all(read_process_presence(group, is_group=True).state == "absent" for group in groups)
     finally:
         stop_machine_agent(runtime)
         process.wait(timeout=5)
