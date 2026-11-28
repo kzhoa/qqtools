@@ -20,6 +20,9 @@ data = ["matplotlib", "pandas"]
 std = ["lmdb", "tqdm", "requests"]
 plugins = ["rich", "scikit-learn", "prompt_toolkit"]
 exp = ["libtmux>=0.62.0", "psutil", "nvidia-ml-py"]
+# The Warp plugin is opt-in even for a full general-purpose installation.
+qneighbor = ["warp-lang"]
+qneighbor-triton = ["triton>=3.4"]
 dev = ["tox==4.61.5", "tox-uv==1.36.0", "uv==0.12.16", "pytest", "ruff", "build"]
 # GitHub Dev Preflight dependency surface. Keep this explicit rather than
 # inheriting `full`: CI needs LMDB/metrics/qcgen/qexp lifecycle coverage and
@@ -45,7 +48,7 @@ full = [
     "qqtools[plugins]",
     "qqtools[exp]",
     "qqtools[dev]",
-] # all optional dependencies
+] # general-purpose extras
 
 
 [project.urls]

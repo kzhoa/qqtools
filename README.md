@@ -65,6 +65,146 @@ pip install qqtools[exp]
 > While some parts still work with `torch==1.x`, `torch>=2.4` is recommended
 
 
+## qneighbor
+
+The public interface is `qqtools.plugins.qneighbor`. Install
+`pip install 'qqtools[qneighbor]'` for Warp, or
+`pip install 'qqtools[qneighbor-triton]'` for the Triton-only alternative.
+Both extras are independent of `full`. The Warp wheel must support the host driver.
+
+```python
+from qqtools.plugins.qneighbor import neighbor_list, neighbor_list_obc, neighbor_list_pbc
+
+# Shortest entry: dispatches by pbc (False by default).
+edge_index, cell_offsets = neighbor_list(positions, cutoff=5.0, batch=batch)
+edge_index, cell_offsets = neighbor_list(
+    positions, cutoff=6.0, batch=batch, cell=cell, pbc=pbc
+)
+
+# Known OBC: return only edges and avoid allocating zero offsets on the GPU.
+edge_index = neighbor_list_obc(positions, cutoff=5.0, batch=batch, max_neighbors=32)
+edge_index, cell_offsets = neighbor_list_pbc(
+    positions, cutoff=6.0, batch=batch, cell=cell, pbc=pbc, max_neighbors=32
+)
+```
+
+All three entries share `(positions, cutoff, batch=None, max_neighbors=32)`.
+The `cell` and `pbc` arguments are keyword-only. Omitting `batch` treats the input
+as a single structure. `neighbor_list` defaults to `pbc=False`, while
+`neighbor_list_pbc` defaults to `pbc=True` and requires a cell for periodic axes.
+
+`radius_graph` is exactly the same function object as `neighbor_list_obc`.
+There is no public initialization step or backend object. The same default
+functions are available from `qqtools.plugins.qneighbor.cuda`; they share the
+same backend selection and function objects as the top-level namespace:
+
+```python
+from qqtools.plugins.qneighbor.cuda import neighbor_list, neighbor_list_obc, neighbor_list_pbc, radius_graph
+```
+
+To specify a backend from the CUDA namespace:
+
+```python
+from qqtools.plugins.qneighbor.cuda import (
+    neighbor_list_obc_warp,
+    neighbor_list_pbc_warp,
+    neighbor_list_obc_triton,
+    neighbor_list_pbc_triton,
+)
+```
+
+Each suffixed name lazily resolves only its specified backend implementation
+and binds the actual function, with no extra call wrapper or default-backend
+selection. Backend-specific namespaces remain available with the same four names:
+
+```python
+from qqtools.plugins.qneighbor.cuda.warp import neighbor_list, neighbor_list_obc, neighbor_list_pbc, radius_graph
+# Or:
+from qqtools.plugins.qneighbor.cuda.triton import neighbor_list, neighbor_list_obc, neighbor_list_pbc, radius_graph
+```
+
+Explicit imports never choose another backend and can coexist in one process.
+They do not change the default interface's selection.
+The short `neighbor_list` always returns `(edge_index, cell_offsets)`, with int64
+shapes `(2, E)` and `(E, 3)` on the positions device. OBC offsets are all zero.
+For known non-periodic systems, use `neighbor_list_obc` or its alias `radius_graph`
+to return only edges and avoid allocating zero offsets on the GPU. Inspecting tensor PBC flags can
+synchronize CUDA; the dedicated entries skip this outer boundary decision.
+
+
+Importing the package or `cuda` does not load either optional backend. The first
+search-function access/import selects Warp (or Triton if Warp is absent) and
+binds direct function references for the default interface. After binding,
+search calls have no backend detection or initialization lock. The dedicated
+OBC/PBC entries bypass the outer boundary dispatch in `neighbor_list`.
+This does not remove input validation, graph preparation, synchronization or
+first-use kernel compilation. Explicit CUDA backend imports bypass this default
+selection entirely, without a global backend-switch operation.
+Broken/incompatible Warp imports and runtime failures propagate, rather than
+silently falling back. If neither backend exists, importing a default CUDA function reports both
+installation options.
+
+The shared API currently accepts **CUDA** float32/float64 positions `(N, 3)`.
+CPU functions are available separately, without ASE, Warp, or Triton:
+
+```python
+from qqtools.plugins.qneighbor.cpu import neighbor_list, neighbor_list_obc, neighbor_list_pbc, radius_graph
+```
+
+They use the existing SciPy dependency and accept CPU tensors with the same
+argument and result conventions. OBC uses direct float64 squared distances for
+graphs with at most 64 atoms and KDTree pair queries for larger graphs; PBC uses
+a KDTree of periodic images. Sparse neighborhoods use radius enumeration;
+dense neighborhoods use nearest-K queries with complete distance-tie repair.
+Shared selection keeps the nearest K incoming neighbors.
+CPU distance arithmetic is float64; PBC cells must be finite and nonsingular,
+including partial PBC. The large-graph OBC and sparse periodic paths materialize
+in-cutoff candidates before applying K. Dense periodic queries reduce candidate storage, but complete
+distance-tie repair can still collect large groups. Periodic images themselves
+remain materialized, so memory is not bounded by returned edge count. The
+small-graph dense path bounds each distance matrix to 64² entries.
+Very small/skewed cells and large cutoffs can require many periodic images.
+The default top-level interface remains CUDA-only; importing CPU functions never
+selects or loads a CUDA backend.
+OBC accepts optional int64 graph labels on the positions device. PBC requires
+nonnegative int64 batch IDs, row-vector cells `(3, 3)` or `(B, 3, 3)`, and PBC
+flags `(3,)`, `(B, 3)` or a Python bool. Single metadata rows broadcast.
+Pass `cell=None` for all-open PBC input. Returned int64 edges `(2, E)` are
+`(source, target)`; int64 offsets `(E, 3)` satisfy
+`positions[target] - positions[source] + offset @ cell_for_target`.
+The default neighbor cap is 32 across these entries. Neighbors are nearest
+neighbors strictly inside the cutoff; self-edges
+with zero offset are excluded. Searches do not record autograd; edge order is
+not part of the shared contract. FP32 near-ties can differ between backends.
+
+Implementation layout:
+
+```text
+qneighbor/
+  __init__.py     # top-level CUDA aliases
+  _dispatch.py    # shared CPU/CUDA boundary dispatch
+  cpu/
+    obc.py
+    pbc.py
+    _search.py
+  cuda/
+    warp/    # obc.py, pbc.py and Warp query/preparation kernels
+    triton/  # obc.py, pbc.py and bounded periodic ghost queries
+```
+
+Warp PBC uses grid search with target bin width 2 Å. Its optional `bin_width`
+control is Warp-specific and is not part of the shared signature. The neutral
+backend choice is fixed on first function access. Explicit `*_warp` entry points
+remain available and never fall back to Triton.
+
+Triton PBC uses the optimized whole/stream/spatial query implementation.
+Periodic ghost expansion consumes memory and has explicit indexing/image-tile
+limits; exceeding them raises an error. Triton OBC currently supports at most
+65536 atoms in an individual graph. Neither backend promises universal speed
+superiority. See [the validation record](docs/development/qneighbor-validation.md)
+for the rationale behind retaining grid search and withdrawing the experimental Warp auto interface.
+
+
 ## qDict
 
 `qDict` is mainly there for cleaner attribute access in batch-like code:

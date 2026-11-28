@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import importlib
 
-__all__ = ["qexp", "qhyperconnect", "qpipeline"]
+__all__ = ["qexp", "qhyperconnect", "qneighbor", "qpipeline"]
 
 
 def __getattr__(name: str):
     if name == "qpipeline":
         return importlib.import_module(".qpipeline", __name__)
+    if name == "qneighbor":
+        return importlib.import_module(".qneighbor", __name__)
     if name == "qexp":
         return importlib.import_module(".qexp", __name__)
     if name == "qhyperconnect":
