@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v1.3.33
+
 - Renamed `qqtools.plugins.qexp.tail_log` to `write_log_to_stream`. Use
   `from qqtools.plugins.qexp import write_log_to_stream` for full or tail output.
 - Removed the four CUDA search aliases with `_warp` or `_triton` suffixes.
@@ -12,6 +14,15 @@
   Use `neighbor_list_pbc(positions, cutoff, batch, max_neighbors, cell=cell, pbc=pbc)`.
   Omit `pbc` for full periodicity. To select Warp explicitly, import the function
   from `qqtools.plugins.qneighbor.cuda.warp`.
+- qexp log output now copies a finite snapshot in bounded chunks and preserves
+  application bytes on binary streams. Project I/O keeps the worker launch
+  command available to running agents during a package upgrade.
+- JSON saves and Google Drive downloads now publish completed files atomically.
+  A failed write, HTTP response, or checksum check preserves an existing file.
+- The log reader now parses scientific notation and Fortran D exponents,
+  retains matched lines for rules without callbacks, and handles trailing
+  optional rules. Balanced sampling consumes shuffled bins in constant time
+  per pop while preserving seeded order.
 
 ## v1.3.32
 
