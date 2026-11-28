@@ -8,6 +8,9 @@
   boundaries. `neighbor_list` returns edge indices and integer cell offsets on
   the positions device. Use `neighbor_list_obc` or its alias `radius_graph`
   when only edges are needed. The default cap is 32 neighbors per target.
+  All three entry points share `positions, cutoff, batch=None, max_neighbors=32`,
+  with `cell` and `pbc` passed by keyword. The `qneighbor` extra accepts any
+  `warp-lang` version.
 - feat: add `qexp project takeover` to preview and apply recovery after machine
   loss, inspect affected Group Tasks and track the operation through completion.
 - feat: improve qexp command results and guide machine setup and sampled
