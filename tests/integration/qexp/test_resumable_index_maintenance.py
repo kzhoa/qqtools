@@ -941,6 +941,8 @@ def test_group_coverage_wait_backs_off_and_resumes_with_cleared_failure(tmp_path
     advance_selected()
     previous = read_work(cfg, **key)
     control_before = read_json(path)["group_control"]
+    if action == "cancel":
+        operation_before = path.read_bytes()
     for _ in range(2):
         update_work(cfg, **key, due_at="2000-01-01T00:00:00+00:00")
         result = advance_selected()
@@ -948,6 +950,8 @@ def test_group_coverage_wait_backs_off_and_resumes_with_cleared_failure(tmp_path
         assert result["maintenance_state"] == "waiting"
         assert current["retry_count"] == previous["retry_count"] + 1
         assert current["meaningful_progress_at"] == previous["meaningful_progress_at"]
+        if action == "cancel":
+            assert path.read_bytes() == operation_before
         assert current["failure"]["code"] == "membership_coverage_pending"
         assert read_json(path)["group_control"]["discovery"] == control_before["discovery"]
         previous = current

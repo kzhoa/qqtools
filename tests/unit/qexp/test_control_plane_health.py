@@ -332,6 +332,11 @@ def test_background_heartbeat_exception_is_contained_and_next_cycle_recovers(tmp
         available_gpus=[],
     )
 
+    # Keep the worker's real deadline loop, and sample health at the exact
+    # recovery time even if the test thread resumes after the stale threshold.
+    clock = _Clock()
+    monkeypatch.setattr(plane._health, "_monotonic", clock.monotonic)
+
     def publish() -> str:
         nonlocal calls
         calls += 1
@@ -354,6 +359,8 @@ def test_background_heartbeat_exception_is_contained_and_next_cycle_recovers(tmp
     assert heartbeat["state"] == "healthy"
     assert heartbeat["consecutive_failures"] == 0
     assert heartbeat["last_failure"]["exception_type"] == "RuntimeError"
+    clock.advance(heartbeat["effective_stale_after_seconds"] + 0.001)
+    assert plane._health.snapshot(heartbeat_thread_alive=True)["heartbeat"]["state"] == "stalled"
 
 
 def test_initial_heartbeat_exception_does_not_prevent_background_retry(tmp_path, monkeypatch) -> None:

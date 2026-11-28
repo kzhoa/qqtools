@@ -4233,7 +4233,7 @@ class AttemptSupervisionCoordinator:
             if (
                 result.state == "repairable"
                 and result.reason != "termination_decision_progress_pending"
-                and not is_deadline_only_decision(candidate.decision)
+                and candidate.decision.get("state") == "confirmed"
             ):
                 local_outcome = self._apply_termination_local_effects(candidate, paths, state)
                 if local_outcome == "invalid":

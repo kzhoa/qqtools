@@ -162,6 +162,7 @@ def _advance_locked(
         ), terminal_results
 
     discovery = control.get("discovery")
+    stored_discovery_fields = frozenset(discovery) if isinstance(discovery, dict) else frozenset()
     if discovery is None:
         # This is the one-time adoption path for an active operation created by
         # the pre-isolation writer.  Existing effect counters remain historical.
@@ -233,11 +234,13 @@ def _advance_locked(
         ), terminal_results
     if not _coverage_allows(status, high_watermark):
         reason = _coverage_reason(status, high_watermark)
-        control["state"] = "converging"
-        control["completed_at"] = None
-        control["blocked_reason"] = reason
-        _persist_operation(cfg, operation, control)
-        _update_group_snapshot(cfg, group_data, control, group_file)
+        if discovery.keys() != stored_discovery_fields or (
+            state != "converging" or control.get("completed_at") is not None or control.get("blocked_reason") != reason
+        ):
+            control.update(state="converging", completed_at=None, blocked_reason=reason)
+            _persist_operation(cfg, operation, control)
+        if group_data.get("cancellation_operation") != control:
+            _update_group_snapshot(cfg, group_data, control, group_file)
         return control, terminal_results
 
     member_cursor = discovery["member_cursor"]
