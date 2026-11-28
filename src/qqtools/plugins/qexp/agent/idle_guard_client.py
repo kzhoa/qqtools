@@ -115,6 +115,7 @@ class IdleGuardClient:
         self._is_ready = False
         self._last_response_at = 0.0
         self._has_orphan = False
+        self.checkpoint_mismatch_revision: int | None = None
         self._registration_horizon: tuple[tuple[int, str, str], int] | None = None
 
     @property
@@ -281,6 +282,8 @@ class IdleGuardClient:
                 self._note_response(request)
                 if time.monotonic() >= deadline or self._channel is not channel:
                     raise TimeoutError("Idle Job guard decision expired before it could be granted.")
+                if received is not None and received[0] != digest:
+                    self.checkpoint_mismatch_revision = revision
                 is_authorized = (
                     received is not None
                     and received[0] == digest

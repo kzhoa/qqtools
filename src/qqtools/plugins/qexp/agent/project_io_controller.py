@@ -1872,6 +1872,10 @@ class ProjectIOController:
             enabled = False
         epoch = status.get("executor_epoch")
         guard = self._idle_job_guard
+        if guard.checkpoint_mismatch_revision is not None:
+            if guard.checkpoint_mismatch_revision == revision:
+                self.runtime.working_set.request_activation_observations(bindings)
+            guard.checkpoint_mismatch_revision = None
         occupied = isinstance(epoch, str) and guard.live(revision, epoch)
         has_capacity = self._admission.has_idle_guard_capacity(already_occupied=occupied)
         if not enabled or not has_capacity:
@@ -3110,7 +3114,9 @@ class ProjectIOController:
                         reason = result.evidence.get("reason")
                         if not isinstance(reason, str):
                             applied = False
-                        elif local_state in {"matching_active", "matching_release_pair"}:
+                        elif local_state == "matching_active" or (
+                            local_state == "matching_release_pair" and reason == "lease_expired_before_launch"
+                        ):
                             released = release_if_matches(self.runtime.root, requested, reason)
                             if not released and classify_exact_reservation(self.runtime.root, requested) not in {
                                 "matching_released",
@@ -6295,7 +6301,9 @@ class ProjectIOController:
             reservation.reservation_id
         )
         try:
-            if classify_exact_reservation(self.runtime.root, reservation) not in {
+            if classify_exact_reservation(
+                self.runtime.root, reservation, release_pair_reason="lease_expired_before_launch"
+            ) not in {
                 "matching_active",
                 "matching_release_pair",
             }:

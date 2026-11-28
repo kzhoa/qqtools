@@ -503,6 +503,8 @@ def _render_agent_status(result: Mapping[str, Any], _presentation: Mapping[str, 
             for project_id in (isolation.get("blocking_project_ids") or ())[:4]:
                 lines.append(f"  Project ID: {encode_display_text(project_id)}")
             warnings_step = diagnostics_step
+        elif envelope == "healthy" and isolation.get("active_worker_count", 0) > 0:
+            lines.extend(("Project I/O activity", "  State: in progress"))
 
     scheduler = result.get("scheduler_diagnostics")
     if isinstance(scheduler, Mapping):

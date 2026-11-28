@@ -482,6 +482,8 @@ def classify_executor_offer(
 def classify_exact_reservation(
     runtime_root: Path,
     identity: ReservationIdentity,
+    *,
+    release_pair_reason: str | None = None,
 ) -> Literal["absent", "matching_active", "matching_released", "matching_release_pair", "conflict"]:
     """Read one active/released CPU reservation using its complete identity."""
     paths = local_paths(runtime_root)
@@ -497,7 +499,13 @@ def classify_exact_reservation(
         states = {state for state, _path in found}
         if states == {"active", "released"}:
             if all(
-                reservation.get("state") == state and identity.exactly_matches(reservation)
+                reservation.get("state") == state
+                and identity.exactly_matches(reservation)
+                and (
+                    state != "released"
+                    or release_pair_reason is None
+                    or reservation.get("release_reason") == release_pair_reason
+                )
                 for state, path in found
                 for reservation in (read_json(path).get("reservation", {}),)
             ):

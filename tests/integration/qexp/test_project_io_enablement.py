@@ -61,7 +61,7 @@ def test_enable_checks_shared_registration_outside_all_machine_guards(tmp_path, 
         calls.append(binding)
         return original(binding, **kwargs) if is_eligible else False
 
-    def status(binding):
+    def status(binding, *, runtime_id=None):
         assert not held, f"shared registration status held machine guards: {held}"
         assert binding == subject
         return {"state": "expired"}
@@ -159,7 +159,9 @@ def test_enable_rejects_removed_binding_before_interpreting_shared_result(tmp_pa
         return is_eligible
 
     monkeypatch.setattr(runtime.registration, "binding_write_eligible", remove_during_validation)
-    monkeypatch.setattr(runtime.registration, "registration_status", lambda _binding: {"state": "superseded"})
+    monkeypatch.setattr(
+        runtime.registration, "registration_status", lambda _binding, *, runtime_id=None: {"state": "superseded"}
+    )
     with pytest.raises(RuntimeError, match="changed during enablement validation; retry"):
         enable(runtime, subject.project_id)
     assert runtime.load_registry_uncached()[1] == [peer]

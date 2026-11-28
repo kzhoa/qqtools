@@ -617,12 +617,14 @@ def classify_executor_offer(
 def classify_exact_reservation(
     runtime_root: Path,
     identity: ReservationIdentity,
+    *,
+    release_pair_reason: str | None = None,
 ) -> Literal["absent", "matching_active", "matching_released", "matching_release_pair", "conflict"]:
     """Read one active/released reservation using its complete local identity."""
     if identity.cpu_slots is not None:
         from .cpu_lane import classify_exact_reservation as classify_exact_cpu_reservation
 
-        return classify_exact_cpu_reservation(runtime_root, identity)
+        return classify_exact_cpu_reservation(runtime_root, identity, release_pair_reason=release_pair_reason)
     paths = local_paths(runtime_root)
     with exclusive(paths["locks"] / "gpu-reservations.lock"):
         name = f"{identity.reservation_id}.json"
@@ -636,7 +638,13 @@ def classify_exact_reservation(
         states = {state for state, _path in found}
         if states == {"active", "released"}:
             if all(
-                reservation.get("state") == state and identity.exactly_matches(reservation)
+                reservation.get("state") == state
+                and identity.exactly_matches(reservation)
+                and (
+                    state != "released"
+                    or release_pair_reason is None
+                    or reservation.get("release_reason") == release_pair_reason
+                )
                 for state, path in found
                 for reservation in (read_json(path).get("reservation", {}),)
             ):

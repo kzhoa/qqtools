@@ -322,6 +322,14 @@ class BindingWorkingSet:
                 state.updated_at = utc_now()
                 self._persist_locked(identity, state)
 
+    def request_activation_observations(self, bindings: Sequence[ProjectBinding]) -> None:
+        """Queue fresh isolated observations after the shared roster digest changes."""
+        with self._lock:
+            for binding in bindings:
+                state = self._states.get(self._identity(binding))
+                if state is not None and state.binding == binding and binding.enabled:
+                    state.observation_due = True
+
     def select_activation_observations(self, *, limit: int = 64) -> tuple[ActivationObservationIntent, ...]:
         """Select due observation cursors fairly without touching Project storage."""
         now = _monotonic()
