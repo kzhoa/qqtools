@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+## v1.3.32
+
+- feat: add CPU, Warp and Triton neighbor searches for open and periodic
+  boundaries. `neighbor_list` returns edge indices and integer cell offsets on
+  the positions device. Use `neighbor_list_obc` or its alias `radius_graph`
+  when only edges are needed. The default cap is 32 neighbors per target.
+- feat: add `qexp project takeover` to preview and apply recovery after machine
+  loss, inspect affected Group Tasks and track the operation through completion.
+- feat: improve qexp command results and guide machine setup and sampled
+  readiness checks to the intended Project.
+- fix: recover stalled pre-launch claims and scheduler diagnostics after agent
+  turnover. Verify current binding and agent evidence during recovery and
+  isolate registration renewal preparation failures.
+- fix: bound Idle Job observations and preserve admission for training work.
 - breaking: rename the balanced sampler and batch grouping strategy
   `lpt-medium` to `lpt_medium`. The existing short alias `lpt` still selects
   the medium tier.
