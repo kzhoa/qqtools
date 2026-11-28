@@ -40,6 +40,26 @@ def _health(tmp_path, clock: _Clock, **kwargs) -> ControlPlaneHealth:
     )
 
 
+def test_persisted_heartbeat_preserves_subsecond_freshness(tmp_path, monkeypatch) -> None:
+    from qqtools.plugins.qexp.agent import control_plane_health
+    from qqtools.plugins.qexp.agent.snapshot_publication_health import observation_freshness
+
+    observed = datetime(2026, 10, 16, microsecond=875000, tzinfo=timezone.utc)
+
+    class FixedDatetime(datetime):
+        @classmethod
+        def now(cls, tz):
+            return observed.astimezone(tz)
+
+    monkeypatch.setattr(control_plane_health, "datetime", FixedDatetime)
+    health = ControlPlaneHealth(tmp_path, instance_id="agent-instance", interval_seconds=0.1)
+    health.complete_heartbeat_cycle(health.begin_heartbeat_cycle(), "queued")
+    lane = health.snapshot(heartbeat_thread_alive=True)["heartbeat"]
+    seen_at, threshold = lane["last_success_at"], lane["effective_stale_after_seconds"]
+    assert observation_freshness(seen_at, threshold, now=observed) == "fresh"
+    assert observation_freshness(seen_at, threshold, now=observed + timedelta(milliseconds=301)) == "stale"
+
+
 def test_responsive_failures_degrade_after_three_intervals_and_recover(tmp_path) -> None:
     clock = _Clock()
     health = _health(tmp_path, clock)

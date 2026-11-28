@@ -7513,16 +7513,23 @@ def test_completed_claim_reconciles_after_unrelated_registry_revision_change(tmp
         binding.project_id,
         lane="gpu",
     )
-    controller.advance_scheduler_claims(
-        bindings,
-        revision,
-        lane="gpu",
-        admission_role="primary",
-        observations=observations,
-        available_gpu_ids=[0],
-        available_cpu_slots=0,
-    )
-    claim = next(request for request in executor.unresolved_requests() if request.operation_kind == "scheduler_claim")
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        controller.advance_scheduler_claims(
+            bindings,
+            revision,
+            lane="gpu",
+            admission_role="primary",
+            observations=observations,
+            available_gpu_ids=[0],
+            available_cpu_slots=0,
+        )
+        claim = next((r for r in executor.unresolved_requests() if r.operation_kind == "scheduler_claim"), None)
+        if claim is not None:
+            break
+        time.sleep(0.02)
+    else:
+        pytest.fail("scheduler claim was never admitted")
     offer_identity = _claim_offer_identity(claim)
     deadline = time.monotonic() + 5.0
     while time.monotonic() < deadline:
@@ -7530,6 +7537,8 @@ def test_completed_claim_reconciles_after_unrelated_registry_revision_change(tmp
         if executor.load_result(claim.request_id) is not None and executor.status_view()["active_worker_count"] == 0:
             break
         time.sleep(0.02)
+    else:
+        pytest.fail("scheduler claim did not complete before the registry change")
     _other_cfg, _other, current_revision, current_bindings = _registered(tmp_path, "project-b", runtime)
 
     completions = controller.advance_scheduler_claims(

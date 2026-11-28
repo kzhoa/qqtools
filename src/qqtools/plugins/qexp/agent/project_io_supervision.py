@@ -3387,10 +3387,7 @@ class AttemptSupervisionCoordinator:
                     candidate.post_update_process_identity,
                     candidate.observation_identity,
                 )
-                self._settled_terminal_rechecks.pop(key, None)
-                if len(self._settled_terminal_rechecks) >= _MAX_CACHED_TERMINAL_CANDIDATES:
-                    self._settled_terminal_rechecks.pop(next(iter(self._settled_terminal_rechecks)))
-                self._settled_terminal_rechecks[key] = time.monotonic() + _SETTLED_TERMINAL_RECHECK_SECONDS
+                self._pace_settled_terminal_recheck(key)
             if local_outcome in {"applied", "invalid"}:
                 self._terminal_candidates.pop(project_id, None)
 
@@ -3432,6 +3429,12 @@ class AttemptSupervisionCoordinator:
             elif project_id in observation_results:
                 results[project_id] = observation_results[project_id]
         return results
+
+    def _pace_settled_terminal_recheck(self, key: tuple[tuple[str, ...], str, str]) -> None:
+        self._settled_terminal_rechecks.pop(key, None)
+        if len(self._settled_terminal_rechecks) >= _MAX_CACHED_TERMINAL_CANDIDATES:
+            self._settled_terminal_rechecks.pop(next(iter(self._settled_terminal_rechecks)))
+        self._settled_terminal_rechecks[key] = time.monotonic() + _SETTLED_TERMINAL_RECHECK_SECONDS
 
     @staticmethod
     def _termination_key(candidate: _TerminationCandidate) -> tuple[str, str]:
@@ -4261,6 +4264,17 @@ class AttemptSupervisionCoordinator:
                         candidate.convergence = refreshed
 
             if candidate.convergence.state == "converged":
+                # Pace only repeated shared reads of a proven, locally converged
+                # signal completion. Changed local evidence still gets repaired above.
+                recheck_key = (
+                    candidate.binding_signature,
+                    candidate.process_identity,
+                    termination_decision_digest(candidate.decision),
+                )
+                if self._settled_terminal_rechecks.get(recheck_key, 0.0) > time.monotonic():
+                    self._termination_candidates.pop(key, None)
+                    selected_candidates.pop(key, None)
+                    continue
                 try:
                     exit_observation = _read_terminal_exit_observation(
                         paths["observations"] / f"{candidate.parameters['attempt_id']}.json",
@@ -4578,6 +4592,14 @@ class AttemptSupervisionCoordinator:
                 continue
             paths = machine_project_paths(self.runtime.root, candidate.binding.project_id)
             local_outcome = self._apply_termination_local_effects(candidate, paths, state)
+            if local_outcome == "applied" and candidate.decision is not None:
+                self._pace_settled_terminal_recheck(
+                    (
+                        candidate.binding_signature,
+                        candidate.post_update_process_identity or candidate.process_identity,
+                        termination_decision_digest(candidate.decision),
+                    )
+                )
             if local_outcome in {"applied", "invalid"}:
                 self._termination_candidates.pop(self._termination_key(candidate), None)
             if project_id in publication_results:

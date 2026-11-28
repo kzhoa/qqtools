@@ -141,7 +141,10 @@ def test_startup_retains_actionable_missing_gpu_warning(tmp_path, monkeypatch) -
     try:
         deadline = time.monotonic() + 5
         status = get_machine_agent_status(runtime)
-        while not status.get("warnings") and time.monotonic() < deadline:
+        while (
+            not any(item.get("reason") == "configured_gpu_ids_not_discovered" for item in status.get("warnings", ()))
+            and time.monotonic() < deadline
+        ):
             time.sleep(0.05)
             status = get_machine_agent_status(runtime)
 

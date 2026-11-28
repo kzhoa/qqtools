@@ -8,11 +8,10 @@ import re
 import threading
 import time
 from collections.abc import Callable, Mapping
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from ..runtime.records import utc_now
 from ..runtime.store import atomic_replace, read_json_limited
 from .diagnostics import bounded_exception_evidence
 
@@ -253,6 +252,11 @@ def _new_lane(threshold: float) -> dict[str, Any]:
     return lane
 
 
+def _health_timestamp() -> str:
+    # Health deadlines can be shorter than one second.
+    return datetime.now(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
+
+
 class ControlPlaneHealth:
     """Maintain bounded heartbeat and authority health for one agent instance."""
 
@@ -263,7 +267,7 @@ class ControlPlaneHealth:
         instance_id: str,
         interval_seconds: float,
         monotonic: Callable[[], float] = time.monotonic,
-        utc_clock: Callable[[], str] = utc_now,
+        utc_clock: Callable[[], str] = _health_timestamp,
         private_log: Callable[[str], None] | None = None,
         publish_instance_evidence: Callable[[Mapping[str, object]], bool] | None = None,
     ) -> None:
@@ -618,10 +622,10 @@ class ControlPlaneHealth:
         try:
             value = self._utc_clock()
         except Exception:
-            value = utc_now()
+            value = _health_timestamp()
         if isinstance(value, str) and value:
             return value[:64]
-        return utc_now()
+        return _health_timestamp()
 
     def _complete_success(
         self,

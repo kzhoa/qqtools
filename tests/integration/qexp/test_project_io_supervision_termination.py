@@ -165,6 +165,12 @@ def test_termination_coordinator_commits_before_signaling_and_converges_capacity
             assert decision["observed_exit_code"] is None
             assert read_json(manifest)["process"]["observed_exit_code"] is None
             assert not executor.has_unfinished_work()
+            # A signal-only exit lacks a runner observation. Once shared
+            # publication is proven, revisiting its unchanged manifest must
+            # leave the serialized worker slot available for queued work.
+            for _ in range(8):
+                coordinator.advance_terminations([binding], revision)
+                assert not executor.has_unfinished_work()
             for _ in range(8):
                 coordinator._advance_initial_reconciliation([binding], revision)
                 if coordinator.initially_reconciled(binding, revision):
