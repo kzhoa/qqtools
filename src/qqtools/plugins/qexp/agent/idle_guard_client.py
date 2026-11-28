@@ -13,11 +13,11 @@ from contextlib import contextmanager, suppress
 from typing import TYPE_CHECKING
 
 from .idle_guard_digest import LOCKS_PER_PROJECT, MAX_REGISTRATION_HORIZON_NS
-from .project_io_protocol import PROJECT_IO_OVERDUE_SECONDS, ProjectIORequest
-from .project_io_transport_support import ProjectIOProtocolError
+from .project_io.protocol import PROJECT_IO_OVERDUE_SECONDS, ProjectIORequest
+from .project_io.transport import ProjectIOProtocolError
 
 if TYPE_CHECKING:
-    from .project_io_executor import ProjectIOExecutor
+    from .project_io.executor import ProjectIOExecutor
 
 _OPERATION = "idle_decision_guard"
 _MAX_DESCRIPTORS_PER_PACKET = 100

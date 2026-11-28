@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import os
+import subprocess
 from pathlib import Path
 
 import pytest
 
 from qqtools.plugins.qexp import init_shared_root
 from qqtools.plugins.qexp.agent.context import MachineRuntime
-from qqtools.plugins.qexp.agent.project_io_executor import ProjectIOExecutor
+from qqtools.plugins.qexp.agent.project_io.executor import ProjectIOExecutor
 from qqtools.plugins.qexp.agent.project_io_stop import publish_project_stop_snapshots
 from qqtools.plugins.qexp.agent.setup import initialize_machine
 from qqtools.plugins.qexp.layout import machine_state_path
@@ -27,11 +28,21 @@ def _bindings(tmp_path: Path, count: int):
     return runtime, pairs, revision
 
 
-def test_stop_snapshots_publish_through_fresh_executor_epoch(tmp_path: Path) -> None:
+def test_stop_snapshots_publish_through_fresh_executor_epoch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # A running agent keeps its launch command when a package upgrade replaces the worker.
+    popen = subprocess.Popen
+    worker_entries = []
+
+    def start_worker(command, **kwargs):
+        if "--request-id" in command:
+            worker_entries.append(command[1:3])
+        return popen(command, **kwargs)
+
     runtime, pairs, _revision = _bindings(tmp_path, 2)
     executor = ProjectIOExecutor(runtime)
     executor.begin_epoch()
     executor.shutdown()
+    monkeypatch.setattr(subprocess, "Popen", start_worker)
 
     publish_project_stop_snapshots(
         runtime,
@@ -43,6 +54,7 @@ def test_stop_snapshots_publish_through_fresh_executor_epoch(tmp_path: Path) -> 
         stop_reason="idle",
     )
 
+    assert worker_entries == [["-m", "qqtools.plugins.qexp.agent.project_io_worker"]] * len(pairs)
     for cfg, _binding in pairs:
         agent = read_json(machine_state_path(cfg, "agent.json"))["agent"]
         assert agent["instance_id"] == "agent-a"

@@ -28,7 +28,7 @@ from .idle_guard_digest import (
     IdleGuardCheckpoint,
     idle_guard_digest,
 )
-from .project_io_protocol import ProjectIORequest
+from .project_io.protocol import ProjectIORequest
 
 _IDLE_MILLISECONDS = 15_000
 _ACTIVATION_LOCK_NAME = "project-activation-v1.lock"

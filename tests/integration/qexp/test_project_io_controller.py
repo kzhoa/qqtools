@@ -16,22 +16,25 @@ import pytest
 
 from qqtools.plugins.qexp import init_shared_root, submit
 from qqtools.plugins.qexp import project_maintenance as project_maintenance_module
-from qqtools.plugins.qexp.agent import dispatch_loop, project_io_process, project_io_supervision
-from qqtools.plugins.qexp.agent import project_io_admission as project_io_admission_module
-from qqtools.plugins.qexp.agent import project_io_controller as project_io_controller_module
-from qqtools.plugins.qexp.agent import project_io_executor as project_io_executor_module
-from qqtools.plugins.qexp.agent import project_io_worker as project_io_worker_module
+from qqtools.plugins.qexp.agent import dispatch_loop, project_io_process
 from qqtools.plugins.qexp.agent.context import MachineRuntime
 from qqtools.plugins.qexp.agent.dispatch_loop import dispatch_machine_cycle_locked
-from qqtools.plugins.qexp.agent.helpers import _machine_is_true_idle
-from qqtools.plugins.qexp.agent.project_io_controller import ProjectIOController
-from qqtools.plugins.qexp.agent.project_io_executor import ProjectIOExecutor
-from qqtools.plugins.qexp.agent.project_io_protocol import (
+from qqtools.plugins.qexp.agent.idle_exit import can_exit_when_idle
+from qqtools.plugins.qexp.agent.project_io import admission as project_io_admission_module
+from qqtools.plugins.qexp.agent.project_io import controller as project_io_controller_module
+from qqtools.plugins.qexp.agent.project_io import executor as project_io_executor_module
+from qqtools.plugins.qexp.agent.project_io import worker as project_io_worker_module
+from qqtools.plugins.qexp.agent.project_io.controller import ProjectIOController
+from qqtools.plugins.qexp.agent.project_io.executor import ProjectIOExecutor
+from qqtools.plugins.qexp.agent.project_io.protocol import (
     ProjectIOProcess,
     ProjectIOResult,
     authority_terminal_transition_digest,
 )
-from qqtools.plugins.qexp.agent.project_io_supervision import AttemptSupervisionCoordinator
+from qqtools.plugins.qexp.agent.project_io.scheduling import execution as scheduler_execution
+from qqtools.plugins.qexp.agent.project_io.supervision import coordinator as project_io_supervision
+from qqtools.plugins.qexp.agent.project_io.supervision import running_publication
+from qqtools.plugins.qexp.agent.project_io.supervision.coordinator import AttemptSupervisionCoordinator
 from qqtools.plugins.qexp.agent.setup import initialize_machine
 from qqtools.plugins.qexp.agent.working_set import SERVICE_LANES
 from qqtools.plugins.qexp.commands.group import change_worker, create_group
@@ -433,19 +436,19 @@ def test_isolated_dispatch_advances_complete_attempt_supervision_and_readiness(
     coordinator = runtime.attempt_supervision_coordinator
     calls: list[str] = []
 
-    for name in (
-        "advance_running_publications",
-        "advance_terminal_completions",
-        "advance_terminations",
-        "advance_orphan_recoveries",
+    for owner, name in (
+        (coordinator.running_publications, "advance"),
+        (coordinator, "advance_terminal_completions"),
+        (coordinator, "advance_terminations"),
+        (coordinator, "advance_orphan_recoveries"),
     ):
-        original = getattr(coordinator, name)
+        original = getattr(owner, name)
 
         def record(*args, __name=name, __original=original, **kwargs):
             calls.append(__name)
             return __original(*args, **kwargs)
 
-        monkeypatch.setattr(coordinator, name, record)
+        monkeypatch.setattr(owner, name, record)
 
     try:
         deadline = time.monotonic() + 5.0
@@ -463,7 +466,7 @@ def test_isolated_dispatch_advances_complete_attempt_supervision_and_readiness(
             raise AssertionError("isolated attempt supervision did not complete initial reconciliation")
 
         assert set(calls) == {
-            "advance_running_publications",
+            "advance",
             "advance_terminal_completions",
             "advance_terminations",
             "advance_orphan_recoveries",
@@ -1544,13 +1547,13 @@ def test_due_offer_worker_reports_noop_and_disabled_binding_starts_nothing(
     controller.advance_scheduler_due_offers(bindings, revision)
     assert any(request.operation_kind == "scheduler_due_offer" for request in executor.unresolved_requests())
     stale_resolutions = []
-    original_resolve_stale = executor.resolve_stale_scheduler_due_offer
+    original_resolve_stale = executor.resolve_stale_scheduler_work
 
-    def resolve_stale(request_id, request):
-        stale_resolutions.append(request_id)
-        return original_resolve_stale(request_id, request)
+    def resolve_stale(request):
+        stale_resolutions.append(request.request_id)
+        return original_resolve_stale(request)
 
-    monkeypatch.setattr(executor, "resolve_stale_scheduler_due_offer", resolve_stale)
+    monkeypatch.setattr(executor, "resolve_stale_scheduler_work", resolve_stale)
     controller.advance_scheduler_due_offers(
         bindings,
         revision,
@@ -1611,7 +1614,7 @@ def test_due_offer_rechecks_authority_inside_availability_transaction(
             project_io_worker_module._ExecutorEpochFenced,
         )
     ):
-        project_io_worker_module._scheduler_due_offer(
+        project_io_worker_module._run_scheduler_work(
             request,
             runtime.root,
             executor.paths,
@@ -1681,7 +1684,7 @@ def test_due_offer_fences_clock_observation_before_shared_write(
     monkeypatch.setattr(availability_transitions_module, "persist_clock_observation", fence_then_persist)
     write_possible = [False]
     with pytest.raises(project_io_worker_module._BindingAuthorityChanged):
-        project_io_worker_module._scheduler_due_offer(
+        project_io_worker_module._run_scheduler_work(
             request,
             runtime.root,
             executor.paths,
@@ -1726,7 +1729,7 @@ def test_due_offer_fences_deadline_directory_fsync(
     monkeypatch.setattr(offer_deadline_module, "_sync_directory", fence_then_sync)
     write_possible = [False]
     with pytest.raises(project_io_worker_module._BindingAuthorityChanged):
-        project_io_worker_module._scheduler_due_offer(
+        project_io_worker_module._run_scheduler_work(
             request,
             runtime.root,
             executor.paths,
@@ -1817,17 +1820,17 @@ def test_ready_index_worker_uses_project_machine_runtime_and_builds_to_active(tm
         observed_runtime_roots.append(worker_cfg.runtime_root)
         return {"state": "active", "revision": 1, "build": None}
 
-    original = project_io_worker_module.advance_ready_index_build
-    project_io_worker_module.advance_ready_index_build = observe_runtime_root
+    original = scheduler_execution.advance_ready_index_build
+    scheduler_execution.advance_ready_index_build = observe_runtime_root
     try:
-        evidence = project_io_worker_module._scheduler_ready_index_build(
+        evidence = project_io_worker_module._run_scheduler_work(
             request,
             runtime.root,
             executor.paths,
             [False],
         )
     finally:
-        project_io_worker_module.advance_ready_index_build = original
+        scheduler_execution.advance_ready_index_build = original
     assert evidence == {"state": "active", "revision": 1, "build_id": None, "phase": None}
     assert observed_runtime_roots == [runtime.project_paths(binding.project_id)["root"]]
     assert observed_runtime_roots[0] != cfg.runtime_root
@@ -1869,8 +1872,8 @@ def test_isolated_dispatch_builds_ready_index_without_synchronous_builder(
             time.sleep(0.02)
         assert read_ready_index_state(cfg) == "active", {
             "workers": describe_project_io_workers(executor),
-            "needed": len(controller._ready_index_needed),
-            "settled": len(controller._ready_index_settled),
+            "needed": len(controller._ready_index_build_policy.needed),
+            "settled": len(controller._ready_index_build_policy.settled),
             "queued": controller._admission.pending_count,
             "working_set": runtime.working_set.snapshot(),
             "backoff": [(key[1:], value) for key, value in controller._service_backoff.items()],
@@ -2039,7 +2042,7 @@ def test_ready_index_build_rechecks_binding_before_json_state_publication(
     monkeypatch.setattr(ready_state_module, "atomic_replace", fence_then_replace)
     write_possible = [False]
     with pytest.raises(project_io_worker_module._BindingAuthorityChanged):
-        project_io_worker_module._scheduler_ready_index_build(
+        project_io_worker_module._run_scheduler_work(
             request,
             runtime.root,
             executor.paths,
@@ -2072,7 +2075,7 @@ def test_ready_index_build_fences_activation_directory_fsync(
     monkeypatch.setattr(project_activation_module, "_sync_directory", fence_then_sync)
     write_possible = [False]
     with pytest.raises(project_io_worker_module._BindingAuthorityChanged):
-        project_io_worker_module._scheduler_ready_index_build(
+        project_io_worker_module._run_scheduler_work(
             request,
             runtime.root,
             executor.paths,
@@ -2112,7 +2115,7 @@ def test_ready_index_build_rechecks_authority_before_non_json_layout_mutation(
     with pytest.raises(
         (project_io_worker_module._BindingAuthorityChanged, project_io_worker_module._ExecutorEpochFenced)
     ):
-        project_io_worker_module._scheduler_ready_index_build(
+        project_io_worker_module._run_scheduler_work(
             request,
             runtime.root,
             executor.paths,
@@ -2180,9 +2183,9 @@ def test_ready_index_repair_intents_are_bounded_and_re_admit_healthy_eviction(
         identities.append(identity)
         controller._mark_ready_index_needed(identity)
 
-    assert len(controller._ready_index_needed) == 64
-    assert identities[0] not in controller._ready_index_needed
-    assert identities[-1] in controller._ready_index_needed
+    assert len(controller._ready_index_build_policy.needed) == 64
+    assert identities[0] not in controller._ready_index_build_policy.needed
+    assert identities[-1] in controller._ready_index_build_policy.needed
     for identity in identities[1:]:
         controller._validated.add(identity)
         controller._record_service_failure((identity, "scheduler_ready_index_build", "ready_index", "advance"))
@@ -2191,8 +2194,8 @@ def test_ready_index_repair_intents_are_bounded_and_re_admit_healthy_eviction(
     for identity in identities:
         controller._mark_ready_index_needed(identity)
 
-    assert len(controller._ready_index_needed) == 64
-    assert identities[0] in controller._ready_index_needed
+    assert len(controller._ready_index_build_policy.needed) == 64
+    assert identities[0] in controller._ready_index_build_policy.needed
     selected: list[str] = []
 
     def record_offer(identity, _kind, _prepare, *_key):
@@ -2701,7 +2704,7 @@ def test_maintenance_descriptor_machine_timer_inhibits_idle_and_retries(tmp_path
 
     assert binding.project_id in runtime.maintenance_retry_deadlines
     assert binding.project_id in runtime.maintenance_retry_idle_blocked_projects
-    assert not _machine_is_true_idle(runtime, has_consumed_binding=True)
+    assert not can_exit_when_idle(runtime, has_consumed_binding=True)
     _retry_binding, retry_at = runtime.maintenance_retry_deadlines[binding.project_id]
     while time.monotonic() < retry_at:
         time.sleep(0.01)
@@ -7075,24 +7078,24 @@ def test_running_publication_scan_reaches_tail_pages_beyond_state_capacity(
 
     tail_registrations = runtime.project_paths(bindings[-1].project_id)["registrations"]
     tail_paths: list[Path] = []
-    original = project_io_supervision._read_running_publication_source
+    original = running_publication.read_registration
 
     def record_tail(path, *args, **kwargs):
         if path.parent == tail_registrations:
             tail_paths.append(path)
         return original(path, *args, **kwargs)
 
-    monkeypatch.setattr(project_io_supervision, "_read_running_publication_source", record_tail)
+    monkeypatch.setattr(running_publication, "read_registration", record_tail)
     executor = ProjectIOExecutor(runtime)
     executor.begin_epoch()
     controller = ProjectIOController(runtime, executor)
     coordinator = AttemptSupervisionCoordinator(runtime, controller)
     try:
         for _ in range(40):
-            coordinator.advance_running_publications(bindings, revision)
+            coordinator.running_publications.advance(bindings, revision)
 
         assert len(set(tail_paths)) >= 2
-        assert len(coordinator._scans) <= 256
+        assert len(coordinator.running_publications._scans) <= 256
     finally:
         coordinator.close()
         executor.shutdown()

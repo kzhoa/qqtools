@@ -14,14 +14,14 @@ from types import SimpleNamespace
 import pytest
 
 from qqtools.plugins.qexp import init_shared_root
-from qqtools.plugins.qexp.agent import project_io_supervision as project_io_supervision_module
 from qqtools.plugins.qexp.agent import registration as registration_module
 from qqtools.plugins.qexp.agent import working_set as working_set_module
 from qqtools.plugins.qexp.agent.context import MachineRuntime
 from qqtools.plugins.qexp.agent.control_plane import _MachineControlPlane
 from qqtools.plugins.qexp.agent.dispatch_loop import _advance_activation_working_set
-from qqtools.plugins.qexp.agent.project_io_controller import ProjectIOController
-from qqtools.plugins.qexp.agent.project_io_executor import ProjectIOExecutor
+from qqtools.plugins.qexp.agent.project_io.controller import ProjectIOController
+from qqtools.plugins.qexp.agent.project_io.executor import ProjectIOExecutor
+from qqtools.plugins.qexp.agent.project_io.supervision import coordinator as project_io_supervision_module
 from qqtools.plugins.qexp.agent.working_set import SERVICE_LANES, BindingWorkingSet
 from qqtools.plugins.qexp.lease import LeasePolicy
 from qqtools.plugins.qexp.runtime.project_activation import (

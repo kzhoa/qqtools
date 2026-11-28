@@ -10,8 +10,8 @@ import pytest
 from qqtools.plugins.qexp import init_shared_root
 from qqtools.plugins.qexp.agent import dispatch_loop
 from qqtools.plugins.qexp.agent.context import MachineRuntime
-from qqtools.plugins.qexp.agent.project_io_controller import ProjectIOController
-from qqtools.plugins.qexp.agent.project_io_executor import ProjectIOExecutor
+from qqtools.plugins.qexp.agent.project_io.controller import ProjectIOController
+from qqtools.plugins.qexp.agent.project_io.executor import ProjectIOExecutor
 from qqtools.plugins.qexp.agent.recovery_enrollment import RecoveryEnrollment
 from qqtools.plugins.qexp.runtime.group_discovery import service
 from qqtools.plugins.qexp.runtime.store import atomic_replace, read_json

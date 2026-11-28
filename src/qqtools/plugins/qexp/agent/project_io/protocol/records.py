@@ -14,19 +14,18 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Mapping
 
-from ..runtime.records import validate_identifier
-from ..runtime.store import require_json_size
-from ..runtime.submission_control_continuation import submission_control_continuation
-from .group_service_transport import (
-    group_service_advance_evidence,
-    group_service_advance_parameters,
-    group_service_probe_evidence,
-    group_service_probe_parameters,
+from ....runtime.store import require_json_size
+from ....runtime.submission_control_continuation import submission_control_continuation
+from ...group_service_transport import (
+    validate_group_service_advance_evidence,
+    validate_group_service_advance_parameters,
+    validate_group_service_probe_evidence,
+    validate_group_service_probe_parameters,
 )
-from .primary_probe_transport import validate_probe_state
-from .progress_transport import progress_context, progress_evidence, progress_projection
-from .ready_cursor_validation import validate_ready_cursor_transition
-from .recovery_transport import (
+from ...primary_probe_transport import validate_probe_state
+from ...progress_transport import progress_context, progress_evidence, progress_projection
+from ...ready_cursor_validation import validate_ready_cursor_transition
+from ...recovery_transport import (
     legacy_capture_evidence,
     legacy_capture_parameters,
     legacy_scan_evidence,
@@ -38,7 +37,9 @@ from .recovery_transport import (
     source_hold_evidence,
     source_hold_parameters,
 )
-from .takeover_transport import takeover_registration_evidence, takeover_registration_parameters
+from ...takeover_transport import takeover_registration_evidence, takeover_registration_parameters
+from . import scheduler
+from .fields import _require_exact_keys, _require_identifier, _require_text
 
 RESERVATION_RECONCILE_RELEASE_REASONS = frozenset({"task_missing", "claim_missing", "lease_expired_before_launch"})
 
@@ -337,31 +338,11 @@ def _require_mapping(value: object, label: str) -> Mapping[str, Any]:
     return value
 
 
-def _require_exact_keys(value: Mapping[str, Any], keys: frozenset[str], label: str) -> None:
-    if set(value) != keys:
-        raise ValueError(f"{label} has missing or unknown fields.")
-
-
 def _require_envelope(value: object, envelope: str, label: str) -> Mapping[str, Any]:
     record = _require_mapping(value, label)
     if set(record) != {envelope}:
         raise ValueError(f"{label} must contain only the {envelope!r} envelope.")
     return _require_mapping(record[envelope], f"{label}.{envelope}")
-
-
-def _require_text(value: object, label: str, *, maximum: int = 256) -> str:
-    if not isinstance(value, str) or not value or len(value) > maximum or "\x00" in value:
-        raise ValueError(f"{label} is invalid.")
-    return value
-
-
-def _require_identifier(value: object, label: str, *, maximum: int = 128) -> str:
-    text = _require_text(value, label, maximum=maximum)
-    try:
-        validate_identifier(text, label)
-    except ValueError as exc:
-        raise ValueError(f"{label} is invalid.") from exc
-    return text
 
 
 def _require_timestamp(value: object, label: str) -> str:
@@ -819,10 +800,10 @@ def _request_parameters(operation_kind: str, value: object) -> dict[str, Any]:
         _require_exact_keys(parameters, frozenset({"machine_name"}), f"{operation_kind} parameters")
         parameters["machine_name"] = _require_identifier(parameters["machine_name"], "machine_name")
     elif operation_kind == "group_service_probe":
-        parameters = group_service_probe_parameters(parameters)
+        parameters = validate_group_service_probe_parameters(parameters)
         parameters["machine_name"] = _require_identifier(parameters["machine_name"], "machine_name")
     elif operation_kind == "group_service_advance":
-        parameters = group_service_advance_parameters(parameters)
+        parameters = validate_group_service_advance_parameters(parameters)
         parameters["machine_name"] = _require_identifier(parameters["machine_name"], "machine_name")
     elif operation_kind == "recovery_source_hold":
         parameters = source_hold_parameters(parameters)
@@ -1213,12 +1194,8 @@ def _request_parameters(operation_kind: str, value: object) -> dict[str, Any]:
             parameters["process_identity"], "authority_running_publish process_identity"
         )
         parameters["process_created_at"] = _require_timestamp(parameters["process_created_at"], "process_created_at")
-    elif operation_kind == "scheduler_due_offer":
-        _require_exact_keys(parameters, frozenset({"machine_name"}), "scheduler_due_offer parameters")
-        parameters["machine_name"] = _require_identifier(parameters["machine_name"], "machine_name")
-    elif operation_kind == "scheduler_ready_index_build":
-        _require_exact_keys(parameters, frozenset({"machine_name"}), "scheduler_ready_index_build parameters")
-        parameters["machine_name"] = _require_identifier(parameters["machine_name"], "machine_name")
+    elif operation_kind in scheduler.OPERATIONS:
+        scheduler.validate_parameters(operation_kind, parameters)
     elif operation_kind == "maintenance_descriptor_advance":
         _require_exact_keys(parameters, frozenset({"machine_name"}), "maintenance_descriptor_advance parameters")
         parameters["machine_name"] = _require_identifier(parameters["machine_name"], "machine_name")
@@ -1618,14 +1595,8 @@ def _request_fields(value: object) -> dict[str, Any]:
             raise ValueError("reservation_identity differs from its request binding.")
         if offer_id is not None:
             raise ValueError("scheduler_reservation_reconcile cannot name a provisional offer.")
-    elif operation_kind == "scheduler_due_offer":
-        _require_exact_keys(revisions, frozenset(), "scheduler_due_offer source_revisions")
-        if offer_id is not None:
-            raise ValueError("scheduler_due_offer cannot name a provisional offer.")
-    elif operation_kind == "scheduler_ready_index_build":
-        _require_exact_keys(revisions, frozenset(), "scheduler_ready_index_build source_revisions")
-        if offer_id is not None:
-            raise ValueError("scheduler_ready_index_build cannot name a provisional offer.")
+    elif operation_kind in scheduler.OPERATIONS:
+        scheduler.validate_source(operation_kind, revisions, offer_id)
     elif operation_kind == "maintenance_descriptor_advance":
         _require_exact_keys(revisions, frozenset(), "maintenance_descriptor_advance source_revisions")
         if offer_id is not None:
@@ -1989,61 +1960,9 @@ def _validate_evidence(request: ProjectIORequest, status: str, value: Mapping[st
                 raise ValueError("required_capabilities evidence is invalid.")
             evidence["required_capabilities"] = list(capabilities)
         elif request.operation_kind == "scheduler_due_offer":
-            _require_exact_keys(
-                evidence,
-                frozenset({"outcome", "reason", "task_id"}),
-                "scheduler_due_offer evidence",
-            )
-            reasons = {
-                "offered",
-                "no_due_deadline",
-                "task_missing",
-                "task_not_queued",
-                "claim_active",
-                "not_home_machine",
-                "deadline_not_due",
-                "elapsed_offer_unproven",
-                "offer_rejected",
-            }
-            if evidence["outcome"] not in {"offered", "noop"} or evidence["reason"] not in reasons:
-                raise ValueError("scheduler_due_offer outcome or reason is invalid.")
-            if (evidence["outcome"] == "offered") != (evidence["reason"] == "offered"):
-                raise ValueError("scheduler_due_offer outcome and reason do not agree.")
-            task_id = evidence["task_id"]
-            if evidence["reason"] == "no_due_deadline":
-                if task_id is not None:
-                    raise ValueError("scheduler_due_offer empty result cannot name a Task.")
-            else:
-                evidence["task_id"] = _require_identifier(task_id, "scheduler_due_offer task_id")
+            scheduler.validate_due_offer_evidence(evidence)
         elif request.operation_kind == "scheduler_ready_index_build":
-            _require_exact_keys(
-                evidence,
-                frozenset({"state", "revision", "build_id", "phase"}),
-                "scheduler_ready_index_build evidence",
-            )
-            if evidence["state"] not in {"absent", "building", "active", "degraded"}:
-                raise ValueError("scheduler_ready_index_build state is invalid.")
-            revision = evidence["revision"]
-            if type(revision) is not int or revision < 0:
-                raise ValueError("scheduler_ready_index_build revision is invalid.")
-            build_id = evidence["build_id"]
-            phase = evidence["phase"]
-            if build_id is not None:
-                build_id = _require_identifier(build_id, "scheduler_ready_index_build build_id")
-            if phase is not None and phase not in {
-                "reset-projection",
-                "inventory",
-                "backfill",
-                "audit",
-                "primary-rebuild",
-            }:
-                raise ValueError("scheduler_ready_index_build phase is invalid.")
-            if evidence["state"] != "building" and (build_id is not None or phase is not None):
-                raise ValueError("scheduler_ready_index_build non-building evidence cannot name a build.")
-            if evidence["state"] == "building" and (build_id is None or phase is None):
-                raise ValueError("scheduler_ready_index_build building evidence requires build identity.")
-            evidence["build_id"] = build_id
-            evidence["phase"] = phase
+            scheduler.validate_ready_index_build_evidence(evidence)
         elif request.operation_kind == "maintenance_descriptor_advance":
             _require_exact_keys(
                 evidence,
@@ -2398,9 +2317,9 @@ def _validate_evidence(request: ProjectIORequest, status: str, value: Mapping[st
                 _json_copy(evidence), _json_copy(request.parameters), request.registration_generation
             )
         elif request.operation_kind == "group_service_probe":
-            evidence = group_service_probe_evidence(evidence)
+            evidence = validate_group_service_probe_evidence(evidence)
         elif request.operation_kind == "group_service_advance":
-            evidence = group_service_advance_evidence(evidence, request.parameters["candidate"])
+            evidence = validate_group_service_advance_evidence(evidence, request.parameters["candidate"])
         elif request.operation_kind == "observation_service":
             _require_exact_keys(
                 evidence, frozenset({"state", "quiescent", "reason_code"}), "observation_service evidence"

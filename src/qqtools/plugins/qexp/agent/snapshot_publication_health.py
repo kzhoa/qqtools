@@ -10,7 +10,7 @@ from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Literal
 
 if TYPE_CHECKING:
-    from .project_io_controller import _ValidationIdentity
+    from .project_io.identity import ValidationIdentity
 
 SNAPSHOT_HEALTH_ITEM_LIMIT = 8
 SNAPSHOT_COVERAGE_FILENAME = "snapshot-coverage.json"
@@ -95,8 +95,8 @@ class SnapshotPublicationHealth:
         self._utc_clock = utc_clock
         self._max_retry_seconds = max_retry_seconds
         self._instance_id: str | None = None
-        self._progress: dict[tuple[_ValidationIdentity, str], _PublicationProgress] = {}
-        self._last_publication: dict[_ValidationIdentity, tuple[str, float]] = {}
+        self._progress: dict[tuple[ValidationIdentity, str], _PublicationProgress] = {}
+        self._last_publication: dict[ValidationIdentity, tuple[str, float]] = {}
         self._observations: dict[tuple[str, str, str], _PublicationObservation] = {}
 
     def reset_instance(self, instance_id: str) -> None:
@@ -106,7 +106,7 @@ class SnapshotPublicationHealth:
             self._observations.clear()
             self._instance_id = instance_id
 
-    def prune(self, current_identities: Collection[_ValidationIdentity]) -> None:
+    def prune(self, current_identities: Collection[ValidationIdentity]) -> None:
         self._progress = {
             key: entry
             for key, entry in self._progress.items()
@@ -133,7 +133,7 @@ class SnapshotPublicationHealth:
             return None
         return observation.sequence, observation.last_published_at
 
-    def record_snapshot_evidence(self, identity: _ValidationIdentity, snapshot_at: str, accepted_at: str) -> None:
+    def record_snapshot_evidence(self, identity: ValidationIdentity, snapshot_at: str, accepted_at: str) -> None:
         owner = identity.request_owner
         observation = self._observations[owner]
         self._observations[owner] = replace(observation, snapshot_evidence=(snapshot_at, accepted_at))
@@ -146,22 +146,22 @@ class SnapshotPublicationHealth:
         observation = self._observations.get((runtime_id, project_id, registration_generation))
         return observation.snapshot_evidence if observation is not None else None
 
-    def discard_progress(self, identity: _ValidationIdentity, instance_id: str) -> None:
+    def discard_progress(self, identity: ValidationIdentity, instance_id: str) -> None:
         self._progress.pop((identity, instance_id), None)
 
-    def stage(self, identity: _ValidationIdentity, instance_id: str) -> str | None:
+    def stage(self, identity: ValidationIdentity, instance_id: str) -> str | None:
         entry = self._progress.get((identity, instance_id))
         return entry.stage if entry is not None else None
 
-    def last_publication(self, identity: _ValidationIdentity) -> tuple[str, float] | None:
+    def last_publication(self, identity: ValidationIdentity) -> tuple[str, float] | None:
         return self._last_publication.get(identity)
 
-    def record_publication(self, identity: _ValidationIdentity, signature: str, published_at: float) -> None:
+    def record_publication(self, identity: ValidationIdentity, signature: str, published_at: float) -> None:
         self._last_publication[identity] = (signature, published_at)
 
     def begin_intent(
         self,
-        identity: _ValidationIdentity,
+        identity: ValidationIdentity,
         instance_id: str,
         heartbeat_interval_seconds: int | float,
         *,
@@ -184,7 +184,7 @@ class SnapshotPublicationHealth:
 
     def report_request(
         self,
-        identity: _ValidationIdentity,
+        identity: ValidationIdentity,
         instance_id: str,
         heartbeat_interval_seconds: int | float,
         request_id: str,
@@ -232,7 +232,7 @@ class SnapshotPublicationHealth:
 
     def report_failure(
         self,
-        identity: _ValidationIdentity,
+        identity: ValidationIdentity,
         instance_id: str,
         heartbeat_interval_seconds: int | float,
         *,
@@ -301,7 +301,7 @@ class SnapshotPublicationHealth:
         return {"total": total, "omitted_count": total - len(retained), "items": retained}
 
     def _entry(
-        self, identity: _ValidationIdentity, instance_id: str, heartbeat_interval_seconds: int | float
+        self, identity: ValidationIdentity, instance_id: str, heartbeat_interval_seconds: int | float
     ) -> _PublicationProgress:
         key = (identity, instance_id)
         stale_after = float(heartbeat_interval_seconds) * 3.0

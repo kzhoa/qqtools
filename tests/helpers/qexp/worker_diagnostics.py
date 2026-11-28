@@ -11,8 +11,8 @@ from qqtools.plugins.qexp.runtime.store import read_json_limited
 
 def trace_project_io_requests() -> None:
     """Print a bounded actual request chronology inside a test-owned agent."""
-    from qqtools.plugins.qexp.agent.project_io_admission import ProjectIOAdmission
-    from qqtools.plugins.qexp.agent.project_io_executor import ProjectIOExecutor
+    from qqtools.plugins.qexp.agent.project_io.admission import ProjectIOAdmission
+    from qqtools.plugins.qexp.agent.project_io.executor import ProjectIOExecutor
 
     original_start = ProjectIOExecutor.start
     original_consume = ProjectIOExecutor.consume

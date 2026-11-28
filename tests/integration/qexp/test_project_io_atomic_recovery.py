@@ -13,7 +13,7 @@ import pytest
 
 from qqtools.plugins.qexp import init_shared_root
 from qqtools.plugins.qexp.agent.context import MachineRuntime
-from qqtools.plugins.qexp.agent.project_io_executor import ProjectIOExecutor
+from qqtools.plugins.qexp.agent.project_io.executor import ProjectIOExecutor
 from qqtools.plugins.qexp.agent.setup import initialize_machine
 
 pytestmark = [pytest.mark.integration, pytest.mark.qexp_fast_io]

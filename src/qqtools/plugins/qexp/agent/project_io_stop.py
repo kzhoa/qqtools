@@ -9,7 +9,7 @@ from typing import Any
 from ..gpu_policy import show_gpu_policy
 from ..runtime.resources.reservations import reservation_snapshot
 from .context import MachineRuntime, ProjectBinding
-from .project_io_executor import ProjectIOExecutor
+from .project_io.executor import ProjectIOExecutor
 
 PROJECT_STOP_PUBLICATION_BUDGET_SECONDS = 2.0
 

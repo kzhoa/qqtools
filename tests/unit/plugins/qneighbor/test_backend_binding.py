@@ -1,18 +1,21 @@
 """One-time selection, precise fallback and direct-function binding."""
 
 from concurrent.futures import ThreadPoolExecutor
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
 
+from qqtools.plugins import qneighbor
 from qqtools.plugins.qneighbor import cuda
+from qqtools.plugins.qneighbor._boundary import make_neighbor_list
 
 
 @pytest.fixture
 def binding(monkeypatch):
-    previous = {name: cuda.__dict__.get(name) for name in cuda._LAZY_NAMES}
+    previous = {name: cuda.__dict__.get(name) for name in qneighbor.__all__}
     monkeypatch.setattr(cuda, "_selected", None)
-    for name in cuda._LAZY_NAMES:
+    for name in qneighbor.__all__:
         cuda.__dict__.pop(name, None)
     try:
         yield cuda
@@ -23,21 +26,20 @@ def binding(monkeypatch):
                 cuda.__dict__[name] = value
 
 
-def backend(name):
-    def graph(*args, **kwargs):
-        return 42
-
-    return cuda._Backend(name, graph, graph, graph, graph)
+def backend(obc=None, pbc=None):
+    obc = obc or Mock(return_value=42)
+    pbc = pbc or Mock(return_value=42)
+    return SimpleNamespace(
+        neighbor_list=make_neighbor_list(obc, pbc), neighbor_list_obc=obc, radius_graph=obc, neighbor_list_pbc=pbc
+    )
 
 
 def missing(name):
-    error = ImportError(f"Failed to import {name}")
-    error.__cause__ = ModuleNotFoundError(name, name=name)
-    return error
+    return ModuleNotFoundError(name, name=name)
 
 
 def test_first_access_binds_real_functions_without_dispatch(binding, monkeypatch):
-    selected = backend("warp")
+    selected = backend()
     loader = Mock(return_value=selected)
     monkeypatch.setattr(binding, "_load_backend", loader)
     fn = binding.radius_graph
@@ -46,13 +48,13 @@ def test_first_access_binds_real_functions_without_dispatch(binding, monkeypatch
     loader.assert_called_once_with("warp")
     monkeypatch.setattr(binding, "_ensure_backend", Mock(side_effect=AssertionError("No repeated init")))
     monkeypatch.setattr(binding, "_load_backend", Mock(side_effect=AssertionError("No repeated lookup")))
-    for name in binding._FUNCTIONS:
+    for name in qneighbor.__all__:
         assert getattr(binding, name) is getattr(selected, name)
-        assert getattr(binding, name)() == 42
+    assert binding.neighbor_list_pbc() == 42
 
 
 def test_concurrent_init_selects_once(binding, monkeypatch):
-    selected = backend("warp")
+    selected = backend()
     loader = Mock(return_value=selected)
     monkeypatch.setattr(binding, "_load_backend", loader)
     with ThreadPoolExecutor(max_workers=8) as pool:
@@ -62,7 +64,7 @@ def test_concurrent_init_selects_once(binding, monkeypatch):
 
 
 def test_absent_warp_falls_back_once(binding, monkeypatch):
-    selected = backend("triton")
+    selected = backend()
     loader = Mock(side_effect=[missing("warp"), selected])
     monkeypatch.setattr(binding, "_load_backend", loader)
     assert binding._ensure_backend() is selected
@@ -80,7 +82,7 @@ def test_broken_warp_does_not_trigger_fallback(binding, monkeypatch, error):
         binding._ensure_backend()
     loader.assert_called_once_with("warp")
     assert binding._selected is None
-    assert all(name not in binding.__dict__ for name in binding._FUNCTIONS)
+    assert all(name not in binding.__dict__ for name in qneighbor.__all__)
 
 
 def test_both_missing_has_installation_guidance(binding, monkeypatch):
@@ -91,7 +93,7 @@ def test_both_missing_has_installation_guidance(binding, monkeypatch):
 
 
 def test_named_routes_are_direct_aliases(binding, monkeypatch):
-    selected = backend("warp")
+    selected = backend()
     monkeypatch.setattr(binding, "_load_backend", Mock(return_value=selected))
     binding._ensure_backend()
     assert binding.neighbor_list_obc is binding.radius_graph is selected.radius_graph
@@ -104,7 +106,7 @@ def test_short_name_dispatches_without_reselecting_backend(binding, monkeypatch)
     edges = torch.tensor([[1, 0], [0, 1]])
     periodic_result = (edges, torch.ones((2, 3), dtype=torch.long))
     obc, pbc = Mock(return_value=edges), Mock(return_value=periodic_result)
-    monkeypatch.setattr(binding, "_load_backend", Mock(return_value=cuda._Backend("warp", obc, pbc, pbc, pbc)))
+    monkeypatch.setattr(binding, "_load_backend", Mock(return_value=backend(obc, pbc)))
     search = binding.neighbor_list
     monkeypatch.setattr(binding, "_ensure_backend", Mock(side_effect=AssertionError("Repeated init")))
     pos = torch.zeros((2, 3))

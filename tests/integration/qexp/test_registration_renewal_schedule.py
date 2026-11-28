@@ -218,7 +218,7 @@ def test_registration_guard_callback_failure_prevents_shared_save(registration, 
 def test_idle_heartbeat_keeps_registration_alive_with_near_ttl_renewal_interval(registration):
     from qqtools.plugins.qexp.agent.control_plane import _MachineControlPlane
     from qqtools.plugins.qexp.agent.dispatch_loop import dispatch_machine_cycle_locked
-    from qqtools.plugins.qexp.agent.project_io_executor import ProjectIOExecutor
+    from qqtools.plugins.qexp.agent.project_io.executor import ProjectIOExecutor
 
     cfg, runtime, binding, path, _now, _publications = registration
     # The subprocess uses the system clock, so this integration slice replaces

@@ -12,9 +12,9 @@ import pytest
 from qqtools.plugins.qexp import init_shared_root, submit
 from qqtools.plugins.qexp.agent import project_io_orphan_recovery
 from qqtools.plugins.qexp.agent.context import MachineRuntime
-from qqtools.plugins.qexp.agent.project_io_controller import ProjectIOController
-from qqtools.plugins.qexp.agent.project_io_executor import ProjectIOExecutor
-from qqtools.plugins.qexp.agent.project_io_supervision import AttemptSupervisionCoordinator
+from qqtools.plugins.qexp.agent.project_io.controller import ProjectIOController
+from qqtools.plugins.qexp.agent.project_io.executor import ProjectIOExecutor
+from qqtools.plugins.qexp.agent.project_io.supervision.coordinator import AttemptSupervisionCoordinator
 from qqtools.plugins.qexp.agent.setup import initialize_machine
 from qqtools.plugins.qexp.infrastructure.process import process_start_time_ticks
 from qqtools.plugins.qexp.runtime import attempt_recovery

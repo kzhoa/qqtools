@@ -186,7 +186,7 @@ class SubmissionFinalizationError(RuntimeError):
         self.idempotency_key = idempotency_key
 
 
-class SubmissionResult(list[TaskRecord]):
+class RuntimeSubmissionResult(list[TaskRecord]):
     def __init__(
         self,
         tasks: Iterable[TaskRecord],
@@ -221,9 +221,9 @@ class SubmissionResult(list[TaskRecord]):
         }
 
 
-def _submission_result(tasks: Iterable[TaskRecord], submission: dict[str, Any]) -> SubmissionResult:
+def _submission_result(tasks: Iterable[TaskRecord], submission: dict[str, Any]) -> RuntimeSubmissionResult:
     context = submission.get("resolved_context") or {}
-    return SubmissionResult(
+    return RuntimeSubmissionResult(
         tasks,
         operation_id=submission["operation_id"],
         idempotency_key=submission["idempotency_key"],
@@ -828,7 +828,7 @@ def _execute_submission_locked(
     plan: SubmissionPlan,
     *,
     on_prepared: Callable[[str, str], None] | None = None,
-) -> SubmissionResult:
+) -> RuntimeSubmissionResult:
     """Execute a prepared operation while the schema and idempotency fences are held."""
     _validate_operation_plan(cfg, operation, plan)
     submission = operation["submission"]
@@ -1357,7 +1357,7 @@ def submit_specs(
     kind: str = "single",
     worker_set: list[str] | dict[str, Any] | None = None,
     on_prepared: Callable[[str, str], None] | None = None,
-) -> SubmissionResult:
+) -> RuntimeSubmissionResult:
     request = normalize_submission_request(specs, group_name=group_name, kind=kind, worker_set=worker_set)
     key = idempotency_key or new_id()
     if not isinstance(key, str):

@@ -23,14 +23,14 @@ class GroupServiceRequestSpec:
         if type(self.operation_kind) is not str or self.operation_kind not in _GROUP_SERVICE_OPERATION_KINDS:
             raise ValueError(f"unsupported Group-service request operation: {self.operation_kind!r}")
         validator = (
-            group_service_probe_parameters
+            validate_group_service_probe_parameters
             if self.operation_kind == "group_service_probe"
-            else group_service_advance_parameters
+            else validate_group_service_advance_parameters
         )
         object.__setattr__(self, "parameters", validator(self.parameters))
 
 
-def group_service_probe_parameters(value: object) -> dict[str, Any]:
+def validate_group_service_probe_parameters(value: object) -> dict[str, Any]:
     """Validate one Group-service census parameter object."""
     if not isinstance(value, Mapping) or set(value) != {"machine_name", "probe_state"}:
         raise ValueError("Group-service probe parameters have missing or unknown fields.")
@@ -40,15 +40,15 @@ def group_service_probe_parameters(value: object) -> dict[str, Any]:
     return {"machine_name": machine_name, "probe_state": validate_group_service_probe_state(value["probe_state"])}
 
 
-def group_service_probe_request(machine_name: str, probe_state: Mapping[str, Any]) -> GroupServiceRequestSpec:
+def build_group_service_probe_request(machine_name: str, probe_state: Mapping[str, Any]) -> GroupServiceRequestSpec:
     """Build one closed Group-service probe request specification."""
     return GroupServiceRequestSpec(
         operation_kind="group_service_probe",
-        parameters=group_service_probe_parameters({"machine_name": machine_name, "probe_state": probe_state}),
+        parameters=validate_group_service_probe_parameters({"machine_name": machine_name, "probe_state": probe_state}),
     )
 
 
-def group_service_probe_evidence(value: object) -> dict[str, Any]:
+def validate_group_service_probe_evidence(value: object) -> dict[str, Any]:
     """Validate one closed Group-service census result."""
     if not isinstance(value, Mapping) or set(value) != {"state", "probe_state", "candidate"}:
         raise ValueError("Group-service probe evidence has missing or unknown fields.")
@@ -56,7 +56,7 @@ def group_service_probe_evidence(value: object) -> dict[str, Any]:
     if state not in {"quiescent", "active", "pending"}:
         raise ValueError("Group-service probe state is invalid.")
     candidate_value = value["candidate"]
-    candidate = None if candidate_value is None else group_service_candidate(candidate_value)
+    candidate = None if candidate_value is None else validate_group_service_candidate(candidate_value)
     if (state == "active") != (candidate is not None):
         raise ValueError("Group-service active evidence must name exactly one candidate.")
     return {
@@ -66,7 +66,7 @@ def group_service_probe_evidence(value: object) -> dict[str, Any]:
     }
 
 
-def group_service_candidate(value: object) -> dict[str, Any]:
+def validate_group_service_candidate(value: object) -> dict[str, Any]:
     """Validate one exact candidate captured by the census."""
     if not isinstance(value, Mapping) or set(value) != {"group", "lane", "generation"}:
         raise ValueError("Group-service candidate is invalid.")
@@ -108,7 +108,7 @@ def initial_group_service_continuation(candidate: Mapping[str, Any]) -> dict[str
     return None
 
 
-def group_service_advance_parameters(value: object) -> dict[str, Any]:
+def validate_group_service_advance_parameters(value: object) -> dict[str, Any]:
     """Validate one exact bounded Group transaction request."""
 
     if not isinstance(value, Mapping) or set(value) != {
@@ -121,7 +121,7 @@ def group_service_advance_parameters(value: object) -> dict[str, Any]:
     machine_name = value["machine_name"]
     if not isinstance(machine_name, str) or not machine_name:
         raise ValueError("Group-service advance machine_name is invalid.")
-    candidate = group_service_candidate(value["candidate"])
+    candidate = validate_group_service_candidate(value["candidate"])
     return {
         "machine_name": machine_name,
         "candidate": candidate,
@@ -130,7 +130,7 @@ def group_service_advance_parameters(value: object) -> dict[str, Any]:
     }
 
 
-def group_service_advance_request(
+def build_group_service_advance_request(
     machine_name: str,
     candidate: Mapping[str, Any],
     continuation: Mapping[str, Any] | None,
@@ -139,7 +139,7 @@ def group_service_advance_request(
     """Build one closed Group-service advance request specification."""
     return GroupServiceRequestSpec(
         operation_kind="group_service_advance",
-        parameters=group_service_advance_parameters(
+        parameters=validate_group_service_advance_parameters(
             {
                 "machine_name": machine_name,
                 "candidate": candidate,
@@ -150,7 +150,7 @@ def group_service_advance_request(
     )
 
 
-def group_service_advance_evidence(value: object, candidate: Mapping[str, Any]) -> dict[str, Any]:
+def validate_group_service_advance_evidence(value: object, candidate: Mapping[str, Any]) -> dict[str, Any]:
     """Validate one bounded Group transaction result."""
 
     if not isinstance(value, Mapping) or set(value) != {"state", "continuation", "probe"}:
@@ -162,18 +162,18 @@ def group_service_advance_evidence(value: object, candidate: Mapping[str, Any]) 
     if probe is not None:
         if candidate["lane"] != "legacy" or value["state"] not in {"quiescent", "stale"}:
             raise ValueError("Only settled legacy Group work can carry a follow-up census.")
-        probe = group_service_probe_evidence(probe)
+        probe = validate_group_service_probe_evidence(probe)
     return {"state": value["state"], "continuation": continuation, "probe": probe}
 
 
 __all__ = [
     "GroupServiceRequestSpec",
-    "group_service_advance_evidence",
-    "group_service_advance_parameters",
-    "group_service_advance_request",
-    "group_service_candidate",
-    "group_service_probe_evidence",
-    "group_service_probe_parameters",
-    "group_service_probe_request",
+    "validate_group_service_advance_evidence",
+    "validate_group_service_advance_parameters",
+    "build_group_service_advance_request",
+    "validate_group_service_candidate",
+    "validate_group_service_probe_evidence",
+    "validate_group_service_probe_parameters",
+    "build_group_service_probe_request",
     "initial_group_service_continuation",
 ]

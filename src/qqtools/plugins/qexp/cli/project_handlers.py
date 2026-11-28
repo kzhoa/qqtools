@@ -546,7 +546,7 @@ def dispatch_project(
                     return CommandOutcome(130)
                 except BrokenPipeError:
                     return CommandOutcome(0)
-            log_commands.write_logs(cfg, args.task_id, tail_lines=args.tail)
+            log_commands.write_log_to_stream(cfg, args.task_id, tail_lines=args.tail)
             return CommandOutcome(0)
         elif handler == "task_wait":
             timeout = wait_commands.parse_wait_timeout(args.timeout)

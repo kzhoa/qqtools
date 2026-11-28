@@ -4,34 +4,25 @@ except ImportError:
     import json
 
 from pathlib import Path
-from typing import Any, Callable, Optional, Union
+from typing import Any, Callable, Union
+
+from ._atomic_file import atomic_output_file
 
 
 def save_json(
-    obj,
-    fpath,
+    obj: Any,
+    fpath: str | Path,
     indent: int = 2,
-    sort_keys=False,
-    default_serializer=None,
-    overwrite=True,
-    verbose=True,
+    sort_keys: bool = False,
+    default_serializer: Callable[[Any], Any] | None = None,
+    overwrite: bool = True,
+    verbose: bool = True,
 ) -> bool:
-    fpath = Path(fpath) if not isinstance(fpath, Path) else fpath
-
-    if Path(fpath).exists() and not overwrite:
-        if verbose:
-            print(f"File already exists: {fpath}")
-        return False
-
+    """Publish JSON atomically and return whether the file was saved."""
+    fpath = Path(fpath)
     try:
-        with open(fpath, "w", encoding="utf-8") as f:
-            json.dump(
-                obj,
-                f,
-                indent=indent,
-                sort_keys=sort_keys,
-                default=default_serializer,
-            )
+        with atomic_output_file(fpath, overwrite=overwrite) as staged, staged.open("w", encoding="utf-8") as f:
+            json.dump(obj, f, indent=indent, sort_keys=sort_keys, default=default_serializer)
         return True
     except Exception as e:
         if verbose:

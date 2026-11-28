@@ -7,12 +7,12 @@ from pathlib import Path
 import pytest
 
 from qqtools.plugins.qexp import init_shared_root, submit
-from qqtools.plugins.qexp.agent import project_io_supervision
 from qqtools.plugins.qexp.agent.bindings import ProjectBinding
 from qqtools.plugins.qexp.agent.context import MachineRuntime
-from qqtools.plugins.qexp.agent.project_io_controller import ProjectIOController
-from qqtools.plugins.qexp.agent.project_io_executor import ProjectIOExecutor
-from qqtools.plugins.qexp.agent.project_io_supervision import AttemptSupervisionCoordinator
+from qqtools.plugins.qexp.agent.project_io.controller import ProjectIOController
+from qqtools.plugins.qexp.agent.project_io.executor import ProjectIOExecutor
+from qqtools.plugins.qexp.agent.project_io.supervision import coordinator as project_io_supervision
+from qqtools.plugins.qexp.agent.project_io.supervision.coordinator import AttemptSupervisionCoordinator
 from qqtools.plugins.qexp.agent.setup import initialize_machine
 from qqtools.plugins.qexp.commands.task import retry
 from qqtools.plugins.qexp.runtime.paths import attempt_path, local_paths

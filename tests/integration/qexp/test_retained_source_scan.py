@@ -9,9 +9,9 @@ import pytest
 
 from qqtools.plugins.qexp import init_shared_root
 from qqtools.plugins.qexp.agent.context import MachineRuntime
-from qqtools.plugins.qexp.agent.project_io_controller import ProjectIOController
-from qqtools.plugins.qexp.agent.project_io_executor import ProjectIOExecutor
-from qqtools.plugins.qexp.agent.project_io_protocol import ProjectIOProcess
+from qqtools.plugins.qexp.agent.project_io.controller import ProjectIOController
+from qqtools.plugins.qexp.agent.project_io.executor import ProjectIOExecutor
+from qqtools.plugins.qexp.agent.project_io.protocol import ProjectIOProcess
 from qqtools.plugins.qexp.agent.recovery_capture import recovery_owner
 from qqtools.plugins.qexp.agent.recovery_transport import decode_capture_locator
 from qqtools.plugins.qexp.agent.setup import initialize_machine
@@ -468,7 +468,7 @@ def test_source_release_worker_uses_exact_local_receipt_without_target_writes(ca
 
 @pytest.mark.parametrize("failure", ["exception", "epoch", "receipt"])
 def test_lost_source_release_result_is_unknown_until_exact_replay(case, monkeypatch, failure):
-    from qqtools.plugins.qexp.agent import project_io_worker as worker
+    from qqtools.plugins.qexp.agent.project_io import worker
 
     runtime, binding, source, target, *_middle, executor = case
     proof = complete_empty_capture(case)
@@ -565,7 +565,7 @@ def test_group_authority_worker_activates_shared_truth_without_local_effects(cas
 
 @pytest.mark.parametrize("failure", ["epoch_before_move", "exception_after_move", "epoch_after_move"])
 def test_group_directory_move_is_fenced_and_ambiguous_publication_remains_unknown(case, monkeypatch, failure):
-    from qqtools.plugins.qexp.agent import project_io_worker as worker
+    from qqtools.plugins.qexp.agent.project_io import worker
 
     runtime, binding, _source, _target, *_middle, executor = case
     proof = complete_empty_capture(case)
@@ -772,7 +772,7 @@ def test_generation_source_normalization_cannot_skip_local_reset(case):
 
 @pytest.mark.parametrize("phase", ["retain", "normalize"])
 def test_generation_result_loss_after_source_effect_is_unknown_not_local_reset(case, monkeypatch, phase):
-    from qqtools.plugins.qexp.agent import project_io_worker as worker
+    from qqtools.plugins.qexp.agent.project_io import worker
 
     runtime, _binding, source, target, *_middle, executor = case
     proof = complete_empty_capture(case)

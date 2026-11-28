@@ -224,7 +224,7 @@ def _query_kernel(dtype, periodic_images, full_pbc=False):
 
 
 @torch.no_grad()
-def build_neighbor_list_batch_warp(
+def grid_neighbors(
     positions: Tensor,
     cell: Tensor | None,
     pbc: Tensor | None,

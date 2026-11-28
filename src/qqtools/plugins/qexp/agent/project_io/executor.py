@@ -20,18 +20,20 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any, Mapping, TypeVar
 
-from ..runtime.locks import exclusive
-from ..runtime.paths import machine_project_paths, machine_runtime_paths
-from ..runtime.records import utc_now, validate_identifier
-from ..runtime.resources.reservations import (
+from ...runtime.locks import exclusive
+from ...runtime.paths import machine_project_paths, machine_runtime_paths
+from ...runtime.records import utc_now, validate_identifier
+from ...runtime.resources.reservations import (
     ReservationIdentity,
     classify_exact_reservation,
     classify_executor_offer,
     release_executor_offer,
 )
-from ..runtime.store import atomic_replace, read_json_bytes_limited, read_json_limited, require_json_size
-from .group_service_transport import GroupServiceRequestSpec
-from .project_io_protocol import (
+from ...runtime.store import atomic_replace, read_json_bytes_limited, read_json_limited, require_json_size
+from ..group_service_transport import GroupServiceRequestSpec
+from ..takeover_intent import TakeoverIntent
+from ..takeover_transport import takeover_registration_parameters
+from .protocol import (
     IDLE_DECISION_GUARD_PROJECT_ID,
     PROJECT_IO_CAPACITY,
     PROJECT_IO_MAX_RECORD_BYTES,
@@ -48,7 +50,8 @@ from .project_io_protocol import (
     ProjectIOResult,
     authority_terminal_transition_digest,
 )
-from .project_io_transport_support import (
+from .protocol.scheduler import OPERATIONS as SCHEDULER_WORK_OPERATIONS
+from .transport import (
     _PROCESS_ABSENT,
     _PROCESS_LIVE,
     _PROCESS_UNVERIFIED,
@@ -57,8 +60,6 @@ from .project_io_transport_support import (
     _resolve_runtime_id,
     inspect_process_identity,
 )
-from .takeover_intent import TakeoverIntent
-from .takeover_transport import takeover_registration_parameters
 
 _RECORD_ID = re.compile(r"^[0-9a-f]{32}$")
 _RECORD_NAME = re.compile(r"([0-9a-f]{32})\.json")
@@ -1805,21 +1806,11 @@ class ProjectIOExecutor:
             raise ValueError("stale descriptor resolution requires maintenance_descriptor_advance.")
         return self._resolve_stale_request(request_id, current_request)
 
-    def resolve_stale_scheduler_due_offer(self, request_id: str, current_request: ProjectIORequest) -> bool:
-        """Archive obsolete due-offer work only after proving worker absence."""
-        if current_request.operation_kind != "scheduler_due_offer":
-            raise ValueError("stale due-offer resolution requires scheduler_due_offer.")
-        return self._resolve_stale_request(request_id, current_request)
-
-    def resolve_stale_scheduler_ready_index_build(
-        self,
-        request_id: str,
-        current_request: ProjectIORequest,
-    ) -> bool:
-        """Archive obsolete ready-index work only after proving worker absence."""
-        if current_request.operation_kind != "scheduler_ready_index_build":
-            raise ValueError("stale ready-index resolution requires scheduler_ready_index_build.")
-        return self._resolve_stale_request(request_id, current_request)
+    def resolve_stale_scheduler_work(self, request: ProjectIORequest) -> bool:
+        """Archive obsolete scheduling work only after proving worker absence."""
+        if request.operation_kind not in SCHEDULER_WORK_OPERATIONS:
+            raise ValueError("Expected a due-offer or ready-index request.")
+        return self._resolve_stale_request(request.request_id, request)
 
     def reset_ambiguous_machine_snapshot_for_retry(
         self,
@@ -2508,28 +2499,12 @@ class ProjectIOExecutor:
             operation_kind=operation_kind,
         )
 
-    def reset_ambiguous_scheduler_due_offer_for_retry(
-        self,
-        request_id: str,
-        current_request: ProjectIORequest,
-    ) -> bool:
-        """Make one exact fenced due-offer advance replayable."""
+    def reset_ambiguous_scheduler_work(self, request: ProjectIORequest) -> bool:
+        """Make the same bounded scheduling request replayable after a possible shared write."""
+        if request.operation_kind not in SCHEDULER_WORK_OPERATIONS:
+            raise ValueError("Expected a due-offer or ready-index request.")
         return self._reset_ambiguous_request_for_retry(
-            request_id,
-            current_request,
-            operation_kind="scheduler_due_offer",
-        )
-
-    def reset_ambiguous_scheduler_ready_index_build_for_retry(
-        self,
-        request_id: str,
-        current_request: ProjectIORequest,
-    ) -> bool:
-        """Make one exact fenced ready-index slice replayable."""
-        return self._reset_ambiguous_request_for_retry(
-            request_id,
-            current_request,
-            operation_kind="scheduler_ready_index_build",
+            request.request_id, request, operation_kind=request.operation_kind
         )
 
     def resolve_stale_scheduler_launch_authorize(

@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from qqtools.plugins.qexp.agent.project_io_protocol import ProjectIORequest, ProjectIOResult
+from qqtools.plugins.qexp.agent.project_io.protocol import ProjectIORequest, ProjectIOResult
 
 
 def _request(tmp_path: Path) -> ProjectIORequest:

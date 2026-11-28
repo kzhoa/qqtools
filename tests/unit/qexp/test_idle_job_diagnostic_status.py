@@ -11,6 +11,7 @@ import pytest
 from qqtools.plugins.qexp.agent import idle_job as module
 from qqtools.plugins.qexp.agent.context import MachineRuntime
 from qqtools.plugins.qexp.agent.idle_job_config import set_idle_job_config
+from qqtools.plugins.qexp.agent.idle_job_status import validate_status
 from qqtools.plugins.qexp.agent.setup import initialize_machine
 from qqtools.plugins.qexp.runtime.store import atomic_replace
 
@@ -163,7 +164,7 @@ def test_v1_reader_accepts_enriched_file_and_new_reader_accepts_base(supervised)
     supervisor._publish(state="waiting", reason="unknown_demand")
     envelope = _envelope(runtime)
     # This is precisely the released v1 reader contract: select and validate the member.
-    assert module._canonical_status(envelope["idle_job_status"])["reason"] == "unknown_demand"
+    assert validate_status(envelope["idle_job_status"])["reason"] == "unknown_demand"
     assert module.idle_job_status(runtime)["demand_detail"]["code"] == "upgrade_blocks_idle"
 
 

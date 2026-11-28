@@ -6,9 +6,13 @@ import operator
 import torch
 from torch import Tensor
 
-from ._periodic_bounded import build_pbc
+from ._periodic_bounded import search_bounded
+from ._periodic_geometry import prepare_geometry
+from ._periodic_whole import search_whole
+from .obc import open_radius_graph
 
 
+@torch.no_grad()
 def neighbor_list_pbc(
     positions: Tensor,
     cutoff: float,
@@ -24,7 +28,10 @@ def neighbor_list_pbc(
         positions: Cartesian CUDA coordinates (N, 3), float32 or float64.
         cutoff: Strict positive distance cutoff.
         batch: Optional nonnegative int64 graph IDs on positions.device;
-            defaults to a single graph.
+            defaults to a single graph. Assign consecutive IDs from 0 to B-1
+            within each batch and use them to index per-graph cell and pbc rows.
+            Nodes may be interleaved. GPU workspaces scale with max(batch) + 1,
+            so gaps can increase memory use and runtime.
         max_neighbors: Positive incoming cap per target; defaults to 32.
         cell: Row-vector lattice (3, 3) or (B, 3, 3), required for periodic axes.
         pbc: True for full PBC (default), False for OBC, or axis flags (3,)/(B,3).
@@ -36,38 +43,10 @@ def neighbor_list_pbc(
     """
     if batch is None:
         batch = torch.zeros(len(positions), device=positions.device, dtype=torch.long)
-    return build_neighbor_list_batch(positions, cell, pbc, batch, cutoff, max_neighbors)
-
-
-def build_neighbor_list_batch(
-    positions: Tensor,
-    cell: Tensor | None,
-    pbc: Tensor | bool,
-    batch: Tensor,
-    cutoff: float,
-    max_neighbors: int = 32,
-) -> tuple[Tensor, Tensor]:
-    """Build incoming CUDA edges and integer offsets using bounded ghost queries.
-
-    Args:
-        positions: CUDA float32/float64 Cartesian coordinates (N, 3).
-        cell: Row-vector cells (3, 3) or (B, 3, 3); None for all-open input.
-        pbc: Boolean or axis flags (3,) / (B, 3). Single rows broadcast.
-        batch: Nonnegative int64 graph IDs on the positions device.
-        cutoff: Strict positive distance cutoff.
-        max_neighbors: Positive incoming neighbor cap; defaults to 32.
-
-    Returns:
-        Int64 CUDA edge_index (2, E) and offsets (E, 3), with displacement
-        positions[target] - positions[source] + offsets @ cell_for_target.
-        Zero-offset self edges are excluded; periodic self images are retained.
-        Equal distances are ordered by source and integer offset.
-
-    Raises:
-        ValueError: If geometry, metadata or search parameters are invalid,
-            or periodic expansion exceeds supported indexing/tile limits.
-    """
-    if not math.isfinite(cutoff) or cutoff <= 0 or operator.index(max_neighbors) <= 0:
+    if not math.isfinite(cutoff) or cutoff <= 0:
+        raise ValueError("Expected positive cutoff and neighbor cap")
+    cap = operator.index(max_neighbors)
+    if cap <= 0:
         raise ValueError("Expected positive cutoff and neighbor cap")
     if not isinstance(pbc, (bool, Tensor)):
         raise ValueError("Expected a Boolean or tensor PBC mask")
@@ -77,17 +56,44 @@ def build_neighbor_list_batch(
         raise ValueError("Expected cell metadata of shape (3, 3) or (B, 3, 3)")
     if pbc is True and cell is None:
         raise ValueError("Periodic graphs require cell metadata")
-    return build_pbc(positions, cell, pbc, batch, cutoff, max_neighbors)
-
-
-def build_neighbor_list_batch_full_pbc(
-    positions: Tensor,
-    cell: Tensor,
-    batch: Tensor,
-    cutoff: float,
-    max_neighbors: int = 32,
-) -> tuple[Tensor, Tensor]:
-    """Build CUDA neighbors assuming every axis is periodic."""
+    pos = positions
+    if (
+        not pos.is_cuda
+        or pos.dtype not in (torch.float32, torch.float64)
+        or pos.shape != (len(batch), 3)
+        or batch.dtype != torch.long
+        or batch.ndim != 1
+        or batch.device != pos.device
+    ):
+        raise ValueError("Expected FP32 or FP64 CUDA positions and int64 graph IDs")
+    if not len(pos):
+        return batch.new_empty((2, 0)), batch.new_empty((0, 3))
+    minimum, maximum = torch.aminmax(batch)
+    first, last = torch.stack((minimum, maximum)).tolist()
+    if first < 0:
+        raise ValueError("Negative graph ID")
+    graphs = last + 1
+    mask = None
+    if isinstance(pbc, bool):
+        has_images = pbc
+    else:
+        mask = pbc.to(pos.device, torch.bool).reshape(-1, 3)
+        mask = mask.expand(graphs, -1) if len(mask) == 1 else mask[:graphs]
+        if len(mask) != graphs:
+            raise ValueError("Missing PBC metadata")
+        has_images = bool(mask.any())
+    if not has_images:
+        edges = open_radius_graph(pos, cutoff, batch, cap)
+        return edges, edges.new_zeros((edges.shape[1], 3))
     if cell is None:
-        raise ValueError("Periodic graphs require cell metadata")
-    return build_neighbor_list_batch(positions, cell, True, batch, cutoff, max_neighbors)
+        raise ValueError("Expected periodic cells")
+    cell = cell.to(pos.device, pos.dtype).reshape(-1, 3, 3)
+    cell = cell.expand(graphs, -1, -1) if len(cell) == 1 else cell[:graphs]
+    if len(cell) != graphs:
+        raise ValueError("Missing cell metadata")
+    if mask is not None:
+        cell = torch.where(mask.any(1)[:, None, None], cell, torch.eye(3, device=pos.device, dtype=pos.dtype))
+    pos, cell, batch = pos.contiguous(), cell.contiguous(), batch.contiguous()
+    geometry = prepare_geometry(pos, cell, batch, cutoff)
+    search = search_whole if cap > 256 else search_bounded
+    return search(pos, cell, mask, batch, cutoff, cap, geometry)

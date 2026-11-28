@@ -16,15 +16,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from ..runtime.authority_scan import EvidenceScan, is_path_present, validate_evidence_path
-from ..runtime.local_exit_reconciliation import LocalExitReconciler
-from ..runtime.paths import local_paths, machine_project_paths
-from ..runtime.process_evidence import inspect_local_group_identity, inspect_wrapper_identity
-from ..runtime.records import utc_now, validate_identifier
-from ..runtime.resources.reservations import ReservationIdentity
-from ..runtime.responsibility_cleanup import evidence_write_guard
-from ..runtime.store import atomic_replace, read_json_limited
-from ..runtime.termination import (
+from ....runtime.authority_scan import EvidenceScan, is_path_present, validate_evidence_path
+from ....runtime.local_exit_reconciliation import LocalExitReconciler
+from ....runtime.paths import local_paths, machine_project_paths
+from ....runtime.process_evidence import inspect_local_group_identity, inspect_wrapper_identity
+from ....runtime.records import utc_now, validate_identifier
+from ....runtime.resources.reservations import ReservationIdentity
+from ....runtime.responsibility_cleanup import evidence_write_guard
+from ....runtime.store import atomic_replace, read_json_limited
+from ....runtime.termination import (
     RootConfig,
     advance_signals,
     attempt_control_lock,
@@ -39,19 +39,17 @@ from ..runtime.termination import (
     update_decision,
     update_timeout_retirement,
 )
-from ..runtime.work_budget import diagnostic_increment
-from .context import MachineRuntime, ProjectBinding
-from .process_reservation_recovery import ProcessReservationRecovery, registration_reservation
-from .project_io_controller import ProjectIOController
-from .project_io_orphan_recovery import OrphanRecovery
-from .project_io_process import PROCESS_IDENTITY_FIELDS, authority_evidence_matches_intent
-from .project_io_process import binding_prefix as _authority_due_binding_prefix
-from .project_io_process import binding_signature as _authority_binding_signature
-from .project_io_process import local_binding_config as _termination_local_config
-from .project_io_process import read_isolated_authority_manifest as _read_isolated_authority_manifest
-from .project_io_process import read_process_manifest as _read_process_manifest
-from .project_io_protocol import PROJECT_IO_CAPACITY, ProjectIORequest, authority_terminal_transition_digest
-from .project_io_terminal_proof import (
+from ....runtime.work_budget import diagnostic_increment
+from ...context import MachineRuntime, ProjectBinding
+from ...process_reservation_recovery import ProcessReservationRecovery, registration_reservation
+from ...project_io_orphan_recovery import OrphanRecovery
+from ...project_io_process import PROCESS_IDENTITY_FIELDS, authority_evidence_matches_intent
+from ...project_io_process import binding_prefix as _authority_due_binding_prefix
+from ...project_io_process import binding_signature as _authority_binding_signature
+from ...project_io_process import local_binding_config as _termination_local_config
+from ...project_io_process import read_isolated_authority_manifest as _read_isolated_authority_manifest
+from ...project_io_process import read_process_manifest as _read_process_manifest
+from ...project_io_terminal_proof import (
     TerminalObservationProof,
     TerminalPublicationProof,
     TerminationObservationProof,
@@ -62,15 +60,27 @@ from .project_io_terminal_proof import (
     matches_terminal_observation_identity,
     terminal_proof_matches_candidate,
 )
-from .project_io_terminal_proof import build_terminal_transition as _construct_terminal_transition
-from .project_io_terminal_proof import has_exact_terminal_revisions as _has_exact_terminal_revisions
-from .project_io_terminal_proof import terminal_transition_target as _select_terminal_transition_target
-from .project_io_termination_convergence import (
+from ...project_io_terminal_proof import build_terminal_transition as _construct_terminal_transition
+from ...project_io_terminal_proof import has_exact_terminal_revisions as _has_exact_terminal_revisions
+from ...project_io_terminal_proof import terminal_transition_target as _select_terminal_transition_target
+from ...project_io_termination_convergence import (
     TerminationConvergence,
     TerminationConvergenceEvidence,
     classify_termination_convergence,
 )
-from .working_set import BindingTurn
+from ...working_set import BindingTurn
+from ..controller import ProjectIOController
+from ..protocol import PROJECT_IO_CAPACITY, ProjectIORequest, authority_terminal_transition_digest
+from .evidence import (
+    SOURCE_ERRORS,
+    ProcessRecord,
+    canonical_record,
+    is_valid_utc_timestamp,
+    read_launch_intent,
+    read_process_record,
+    read_registration,
+)
+from .running_publication import RunningPublications
 
 _MAX_AUTHORITY_DUE_KEYS = 256
 _MAX_AUTHORITY_SCAN_STATES = 256
@@ -514,9 +524,6 @@ def advance_authority_renewals(
             intents.pop(project_id, None)
 
 
-_RUNNING_PUBLICATION_SOURCE_ERRORS = (OSError, RuntimeError, ValueError, TypeError, KeyError)
-_MAX_PENDING_RUNNING_PUBLICATIONS = 256
-_MAX_RUNNING_PUBLICATION_BINDINGS = 64
 _MAX_CACHED_TERMINAL_CANDIDATES = 256
 _SETTLED_TERMINAL_RECHECK_SECONDS = 5.0
 _MAX_TERMINAL_BINDINGS = 64
@@ -542,44 +549,6 @@ _SUPERVISION_OPERATION_KINDS = frozenset(
         "authority_running_publish",
     }
 )
-
-
-@dataclass(frozen=True, slots=True)
-class _RunningPublicationSource:
-    """One validated local registration or launch intent."""
-
-    record: dict[str, Any]
-    parameters: dict[str, Any]
-    identity: tuple[Any, ...]
-
-
-@dataclass(slots=True)
-class _RunningPublicationScans:
-    """Persistent discovery state for one binding signature."""
-
-    registrations: EvidenceScan
-    launch_intents: EvidenceScan
-    next_lane: str = "registration"
-    registrations_complete: bool = False
-    launch_intents_complete: bool = False
-
-    def close(self) -> None:
-        self.registrations.close()
-        self.launch_intents.close()
-
-    @property
-    def complete(self) -> bool:
-        """Whether both source lanes have reached EOF for this sweep."""
-        return self.registrations_complete and self.launch_intents_complete
-
-
-@dataclass(frozen=True, slots=True)
-class _TerminalProcessRecord:
-    """One validated local process manifest and its full canonical identity."""
-
-    record: dict[str, Any]
-    identity: str
-    parameters: dict[str, Any]
 
 
 @dataclass(frozen=True, slots=True)
@@ -658,104 +627,6 @@ class _TerminationCandidate:
     is_retained_replay: bool = False
 
 
-def _canonical_terminal_record(record: Mapping[str, Any]) -> str:
-    return json.dumps(
-        record,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-        allow_nan=False,
-    )
-
-
-def _is_valid_utc_timestamp(value: object) -> bool:
-    if not isinstance(value, str) or not value or len(value) > 40:
-        return False
-    try:
-        parsed = datetime.fromisoformat(value[:-1] + "+00:00" if value.endswith("Z") else value)
-    except ValueError:
-        return False
-    return parsed.tzinfo is not None and parsed.utcoffset() == timezone.utc.utcoffset(parsed)
-
-
-def _read_terminal_process_record(
-    path: Path,
-    project_root: Path,
-    binding: ProjectBinding,
-) -> _TerminalProcessRecord | None:
-    """Read one exact local process manifest for natural-exit supervision."""
-    if not validate_evidence_path(path, project_root):
-        return None
-    envelope = read_json_limited(path, max_bytes=65_536, record_type="process_manifest")
-    if set(envelope) != {"process"}:
-        return None
-    record = envelope.get("process")
-    if (
-        not isinstance(record, dict)
-        or type(record.get("protocol_version")) is not int
-        or record.get("protocol_version") != 1
-    ):
-        return None
-
-    task_id = record.get("task_id")
-    attempt_id = record.get("attempt_id")
-    if not isinstance(task_id, str) or not isinstance(attempt_id, str) or path.stem != attempt_id:
-        return None
-    try:
-        validate_identifier(task_id, "process task_id")
-        validate_identifier(attempt_id, "process attempt_id")
-    except ValueError:
-        return None
-    prefix = f"{task_id}-attempt-"
-    if not attempt_id.startswith(prefix):
-        return None
-    suffix = attempt_id[len(prefix) :]
-    if not suffix.isascii() or not suffix.isdigit():
-        return None
-    attempt_number = int(suffix)
-    if attempt_number < 1 or attempt_id != f"{task_id}-attempt-{attempt_number}":
-        return None
-
-    fencing_token = record.get("fencing_token")
-    reservation_id = record.get("reservation_id")
-    if (
-        record.get("machine_name") != binding.machine_name
-        or type(fencing_token) is not int
-        or fencing_token < 1
-        or record.get("observed_state") not in {"running", "exited"}
-    ):
-        return None
-    if reservation_id is not None:
-        try:
-            validate_identifier(reservation_id, "process reservation_id")
-        except ValueError:
-            return None
-
-    process_identity: dict[str, int | None] = {}
-    for field in PROCESS_IDENTITY_FIELDS:
-        if field not in record:
-            return None
-        value = record[field]
-        positive = field in {"wrapper_pid", "process_group_id"}
-        if value is not None and (type(value) is not int or value < (1 if positive else 0)):
-            return None
-        process_identity[field] = value
-
-    parameters = {
-        "task_id": task_id,
-        "attempt_id": attempt_id,
-        "attempt_number": attempt_number,
-        "fencing_token": fencing_token,
-        "reservation_id": reservation_id,
-        "process_identity": process_identity,
-    }
-    return _TerminalProcessRecord(
-        record=record,
-        identity=_canonical_terminal_record(record),
-        parameters=parameters,
-    )
-
-
 def _read_terminal_exit_observation(
     path: Path,
     project_root: Path,
@@ -777,12 +648,12 @@ def _read_terminal_exit_observation(
         or path.stem != attempt_id
         or record.get("task_id") not in {None, task_id}
         or type(record.get("observed_exit_code")) is not int
-        or not _is_valid_utc_timestamp(record.get("observed_at"))
+        or not is_valid_utc_timestamp(record.get("observed_at"))
     ):
         return None
     return _TerminalExitObservation(
         record=record,
-        identity=_canonical_terminal_record(record),
+        identity=canonical_record(record),
         exit_code=record["observed_exit_code"],
     )
 
@@ -818,7 +689,7 @@ def _termination_exit_observation_state(
         or path.stem != attempt_id
         or record.get("task_id") not in {None, task_id}
         or type(record.get("observed_exit_code")) is not int
-        or not _is_valid_utc_timestamp(record.get("observed_at"))
+        or not is_valid_utc_timestamp(record.get("observed_at"))
     ):
         return "invalid"
     if manifest_exit_code is None and not manifest_complete:
@@ -831,7 +702,7 @@ def _termination_exit_observation_state(
 def _termination_reservation_state(
     runtime_root: Path,
     binding: ProjectBinding,
-    process: _TerminalProcessRecord,
+    process: ProcessRecord,
 ) -> str:
     """Read one exact GPU/CPU reservation identity across all state lanes."""
     reservation_id = process.parameters.get("reservation_id")
@@ -890,7 +761,7 @@ def _termination_reservation_state(
 
 def _record_terminal_observation_problem(
     state: _TerminalBindingState,
-    process: _TerminalProcessRecord,
+    process: ProcessRecord,
     observation_path: Path,
 ) -> None:
     """Preserve legacy local diagnostics when strict terminal evidence is unusable."""
@@ -928,9 +799,9 @@ def _read_termination_process_record(
     path: Path,
     project_root: Path,
     binding: ProjectBinding,
-) -> _TerminalProcessRecord | None:
+) -> ProcessRecord | None:
     """Read a live manifest that has not acquired a natural exit observation."""
-    process = _read_terminal_process_record(path, project_root, binding)
+    process = read_process_record(path, project_root, binding)
     if process is None or process.record.get("observed_state") != "running":
         return None
     observation_path = project_root / "process-observations" / f"{process.parameters['attempt_id']}.json"
@@ -951,7 +822,7 @@ def _termination_holder_safe_deadline(process: Mapping[str, Any]) -> float | Non
     lease_expires_at = process.get("lease_expires_at")
     clock_error = process.get("clock_error_bound_seconds")
     if (
-        not _is_valid_utc_timestamp(lease_expires_at)
+        not is_valid_utc_timestamp(lease_expires_at)
         or type(clock_error) not in {int, float}
         or not math.isfinite(float(clock_error))
         or float(clock_error) < 0.0
@@ -1664,7 +1535,7 @@ def _apply_terminal_local_effects(
         if not acquired:
             return "deferred"
         acquired_guard = True
-        process = _read_terminal_process_record(candidate.process_path, paths["root"], candidate.binding)
+        process = read_process_record(candidate.process_path, paths["root"], candidate.binding)
         observation = _read_terminal_exit_observation(
             candidate.observation_path,
             paths["root"],
@@ -1698,7 +1569,7 @@ def _apply_terminal_local_effects(
         elif (
             process.record.get("observed_state") == "exited"
             and process.record.get("observed_exit_code") == candidate.exit_code
-            and _is_valid_utc_timestamp(process.record.get("observed_exited_at"))
+            and is_valid_utc_timestamp(process.record.get("observed_exited_at"))
         ):
             candidate.post_update_process = dict(process.record)
             candidate.post_update_process_identity = process.identity
@@ -1713,10 +1584,10 @@ def _apply_terminal_local_effects(
                     }
                 )
                 candidate.post_update_process = updated
-                candidate.post_update_process_identity = _canonical_terminal_record(updated)
+                candidate.post_update_process_identity = canonical_record(updated)
             try:
                 atomic_replace(candidate.process_path, {"process": candidate.post_update_process})
-            except _RUNNING_PUBLICATION_SOURCE_ERRORS:
+            except SOURCE_ERRORS:
                 # Preserve the exact desired record so an ambiguous local replace
                 # can be replayed without changing its timestamp or other fields.
                 return "deferred"
@@ -1724,222 +1595,6 @@ def _apply_terminal_local_effects(
     if acquired_guard and exact_evidence:
         reconciler.reconcile_observation(candidate.observation_path, bounded=True)
     return "applied"
-
-
-def _read_running_publication_source(
-    path: Path,
-    project_root: Path,
-    binding: ProjectBinding,
-    envelope_key: str,
-    *,
-    allow_unassigned_reservation: bool = False,
-) -> _RunningPublicationSource | None:
-    """Read one bounded runner registration and derive its canonical Attempt number."""
-    if not validate_evidence_path(path, project_root):
-        return None
-    envelope = read_json_limited(path, max_bytes=65_536, record_type=envelope_key)
-    if set(envelope) != {envelope_key}:
-        return None
-    record = envelope.get(envelope_key)
-    if (
-        envelope_key != "process_registration"
-        or not isinstance(record, dict)
-        or type(record.get("protocol_version")) is not int
-        or record.get("protocol_version") != 1
-    ):
-        return None
-
-    task_id = record.get("task_id")
-    attempt_id = record.get("attempt_id")
-    if not isinstance(task_id, str) or not isinstance(attempt_id, str) or path.stem != attempt_id:
-        return None
-    try:
-        validate_identifier(task_id, "process task_id")
-        validate_identifier(attempt_id, "process attempt_id")
-    except ValueError:
-        return None
-    prefix = f"{task_id}-attempt-"
-    suffix = attempt_id.removeprefix(prefix)
-    if not attempt_id.startswith(prefix) or not suffix.isascii() or not suffix.isdecimal():
-        return None
-    attempt_number = int(suffix)
-    if attempt_number < 1 or attempt_id != f"{task_id}-attempt-{attempt_number}":
-        return None
-
-    fencing_token = record.get("fencing_token")
-    reservation_id = registration_reservation(record, project_root)
-    process_created_at = record.get("process_created_at")
-    if record.get("machine_name") != binding.machine_name or type(fencing_token) is not int or fencing_token < 1:
-        return None
-    if not isinstance(process_created_at, str) or not process_created_at or len(process_created_at) > 40:
-        return None
-    if reservation_id is None:
-        if not allow_unassigned_reservation:
-            return None
-    elif isinstance(reservation_id, str):
-        try:
-            validate_identifier(reservation_id, "process reservation_id")
-        except ValueError:
-            return None
-    else:
-        return None
-    try:
-        parsed_created_at = datetime.fromisoformat(
-            process_created_at[:-1] + "+00:00" if process_created_at.endswith("Z") else process_created_at
-        )
-    except ValueError:
-        return None
-    if parsed_created_at.tzinfo is None or parsed_created_at.utcoffset() != timezone.utc.utcoffset(parsed_created_at):
-        return None
-
-    process_identity: dict[str, int | None] = {}
-    for field in PROCESS_IDENTITY_FIELDS:
-        if field not in record:
-            return None
-        value = record.get(field)
-        positive = field in {"wrapper_pid", "process_group_id"}
-        if value is not None and (type(value) is not int or value < (1 if positive else 0)):
-            return None
-        process_identity[field] = value
-
-    parameters = {
-        "task_id": task_id,
-        "attempt_id": attempt_id,
-        "attempt_number": attempt_number,
-        "fencing_token": fencing_token,
-        "reservation_id": reservation_id,
-        "process_identity": process_identity,
-        "process_created_at": process_created_at,
-    }
-    identity = (
-        task_id,
-        attempt_id,
-        attempt_number,
-        fencing_token,
-        binding.machine_name,
-        process_created_at,
-        *(process_identity[field] for field in PROCESS_IDENTITY_FIELDS),
-        json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
-    )
-    return _RunningPublicationSource(record=record, parameters=parameters, identity=identity)
-
-
-def _read_launch_intent_source(
-    path: Path,
-    project_root: Path,
-) -> _RunningPublicationSource | None:
-    """Read the smaller pre-child Runner envelope without inventing registration fields."""
-    if not validate_evidence_path(path, project_root):
-        return None
-    envelope = read_json_limited(path, max_bytes=65_536, record_type="launch_intent")
-    if set(envelope) != {"launch_intent"}:
-        return None
-    record = envelope.get("launch_intent")
-    if (
-        not isinstance(record, dict)
-        or type(record.get("protocol_version")) is not int
-        or record.get("protocol_version") != 1
-    ):
-        return None
-    task_id = record.get("task_id")
-    attempt_id = record.get("attempt_id")
-    fencing_token = record.get("fencing_token")
-    if (
-        not isinstance(task_id, str)
-        or not isinstance(attempt_id, str)
-        or path.stem != attempt_id
-        or type(fencing_token) is not int
-        or fencing_token < 1
-        or "wrapper_pid" not in record
-        or "wrapper_start_time_ticks" not in record
-    ):
-        return None
-    try:
-        validate_identifier(task_id, "launch intent task_id")
-        validate_identifier(attempt_id, "launch intent attempt_id")
-    except ValueError:
-        return None
-    prefix = f"{task_id}-attempt-"
-    suffix = attempt_id.removeprefix(prefix)
-    if (
-        not attempt_id.startswith(prefix)
-        or not suffix.isascii()
-        or not suffix.isdecimal()
-        or int(suffix) < 1
-        or attempt_id != f"{task_id}-attempt-{int(suffix)}"
-    ):
-        return None
-    wrapper_pid = record.get("wrapper_pid")
-    wrapper_ticks = record.get("wrapper_start_time_ticks")
-    if wrapper_pid is not None and (type(wrapper_pid) is not int or wrapper_pid < 1):
-        return None
-    if wrapper_ticks is not None and (type(wrapper_ticks) is not int or wrapper_ticks < 0):
-        return None
-    identity = (
-        task_id,
-        attempt_id,
-        fencing_token,
-        wrapper_pid,
-        wrapper_ticks,
-        json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
-    )
-    return _RunningPublicationSource(record=record, parameters={}, identity=identity)
-
-
-def _registration_matches_intent(
-    registration: _RunningPublicationSource,
-    intent: _RunningPublicationSource,
-) -> bool:
-    """Match only identity fields present before the child process exists."""
-    return all(
-        registration.record.get(field) == intent.record.get(field)
-        for field in (
-            "task_id",
-            "attempt_id",
-            "fencing_token",
-            "wrapper_pid",
-            "wrapper_start_time_ticks",
-        )
-    )
-
-
-def _ensure_running_manifest(
-    paths: Mapping[str, Path],
-    source: _RunningPublicationSource,
-) -> dict[str, Any]:
-    """Materialize a registration once and return its typed publication fields."""
-    attempt_id = source.parameters["attempt_id"]
-    manifest = paths["processes"] / f"{attempt_id}.json"
-    if not is_path_present(manifest):
-        process = dict(source.record)
-        process.update(
-            {
-                "observed_state": "running",
-                "supervisor": "agent",
-                "authority_state": "healthy",
-                "created_by": "agent",
-            }
-        )
-        atomic_replace(manifest, {"process": process})
-    return dict(source.parameters)
-
-
-def _terminal_matches_running_request(
-    request: ProjectIORequest,
-    binding: ProjectBinding,
-    terminal: _TerminalProcessRecord,
-) -> bool:
-    """Correlate an exited manifest with only its exact running publication."""
-    return (
-        request.operation_kind == "authority_running_publish"
-        and request.project_id == binding.project_id
-        and dict(request.parameters)
-        == {
-            "machine_name": binding.machine_name,
-            **terminal.parameters,
-            "process_created_at": terminal.record.get("process_created_at"),
-        }
-    )
 
 
 @dataclass(slots=True)
@@ -1980,9 +1635,7 @@ class AttemptSupervisionCoordinator:
         self.runtime = runtime
         self.controller = controller
         self._reservation_recovery = ProcessReservationRecovery(runtime.root)
-        self._scans: dict[tuple[str, ...], _RunningPublicationScans] = {}
-        self._running_publication_intents: dict[tuple[str, ...], Mapping[str, Any]] = {}
-        self._binding_offset = 0
+        self.running_publications = RunningPublications(runtime, controller)
         self._terminal_states: dict[tuple[str, ...], _TerminalBindingState] = {}
         self._terminal_candidates: dict[str, _TerminalCandidate] = {}
         self._settled_terminal_rechecks: dict[tuple[tuple[str, ...], str, str], float] = {}
@@ -2007,11 +1660,7 @@ class AttemptSupervisionCoordinator:
     def close(self) -> None:
         """Release all owned advisory scans; repeated calls are harmless."""
         self._reservation_recovery.close()
-        for scans in self._scans.values():
-            scans.close()
-        self._scans.clear()
-        self._running_publication_intents.clear()
-        self._binding_offset = 0
+        self.running_publications.close()
         for state in self._terminal_states.values():
             state.close()
         self._terminal_states.clear()
@@ -2107,7 +1756,7 @@ class AttemptSupervisionCoordinator:
     def _initial_reservation_settled(
         self,
         binding: ProjectBinding,
-        process: _TerminalProcessRecord,
+        process: ProcessRecord,
     ) -> bool:
         """Prove that a terminated process no longer owns a local reservation."""
         return _termination_reservation_state(self.runtime.root, binding, process) in {"unassigned", "released"}
@@ -2131,7 +1780,7 @@ class AttemptSupervisionCoordinator:
         signature: tuple[str, ...],
         decision_path_value: Path,
         *,
-        process: _TerminalProcessRecord | None = None,
+        process: ProcessRecord | None = None,
         decision: Mapping[str, Any] | None = None,
     ) -> TerminationConvergence | None:
         """Read complete bounded local evidence and classify one termination decision."""
@@ -2142,7 +1791,9 @@ class AttemptSupervisionCoordinator:
                 or not validate_evidence_path(decision_path_value, paths["root"])
                 or not decision_path_value.parent.name
             ):
-                result = TerminationConvergence("invalid", "termination_decision_invalid", None, False, False)
+                result = TerminationConvergence(
+                    "invalid", "termination_decision_invalid", None, process_absent=False, reservation_settled=False
+                )
                 self._record_termination_convergence(signature, decision_path_value.parent.name, result)
                 return result
             attempt_id = decision_path_value.parent.name
@@ -2153,19 +1804,21 @@ class AttemptSupervisionCoordinator:
                     "invalid",
                     "termination_decision_invalid",
                     None,
-                    False,
-                    False,
+                    process_absent=False,
+                    reservation_settled=False,
                 )
                 self._record_termination_convergence(signature, "invalid-attempt", result)
                 return result
             if process is None:
-                process = _read_terminal_process_record(
+                process = read_process_record(
                     paths["processes"] / f"{attempt_id}.json",
                     paths["root"],
                     binding,
                 )
             if process is None or process.parameters["attempt_id"] != attempt_id:
-                result = TerminationConvergence("invalid", "termination_decision_invalid", None, False, False)
+                result = TerminationConvergence(
+                    "invalid", "termination_decision_invalid", None, process_absent=False, reservation_settled=False
+                )
                 self._record_termination_convergence(signature, attempt_id, result)
                 return result
             if decision is None:
@@ -2180,12 +1833,16 @@ class AttemptSupervisionCoordinator:
                 except OSError:
                     raise
                 except (TypeError, ValueError):
-                    result = TerminationConvergence("invalid", "termination_decision_invalid", None, False, False)
+                    result = TerminationConvergence(
+                        "invalid", "termination_decision_invalid", None, process_absent=False, reservation_settled=False
+                    )
                     self._record_termination_convergence(signature, attempt_id, result)
                     return result
                 decision = envelope.get("termination_decision") if set(envelope) == {"termination_decision"} else None
             if not isinstance(decision, Mapping):
-                result = TerminationConvergence("invalid", "termination_decision_invalid", None, False, False)
+                result = TerminationConvergence(
+                    "invalid", "termination_decision_invalid", None, process_absent=False, reservation_settled=False
+                )
                 self._record_termination_convergence(signature, attempt_id, result)
                 return result
 
@@ -2207,7 +1864,9 @@ class AttemptSupervisionCoordinator:
                 and _termination_decision_matches_candidate(decision, candidate)
             )
             if not decision_matches:
-                result = TerminationConvergence("invalid", "termination_decision_invalid", None, False, False)
+                result = TerminationConvergence(
+                    "invalid", "termination_decision_invalid", None, process_absent=False, reservation_settled=False
+                )
                 self._record_termination_convergence(signature, attempt_id, result)
                 return result
 
@@ -2220,8 +1879,8 @@ class AttemptSupervisionCoordinator:
                         "invalid",
                         "timeout_decision_retirement_invalid",
                         None,
-                        False,
-                        False,
+                        process_absent=False,
+                        reservation_settled=False,
                     )
                     self._record_termination_convergence(signature, attempt_id, result)
                     return result
@@ -2241,24 +1900,24 @@ class AttemptSupervisionCoordinator:
                         "repairable",
                         "timeout_decision_retirement_pending",
                         None,
-                        False,
-                        False,
+                        process_absent=False,
+                        reservation_settled=False,
                     )
                 elif retirement is not None and retirement.get("state") == "retired":
                     result = TerminationConvergence(
                         "converged",
                         "timeout_decision_retired",
                         None,
-                        False,
-                        False,
+                        process_absent=False,
+                        reservation_settled=False,
                     )
                 else:
                     result = TerminationConvergence(
                         "repairable",
                         "timeout_decision_retirement_pending",
                         None,
-                        False,
-                        False,
+                        process_absent=False,
+                        reservation_settled=False,
                     )
                 self._record_termination_convergence(signature, attempt_id, result)
                 return result
@@ -2283,7 +1942,7 @@ class AttemptSupervisionCoordinator:
                         confirmation=decision.get("confirmation"),
                         manifest_state=process.record.get("observed_state"),
                         manifest_exit_code=process.record.get("observed_exit_code"),
-                        manifest_exited_at_valid=_is_valid_utc_timestamp(process.record.get("observed_exited_at")),
+                        manifest_exited_at_valid=is_valid_utc_timestamp(process.record.get("observed_exited_at")),
                         process_absent=process_absent,
                         registration_matches=True,
                         exit_observation_state="absent",
@@ -2293,11 +1952,10 @@ class AttemptSupervisionCoordinator:
                 self._record_termination_convergence(signature, attempt_id, result)
                 return result
 
-            registration = _read_running_publication_source(
+            registration = read_registration(
                 paths["registrations"] / f"{attempt_id}.json",
                 paths["root"],
                 binding,
-                "process_registration",
                 allow_unassigned_reservation=True,
             )
             registration_matches = (
@@ -2323,7 +1981,7 @@ class AttemptSupervisionCoordinator:
                 process.record.get("observed_exit_code"),
                 manifest_complete=(
                     process.record.get("observed_state") == "exited"
-                    and _is_valid_utc_timestamp(process.record.get("observed_exited_at"))
+                    and is_valid_utc_timestamp(process.record.get("observed_exited_at"))
                 ),
             )
             reservation_state = _termination_reservation_state(self.runtime.root, binding, process)
@@ -2335,7 +1993,7 @@ class AttemptSupervisionCoordinator:
                     confirmation=decision.get("confirmation"),
                     manifest_state=process.record.get("observed_state"),
                     manifest_exit_code=process.record.get("observed_exit_code"),
-                    manifest_exited_at_valid=_is_valid_utc_timestamp(process.record.get("observed_exited_at")),
+                    manifest_exited_at_valid=is_valid_utc_timestamp(process.record.get("observed_exited_at")),
                     process_absent=process_absent,
                     registration_matches=registration_matches,
                     exit_observation_state=observation_state,
@@ -2465,29 +2123,28 @@ class AttemptSupervisionCoordinator:
         page_paths = getattr(page, "paths", ())
         for source_path in page_paths:
             if lane == "registrations":
-                source = _read_running_publication_source(
+                source = read_registration(
                     source_path,
                     paths["root"],
                     binding,
-                    "process_registration",
                     allow_unassigned_reservation=True,
                 )
                 if source is None:
                     return False
                 manifest = paths["processes"] / f"{source.record['attempt_id']}.json"
-                process = _read_terminal_process_record(manifest, paths["root"], binding)
+                process = read_process_record(manifest, paths["root"], binding)
                 if process is None or process.parameters["attempt_id"] != source.record["attempt_id"]:
                     return False
             elif lane == "launch_intents":
-                source = _read_launch_intent_source(source_path, paths["root"])
+                source = read_launch_intent(source_path, paths["root"])
                 if source is None:
                     return False
                 manifest = paths["processes"] / f"{source.record['attempt_id']}.json"
-                process = _read_terminal_process_record(manifest, paths["root"], binding)
+                process = read_process_record(manifest, paths["root"], binding)
                 if process is None or process.parameters["attempt_id"] != source.record["attempt_id"]:
                     return False
             elif lane == "processes":
-                process = _read_terminal_process_record(source_path, paths["root"], binding)
+                process = read_process_record(source_path, paths["root"], binding)
                 if process is None:
                     return False
                 record = process.record
@@ -2518,7 +2175,7 @@ class AttemptSupervisionCoordinator:
                             return False
             elif lane == "observations":
                 attempt_id = source_path.stem
-                process = _read_terminal_process_record(
+                process = read_process_record(
                     paths["processes"] / f"{attempt_id}.json",
                     paths["root"],
                     binding,
@@ -2535,7 +2192,7 @@ class AttemptSupervisionCoordinator:
                     observation is None
                     or process.record.get("observed_state") != "exited"
                     or process.record.get("observed_exit_code") != observation.exit_code
-                    or not _is_valid_utc_timestamp(process.record.get("observed_exited_at"))
+                    or not is_valid_utc_timestamp(process.record.get("observed_exited_at"))
                     or not self._initial_reservation_settled(binding, process)
                 ):
                     return False
@@ -2563,7 +2220,7 @@ class AttemptSupervisionCoordinator:
                     return False
                 if (
                     process.record.get("observed_state") != "exited"
-                    or not _is_valid_utc_timestamp(process.record.get("observed_exited_at"))
+                    or not is_valid_utc_timestamp(process.record.get("observed_exited_at"))
                     or not self._initial_reservation_settled(binding, process)
                     or inspect_local_group_identity(process.record).state != "absent"
                 ):
@@ -2832,7 +2489,7 @@ class AttemptSupervisionCoordinator:
             ),
             (
                 "running_publications",
-                lambda: self.advance_running_publications(bindings, registry_revision),
+                lambda: self.running_publications.advance(bindings, registry_revision),
             ),
             (
                 "terminations",
@@ -2853,267 +2510,6 @@ class AttemptSupervisionCoordinator:
                 results[name] = value
         self._advance_initial_reconciliation(bindings, registry_revision, validated_registry=validated_registry)
         return results
-
-    def advance_running_publications(
-        self,
-        bindings: Sequence[ProjectBinding],
-        registry_revision: int,
-        *,
-        pending_attempt_ids: Collection[str] = (),
-    ) -> dict[str, Mapping[str, Any]]:
-        """Advance one bounded local evidence opportunity per selected binding."""
-        if type(registry_revision) is not int or registry_revision < 0:
-            raise ValueError("registry_revision must be a nonnegative integer.")
-        if isinstance(pending_attempt_ids, (str, bytes)) or not isinstance(pending_attempt_ids, Collection):
-            raise ValueError("pending_attempt_ids must be a finite collection of identifiers.")
-        if len(pending_attempt_ids) > _MAX_PENDING_RUNNING_PUBLICATIONS:
-            raise ValueError("pending_attempt_ids cannot contain more than 256 identifiers.")
-        pending: set[str] = set()
-        for attempt_id in pending_attempt_ids:
-            pending.add(validate_identifier(attempt_id, "pending attempt_id"))
-
-        eligible = list(bindings)
-        signatures = [_authority_binding_signature(binding, registry_revision) for binding in eligible]
-        current_signatures = set(signatures)
-        for signature in tuple(self._scans):
-            scans = self._scans[signature]
-            if signature not in current_signatures or scans.complete:
-                self._scans.pop(signature).close()
-        self._running_publication_intents = {
-            signature: parameters
-            for signature, parameters in self._running_publication_intents.items()
-            if signature in current_signatures
-        }
-
-        if eligible:
-            start = self._binding_offset % len(eligible)
-            rotated = eligible[start:] + eligible[:start]
-            selected_count = min(_MAX_RUNNING_PUBLICATION_BINDINGS, len(rotated))
-            selected = rotated[:selected_count]
-            self._binding_offset = (start + selected_count) % len(eligible)
-        else:
-            selected = []
-            self._binding_offset = 0
-
-        publications: dict[str, Mapping[str, Any]] = {}
-        publication_bindings: list[ProjectBinding] = []
-        reconciliation_bindings: list[ProjectBinding] = []
-        unresolved_running_requests = tuple(
-            request
-            for request in self.controller.executor.unresolved_requests()
-            if request.operation_kind == "authority_running_publish"
-        )
-        for binding in selected:
-            signature = _authority_binding_signature(binding, registry_revision)
-            paths = machine_project_paths(self.runtime.root, binding.project_id)
-            scans = self._scans.get(signature)
-            retained = self._running_publication_intents.get(signature)
-            if retained is not None:
-                try:
-                    source = _read_running_publication_source(
-                        paths["registrations"] / f"{retained['attempt_id']}.json",
-                        paths["root"],
-                        binding,
-                        "process_registration",
-                    )
-                    process = _read_terminal_process_record(
-                        paths["processes"] / f"{retained['attempt_id']}.json", paths["root"], binding
-                    )
-                except _RUNNING_PUBLICATION_SOURCE_ERRORS:
-                    continue
-                if (
-                    source is None
-                    or source.parameters != retained
-                    or process is None
-                    or any(
-                        process.parameters[field] != retained[field]
-                        for field in (
-                            "task_id",
-                            "attempt_id",
-                            "attempt_number",
-                            "fencing_token",
-                            "reservation_id",
-                            "process_identity",
-                        )
-                    )
-                    or process.record.get("observed_state") == "exited"
-                ):
-                    self._running_publication_intents.pop(signature, None)
-                else:
-                    if retained["attempt_id"] not in pending:
-                        publications[binding.project_id] = retained
-                        publication_bindings.append(binding)
-                    continue
-            if scans is None:
-                if len(self._scans) >= _MAX_TERMINAL_STATES:
-                    diagnostic_increment("scheduler.isolated.running_scan_capacity_exhausted")
-                    continue
-                scans = _RunningPublicationScans(
-                    registrations=EvidenceScan(paths["registrations"]),
-                    launch_intents=EvidenceScan(paths["launch_intents"]),
-                )
-                self._scans[signature] = scans
-
-            if scans.registrations_complete:
-                lane = "launch_intent"
-            elif scans.launch_intents_complete:
-                lane = "registration"
-            else:
-                lane = scans.next_lane
-                scans.next_lane = "launch_intent" if lane == "registration" else "registration"
-            scan = scans.registrations if lane == "registration" else scans.launch_intents
-            try:
-                page = scan.take(1)
-            except _RUNNING_PUBLICATION_SOURCE_ERRORS:
-                continue
-            if lane == "registration":
-                scans.registrations_complete = page.is_complete
-            else:
-                scans.launch_intents_complete = page.is_complete
-            if not page.paths:
-                if scans.complete:
-                    self._scans.pop(signature, scans).close()
-                continue
-
-            source_path = page.paths[0]
-            try:
-                source = (
-                    _read_running_publication_source(
-                        source_path,
-                        paths["root"],
-                        binding,
-                        "process_registration",
-                    )
-                    if lane == "registration"
-                    else _read_launch_intent_source(source_path, paths["root"])
-                )
-            except _RUNNING_PUBLICATION_SOURCE_ERRORS:
-                continue
-            if source is None or source.record["attempt_id"] in pending:
-                continue
-
-            try:
-                if lane == "registration":
-                    with evidence_write_guard(paths["root"], source.record["attempt_id"]) as acquired:
-                        if not acquired:
-                            continue
-                        current_source = _read_running_publication_source(
-                            source_path,
-                            paths["root"],
-                            binding,
-                            "process_registration",
-                        )
-                        if current_source is None or current_source.identity != source.identity:
-                            continue
-                        terminal_process = _read_terminal_process_record(
-                            paths["processes"] / f"{source.record['attempt_id']}.json",
-                            paths["root"],
-                            binding,
-                        )
-                        if terminal_process is not None and terminal_process.record.get("observed_state") == "exited":
-                            if any(
-                                _terminal_matches_running_request(request, binding, terminal_process)
-                                for request in unresolved_running_requests
-                            ):
-                                reconciliation_bindings.append(binding)
-                            continue
-                        parameters = _ensure_running_manifest(paths, current_source)
-                else:
-                    parameters, terminal = self._advance_launch_intent(
-                        binding,
-                        paths,
-                        source_path,
-                        source,
-                        pending,
-                    )
-                    if terminal is not None and any(
-                        _terminal_matches_running_request(request, binding, terminal)
-                        for request in unresolved_running_requests
-                    ):
-                        reconciliation_bindings.append(binding)
-            except _RUNNING_PUBLICATION_SOURCE_ERRORS:
-                continue
-
-            if parameters is not None:
-                if len(self._running_publication_intents) >= _MAX_RUNNING_PUBLICATION_BINDINGS:
-                    continue
-                self._running_publication_intents[signature] = parameters
-                publications[binding.project_id] = parameters
-                publication_bindings.append(binding)
-            if scans.complete:
-                self._scans.pop(signature, scans).close()
-
-        if not publications and not reconciliation_bindings:
-            return {}
-        publication_project_ids = {binding.project_id for binding in publication_bindings}
-        reconciliation_bindings = [
-            binding for binding in reconciliation_bindings if binding.project_id not in publication_project_ids
-        ]
-        results = self.controller.advance_authority_running_publications(
-            [*publication_bindings, *reconciliation_bindings],
-            registry_revision,
-            publications,
-        )
-        for binding in publication_bindings:
-            if results.get(binding.project_id, {}).get("outcome") == "processed":
-                self._running_publication_intents.pop(_authority_binding_signature(binding, registry_revision), None)
-        return results
-
-    def _advance_launch_intent(
-        self,
-        binding: ProjectBinding,
-        paths: Mapping[str, Path],
-        source_path: Path,
-        source: _RunningPublicationSource,
-        pending: set[str],
-    ) -> tuple[dict[str, Any] | None, _TerminalProcessRecord | None]:
-        attempt_id = source.record["attempt_id"]
-        if attempt_id in pending:
-            return None, None
-        with evidence_write_guard(paths["root"], attempt_id) as acquired:
-            if not acquired:
-                return None, None
-            current_intent = _read_launch_intent_source(source_path, paths["root"])
-            if current_intent is None or current_intent.identity != source.identity:
-                return None, None
-
-            manifest = paths["processes"] / f"{attempt_id}.json"
-            terminal_process = _read_terminal_process_record(manifest, paths["root"], binding)
-            if terminal_process is not None and terminal_process.record.get("observed_state") == "exited":
-                return None, terminal_process
-
-            registration_path = paths["registrations"] / f"{attempt_id}.json"
-            if is_path_present(registration_path):
-                registration = _read_running_publication_source(
-                    registration_path,
-                    paths["root"],
-                    binding,
-                    "process_registration",
-                )
-                if registration is None or not _registration_matches_intent(registration, current_intent):
-                    return None, None
-                return _ensure_running_manifest(paths, registration), None
-
-            if is_path_present(manifest):
-                return None, None
-            try:
-                wrapper_state = inspect_wrapper_identity(current_intent.record).state
-            except _RUNNING_PUBLICATION_SOURCE_ERRORS:
-                wrapper_state = "unknown"
-            if wrapper_state == "alive":
-                return None, None
-
-            process = dict(current_intent.record)
-            process.update(
-                {
-                    "observed_state": "launch_unverifiable",
-                    "supervisor": "agent",
-                    "authority_state": "isolated",
-                    "created_by": "agent",
-                }
-            )
-            atomic_replace(manifest, {"process": process})
-            return None, None
 
     def advance_terminal_completions(
         self,
@@ -3163,14 +2559,14 @@ class AttemptSupervisionCoordinator:
             paths = machine_project_paths(self.runtime.root, binding.project_id)
             examined_projects.add(project_id)
             try:
-                process = _read_terminal_process_record(candidate.process_path, paths["root"], binding)
+                process = read_process_record(candidate.process_path, paths["root"], binding)
                 observation = _read_terminal_exit_observation(
                     candidate.observation_path,
                     paths["root"],
                     candidate.parameters["task_id"],
                     candidate.parameters["attempt_id"],
                 )
-            except _RUNNING_PUBLICATION_SOURCE_ERRORS:
+            except SOURCE_ERRORS:
                 self._terminal_candidates.pop(project_id, None)
                 continue
             state = self._terminal_states.get(candidate.binding_signature)
@@ -3212,14 +2608,14 @@ class AttemptSupervisionCoordinator:
             examined_projects.add(project_id)
             try:
                 page = state.process_scan.take(1)
-            except _RUNNING_PUBLICATION_SOURCE_ERRORS:
+            except SOURCE_ERRORS:
                 continue
             state.process_scan_complete = page.is_complete
             if not page.paths:
                 continue
             process_path = page.paths[0]
             try:
-                process = _read_terminal_process_record(process_path, paths["root"], binding)
+                process = read_process_record(process_path, paths["root"], binding)
                 if process is None:
                     continue
                 observation_path = paths["observations"] / f"{process.parameters['attempt_id']}.json"
@@ -3229,7 +2625,7 @@ class AttemptSupervisionCoordinator:
                     process.parameters["task_id"],
                     process.parameters["attempt_id"],
                 )
-            except _RUNNING_PUBLICATION_SOURCE_ERRORS:
+            except SOURCE_ERRORS:
                 continue
             if observation is None:
                 _record_terminal_observation_problem(state, process, observation_path)
@@ -3240,7 +2636,7 @@ class AttemptSupervisionCoordinator:
                 # shared observations of this exact settled image are paced.
                 try:
                     state.reconciler.reconcile_observation(observation_path, bounded=True)
-                except _RUNNING_PUBLICATION_SOURCE_ERRORS:
+                except SOURCE_ERRORS:
                     pass
                 continue
             if len(self._terminal_candidates) >= _MAX_CACHED_TERMINAL_CANDIDATES:
@@ -3279,12 +2675,12 @@ class AttemptSupervisionCoordinator:
                 continue
             try:
                 state.reconciler.reconcile_observation(candidate.observation_path, bounded=True)
-            except _RUNNING_PUBLICATION_SOURCE_ERRORS:
+            except SOURCE_ERRORS:
                 continue
         if candidates:
             try:
                 unresolved = self.controller.executor.unresolved_requests()
-            except _RUNNING_PUBLICATION_SOURCE_ERRORS:
+            except SOURCE_ERRORS:
                 unresolved = ()
             candidates_by_project = dict(candidates)
             for request in unresolved:
@@ -3379,7 +2775,7 @@ class AttemptSupervisionCoordinator:
                     paths,
                     state.reconciler,
                 )
-            except _RUNNING_PUBLICATION_SOURCE_ERRORS:
+            except SOURCE_ERRORS:
                 continue
             if local_outcome == "applied" and candidate.post_update_process_identity is not None:
                 key = (
@@ -3445,7 +2841,7 @@ class AttemptSupervisionCoordinator:
         binding: ProjectBinding,
         signature: tuple[str, ...],
         process_path: Path,
-        process: _TerminalProcessRecord,
+        process: ProcessRecord,
     ) -> _TerminationCandidate:
         parameters = dict(process.parameters)
         parameters["mode"] = "active"
@@ -3466,7 +2862,7 @@ class AttemptSupervisionCoordinator:
         if not isinstance(evidence, Mapping) or evidence.get("attempt_result_reason") != "terminated_by_agent":
             return None
         paths = machine_project_paths(self.runtime.root, candidate.binding.project_id)
-        process = _read_terminal_process_record(candidate.process_path, paths["root"], candidate.binding)
+        process = read_process_record(candidate.process_path, paths["root"], candidate.binding)
         if (
             process is None
             or process.parameters != {key: value for key, value in candidate.parameters.items() if key != "mode"}
@@ -3502,7 +2898,7 @@ class AttemptSupervisionCoordinator:
         signature: tuple[str, ...],
         paths: Mapping[str, Path],
         process_path: Path,
-        process: _TerminalProcessRecord,
+        process: ProcessRecord,
     ) -> tuple[Path, dict[str, Any]] | None:
         """Find one exact durable termination decision for a retained manifest."""
         attempt_id = process.parameters["attempt_id"]
@@ -3545,7 +2941,7 @@ class AttemptSupervisionCoordinator:
 
     @staticmethod
     def _termination_process_matches(
-        process: _TerminalProcessRecord | None,
+        process: ProcessRecord | None,
         candidate: _TerminationCandidate,
     ) -> bool:
         return (
@@ -3680,7 +3076,7 @@ class AttemptSupervisionCoordinator:
                 paths = machine_project_paths(self.runtime.root, binding.project_id)
                 process_path = paths["processes"] / f"{attempt_id}.json"
                 try:
-                    process = _read_terminal_process_record(process_path, paths["root"], binding)
+                    process = read_process_record(process_path, paths["root"], binding)
                 except _TERMINATION_SOURCE_ERRORS:
                     continue
                 if process is None:
@@ -3727,7 +3123,7 @@ class AttemptSupervisionCoordinator:
                 with attempt_control_lock(cfg, attempt_id, blocking=False) as lock_acquired:
                     if not lock_acquired:
                         return "deferred"
-                    process = _read_terminal_process_record(candidate.process_path, paths["root"], candidate.binding)
+                    process = read_process_record(candidate.process_path, paths["root"], candidate.binding)
                     if not self._termination_process_matches(process, candidate):
                         return "invalid"
                     decision = create_decision(
@@ -3766,7 +3162,7 @@ class AttemptSupervisionCoordinator:
                 with attempt_control_lock(cfg, attempt_id, blocking=False) as lock_acquired:
                     if not lock_acquired:
                         return "deferred"
-                    process = _read_terminal_process_record(candidate.process_path, paths["root"], candidate.binding)
+                    process = read_process_record(candidate.process_path, paths["root"], candidate.binding)
                     if not self._termination_process_matches(process, candidate):
                         return "invalid"
                     decision = _read_termination_decision(cfg, attempt_id, candidate.decision_id)
@@ -3836,8 +3232,8 @@ class AttemptSupervisionCoordinator:
                         "converged",
                         "timeout_decision_retired",
                         None,
-                        False,
-                        False,
+                        process_absent=False,
+                        reservation_settled=False,
                     )
                     self._record_termination_convergence(
                         candidate.binding_signature,
@@ -3865,7 +3261,7 @@ class AttemptSupervisionCoordinator:
                 with attempt_control_lock(cfg, attempt_id, blocking=False) as lock_acquired:
                     if not lock_acquired:
                         return "deferred"
-                    process = _read_terminal_process_record(candidate.process_path, paths["root"], candidate.binding)
+                    process = read_process_record(candidate.process_path, paths["root"], candidate.binding)
                     if not self._termination_process_matches(process, candidate):
                         return "invalid"
                     decision = _read_termination_decision(cfg, attempt_id, candidate.decision_id)
@@ -3923,7 +3319,7 @@ class AttemptSupervisionCoordinator:
                 with attempt_control_lock(cfg, attempt_id, blocking=False) as lock_acquired:
                     if not lock_acquired:
                         return "deferred"
-                    process = _read_terminal_process_record(candidate.process_path, paths["root"], candidate.binding)
+                    process = read_process_record(candidate.process_path, paths["root"], candidate.binding)
                     decision = _read_termination_decision(cfg, attempt_id, candidate.decision_id)
                     if (
                         not self._termination_process_matches(process, candidate)
@@ -3970,7 +3366,7 @@ class AttemptSupervisionCoordinator:
                     if not (
                         process.record.get("observed_state") == "exited"
                         and (exit_code is None or type(exit_code) is int)
-                        and _is_valid_utc_timestamp(process.record.get("observed_exited_at"))
+                        and is_valid_utc_timestamp(process.record.get("observed_exited_at"))
                     ):
                         updated.update(
                             {
@@ -3981,7 +3377,7 @@ class AttemptSupervisionCoordinator:
                         )
                         atomic_replace(candidate.process_path, {"process": updated})
                     candidate.post_update_process = updated
-                    candidate.post_update_process_identity = _canonical_terminal_record(updated)
+                    candidate.post_update_process_identity = canonical_record(updated)
                     if state.reconciler.release_confirmed_termination(updated, dict(decision)):
                         return "applied"
                     if updated.get("reservation_id") is None:
@@ -4042,7 +3438,7 @@ class AttemptSupervisionCoordinator:
             binding = binding_by_project[candidate.binding.project_id]
             paths = machine_project_paths(self.runtime.root, binding.project_id)
             try:
-                process = _read_terminal_process_record(candidate.process_path, paths["root"], binding)
+                process = read_process_record(candidate.process_path, paths["root"], binding)
                 natural_observation = is_path_present(
                     paths["observations"] / f"{candidate.parameters['attempt_id']}.json"
                 )
@@ -4134,7 +3530,7 @@ class AttemptSupervisionCoordinator:
             try:
                 process = _read_termination_process_record(process_path, paths["root"], binding)
                 if process is None:
-                    retained = _read_terminal_process_record(process_path, paths["root"], binding)
+                    retained = read_process_record(process_path, paths["root"], binding)
                     if retained is None or retained.record.get("observed_state") != "exited":
                         continue
                     decision_match = self._find_termination_decision_for_process(
@@ -4208,8 +3604,8 @@ class AttemptSupervisionCoordinator:
                         "converged",
                         "timeout_decision_retired",
                         None,
-                        False,
-                        False,
+                        process_absent=False,
+                        reservation_settled=False,
                     )
                     self._record_termination_convergence(
                         candidate.binding_signature,
@@ -4244,8 +3640,8 @@ class AttemptSupervisionCoordinator:
                         "invalid",
                         "termination_decision_invalid",
                         result.manifest_exit_code,
-                        result.process_absent,
-                        False,
+                        process_absent=result.process_absent,
+                        reservation_settled=False,
                     )
                 elif local_outcome == "applied":
                     try:
@@ -4337,7 +3733,7 @@ class AttemptSupervisionCoordinator:
             if _termination_observation_is_current(evidence, candidate):
                 paths = machine_project_paths(self.runtime.root, candidate.binding.project_id)
                 try:
-                    process = _read_terminal_process_record(candidate.process_path, paths["root"], candidate.binding)
+                    process = read_process_record(candidate.process_path, paths["root"], candidate.binding)
                 except _TERMINATION_SOURCE_ERRORS:
                     continue
                 if not self._termination_process_matches(process, candidate):
@@ -4500,8 +3896,8 @@ class AttemptSupervisionCoordinator:
                     "repairable",
                     "timeout_decision_retirement_pending",
                     None,
-                    False,
-                    False,
+                    process_absent=False,
+                    reservation_settled=False,
                 )
 
         # Advance one nonblocking local signal step only after exact commit proof.

@@ -49,8 +49,7 @@ from ..runtime.ready import (
 )
 from ..runtime.records import AttemptRecord, TaskRecord, utc_now, validate_group_name, validate_identifier
 from ..runtime.store import atomic_replace, read_json
-from ..runtime.submission import SubmissionResult as RuntimeSubmissionResult
-from ..runtime.submission import submit_specs
+from ..runtime.submission import RuntimeSubmissionResult, submit_specs
 from ..runtime.tasks import load_task, save_task
 from ..submission_contracts import SubmissionRequest
 from ..task_observation import validate_tmux_override

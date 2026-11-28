@@ -10,7 +10,7 @@ import pytest
 
 from qqtools.plugins.qexp import init_shared_root
 from qqtools.plugins.qexp.agent.context import MachineRuntime
-from qqtools.plugins.qexp.agent.helpers import _machine_is_true_idle
+from qqtools.plugins.qexp.agent.idle_exit import can_exit_when_idle
 from qqtools.plugins.qexp.agent.setup import initialize_machine
 from qqtools.plugins.qexp.events import flush_local_events
 from qqtools.plugins.qexp.runtime.locks import exclusive
@@ -131,7 +131,7 @@ def test_pending_writer_capture_retains_an_empty_binding(tmp_path, is_corrupt, l
     assert not ledger.has_members()
     prefix = "legacy:" if location == "legacy" else ""
     assert f"{prefix}writer_capture_pending" in runtime.binding_blockers(binding)
-    assert not _machine_is_true_idle(runtime, has_consumed_binding=True)
+    assert not can_exit_when_idle(runtime, has_consumed_binding=True)
     with pytest.raises(RuntimeError, match="writer capture"):
         runtime.remove_binding(binding.project_id)
     assert root.exists() and (capture_root / CAPTURE_FILE).exists()
@@ -152,7 +152,7 @@ def binding_fixture(tmp_path, *, enabled=False):
 @pytest.mark.parametrize("state", ["active", "maintenance", "source_only", "corrupt"])
 def test_membership_without_evidence_prevents_idle_exit(tmp_path, enabled, state):
     cfg, runtime, binding, root = binding_fixture(tmp_path, enabled=enabled)
-    assert _machine_is_true_idle(runtime, has_consumed_binding=True)
+    assert can_exit_when_idle(runtime, has_consumed_binding=True)
     ledger = Ledger.open_or_create(responsibility_root(root))
     payload = {"task_id": "task", "attempt_number": 1}
     generation = ledger.publish("task-attempt-1", payload)
@@ -163,7 +163,7 @@ def test_membership_without_evidence_prevents_idle_exit(tmp_path, enabled, state
     elif state == "corrupt":
         (ledger.root / "marker").write_text("broken")
 
-    assert not _machine_is_true_idle(runtime, has_consumed_binding=True)
+    assert not can_exit_when_idle(runtime, has_consumed_binding=True)
     disabled = runtime.set_enabled(binding.project_id, False)
     assert runtime.binding_state(disabled) == "draining"
     with pytest.raises(RuntimeError, match="recovery_responsibilities"):
@@ -177,14 +177,14 @@ def test_incomplete_migration_is_retained_before_first_capture(tmp_path, state):
     value = {"migration": {"state": state, "legacy_runtime_root": str(cfg.runtime_root)}}
     atomic_replace(runtime.migration_path(binding.project_id), value)
 
-    assert not _machine_is_true_idle(runtime, has_consumed_binding=True)
+    assert not can_exit_when_idle(runtime, has_consumed_binding=True)
     with pytest.raises(RuntimeError, match="legacy_migration_incomplete"):
         runtime.remove_binding(binding.project_id)
     assert root.exists()
 
     value["migration"]["state"] = "active"
     atomic_replace(runtime.migration_path(binding.project_id), value)
-    assert _machine_is_true_idle(runtime, has_consumed_binding=True)
+    assert can_exit_when_idle(runtime, has_consumed_binding=True)
     assert runtime.remove_binding(binding.project_id) == binding
 
 
@@ -211,20 +211,20 @@ def test_unimported_source_evidence_prevents_retirement(tmp_path, lane):
     source = local_paths(cfg.runtime_root)[lane] / "unimported.json"
     atomic_replace(source, {"fixture": "uncaptured source evidence"})
 
-    assert not _machine_is_true_idle(runtime, has_consumed_binding=True)
+    assert not can_exit_when_idle(runtime, has_consumed_binding=True)
     with pytest.raises(RuntimeError, match=f"legacy:{lane}"):
         runtime.remove_binding(binding.project_id)
     assert source.exists() and root.exists()
 
     source.unlink()
-    assert _machine_is_true_idle(runtime, has_consumed_binding=True)
+    assert can_exit_when_idle(runtime, has_consumed_binding=True)
     assert runtime.remove_binding(binding.project_id) == binding
 
 
 def test_unreadable_migration_retains_binding_and_prevents_idle_exit(tmp_path):
     cfg, runtime, binding, root = binding_fixture(tmp_path)
     runtime.migration_path(binding.project_id).write_text("broken")
-    assert not _machine_is_true_idle(runtime, has_consumed_binding=True)
+    assert not can_exit_when_idle(runtime, has_consumed_binding=True)
     with pytest.raises(RuntimeError, match="legacy_migration_unavailable"):
         runtime.remove_binding(binding.project_id)
     assert root.exists()
@@ -237,9 +237,9 @@ def test_existing_cpu_snapshot_prevents_reservation_only_idle_exit(tmp_path, is_
     reservation = reserve_cpu(runtime.root, "task", 1, attempt_id="task-attempt-1", fencing_token=1)["reservation"]
     if is_active:
         attach_cpu(runtime.root, reservation["reservation_id"], "task-attempt-1", 1)
-    assert not _machine_is_true_idle(runtime, has_consumed_binding=True)
+    assert not can_exit_when_idle(runtime, has_consumed_binding=True)
     release_cpu(runtime.root, reservation["reservation_id"])
-    assert _machine_is_true_idle(runtime, has_consumed_binding=True)
+    assert can_exit_when_idle(runtime, has_consumed_binding=True)
 
 
 def test_idle_retention_stops_at_first_evidence_file(tmp_path, monkeypatch):
@@ -269,7 +269,7 @@ def test_idle_retention_stops_at_first_evidence_file(tmp_path, monkeypatch):
 
     with monkeypatch.context() as patch:
         patch.setattr(os, "scandir", guarded_scandir)
-        assert not _machine_is_true_idle(runtime, has_consumed_binding=True)
+        assert not can_exit_when_idle(runtime, has_consumed_binding=True)
     assert closed == [directory]
 
 
@@ -295,7 +295,7 @@ def test_unreadable_evidence_directory_retains_recovery(tmp_path, monkeypatch, i
 
     with monkeypatch.context() as patch:
         patch.setattr(os, "scandir", unavailable)
-        assert not _machine_is_true_idle(runtime, has_consumed_binding=True)
+        assert not can_exit_when_idle(runtime, has_consumed_binding=True)
         with pytest.raises(RuntimeError, match="unavailable"):
             runtime.remove_binding(binding.project_id)
     assert evidence.exists() and root.exists()
@@ -305,7 +305,7 @@ def test_evidence_lane_replaced_by_file_is_not_empty(tmp_path):
     cfg, runtime, binding, root = binding_fixture(tmp_path)
     directory = local_paths(root)["observations"]
     directory.write_text("damaged lane")
-    assert not _machine_is_true_idle(runtime, has_consumed_binding=True)
+    assert not can_exit_when_idle(runtime, has_consumed_binding=True)
     with pytest.raises(RuntimeError, match="unavailable"):
         runtime.remove_binding(binding.project_id)
     assert directory.read_text() == "damaged lane"
@@ -334,7 +334,7 @@ def test_inaccessible_recovery_metadata_never_proves_idle(tmp_path, monkeypatch,
 
     with monkeypatch.context() as patch:
         patch.setattr(Path, "stat", unavailable)
-        assert not _machine_is_true_idle(runtime, has_consumed_binding=True)
+        assert not can_exit_when_idle(runtime, has_consumed_binding=True)
         with pytest.raises(PermissionError, match="metadata inaccessible"):
             runtime.remove_binding(binding.project_id)
     assert root.exists()
@@ -345,10 +345,10 @@ def test_pending_local_event_retains_binding_until_shared_publication(tmp_path):
     event = {"event_id": "diagnostic", "timestamp": "2026-09-18T00:00:00Z", "event_type": "retained"}
     source = local_paths(root)["events"] / "machine" / "diagnostic.json"
     atomic_replace(source, event)
-    assert not _machine_is_true_idle(runtime, has_consumed_binding=True)
+    assert not can_exit_when_idle(runtime, has_consumed_binding=True)
     with pytest.raises(RuntimeError, match="events:"):
         runtime.remove_binding(binding.project_id)
     assert flush_local_events(replace(cfg, runtime_root=root)) == 1
     assert read_json(cfg.shared_root / "events" / "2026-09-18" / source.name) == event
-    assert _machine_is_true_idle(runtime, has_consumed_binding=True)
+    assert can_exit_when_idle(runtime, has_consumed_binding=True)
     runtime.remove_binding(binding.project_id)

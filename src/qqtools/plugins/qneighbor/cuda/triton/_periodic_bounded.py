@@ -1,15 +1,11 @@
 """Periodic radius graph with automatic whole, streaming or spatial queries."""
 
-import math
-import operator
-
 import torch
 import triton
 import triton.language as tl
 
-from ._periodic_whole import _images
-from ._periodic_whole import build_pbc as _whole_neighbors
-from .obc import open_radius_graph
+from ._periodic_geometry import PeriodicGeometry
+from ._periodic_whole import _images, _nearest
 
 
 @triton.jit
@@ -225,76 +221,19 @@ def _halo_bounds(
     tl.atomic_add(counts + g, size, valid, sem="relaxed")
 
 
-@torch.no_grad()
-def build_pbc(pos, cell, pbc, batch, cutoff, cap):
-    cap = operator.index(cap)
-    if cap > 256:
-        return _whole_neighbors(pos, cell, pbc, batch, cutoff, cap)
-    if (
-        not pos.is_cuda
-        or pos.dtype not in (torch.float32, torch.float64)
-        or pos.shape != (len(batch), 3)
-        or batch.dtype != torch.long
-        or batch.ndim != 1
-        or batch.device != pos.device
-    ):
-        raise ValueError("Expected FP32 or FP64 CUDA positions and int64 graph IDs")
-    if cap < 1 or not math.isfinite(cutoff) or cutoff <= 0:
-        raise ValueError("Invalid cutoff or cap")
-    if not len(pos):
-        return batch.new_empty((2, 0)), batch.new_empty((0, 3))
-    minimum, maximum = torch.aminmax(batch)
-    first, last = torch.stack((minimum, maximum)).tolist()
-    if first < 0:
-        raise ValueError("Negative graph ID")
-    graphs = last + 1
-    mask = None
-    if isinstance(pbc, bool):
-        has_images = pbc
-    else:
-        if pbc.ndim not in (1, 2) or pbc.shape[-1] != 3:
-            raise ValueError("Invalid PBC mask")
-        mask = pbc.to(pos.device, torch.bool).reshape(-1, 3)
-        mask = mask.expand(graphs, -1) if len(mask) == 1 else mask[:graphs]
-        if len(mask) != graphs:
-            raise ValueError("Missing PBC metadata")
-        has_images = bool(mask.any())
-    if not has_images:
-        edges = open_radius_graph(pos, cutoff, batch, cap)
-        return edges, edges.new_zeros((edges.shape[1], 3))
-    if cell is None or cell.ndim not in (2, 3) or cell.shape[-2:] != (3, 3):
-        raise ValueError("Expected periodic cells")
-    cell = cell.to(pos.device, pos.dtype).reshape(-1, 3, 3)
-    cell = cell.expand(graphs, -1, -1) if len(cell) == 1 else cell[:graphs]
-    if len(cell) != graphs:
-        raise ValueError("Missing cell metadata")
-    if mask is not None:
-        cell = torch.where(mask.any(1)[:, None, None], cell, torch.eye(3, device=pos.device, dtype=pos.dtype))
-    pos, cell, batch = pos.contiguous(), cell.contiguous(), batch.contiguous()
-    inv, info = torch.linalg.inv_ex(cell.double())
-    frac = (pos.double()[:, None] @ inv[batch]).squeeze(1)
-    norms = inv.norm(dim=1)
-    if not bool((info == 0).all() & torch.isfinite(frac).all() & torch.isfinite(norms).all()):
-        raise ValueError("Invalid periodic geometry")
-    lo = frac.new_full((len(cell), 3), torch.inf)
-    hi = -lo
-    ids = batch[:, None].expand_as(frac)
-    lo.scatter_reduce_(0, ids, frac, reduce="amin")
-    hi.scatter_reduce_(0, ids, frac, reduce="amax")
-    span = (cutoff + 1e-4) * norms
-    graphs, order = batch.sort(stable=True)
+def search_bounded(pos, cell, mask, batch, cutoff, cap, geometry: PeriodicGeometry):
     low = torch.empty((len(pos), 3), device=pos.device, dtype=torch.int32)
     shape = torch.empty_like(low)
     sizes = torch.empty_like(batch)
     per_graph = batch.new_zeros(len(cell))
     with torch.cuda.device(pos.device):
         _halo_bounds[(triton.cdiv(len(pos), 128),)](
-            frac,
-            graphs,
-            order,
-            lo,
-            hi,
-            span,
+            geometry.fractional,
+            geometry.sorted_graphs,
+            geometry.order,
+            geometry.lower,
+            geometry.upper,
+            geometry.span,
             mask.contiguous() if mask is not None else low,
             low,
             shape,
@@ -317,12 +256,10 @@ def build_pbc(pos, cell, pbc, batch, cutoff, cap):
     selected = low.new_empty(len(pos), K)
     with torch.cuda.device(pos.device):
         _images[(len(pos),)](
-            cell, batch, order, starts, low, shape, owners, shifts, trans, triton.next_power_of_2(atom_max)
+            cell, batch, geometry.order, starts, low, shape, owners, shifts, trans, triton.next_power_of_2(atom_max)
         )
         has_spatial_bins = graph_max > 8192
         if graph_max <= 1024:
-            from ._periodic_whole import _nearest
-
             B = triton.next_power_of_2(max(graph_max, K))
             _nearest[(len(pos),)](
                 pos, batch, ends, owners, shifts, trans, pos.new_tensor(cutoff**2), selected, K, B, B.bit_length() - 1

@@ -1,13 +1,11 @@
 """Whole-graph Triton periodic query and fallback for large neighbor caps."""
 
-import math
-import operator
-
 import torch
 import triton
 import triton.language as tl
 
-from .obc import _select, open_radius_graph
+from ._periodic_geometry import PeriodicGeometry
+from .obc import _select
 
 
 @triton.jit
@@ -70,65 +68,11 @@ def _nearest(
     tl.store(output + target * K + tl.arange(0, K), selected)
 
 
-@torch.no_grad()
-def build_pbc(pos, cell, pbc, batch, cutoff, cap):
-    cap = operator.index(cap)
-    if (
-        not pos.is_cuda
-        or pos.dtype not in (torch.float32, torch.float64)
-        or pos.shape != (len(batch), 3)
-        or batch.dtype != torch.long
-        or batch.ndim != 1
-        or batch.device != pos.device
-    ):
-        raise ValueError("Expected FP32 or FP64 CUDA positions and int64 graph IDs")
-    if cap < 1 or not math.isfinite(cutoff) or cutoff <= 0:
-        raise ValueError("Invalid cutoff or cap")
-    if not len(pos):
-        return batch.new_empty((2, 0)), batch.new_empty((0, 3))
-    minimum, maximum = torch.aminmax(batch)
-    first, last = torch.stack((minimum, maximum)).tolist()
-    if first < 0:
-        raise ValueError("Negative graph ID")
-    graphs = last + 1
-    mask = None
-    if isinstance(pbc, bool):
-        has_images = pbc
-    else:
-        if pbc.ndim not in (1, 2) or pbc.shape[-1] != 3:
-            raise ValueError("Invalid PBC mask")
-        mask = pbc.to(pos.device, torch.bool).reshape(-1, 3)
-        mask = mask.expand(graphs, -1) if len(mask) == 1 else mask[:graphs]
-        if len(mask) != graphs:
-            raise ValueError("Missing PBC metadata")
-        has_images = bool(mask.any())
-    if not has_images:
-        edges = open_radius_graph(pos, cutoff, batch, cap)
-        return edges, edges.new_zeros((edges.shape[1], 3))
-    if cell is None or cell.ndim not in (2, 3) or cell.shape[-2:] != (3, 3):
-        raise ValueError("Expected periodic cells")
-    cell = cell.to(pos.device, pos.dtype).reshape(-1, 3, 3)
-    cell = cell.expand(graphs, -1, -1) if len(cell) == 1 else cell[:graphs]
-    if len(cell) != graphs:
-        raise ValueError("Missing cell metadata")
-    if mask is not None:
-        cell = torch.where(mask.any(1)[:, None, None], cell, torch.eye(3, device=pos.device, dtype=pos.dtype))
-    pos, cell, batch = pos.contiguous(), cell.contiguous(), batch.contiguous()
-    inv, info = torch.linalg.inv_ex(cell.double())
-    frac = (pos.double()[:, None] @ inv[batch]).squeeze(1)
-    norms = inv.norm(dim=1)
-    if not bool((info == 0).all() & torch.isfinite(frac).all() & torch.isfinite(norms).all()):
-        raise ValueError("Invalid periodic geometry")
-    lo = frac.new_full((len(cell), 3), torch.inf)
-    hi = -lo
-    ids = batch[:, None].expand_as(frac)
-    lo.scatter_reduce_(0, ids, frac, reduce="amin")
-    hi.scatter_reduce_(0, ids, frac, reduce="amax")
-    span = (cutoff + 1e-4) * norms
-    graphs, order = batch.sort(stable=True)
-    f = frac[order]
-    low = (f - (hi + span)[graphs]).ceil().int()
-    shape = (f - (lo - span)[graphs]).floor().int() - low + 1
+def search_whole(pos, cell, mask, batch, cutoff, cap, geometry: PeriodicGeometry):
+    graphs, order = geometry.sorted_graphs, geometry.order
+    f = geometry.fractional[order]
+    low = (f - (geometry.upper + geometry.span)[graphs]).ceil().int()
+    shape = (f - (geometry.lower - geometry.span)[graphs]).floor().int() - low + 1
     if mask is not None:
         active = mask[graphs]
         low = torch.where(active, low, 0)

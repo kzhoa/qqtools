@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
-from qqtools.plugins.qexp.agent.project_io_controller import _ValidationIdentity
+from qqtools.plugins.qexp.agent.project_io.identity import ValidationIdentity
 from qqtools.plugins.qexp.agent.snapshot_publication_health import SnapshotPublicationHealth
 
 
@@ -22,8 +22,8 @@ class _Clock:
         self.utc_value += timedelta(seconds=seconds)
 
 
-def _identity(project_id: str = "project-1") -> _ValidationIdentity:
-    return _ValidationIdentity(
+def _identity(project_id: str = "project-1") -> ValidationIdentity:
+    return ValidationIdentity(
         runtime_id="runtime",
         executor_epoch="epoch",
         project_id=project_id,

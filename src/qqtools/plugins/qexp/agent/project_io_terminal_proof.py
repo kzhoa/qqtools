@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from ..runtime.termination import termination_decision_digest
-from .project_io_protocol import authority_terminal_transition_digest
+from .project_io.protocol import authority_terminal_transition_digest
 
 _TERMINAL_IDENTITY_FIELDS = (
     "task_id",

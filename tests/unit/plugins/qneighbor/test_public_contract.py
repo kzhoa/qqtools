@@ -43,12 +43,6 @@ def test_default_periodic_cap_is_32(namespace, device):
     capped_edges, _ = backend.neighbor_list_pbc(positions, 1.0, batch, max_neighbors=1, cell=cell)
     assert torch.equal(torch.bincount(capped_edges[1], minlength=40), batch.new_ones(40))
     assert backend.radius_graph is backend.neighbor_list_obc
-    if device == "cuda":
-        from qqtools.plugins.qneighbor import cuda
-
-        backend_name = namespace.rsplit(".", 1)[-1]
-        assert getattr(cuda, f"neighbor_list_obc_{backend_name}") is backend.neighbor_list_obc
-        assert getattr(cuda, f"neighbor_list_pbc_{backend_name}") is backend.neighbor_list_pbc
 
 
 @pytest.mark.parametrize("namespace,device", _BACKENDS)

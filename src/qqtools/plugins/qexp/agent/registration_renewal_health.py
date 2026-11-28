@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING
 from .snapshot_publication_health import observation_timestamp
 
 if TYPE_CHECKING:
-    from .project_io_controller import _ValidationIdentity
+    from .project_io.identity import ValidationIdentity
 
 REGISTRATION_RENEWAL_HEALTH_ITEM_LIMIT = 8
 _CAUSE_PATTERN = re.compile(r"[A-Za-z0-9._-]{1,160}")
@@ -36,15 +36,15 @@ class RegistrationRenewalHealth:
         self._utc_clock = utc_clock
         self._lock = Lock()
         self._executor_epoch: str | None = None
-        self._current: frozenset[_ValidationIdentity] = frozenset()
+        self._current: frozenset[ValidationIdentity] = frozenset()
         self._occupied_owners: frozenset[tuple[str, str, str]] = frozenset()
-        self._observations: dict[_ValidationIdentity, _RenewalObservation] = {}
+        self._observations: dict[ValidationIdentity, _RenewalObservation] = {}
 
     def reconcile(
         self,
         executor_epoch: str,
         occupied_owners: set[tuple[str, str, str]],
-        current: frozenset[_ValidationIdentity] | None = None,
+        current: frozenset[ValidationIdentity] | None = None,
     ) -> None:
         with self._lock:
             if executor_epoch != self._executor_epoch:
@@ -71,7 +71,7 @@ class RegistrationRenewalHealth:
 
     def record(
         self,
-        identity: _ValidationIdentity,
+        identity: ValidationIdentity,
         *,
         outcome: str | None = None,
         blocking_reason: str | None = None,
@@ -126,7 +126,7 @@ class RegistrationRenewalHealth:
 
     @staticmethod
     def _active_observation(
-        identity: _ValidationIdentity,
+        identity: ValidationIdentity,
         state: _RenewalObservation,
         occupied_owners: frozenset[tuple[str, str, str]],
         now: float,

@@ -20,12 +20,12 @@ from pathlib import Path
 from typing import Any, Iterator
 from weakref import finalize
 
-from ..config_types import RootConfig
-from ..runtime.authority_scan import validate_evidence_path
-from ..runtime.paths import local_paths, machine_project_paths
-from ..runtime.records import utc_now, validate_identifier
-from ..runtime.resources.cpu_lane import cpu_reservation_snapshot, reserve_cpu, retag_cpu_if_matches
-from ..runtime.resources.reservations import (
+from ...config_types import RootConfig
+from ...runtime.authority_scan import validate_evidence_path
+from ...runtime.paths import local_paths, machine_project_paths
+from ...runtime.records import utc_now, validate_identifier
+from ...runtime.resources.cpu_lane import cpu_reservation_snapshot, reserve_cpu, retag_cpu_if_matches
+from ...runtime.resources.reservations import (
     ReservationIdentity,
     attach_executor_offer,
     classify_exact_reservation,
@@ -37,44 +37,45 @@ from ..runtime.resources.reservations import (
     reserve_admitted,
     retag_if_matches,
 )
-from ..runtime.store import atomic_replace, read_json_limited
-from ..runtime.submission_control_continuation import submission_control_continuation
-from .bindings import ProjectBinding
-from .context import MachineRuntime
-from .dispatch_probe import PrimaryProbeSession
-from .group_service_coordinator import GroupServiceCoordinator, GroupServiceOffer
-from .idle_executor_observation import IdleExecutorObservation
-from .idle_guard_client import IdleGuardClient
-from .idle_job_config import load_idle_job_config
-from .idle_job_demand import IdleJobCensus, IdleJobDemandCoordinator
-from .primary_probe_transport import encode_probe_session
-from .process_reservation_recovery import registration_reservation
-from .progress_coordinator import ProgressObservationCoordinator
-from .project_io_admission import ProjectIOAdmission, ServiceIntent
-from .project_io_executor import ProjectIOExecutor, ProjectIOProtocolError
-from .project_io_protocol import (
+from ...runtime.store import atomic_replace, read_json_limited
+from ...runtime.submission_control_continuation import submission_control_continuation
+from ..bindings import ProjectBinding
+from ..context import MachineRuntime
+from ..dispatch_probe import PrimaryProbeSession
+from ..group_service_coordinator import GroupServiceCoordinator, GroupServiceOffer
+from ..idle_executor_observation import IdleExecutorObservation
+from ..idle_guard_client import IdleGuardClient
+from ..idle_job_config import load_idle_job_config
+from ..idle_job_demand import IdleJobCensus, IdleJobDemandCoordinator
+from ..machine_snapshot_publication import MachineSnapshotPublication, SnapshotInputs
+from ..primary_probe_transport import encode_probe_session
+from ..process_reservation_recovery import registration_reservation
+from ..progress_coordinator import ProgressObservationCoordinator
+from ..ready_cursor_validation import validate_ready_cursor_transition
+from ..registration_renewal_health import REGISTRATION_RENEWAL_HEALTH_ITEM_LIMIT, RegistrationRenewalHealth
+from ..scheduler_diagnostics import ProducerCoverageCheckpoint
+from ..snapshot_publication_health import SNAPSHOT_HEALTH_ITEM_LIMIT, SnapshotPublicationHealth
+from ..takeover_coordinator import TakeoverCoordinator, takeover_frozen_owner
+from ..takeover_intent import TakeoverIntent, read_takeover_intent, takeover_issue_path
+from ..working_set import BindingTurn
+from .admission import ProjectIOAdmission, ServiceIntent
+from .executor import ProjectIOExecutor, ProjectIOProtocolError
+from .identity import ValidationIdentity
+from .json_data import copy_json_data
+from .protocol import (
     IDLE_DECISION_GUARD_PROJECT_ID,
     PROJECT_IO_OPERATIONS,
     PROJECT_IO_OVERDUE_SECONDS,
     RESERVATION_RECONCILE_RELEASE_REASONS,
     ProjectIORequest,
 )
-from .ready_cursor_validation import validate_ready_cursor_transition
-from .registration_renewal_health import REGISTRATION_RENEWAL_HEALTH_ITEM_LIMIT, RegistrationRenewalHealth
-from .scheduler_diagnostics import ProducerCoverageCheckpoint
-from .snapshot_publication_health import (
-    SNAPSHOT_COVERAGE_FILENAME,
-    SNAPSHOT_HEALTH_ITEM_LIMIT,
-    SnapshotPublicationHealth,
-)
-from .takeover_coordinator import TakeoverCoordinator, takeover_frozen_owner
-from .takeover_intent import TakeoverIntent, read_takeover_intent, takeover_issue_path
-from .working_set import BindingTurn
+from .scheduling.due_offers import DueOfferPolicy
+from .scheduling.ready_index import ReadyIndexBuildPolicy
+from .scheduling.rotation import BindingRotation
 
 _INITIAL_BACKOFF_SECONDS = 5.0
 _MAX_BACKOFF_SECONDS = 300.0
 _RECOVERY_WAIT_RETRY_SECONDS = 1.0
-_SCHEDULER_DUE_OFFER_IDLE_RETRY_SECONDS = 1.0
 _PRELAUNCH_RESERVATION_RECHECK_SECONDS = 15.0
 _MAX_RETAINED_SCHEDULER_INTENTS = 64
 _MAX_RETAINED_RESERVATION_RECONCILIATIONS = 256
@@ -245,31 +246,6 @@ def _admission_operation(method: Callable[..., Any]) -> Callable[..., Any]:
     return wrapped
 
 
-def _json_copy(value: Any) -> Any:
-    """Return a detached mutable copy of protocol-frozen JSON data."""
-    if isinstance(value, Mapping):
-        return {key: _json_copy(item) for key, item in value.items()}
-    if isinstance(value, Sequence) and not isinstance(value, str | bytes):
-        return [_json_copy(item) for item in value]
-    return value
-
-
-@dataclass(frozen=True, slots=True)
-class _ValidationIdentity:
-    runtime_id: str
-    executor_epoch: str
-    project_id: str
-    shared_root: str
-    machine_name: str
-    registration_generation: str
-    runtime_root: str
-    registry_revision: int
-
-    @property
-    def request_owner(self) -> tuple[str, str, str]:
-        return (self.runtime_id, self.project_id, self.registration_generation)
-
-
 @dataclass(frozen=True, slots=True)
 class _FailureBackoff:
     consecutive_failures: int
@@ -289,18 +265,18 @@ class BorrowAdmissionGrant:
     executor_epoch: str
     registry_revision: int
     lane: str
-    identities: frozenset[_ValidationIdentity]
+    identities: frozenset[ValidationIdentity]
     capacity_digest: str
 
 
 @dataclass(slots=True)
 class _PrimaryProbeRound:
     round_id: str
-    identities: frozenset[_ValidationIdentity]
+    identities: frozenset[ValidationIdentity]
     capacity_digest: str
-    states: dict[_ValidationIdentity, Mapping[str, Any]]
-    scanned: set[_ValidationIdentity]
-    verified: set[_ValidationIdentity]
+    states: dict[ValidationIdentity, Mapping[str, Any]]
+    scanned: set[ValidationIdentity]
+    verified: set[ValidationIdentity]
     phase: str = "scan"
 
 
@@ -314,13 +290,13 @@ class _SchedulerQuiescenceRound:
 
 @dataclass(frozen=True, slots=True)
 class _PendingClaimOffer:
-    identity: _ValidationIdentity
+    identity: ValidationIdentity
     binding: ProjectBinding
     candidate: Mapping[str, Any]
     cursor: Mapping[str, Any]
     evidence: Mapping[str, Any]
     offer: Mapping[str, Any]
-    service_key: tuple[_ValidationIdentity, str, str, str]
+    service_key: tuple[ValidationIdentity, str, str, str]
 
 
 class ProjectIOController:
@@ -348,33 +324,32 @@ class ProjectIOController:
         self._needs_successor_turn = False
         self._monotonic = monotonic
         self._observed_executor_epoch: str | None = None
-        self._validated: set[_ValidationIdentity] = set()
-        self._backoff: dict[_ValidationIdentity, _FailureBackoff] = {}
-        self._service_backoff: dict[tuple[_ValidationIdentity, str, str, str], _FailureBackoff] = {}
-        self._reservation_reconcile_backoff: dict[tuple[_ValidationIdentity, str, str, str], _FailureBackoff] = {}
-        self._observations: dict[tuple[_ValidationIdentity, str, str, str], Mapping[str, Any]] = {}
-        self._empty_observations: dict[tuple[_ValidationIdentity, str, str, str], Mapping[str, Any]] = {}
+        self._validated: set[ValidationIdentity] = set()
+        self._backoff: dict[ValidationIdentity, _FailureBackoff] = {}
+        self._service_backoff: dict[tuple[ValidationIdentity, str, str, str], _FailureBackoff] = {}
+        self._reservation_reconcile_backoff: dict[tuple[ValidationIdentity, str, str, str], _FailureBackoff] = {}
+        self._observations: dict[tuple[ValidationIdentity, str, str, str], Mapping[str, Any]] = {}
+        self._empty_observations: dict[tuple[ValidationIdentity, str, str, str], Mapping[str, Any]] = {}
         self._observation_offsets: dict[tuple[str, str], int] = {}
         self._started_requests: set[str] = set()
         self._authorized_reservations: set[ReservationIdentity] = set()
         self._trusted_reservations: dict[ReservationIdentity, float | None] = {}
         self._reservation_reconcile_binding_cursor: tuple[str, str] | None = None
         self._reservation_reconcile_cursors: dict[tuple[str, str], str] = {}
-        self._due_offer_binding_cursor: tuple[str, str] | None = None
-        self._ready_index_binding_cursor: tuple[str, str] | None = None
-        self._maintenance_descriptor_binding_cursor: tuple[str, str] | None = None
-        self._maintenance_descriptor_settled: dict[_ValidationIdentity, BindingTurn] = {}
-        self._maintenance_descriptor_dirty: set[_ValidationIdentity] = set()
+        self._due_offer_policy = DueOfferPolicy(_MAX_RETAINED_SCHEDULER_INTENTS)
+        self._ready_index_build_policy = ReadyIndexBuildPolicy(_MAX_RETAINED_SCHEDULER_INTENTS)
+        self._maintenance_descriptor_rotation = BindingRotation(_MAX_RETAINED_SCHEDULER_INTENTS)
+        self._maintenance_descriptor_settled: dict[ValidationIdentity, BindingTurn] = {}
+        self._maintenance_descriptor_dirty: set[ValidationIdentity] = set()
         self._maintenance_descriptor_turns: dict[str, BindingTurn] = {}
-        self._ready_index_settled: dict[_ValidationIdentity, None] = {}
-        self._ready_index_needed: dict[_ValidationIdentity, None] = {}
-        self._snapshot_coverage_cursor: tuple[str, str] | None = None
-        self._snapshot_health = SnapshotPublicationHealth(
-            monotonic=monotonic, utc_clock=utc_clock, max_retry_seconds=_MAX_BACKOFF_SECONDS
+        self._snapshots = MachineSnapshotPublication(
+            runtime,
+            SnapshotPublicationHealth(monotonic=monotonic, utc_clock=utc_clock, max_retry_seconds=_MAX_BACKOFF_SECONDS),
+            monotonic,
         )
         self._activation_offsets: dict[str, int] = {}
         self._primary_rounds: dict[str, _PrimaryProbeRound] = {}
-        self._scheduler_quiescence_rounds: dict[_ValidationIdentity, _SchedulerQuiescenceRound] = {}
+        self._scheduler_quiescence_rounds: dict[ValidationIdentity, _SchedulerQuiescenceRound] = {}
         self._scheduler_quiescence_requests: dict[str, _SchedulerQuiescenceRound] = {}
         self._idle_job_demand = IdleJobDemandCoordinator(monotonic=monotonic)
         self._idle_job_guard = IdleGuardClient(executor)
@@ -386,17 +361,17 @@ class ProjectIOController:
         self._borrow_grants: dict[str, BorrowAdmissionGrant] = {}
         self._pending_claim_offers: dict[str, _PendingClaimOffer] = {}
         self._offer_recovery_cursor: str | None = None
-        self._upgrade_status: dict[_ValidationIdentity, Mapping[str, Any]] = {}
-        self._upgrade_due: dict[_ValidationIdentity, float] = {}
-        self._submission_cursors: dict[_ValidationIdentity, Mapping[str, Any]] = {}
-        self._submission_due: dict[_ValidationIdentity, float] = {}
-        self._observation_due: dict[_ValidationIdentity, float] = {}
-        self._observation_turns: dict[_ValidationIdentity, BindingTurn] = {}
-        self._registration_due: dict[_ValidationIdentity, float] = {}
-        self._registration_deadlines: dict[_ValidationIdentity, float] = {}
+        self._upgrade_status: dict[ValidationIdentity, Mapping[str, Any]] = {}
+        self._upgrade_due: dict[ValidationIdentity, float] = {}
+        self._submission_cursors: dict[ValidationIdentity, Mapping[str, Any]] = {}
+        self._submission_due: dict[ValidationIdentity, float] = {}
+        self._observation_due: dict[ValidationIdentity, float] = {}
+        self._observation_turns: dict[ValidationIdentity, BindingTurn] = {}
+        self._registration_due: dict[ValidationIdentity, float] = {}
+        self._registration_deadlines: dict[ValidationIdentity, float] = {}
         self._registration_renewal_health = RegistrationRenewalHealth(monotonic=monotonic, utc_clock=utc_clock)
         self._registration_health_registry: tuple[str, int, tuple[ProjectBinding, ...]] | None = None
-        self._submission_turns: dict[_ValidationIdentity, BindingTurn] = {}
+        self._submission_turns: dict[ValidationIdentity, BindingTurn] = {}
         self.progress = ProgressObservationCoordinator(runtime, clock=monotonic)
 
     def advance_takeover(self, registry_revision: int) -> bool:
@@ -468,7 +443,7 @@ class ProjectIOController:
             return None
 
         transition = intent.transition
-        identity = _ValidationIdentity(
+        identity = ValidationIdentity(
             transition.successor_runtime_id,
             epoch,
             transition.project_id,
@@ -489,7 +464,7 @@ class ProjectIOController:
                 self._request_identity(request) == replace(identity, registry_revision=request.registry_revision)
                 and request.parameters["plan_id"] == intent.plan_id
                 and (request.parameters["step"] != "group" or request.parameters.get("group_name") == group_name)
-                and _json_copy(request.parameters["transition"]) == transition.to_dict()
+                and copy_json_data(request.parameters["transition"]) == transition.to_dict()
             ):
                 current_request = request
             elif self.executor.resolve_stale_request(request.request_id, request):
@@ -521,7 +496,7 @@ class ProjectIOController:
         self,
         request: ProjectIORequest,
         step: str | None,
-        service_key: tuple[_ValidationIdentity, str, str, str],
+        service_key: tuple[ValidationIdentity, str, str, str],
     ) -> tuple[str, str] | None:
         request_id = request.request_id
         actual_step = request.parameters["step"]
@@ -565,7 +540,7 @@ class ProjectIOController:
         intent: TakeoverIntent,
         registry_revision: int,
         step: str,
-        service_key: tuple[_ValidationIdentity, str, str, str],
+        service_key: tuple[ValidationIdentity, str, str, str],
         group_name: str | None,
     ) -> None:
         if self._read_active_takeover_intent() != intent:
@@ -688,7 +663,7 @@ class ProjectIOController:
         self,
         binding: ProjectBinding,
         registry_revision: int,
-        key: tuple[_ValidationIdentity, str, str, str],
+        key: tuple[ValidationIdentity, str, str, str],
     ) -> None:
         try:
             request = self.executor.prepare_upgrade_service(binding, registry_revision)
@@ -700,7 +675,7 @@ class ProjectIOController:
     def _start_upgrade_request(
         self,
         request: ProjectIORequest,
-        key: tuple[_ValidationIdentity, str, str, str],
+        key: tuple[ValidationIdentity, str, str, str],
     ) -> None:
         try:
             process = self.executor.start(request.request_id)
@@ -722,21 +697,15 @@ class ProjectIOController:
             or bool(self._pending_claim_offers)
         )
 
-    def _mark_ready_index_needed(self, identity: _ValidationIdentity) -> None:
+    def _mark_ready_index_needed(self, identity: ValidationIdentity) -> None:
         """Retain one bounded, insertion-ordered ready-index repair intent."""
-        if identity in self._ready_index_needed:
-            return
-        if len(self._ready_index_needed) >= _MAX_RETAINED_SCHEDULER_INTENTS:
-            victim = next(
-                (
-                    retained
-                    for retained in self._ready_index_needed
-                    if (retained, "scheduler_ready_index_build", "ready_index", "advance") in self._service_backoff
-                ),
-                next(iter(self._ready_index_needed)),
-            )
-            del self._ready_index_needed[victim]
-        self._ready_index_needed[identity] = None
+        self._ready_index_build_policy.mark_needed(
+            identity,
+            lambda retained: (
+                (retained, self._ready_index_build_policy.kind, self._ready_index_build_policy.service, "advance")
+                in self._service_backoff
+            ),
+        )
 
     def pending_wait_seconds(self, default: float) -> float:
         """Bound idle waits while admitted work or responsive workers need polling."""
@@ -870,7 +839,7 @@ class ProjectIOController:
 
     def _offer_new_request(
         self,
-        identity: _ValidationIdentity,
+        identity: ValidationIdentity,
         kind: str,
         action: Callable[[], None],
         *parts: str,
@@ -922,8 +891,8 @@ class ProjectIOController:
             return {}
         self._observed_executor_epoch = executor_epoch
 
-        current_bindings: dict[_ValidationIdentity, ProjectBinding] = {}
-        ordered_bindings: list[tuple[_ValidationIdentity, ProjectBinding]] = []
+        current_bindings: dict[ValidationIdentity, ProjectBinding] = {}
+        ordered_bindings: list[tuple[ValidationIdentity, ProjectBinding]] = []
         for binding in bindings:
             identity = self._binding_identity(binding, registry_revision, executor_epoch)
             if identity is None or identity in current_bindings:
@@ -1010,7 +979,7 @@ class ProjectIOController:
 
     def _prepare_binding_validation_request(
         self,
-        identity: _ValidationIdentity,
+        identity: ValidationIdentity,
         binding: ProjectBinding,
         registry_revision: int,
     ) -> None:
@@ -1033,7 +1002,7 @@ class ProjectIOController:
     def _advance_prevalidation_requests(
         self,
         unresolved: Sequence[ProjectIORequest],
-        current_binding_identities: set[_ValidationIdentity],
+        current_binding_identities: set[ValidationIdentity],
         executor_epoch: str,
         unresolved_request_ids: set[str],
     ) -> None:
@@ -1120,7 +1089,7 @@ class ProjectIOController:
             return {}
         self._observed_executor_epoch = executor_epoch
 
-        current_bindings: dict[_ValidationIdentity, ProjectBinding] = {}
+        current_bindings: dict[ValidationIdentity, ProjectBinding] = {}
         for binding in bindings:
             if binding.enabled is not True or not self.runtime.working_set.has_current_activation(binding):
                 continue
@@ -1147,10 +1116,9 @@ class ProjectIOController:
             if key[1:] in valid_scheduler_services and (key[1:] != selected_service or key[0] in current_identities)
         }
 
-        unresolved_by_id = {request.request_id: request for request in unresolved}
-        self._started_requests.intersection_update(unresolved_by_id)
+        self._started_requests.intersection_update(request.request_id for request in unresolved)
         observations: dict[str, Mapping[str, Any]] = {
-            binding.project_id: _json_copy(self._observations[service_key])
+            binding.project_id: copy_json_data(self._observations[service_key])
             for identity, binding in current_bindings.items()
             if (service_key := self._observation_service_key(identity, lane, admission_role)) in self._observations
         }
@@ -1158,11 +1126,11 @@ class ProjectIOController:
         def retained_candidate_count() -> int:
             return sum(key[1:] == ("scheduler_observe", lane, admission_role) for key in self._observations)
 
-        def primary_priority(identity: _ValidationIdentity) -> int:
+        def primary_priority(identity: ValidationIdentity) -> int:
             priority = self._admission.candidate_priority(identity.request_owner, "primary")
             return priority if priority is not None else len(current_bindings) * 3 + 1
 
-        def worst_retained_candidate() -> tuple[_ValidationIdentity, str, str, str]:
+        def worst_retained_candidate() -> tuple[ValidationIdentity, str, str, str]:
             return max(
                 (
                     retained_key
@@ -1194,7 +1162,6 @@ class ProjectIOController:
                 ):
                     self._start_observation_request(request, service_key)
                 continue
-            unresolved_by_id.pop(request.request_id, None)
             self._started_requests.discard(request.request_id)
             if result.request != request:
                 raise ProjectIOProtocolError("consumed result does not repeat its exact request identity.")
@@ -1213,7 +1180,6 @@ class ProjectIOController:
             evidence = dict(result.evidence)
             ready_index_inactive = evidence.get("reason") == "ready_index_inactive"
             if ready_index_inactive:
-                self._ready_index_settled.pop(identity, None)
                 self._mark_ready_index_needed(identity)
                 self._observations = {
                     retained_key: retained
@@ -1226,7 +1192,7 @@ class ProjectIOController:
                     if retained_key[0] != identity
                 }
             else:
-                self._ready_index_needed.pop(identity, None)
+                self._ready_index_build_policy.clear_need(identity)
             if evidence["outcome"] == "candidate":
                 quiescence = self._scheduler_quiescence_rounds.pop(identity, None)
                 if quiescence is not None and (
@@ -1250,8 +1216,8 @@ class ProjectIOController:
                     evicted_binding = current_bindings.get(evicted_key[0])
                     if evicted_binding is not None:
                         observations.pop(evicted_binding.project_id, None)
-                self._observations[service_key] = _json_copy(evidence)
-                observations[binding.project_id] = _json_copy(evidence)
+                self._observations[service_key] = copy_json_data(evidence)
+                observations[binding.project_id] = copy_json_data(evidence)
             else:
                 # Empty scans are transient observations, not durable intents.
                 # Keeping one would permanently hide work submitted afterwards.
@@ -1273,8 +1239,8 @@ class ProjectIOController:
                     if evicted_binding is not None:
                         observations.pop(evicted_binding.project_id, None)
                 if not ready_index_inactive:
-                    self._empty_observations[service_key] = _json_copy(evidence)
-                observations[binding.project_id] = _json_copy(evidence)
+                    self._empty_observations[service_key] = copy_json_data(evidence)
+                observations[binding.project_id] = copy_json_data(evidence)
 
         can_start = (
             executor_status["envelope"] != "unknown"
@@ -1292,7 +1258,7 @@ class ProjectIOController:
         for identity, binding in ordered_bindings:
             if not can_start:
                 break
-            if identity in self._ready_index_needed:
+            if identity in self._ready_index_build_policy.needed:
                 continue
             if binding.project_id in observations:
                 continue
@@ -1343,13 +1309,13 @@ class ProjectIOController:
 
     def _prepare_scheduler_observation_request(
         self,
-        identity: _ValidationIdentity,
+        identity: ValidationIdentity,
         binding: ProjectBinding,
         registry_revision: int,
         lane: str,
         admission_role: str,
         cursor_namespace: str,
-        service_key: tuple[_ValidationIdentity, str, str, str],
+        service_key: tuple[ValidationIdentity, str, str, str],
     ) -> None:
         # Admission offers are collected before completed quiescence probes are
         # consumed later in the same machine pass.  Recheck the closed proof at
@@ -1413,8 +1379,8 @@ class ProjectIOController:
             return {}
         self._observed_executor_epoch = executor_epoch
 
-        current_bindings: dict[_ValidationIdentity, ProjectBinding] = {}
-        bindings_by_project: dict[str, tuple[_ValidationIdentity, ProjectBinding]] = {}
+        current_bindings: dict[ValidationIdentity, ProjectBinding] = {}
+        bindings_by_project: dict[str, tuple[ValidationIdentity, ProjectBinding]] = {}
         for binding in bindings:
             identity = self._binding_identity(binding, registry_revision, executor_epoch)
             if (
@@ -1461,9 +1427,6 @@ class ProjectIOController:
 
         unresolved_by_id = {request.request_id: request for request in unresolved}
         self._started_requests.intersection_update(unresolved_by_id)
-        unresolved_owners = {
-            (request.runtime_id, request.project_id, request.registration_generation) for request in unresolved
-        }
         completions: dict[str, Mapping[str, Any]] = {}
 
         for request in unresolved:
@@ -1487,7 +1450,6 @@ class ProjectIOController:
                     resolved = False
                 if resolved:
                     unresolved_by_id.pop(request.request_id, None)
-                    unresolved_owners.discard(identity.request_owner)
                     self._started_requests.discard(request.request_id)
                 continue
             retry_due = self._service_retry_is_due(service_key)
@@ -1502,7 +1464,7 @@ class ProjectIOController:
                 if service_key not in self._service_backoff:
                     self._record_service_failure(service_key)
                 elif retry_due:
-                    self._start_cursor_commit_request(request, service_key)
+                    self._start_current_epoch_request(request, service_key)
                 continue
             try:
                 self.executor._load_process(request.request_id)
@@ -1526,21 +1488,15 @@ class ProjectIOController:
                     raise ProjectIOProtocolError("consumed cursor result differs from its reconciled result.")
                 completions[request.project_id] = dict(consumed.evidence)
                 unresolved_by_id.pop(request.request_id, None)
-                unresolved_owners.discard(identity.request_owner)
                 self._started_requests.discard(request.request_id)
                 self._service_backoff.pop(service_key, None)
                 continue
             consumed = self.executor.consume(request.request_id, request)
             if consumed is not None:
                 unresolved_by_id.pop(request.request_id, None)
-                unresolved_owners.discard(identity.request_owner)
                 self._started_requests.discard(request.request_id)
             self._record_service_failure(service_key)
 
-        unresolved_owners = {
-            (request.runtime_id, request.project_id, request.registration_generation)
-            for request in unresolved_by_id.values()
-        }
         can_start = (
             executor_status["envelope"] != "unknown"
             and executor_status["overdue_worker_count"] <= executor_status["supported_hang_limit"]
@@ -1577,8 +1533,8 @@ class ProjectIOController:
         registry_revision: int,
         cursor: Mapping[str, Any],
         source_revisions: Mapping[str, object],
-        observation_key: tuple[_ValidationIdentity, str, str, str],
-        service_key: tuple[_ValidationIdentity, str, str, str],
+        observation_key: tuple[ValidationIdentity, str, str, str],
+        service_key: tuple[ValidationIdentity, str, str, str],
     ) -> None:
         try:
             request = self.executor.prepare_scheduler_cursor_commit(
@@ -1591,7 +1547,7 @@ class ProjectIOController:
             self._record_service_failure(service_key)
             return
         self._empty_observations.pop(observation_key, None)
-        self._start_cursor_commit_request(request, service_key)
+        self._start_current_epoch_request(request, service_key)
 
     def scheduler_is_quiescent(self, binding: ProjectBinding, registry_revision: int) -> bool:
         """Check a cached exact activation-bound scan without shared reads."""
@@ -1602,7 +1558,7 @@ class ProjectIOController:
         identity = self._binding_identity(binding, registry_revision, self._observed_executor_epoch)
         return self._scheduler_quiescence_is_current(identity)
 
-    def _scheduler_quiescence_is_current(self, identity: _ValidationIdentity | None, *, blocking: bool = True) -> bool:
+    def _scheduler_quiescence_is_current(self, identity: ValidationIdentity | None, *, blocking: bool = True) -> bool:
         round_state = self._scheduler_quiescence_rounds.get(identity)
         return bool(
             round_state is not None
@@ -1718,7 +1674,7 @@ class ProjectIOController:
         offer: GroupServiceOffer,
         binding: ProjectBinding,
         registry_revision: int,
-        key: tuple[_ValidationIdentity, str, str, str],
+        key: tuple[ValidationIdentity, str, str, str],
     ) -> None:
         try:
             request = self._group_service.prepare_request(
@@ -1907,7 +1863,7 @@ class ProjectIOController:
         owner = self.executor.runtime_id
         root = str(self.runtime.root)
         self._offer_new_request(
-            _ValidationIdentity(
+            ValidationIdentity(
                 owner,
                 epoch,
                 IDLE_DECISION_GUARD_PROJECT_ID,
@@ -1957,7 +1913,7 @@ class ProjectIOController:
         if not isinstance(epoch, str) or status.get("envelope") == "unknown":
             return
         self._observed_executor_epoch = epoch
-        census_dependencies = set(self._ready_index_needed) | {
+        census_dependencies = set(self._ready_index_build_policy.needed) | {
             key[0] for key, evidence in self._observations.items() if evidence.get("outcome") == "candidate"
         }
         current = {
@@ -2016,7 +1972,7 @@ class ProjectIOController:
                 continue
             self._service_backoff.pop(key, None)
             evidence = result.evidence
-            round_state.probe_state = _json_copy(evidence["probe_state"])
+            round_state.probe_state = copy_json_data(evidence["probe_state"])
             round_state.is_quiescent = evidence["state"] == "quiescent"
             if not round_state.is_quiescent:
                 self.runtime.working_set.acknowledge(round_state.turn, quiescent=False)
@@ -2041,11 +1997,11 @@ class ProjectIOController:
 
     def _prepare_scheduler_quiescence_probe(
         self,
-        identity: _ValidationIdentity,
+        identity: ValidationIdentity,
         binding: ProjectBinding,
         registry_revision: int,
         round_state: _SchedulerQuiescenceRound | None,
-        key: tuple[_ValidationIdentity, str, str, str],
+        key: tuple[ValidationIdentity, str, str, str],
     ) -> None:
         if self._scheduler_quiescence_rounds.get(identity) is not round_state:
             return
@@ -2100,7 +2056,7 @@ class ProjectIOController:
         if len(supplied) != len(enabled) or set(supplied) != set(enabled):
             self.invalidate_borrow_admission(lane)
             return None
-        current: dict[_ValidationIdentity, ProjectBinding] = {}
+        current: dict[ValidationIdentity, ProjectBinding] = {}
         for binding in supplied:
             identity = self._binding_identity(binding, registry_revision, executor_epoch)
             if identity is None or identity not in self._validated:
@@ -2143,7 +2099,7 @@ class ProjectIOController:
                 self._record_service_failure(key)
                 continue
             self._service_backoff.pop(key, None)
-            round_state.states[identity] = _json_copy(result.evidence["probe_state"])
+            round_state.states[identity] = copy_json_data(result.evidence["probe_state"])
             if result.evidence["demand"] == "no_primary_demand":
                 target = round_state.scanned if round_state.phase == "scan" else round_state.verified
                 target.add(identity)
@@ -2235,7 +2191,7 @@ class ProjectIOController:
         free: int,
         usage: Mapping[str, int],
         state: Mapping[str, Any],
-        service_key: tuple[_ValidationIdentity, str, str, str],
+        service_key: tuple[ValidationIdentity, str, str, str],
     ) -> None:
         if self._primary_rounds.get(lane) is not round_state:
             return
@@ -2406,7 +2362,7 @@ class ProjectIOController:
             return {}
         self._observed_executor_epoch = executor_epoch
 
-        current_bindings: dict[_ValidationIdentity, ProjectBinding] = {}
+        current_bindings: dict[ValidationIdentity, ProjectBinding] = {}
         for binding in bindings:
             identity = self._binding_identity(binding, registry_revision, executor_epoch)
             if identity is None or identity in current_bindings:
@@ -2430,11 +2386,7 @@ class ProjectIOController:
                 and set(bindings) == enabled
             )
 
-        unresolved_by_id = {request.request_id: request for request in unresolved}
-        self._started_requests.intersection_update(unresolved_by_id)
-        unresolved_owners = {
-            (request.runtime_id, request.project_id, request.registration_generation) for request in unresolved
-        }
+        self._started_requests.intersection_update(request.request_id for request in unresolved)
         processed_projects: set[str] = set()
         completions: dict[str, Mapping[str, Any]] = {}
 
@@ -2498,8 +2450,6 @@ class ProjectIOController:
                 consumed = self.executor.consume(request.request_id, request)
                 if consumed is None:
                     continue
-                unresolved_by_id.pop(request.request_id, None)
-                unresolved_owners.discard(identity.request_owner)
                 self._started_requests.discard(request.request_id)
                 self._record_service_failure(service_key)
                 continue
@@ -2532,8 +2482,6 @@ class ProjectIOController:
                 continue
             if consumed.request != request or consumed.status != "completed":
                 raise ProjectIOProtocolError("consumed result differs from the reconciled claim result.")
-            unresolved_by_id.pop(request.request_id, None)
-            unresolved_owners.discard(identity.request_owner)
             self._started_requests.discard(request.request_id)
             if consumed.status == "completed":
                 self._service_backoff.pop(service_key, None)
@@ -2639,7 +2587,7 @@ class ProjectIOController:
 
     def _prepare_scheduler_claim_request(
         self,
-        identity: _ValidationIdentity,
+        identity: ValidationIdentity,
         binding: ProjectBinding,
         candidate: Mapping[str, Any],
         cursor: Mapping[str, Any],
@@ -2649,8 +2597,8 @@ class ProjectIOController:
         allowed_gpu_ids: list[int],
         batch_budget: _ClaimBatchBudget,
         registry_revision: int,
-        observation_key: tuple[_ValidationIdentity, str, str, str],
-        service_key: tuple[_ValidationIdentity, str, str, str],
+        observation_key: tuple[ValidationIdentity, str, str, str],
+        service_key: tuple[ValidationIdentity, str, str, str],
         borrow_admission: BorrowAdmissionGrant | None,
         *,
         defer_request: bool = False,
@@ -2740,9 +2688,9 @@ class ProjectIOController:
                 pending = _PendingClaimOffer(
                     identity,
                     binding,
-                    _json_copy(candidate),
-                    _json_copy(cursor),
-                    _json_copy(evidence),
+                    copy_json_data(candidate),
+                    copy_json_data(cursor),
+                    copy_json_data(evidence),
                     offer,
                     service_key,
                 )
@@ -2800,7 +2748,7 @@ class ProjectIOController:
 
     def _advance_pending_claim_offers(
         self,
-        bindings: Mapping[_ValidationIdentity, ProjectBinding],
+        bindings: Mapping[ValidationIdentity, ProjectBinding],
         lane: str,
         role: str,
     ) -> set[str]:
@@ -2893,16 +2841,16 @@ class ProjectIOController:
 
     @staticmethod
     def _claim_service_key(
-        identity: _ValidationIdentity,
+        identity: ValidationIdentity,
         lane: str,
         admission_role: str,
-    ) -> tuple[_ValidationIdentity, str, str, str]:
+    ) -> tuple[ValidationIdentity, str, str, str]:
         return (identity, "scheduler_claim", lane, admission_role)
 
     def _start_claim_request(
         self,
         request: ProjectIORequest,
-        service_key: tuple[_ValidationIdentity, str, str, str],
+        service_key: tuple[ValidationIdentity, str, str, str],
         *,
         reconcile_only: bool = False,
     ) -> None:
@@ -2944,7 +2892,7 @@ class ProjectIOController:
     def _reserve_claim_offer(
         self,
         binding: ProjectBinding,
-        identity: _ValidationIdentity,
+        identity: ValidationIdentity,
         candidate: Mapping[str, Any],
         gpu_ids: list[int],
         cpu_slots: int,
@@ -3035,8 +2983,8 @@ class ProjectIOController:
             return tuple(sorted(self._trusted_reservations, key=lambda item: item.reservation_id))
         self._observed_executor_epoch = executor_epoch
 
-        current_bindings: dict[_ValidationIdentity, ProjectBinding] = {}
-        bindings_by_project: dict[str, tuple[_ValidationIdentity, ProjectBinding]] = {}
+        current_bindings: dict[ValidationIdentity, ProjectBinding] = {}
+        bindings_by_project: dict[str, tuple[ValidationIdentity, ProjectBinding]] = {}
         for binding in bindings:
             identity = self._binding_identity(binding, registry_revision, executor_epoch)
             if identity is None or identity not in self._validated:
@@ -3264,8 +3212,8 @@ class ProjectIOController:
             return {}
         self._observed_executor_epoch = executor_epoch
 
-        current_bindings: dict[_ValidationIdentity, ProjectBinding] = {}
-        bindings_by_project: dict[str, tuple[_ValidationIdentity, ProjectBinding]] = {}
+        current_bindings: dict[ValidationIdentity, ProjectBinding] = {}
+        bindings_by_project: dict[str, tuple[ValidationIdentity, ProjectBinding]] = {}
         for binding in bindings:
             identity = self._binding_identity(binding, registry_revision, executor_epoch)
             if (
@@ -3278,11 +3226,7 @@ class ProjectIOController:
             current_bindings[identity] = binding
             bindings_by_project[binding.project_id] = (identity, binding)
 
-        unresolved_by_id = {request.request_id: request for request in unresolved}
-        self._started_requests.intersection_update(unresolved_by_id)
-        unresolved_owners = {
-            (request.runtime_id, request.project_id, request.registration_generation) for request in unresolved
-        }
+        self._started_requests.intersection_update(request.request_id for request in unresolved)
         completions: dict[str, Mapping[str, Any]] = {}
         processed_reservations: set[str] = set()
 
@@ -3316,7 +3260,7 @@ class ProjectIOController:
                 if was_started or service_key not in self._service_backoff:
                     self._record_service_failure(service_key)
                 if self._service_retry_is_due(service_key):
-                    self._start_launch_request(request, service_key)
+                    self._start_current_epoch_request(request, service_key)
                 continue
             if result.request != request:
                 raise ProjectIOProtocolError("launch result does not repeat its exact request identity.")
@@ -3331,7 +3275,7 @@ class ProjectIOController:
                 if reset:
                     self._record_service_failure(service_key)
                     if self._service_retry_is_due(service_key):
-                        self._start_launch_request(request, service_key)
+                        self._start_current_epoch_request(request, service_key)
                 continue
             if result.status == "completed" and result.evidence.get("outcome") == "authorized":
                 try:
@@ -3342,11 +3286,9 @@ class ProjectIOController:
             consumed = self.executor.consume(request.request_id, request)
             if consumed is None:
                 continue
-            unresolved_by_id.pop(request.request_id, None)
-            unresolved_owners.discard(identity.request_owner)
             self._started_requests.discard(request.request_id)
             if consumed.status == "completed":
-                completions[reservation_id] = _json_copy(consumed.evidence)
+                completions[reservation_id] = copy_json_data(consumed.evidence)
                 if consumed.evidence.get("outcome") == "authorized":
                     self._authorized_reservations.add(reservation)
                 self._service_backoff.pop(service_key, None)
@@ -3431,7 +3373,7 @@ class ProjectIOController:
         registry_revision: int,
         claim_identity: ReservationIdentity,
         reservation: ReservationIdentity,
-        service_key: tuple[_ValidationIdentity, str, str, str],
+        service_key: tuple[ValidationIdentity, str, str, str],
     ) -> None:
         try:
             if classify_exact_reservation(self.runtime.root, reservation) != "matching_active":
@@ -3445,7 +3387,7 @@ class ProjectIOController:
         except (OSError, RuntimeError, ValueError):
             self._record_service_failure(service_key)
             return
-        self._start_launch_request(request, service_key)
+        self._start_current_epoch_request(request, service_key)
 
     def retry_scheduler_launch_authorization(self, reservation: ReservationIdentity) -> None:
         """Allow exact authorization replay after a proven-local launch failure."""
@@ -3465,143 +3407,22 @@ class ProjectIOController:
         excluded_project_ids = frozenset(start_excluded_project_ids)
         if any(type(project_id) is not str or not project_id for project_id in excluded_project_ids):
             raise ValueError("start_excluded_project_ids must contain nonempty project IDs.")
-        executor_status, unresolved = self._poll_admission_executor()
-        executor_epoch = executor_status.get("executor_epoch")
-        if executor_status.get("envelope") == "unknown" or not isinstance(executor_epoch, str):
+        turn = self._scheduler_turn(bindings, registry_revision)
+        if turn is None:
             return {}
-        self._observed_executor_epoch = executor_epoch
-        current: dict[_ValidationIdentity, ProjectBinding] = {}
-        for binding in bindings:
-            identity = self._binding_identity(binding, registry_revision, executor_epoch)
-            if identity is not None and binding.enabled and identity in self._validated:
-                current[identity] = binding
+        current, unresolved, can_start = turn
+        return self._advance_scheduler_work(
+            self._due_offer_policy,
+            current,
+            unresolved,
+            self._due_offer_policy.candidates(current, can_start=can_start, excluded_projects=excluded_project_ids),
+            registry_revision,
+        )
 
-        unresolved_by_id = {request.request_id: request for request in unresolved}
-        unresolved_owners = {
-            (request.runtime_id, request.project_id, request.registration_generation) for request in unresolved
-        }
-        self._started_requests.intersection_update(unresolved_by_id)
-        completions: dict[str, Mapping[str, Any]] = {}
-        processed: set[str] = set()
-        for request in unresolved:
-            if request.operation_kind != "scheduler_due_offer":
-                continue
-            identity = self._request_identity(request)
-            binding = current.get(identity)
-            if binding is None:
-                if self.executor.resolve_stale_scheduler_due_offer(request.request_id, request):
-                    unresolved_by_id.pop(request.request_id, None)
-                    unresolved_owners.discard(identity.request_owner)
-                    self._started_requests.discard(request.request_id)
-                continue
-            processed.add(binding.project_id)
-            key = (identity, "scheduler_due_offer", "deadline", "advance")
-            try:
-                self.executor._load_process(request.request_id)
-            except FileNotFoundError:
-                was_started = request.request_id in self._started_requests
-                self._started_requests.discard(request.request_id)
-            else:
-                self._started_requests.add(request.request_id)
-                continue
-            result = self.executor.load_result(request.request_id)
-            if result is None:
-                if was_started or key not in self._service_backoff:
-                    self._record_service_failure(key)
-                if self._service_retry_is_due(key):
-                    self._start_scheduler_due_offer_request(request, key)
-                continue
-            if result.request != request:
-                raise ProjectIOProtocolError("due-offer result changed request identity.")
-            if result.status == "outcome_unknown":
-                try:
-                    reset = self.executor.reset_ambiguous_scheduler_due_offer_for_retry(
-                        request.request_id,
-                        request,
-                    )
-                except (OSError, RuntimeError, ValueError):
-                    reset = False
-                if reset:
-                    self._record_service_failure(key)
-                    if self._service_retry_is_due(key):
-                        self._start_scheduler_due_offer_request(request, key)
-                continue
-            consumed = self.executor.consume(request.request_id, request)
-            if consumed is None:
-                continue
-            unresolved_by_id.pop(request.request_id, None)
-            unresolved_owners.discard(identity.request_owner)
-            self._started_requests.discard(request.request_id)
-            if consumed.status == "completed":
-                completions[binding.project_id] = dict(consumed.evidence)
-                if consumed.evidence.get("outcome") == "noop" and consumed.evidence.get("reason") == "no_due_deadline":
-                    self._service_backoff[key] = _FailureBackoff(
-                        0, self._monotonic() + _SCHEDULER_DUE_OFFER_IDLE_RETRY_SECONDS
-                    )
-                else:
-                    self._service_backoff.pop(key, None)
-            else:
-                self._record_service_failure(key)
-
-        can_start = executor_status.get("overdue_worker_count", 0) <= executor_status.get("supported_hang_limit", 0)
-        owners = sorted((identity.project_id, identity.registration_generation) for identity in current)
-        if not can_start or not owners:
-            if not owners:
-                self._due_offer_binding_cursor = None
-            return completions
-        start = 0
-        if self._due_offer_binding_cursor is not None:
-            start = bisect_right(owners, self._due_offer_binding_cursor)
-            if start == len(owners):
-                start = 0
-        selected = (owners[start:] + owners[:start])[:_MAX_RETAINED_SCHEDULER_INTENTS]
-        by_owner = {
-            (identity.project_id, identity.registration_generation): (identity, binding)
-            for identity, binding in current.items()
-        }
-        for owner in selected:
-            self._due_offer_binding_cursor = owner
-            identity, binding = by_owner[owner]
-            if binding.project_id in processed:
-                continue
-            if binding.project_id in excluded_project_ids:
-                continue
-            key = (identity, "scheduler_due_offer", "deadline", "advance")
-            if not self._service_retry_is_due(key):
-                continue
-            self._offer_new_request(
-                identity,
-                "scheduler_due_offer",
-                partial(
-                    self._prepare_scheduler_due_offer_request,
-                    binding,
-                    registry_revision,
-                    key,
-                ),
-                "deadline",
-            )
-            break
-        return completions
-
-    def _prepare_scheduler_due_offer_request(
-        self,
-        binding: ProjectBinding,
-        registry_revision: int,
-        service_key: tuple[_ValidationIdentity, str, str, str],
-    ) -> None:
-        # Ready-route absence does not settle foreign-home deadline work.
-        # Preserve an admitted scan even if that independent census finished.
-        try:
-            request = self.executor.prepare_scheduler_due_offer(binding, registry_revision)
-        except (OSError, RuntimeError, ValueError):
-            self._record_service_failure(service_key)
-            return
-        self._start_scheduler_due_offer_request(request, service_key)
-
-    def _start_scheduler_due_offer_request(
+    def _start_current_epoch_request(
         self,
         request: ProjectIORequest,
-        service_key: tuple[_ValidationIdentity, str, str, str],
+        service_key: tuple[ValidationIdentity, str, str, str],
     ) -> None:
         if request.executor_epoch != self._observed_executor_epoch:
             self._record_service_failure(service_key)
@@ -3628,44 +3449,58 @@ class ProjectIOController:
         """Advance one fairly selected ready-index build slice."""
         if type(observed_only) is not bool:
             raise ValueError("observed_only must be a boolean.")
+        turn = self._scheduler_turn(bindings, registry_revision)
+        if turn is None:
+            return {}
+        eligible, unresolved, can_start = turn
+        current = self._ready_index_build_policy.refresh_bindings(eligible, observed_only)
+        return self._advance_scheduler_work(
+            self._ready_index_build_policy,
+            current,
+            unresolved,
+            self._ready_index_build_policy.candidates(current, can_start=can_start),
+            registry_revision,
+        )
+
+    def _scheduler_turn(
+        self, bindings: Sequence[ProjectBinding], registry_revision: int
+    ) -> tuple[dict[ValidationIdentity, ProjectBinding], tuple[ProjectIORequest, ...], bool] | None:
         executor_status, unresolved = self._poll_admission_executor()
         executor_epoch = executor_status.get("executor_epoch")
         if executor_status.get("envelope") == "unknown" or not isinstance(executor_epoch, str):
-            return {}
+            return None
         self._observed_executor_epoch = executor_epoch
-        eligible: dict[_ValidationIdentity, ProjectBinding] = {}
+        current: dict[ValidationIdentity, ProjectBinding] = {}
         for binding in bindings:
             identity = self._binding_identity(binding, registry_revision, executor_epoch)
             if identity is not None and binding.enabled and identity in self._validated:
-                eligible[identity] = binding
-        self._ready_index_settled = {identity: None for identity in self._ready_index_settled if identity in eligible}
-        self._ready_index_needed = {identity: None for identity in self._ready_index_needed if identity in eligible}
-        current = {
-            identity: binding
-            for identity, binding in eligible.items()
-            if not observed_only or identity in self._ready_index_needed
-        }
+                current[identity] = binding
 
-        unresolved_by_id = {request.request_id: request for request in unresolved}
-        unresolved_owners = {
-            (request.runtime_id, request.project_id, request.registration_generation) for request in unresolved
-        }
-        self._started_requests.intersection_update(unresolved_by_id)
+        can_start = executor_status.get("overdue_worker_count", 0) <= executor_status.get("supported_hang_limit", 0)
+        return current, unresolved, can_start
+
+    def _advance_scheduler_work(
+        self,
+        policy: DueOfferPolicy | ReadyIndexBuildPolicy,
+        current: Mapping[ValidationIdentity, ProjectBinding],
+        unresolved: tuple[ProjectIORequest, ...],
+        candidates: Iterable[ValidationIdentity],
+        registry_revision: int,
+    ) -> dict[str, Mapping[str, Any]]:
+        self._started_requests.intersection_update(request.request_id for request in unresolved)
         completions: dict[str, Mapping[str, Any]] = {}
         processed: set[str] = set()
         for request in unresolved:
-            if request.operation_kind != "scheduler_ready_index_build":
+            if request.operation_kind != policy.kind:
                 continue
             identity = self._request_identity(request)
             binding = current.get(identity)
             if binding is None:
-                if self.executor.resolve_stale_scheduler_ready_index_build(request.request_id, request):
-                    unresolved_by_id.pop(request.request_id, None)
-                    unresolved_owners.discard(identity.request_owner)
+                if self.executor.resolve_stale_scheduler_work(request):
                     self._started_requests.discard(request.request_id)
                 continue
             processed.add(binding.project_id)
-            key = (identity, "scheduler_ready_index_build", "ready_index", "advance")
+            key = (identity, policy.kind, policy.service, "advance")
             try:
                 self.executor._load_process(request.request_id)
             except FileNotFoundError:
@@ -3679,110 +3514,61 @@ class ProjectIOController:
                 if was_started or key not in self._service_backoff:
                     self._record_service_failure(key)
                 if self._service_retry_is_due(key):
-                    self._start_scheduler_ready_index_request(request, key)
+                    self._start_current_epoch_request(request, key)
                 continue
             if result.request != request:
-                raise ProjectIOProtocolError("ready-index result changed request identity.")
+                raise ProjectIOProtocolError(f"{policy.kind} result changed request identity.")
             if result.status == "outcome_unknown":
                 try:
-                    reset = self.executor.reset_ambiguous_scheduler_ready_index_build_for_retry(
-                        request.request_id,
-                        request,
-                    )
+                    reset = self.executor.reset_ambiguous_scheduler_work(request)
                 except (OSError, RuntimeError, ValueError):
                     reset = False
                 if reset:
                     self._record_service_failure(key)
                     if self._service_retry_is_due(key):
-                        self._start_scheduler_ready_index_request(request, key)
+                        self._start_current_epoch_request(request, key)
                 continue
             consumed = self.executor.consume(request.request_id, request)
             if consumed is None:
                 continue
-            unresolved_by_id.pop(request.request_id, None)
-            unresolved_owners.discard(identity.request_owner)
             self._started_requests.discard(request.request_id)
             if consumed.status == "completed":
                 completions[binding.project_id] = dict(consumed.evidence)
-                if consumed.evidence.get("state") in {"active", "degraded"}:
-                    self._ready_index_needed.pop(identity, None)
-                    self._ready_index_settled.pop(identity, None)
-                    self._ready_index_settled[identity] = None
-                    while len(self._ready_index_settled) > _MAX_RETAINED_SCHEDULER_INTENTS:
-                        del self._ready_index_settled[next(iter(self._ready_index_settled))]
-                self._service_backoff.pop(key, None)
+                delay = policy.on_completion(identity, consumed.evidence)
+                if delay is None:
+                    self._service_backoff.pop(key, None)
+                else:
+                    self._service_backoff[key] = _FailureBackoff(0, self._monotonic() + delay)
             else:
                 self._record_service_failure(key)
 
-        can_start = executor_status.get("overdue_worker_count", 0) <= executor_status.get("supported_hang_limit", 0)
-        owners = sorted((identity.project_id, identity.registration_generation) for identity in current)
-        if not can_start or not owners:
-            if not owners:
-                self._ready_index_binding_cursor = None
-            return completions
-        start = 0
-        if self._ready_index_binding_cursor is not None:
-            start = bisect_right(owners, self._ready_index_binding_cursor)
-            if start == len(owners):
-                start = 0
-        selected = (owners[start:] + owners[:start])[:_MAX_RETAINED_SCHEDULER_INTENTS]
-        by_owner = {
-            (identity.project_id, identity.registration_generation): (identity, binding)
-            for identity, binding in current.items()
-        }
-        for owner in selected:
-            self._ready_index_binding_cursor = owner
-            identity, binding = by_owner[owner]
-            if identity in self._ready_index_settled or binding.project_id in processed:
+        for identity in candidates:
+            if identity.project_id in processed:
                 continue
-            key = (identity, "scheduler_ready_index_build", "ready_index", "advance")
-            if not self._service_retry_is_due(key):
-                continue
-            self._offer_new_request(
-                identity,
-                "scheduler_ready_index_build",
-                partial(
-                    self._prepare_scheduler_ready_index_request,
-                    binding,
-                    registry_revision,
-                    key,
-                ),
-                "ready_index",
-            )
-            break
+            key = (identity, policy.kind, policy.service, "advance")
+            if self._service_retry_is_due(key):
+                self._offer_new_request(
+                    identity,
+                    policy.kind,
+                    partial(self._prepare_scheduler_work, policy, current[identity], registry_revision, key),
+                    policy.service,
+                )
+                break
         return completions
 
-    def _prepare_scheduler_ready_index_request(
+    def _prepare_scheduler_work(
         self,
+        policy: DueOfferPolicy | ReadyIndexBuildPolicy,
         binding: ProjectBinding,
         registry_revision: int,
-        service_key: tuple[_ValidationIdentity, str, str, str],
+        key: tuple[ValidationIdentity, str, str, str],
     ) -> None:
         try:
-            request = self.executor.prepare_scheduler_ready_index_build(binding, registry_revision)
+            request = policy.prepare(self.executor, binding, registry_revision)
         except (OSError, RuntimeError, ValueError):
-            self._record_service_failure(service_key)
+            self._record_service_failure(key)
             return
-        self._start_scheduler_ready_index_request(request, service_key)
-
-    def _start_scheduler_ready_index_request(
-        self,
-        request: ProjectIORequest,
-        service_key: tuple[_ValidationIdentity, str, str, str],
-    ) -> None:
-        if request.executor_epoch != self._observed_executor_epoch:
-            self._record_service_failure(service_key)
-            return
-        try:
-            process = self.executor.start(request.request_id)
-        except (OSError, RuntimeError, ValueError):
-            self._record_service_failure(service_key)
-            return
-        if process is None:
-            self._record_service_failure(service_key)
-            return
-        self._started_requests.add(request.request_id)
-        self._service_backoff.pop(service_key, None)
+        self._start_current_epoch_request(request, key)
 
     @_admission_operation
     def advance_maintenance_descriptor_work(
@@ -3796,7 +3582,7 @@ class ProjectIOController:
         if executor_status.get("envelope") == "unknown" or not isinstance(executor_epoch, str):
             return {}
         self._observed_executor_epoch = executor_epoch
-        current: dict[_ValidationIdentity, ProjectBinding] = {}
+        current: dict[ValidationIdentity, ProjectBinding] = {}
         for binding in bindings:
             identity = self._binding_identity(binding, registry_revision, executor_epoch)
             if identity is not None and binding.enabled and identity in self._validated:
@@ -3818,9 +3604,6 @@ class ProjectIOController:
             for request_id, turn in self._maintenance_descriptor_turns.items()
             if request_id in unresolved_by_id
         }
-        unresolved_owners = {
-            (request.runtime_id, request.project_id, request.registration_generation) for request in unresolved
-        }
         self._started_requests.intersection_update(unresolved_by_id)
         completions: dict[str, Mapping[str, Any]] = {}
         processed: set[str] = set()
@@ -3832,7 +3615,6 @@ class ProjectIOController:
             if binding is None:
                 if self.executor.resolve_stale_maintenance_descriptor(request.request_id, request):
                     unresolved_by_id.pop(request.request_id, None)
-                    unresolved_owners.discard(identity.request_owner)
                     self._started_requests.discard(request.request_id)
                     self._maintenance_descriptor_dirty.discard(identity)
                     self._maintenance_descriptor_turns.pop(request.request_id, None)
@@ -3853,7 +3635,7 @@ class ProjectIOController:
                 if was_started or key not in self._service_backoff:
                     self._record_service_failure(key)
                 if self._service_retry_is_due(key):
-                    self._start_maintenance_descriptor_request(request, key)
+                    self._start_current_epoch_request(request, key)
                 continue
             if result.request != request:
                 raise ProjectIOProtocolError("descriptor maintenance result changed request identity.")
@@ -3861,13 +3643,12 @@ class ProjectIOController:
                 if self.executor.reset_ambiguous_maintenance_descriptor_for_retry(request.request_id, request):
                     self._record_service_failure(key)
                     if self._service_retry_is_due(key):
-                        self._start_maintenance_descriptor_request(request, key)
+                        self._start_current_epoch_request(request, key)
                 continue
             consumed = self.executor.consume(request.request_id, request)
             if consumed is None:
                 continue
             unresolved_by_id.pop(request.request_id, None)
-            unresolved_owners.discard(identity.request_owner)
             self._started_requests.discard(request.request_id)
             turn = self._maintenance_descriptor_turns.pop(request.request_id, None)
             if consumed.status == "completed":
@@ -3926,24 +3707,8 @@ class ProjectIOController:
         can_start = executor_status.get("envelope") != "unknown" and executor_status.get(
             "overdue_worker_count", 0
         ) <= executor_status.get("supported_hang_limit", 0)
-        owners = sorted((identity.project_id, identity.registration_generation) for identity in current)
-        if not can_start or not owners:
-            if not owners:
-                self._maintenance_descriptor_binding_cursor = None
-            return completions
-        start = 0
-        if self._maintenance_descriptor_binding_cursor is not None:
-            start = bisect_right(owners, self._maintenance_descriptor_binding_cursor)
-            if start == len(owners):
-                start = 0
-        selected = (owners[start:] + owners[:start])[:_MAX_RETAINED_SCHEDULER_INTENTS]
-        by_owner = {
-            (identity.project_id, identity.registration_generation): (identity, binding)
-            for identity, binding in current.items()
-        }
-        for owner in selected:
-            self._maintenance_descriptor_binding_cursor = owner
-            identity, binding = by_owner[owner]
+        for identity in self._maintenance_descriptor_rotation.candidates(current, can_start=can_start):
+            binding = current[identity]
             if identity in self._maintenance_descriptor_settled or binding.project_id in processed:
                 continue
             key = self._maintenance_descriptor_service_key(identity)
@@ -3966,7 +3731,7 @@ class ProjectIOController:
         self,
         binding: ProjectBinding,
         registry_revision: int,
-        service_key: tuple[_ValidationIdentity, str, str, str],
+        service_key: tuple[ValidationIdentity, str, str, str],
     ) -> None:
         try:
             request = self.executor.prepare_maintenance_descriptor_advance(binding, registry_revision)
@@ -3976,26 +3741,7 @@ class ProjectIOController:
         self._maintenance_descriptor_turns[request.request_id] = self.runtime.working_set.begin_turn(
             binding, "maintenance"
         )
-        self._start_maintenance_descriptor_request(request, service_key)
-
-    def _start_maintenance_descriptor_request(
-        self,
-        request: ProjectIORequest,
-        service_key: tuple[_ValidationIdentity, str, str, str],
-    ) -> None:
-        if request.executor_epoch != self._observed_executor_epoch:
-            self._record_service_failure(service_key)
-            return
-        try:
-            process = self.executor.start(request.request_id)
-        except (OSError, RuntimeError, ValueError):
-            self._record_service_failure(service_key)
-            return
-        if process is None:
-            self._record_service_failure(service_key)
-            return
-        self._started_requests.add(request.request_id)
-        self._service_backoff.pop(service_key, None)
+        self._start_current_epoch_request(request, service_key)
 
     @_admission_operation
     def advance_maintenance_event_flushes(
@@ -4009,17 +3755,13 @@ class ProjectIOController:
         if executor_status.get("envelope") == "unknown" or not isinstance(executor_epoch, str):
             return {}
         self._observed_executor_epoch = executor_epoch
-        current: dict[_ValidationIdentity, ProjectBinding] = {}
+        current: dict[ValidationIdentity, ProjectBinding] = {}
         for binding in bindings:
             identity = self._binding_identity(binding, registry_revision, executor_epoch)
             if identity is not None and binding.enabled and identity in self._validated:
                 current[identity] = binding
 
-        unresolved_by_id = {request.request_id: request for request in unresolved}
-        unresolved_owners = {
-            (request.runtime_id, request.project_id, request.registration_generation) for request in unresolved
-        }
-        self._started_requests.intersection_update(unresolved_by_id)
+        self._started_requests.intersection_update(request.request_id for request in unresolved)
         completions: dict[str, Mapping[str, Any]] = {}
         processed: set[str] = set()
         for request in unresolved:
@@ -4029,8 +3771,6 @@ class ProjectIOController:
             binding = current.get(identity)
             if binding is None:
                 if self.executor.resolve_stale_maintenance_event(request.request_id, request):
-                    unresolved_by_id.pop(request.request_id, None)
-                    unresolved_owners.discard(identity.request_owner)
                     self._started_requests.discard(request.request_id)
                 continue
             processed.add(binding.project_id)
@@ -4058,8 +3798,6 @@ class ProjectIOController:
             consumed = self.executor.consume(request.request_id, request)
             if consumed is None:
                 continue
-            unresolved_by_id.pop(request.request_id, None)
-            unresolved_owners.discard(identity.request_owner)
             self._started_requests.discard(request.request_id)
             if consumed.status == "completed":
                 evidence = dict(consumed.evidence)
@@ -4122,7 +3860,7 @@ class ProjectIOController:
         filename: str,
         event_id: str,
         digest: str,
-        service_key: tuple[_ValidationIdentity, str, str, str],
+        service_key: tuple[ValidationIdentity, str, str, str],
     ) -> None:
         try:
             request = self.executor.prepare_maintenance_flush_event(
@@ -4156,61 +3894,23 @@ class ProjectIOController:
         """Advance one isolated advisory snapshot publication per validated binding."""
         if type(registry_revision) is not int or registry_revision < 0:
             raise ValueError("registry_revision must be a nonnegative integer.")
-        visible = self._snapshot_gpu_ids(visible_gpu_ids, "visible_gpu_ids")
-        if pid is not None and (type(pid) is not int or pid <= 0):
-            raise ValueError("pid must be a positive integer or null.")
-        if (
-            type(heartbeat_interval_seconds) not in {int, float}
-            or (type(heartbeat_interval_seconds) is float and not math.isfinite(heartbeat_interval_seconds))
-            or heartbeat_interval_seconds <= 0
-            or heartbeat_interval_seconds > 86_400
-        ):
-            raise ValueError("heartbeat_interval_seconds is invalid.")
-        if not isinstance(started_at, str):
-            raise ValueError("started_at must be an ISO-8601 timestamp.")
-        reservation_values = self._snapshot_reservations(reservations)
-        reserved = sorted({gpu_id for item in reservation_values for gpu_id in item["gpu_ids"]})
-        summaries_by_project: dict[str, list[dict[str, Any]]] = {}
-        for item in reservation_values:
-            project_id = item["project_id"]
-            if project_id is None:
-                continue
-            summaries_by_project.setdefault(project_id, []).append(
-                {
-                    key: item[key]
-                    for key in (
-                        "reservation_id",
-                        "project_id",
-                        "group_name",
-                        "machine_name",
-                        "task_id",
-                        "attempt_id",
-                        "gpu_ids",
-                        "state",
-                        "admission",
-                    )
-                }
-            )
-        policy_view = getattr(gpu_policy, "with_reservations", None)
-        if callable(policy_view):
-            gpu_policy = policy_view(reserved)
-        policy_to_dict = getattr(gpu_policy, "to_dict", None)
-        if callable(policy_to_dict):
-            gpu_policy = policy_to_dict()
-        if not isinstance(gpu_policy, Mapping):
-            raise ValueError("gpu_policy must be a mapping or policy view.")
-        policy = _json_copy(gpu_policy)
-        if not isinstance(policy, dict):
-            raise ValueError("gpu_policy must be an object.")
-
-        self._snapshot_health.reset_instance(instance_id)
+        inputs = SnapshotInputs.from_observation(
+            instance_id=instance_id,
+            pid=pid,
+            visible_gpu_ids=visible_gpu_ids,
+            reservations=reservations,
+            heartbeat_interval_seconds=heartbeat_interval_seconds,
+            started_at=started_at,
+            gpu_policy=gpu_policy,
+        )
+        self._snapshots.health.reset_instance(instance_id)
 
         executor_status, unresolved = self._poll_admission_executor()
         executor_epoch = executor_status.get("executor_epoch")
         if executor_status.get("envelope") == "unknown" or not isinstance(executor_epoch, str):
             return {}
         self._observed_executor_epoch = executor_epoch
-        current: dict[_ValidationIdentity, ProjectBinding] = {}
+        current: dict[ValidationIdentity, ProjectBinding] = {}
         for binding in bindings:
             identity = self._binding_identity(binding, registry_revision, executor_epoch)
             if (
@@ -4220,13 +3920,9 @@ class ProjectIOController:
                 and identity not in current
             ):
                 current[identity] = binding
-        self._snapshot_health.prune(current)
+        self._snapshots.health.prune(current)
 
-        unresolved_by_id = {request.request_id: request for request in unresolved}
-        unresolved_owners = {
-            (request.runtime_id, request.project_id, request.registration_generation) for request in unresolved
-        }
-        self._started_requests.intersection_update(unresolved_by_id)
+        self._started_requests.intersection_update(request.request_id for request in unresolved)
         completions: dict[str, Mapping[str, Any]] = {}
         processed_projects: set[str] = set()
         for request in unresolved:
@@ -4236,17 +3932,15 @@ class ProjectIOController:
             binding = current.get(identity)
             if binding is None:
                 if self.executor.resolve_stale_machine_snapshot(request.request_id, request):
-                    unresolved_by_id.pop(request.request_id, None)
-                    unresolved_owners.discard(identity.request_owner)
                     self._started_requests.discard(request.request_id)
                 continue
             processed_projects.add(binding.project_id)
             service_key = self._snapshot_service_key(identity)
             heartbeat_interval = float(request.parameters.get("heartbeat_interval_seconds", heartbeat_interval_seconds))
-            stage = self._snapshot_health.stage(identity, instance_id)
+            stage = self._snapshots.health.stage(identity, instance_id)
             retry_is_due = self._service_retry_is_due(service_key)
             if stage != "backoff" or retry_is_due:
-                self._snapshot_health.report_request(
+                self._snapshots.health.report_request(
                     identity,
                     instance_id,
                     heartbeat_interval,
@@ -4259,7 +3953,7 @@ class ProjectIOController:
                 self._started_requests.discard(request.request_id)
             else:
                 self._started_requests.add(request.request_id)
-                self._snapshot_health.report_request(
+                self._snapshots.health.report_request(
                     identity,
                     instance_id,
                     heartbeat_interval,
@@ -4274,7 +3968,7 @@ class ProjectIOController:
                 continue
             if result.request != request:
                 raise ProjectIOProtocolError("machine snapshot result changed request identity.")
-            self._snapshot_health.report_request(
+            self._snapshots.health.report_request(
                 identity,
                 instance_id,
                 heartbeat_interval,
@@ -4299,40 +3993,21 @@ class ProjectIOController:
             consumed = self.executor.consume(request.request_id, request)
             if consumed is None:
                 continue
-            self._snapshot_health.report_request(
+            self._snapshots.health.report_request(
                 identity,
                 instance_id,
                 heartbeat_interval,
                 request.request_id,
                 stage="consumed",
             )
-            unresolved_by_id.pop(request.request_id, None)
-            unresolved_owners.discard(identity.request_owner)
             self._started_requests.discard(request.request_id)
             if consumed.status == "completed":
                 evidence = dict(consumed.evidence)
                 completions[binding.project_id] = evidence
                 if evidence.get("outcome") == "published":
                     self._service_backoff.pop(service_key, None)
-                    if (
-                        request.parameters.get("instance_id") == instance_id
-                        and request.parameters.get("stop_reason") is None
-                        and (observed_registry_revision is None or registry_revision == observed_registry_revision)
-                        and self._snapshot_health.report_request(
-                            identity,
-                            instance_id,
-                            heartbeat_interval,
-                            request.request_id,
-                            stage="published",
-                        )
-                    ):
-                        self._record_snapshot_observation(
-                            identity, instance_id, evidence["snapshot_at"], heartbeat_interval
-                        )
-                    self._snapshot_health.record_publication(
-                        identity,
-                        self._machine_snapshot_signature(request.parameters),
-                        self._monotonic(),
+                    self._snapshots.accept_publication(
+                        identity, request, instance_id, evidence, heartbeat_interval, observed_registry_revision
                     )
                 else:
                     self._validated.discard(identity)
@@ -4359,85 +4034,36 @@ class ProjectIOController:
         can_start = executor_status.get("envelope") != "unknown" and executor_status.get(
             "overdue_worker_count", 0
         ) <= executor_status.get("supported_hang_limit", 0)
-        if not can_start:
-            for identity in current:
-                if identity.project_id in processed_projects:
-                    continue
-                if self._snapshot_health.stage(identity, instance_id) in {None, "published"}:
-                    self._snapshot_health.begin_intent(
-                        identity,
-                        instance_id,
-                        heartbeat_interval_seconds,
-                        new_attempt=True,
-                    )
-            return completions
-        now = self._monotonic()
-        for identity, binding in current.items():
-            if binding.project_id in processed_projects:
-                continue
-            service_key = self._snapshot_service_key(identity)
-            if not self._service_retry_is_due(service_key):
-                continue
-            project_summaries = summaries_by_project.get(binding.project_id, [])
-            signature = self._machine_snapshot_signature(
-                {
-                    "instance_id": instance_id,
-                    "pid": pid,
-                    "visible_gpu_ids": visible,
-                    "reserved_gpu_ids": reserved,
-                    "reservation_summaries": project_summaries,
-                    "heartbeat_interval_seconds": heartbeat_interval_seconds,
-                    "started_at": started_at,
-                    "gpu_policy": policy,
-                }
-            )
-            last_published = self._snapshot_health.last_publication(identity)
-            if (
-                last_published is not None
-                and last_published[0] == signature
-                and now - last_published[1] < heartbeat_interval_seconds
-            ):
-                continue
-            stage = self._snapshot_health.stage(identity, instance_id)
-            attempt_started = self._snapshot_health.begin_intent(
-                identity,
-                instance_id,
-                heartbeat_interval_seconds,
-                new_attempt=stage in {None, "published", "backoff"},
-            )
+        eligible = (
+            identity
+            for identity in current
+            if identity.project_id not in processed_projects
+            and (not can_start or self._service_retry_is_due(self._snapshot_service_key(identity)))
+        )
+        for identity, parameters, deadline in self._snapshots.due_offers(eligible, inputs, can_start=can_start):
             self._offer_new_request(
                 identity,
                 "machine_snapshot_publish",
                 partial(
                     self._prepare_machine_snapshot_publish_request,
-                    binding,
+                    current[identity],
                     registry_revision,
-                    instance_id,
-                    pid,
-                    visible,
-                    reserved,
-                    project_summaries,
-                    heartbeat_interval_seconds,
-                    started_at,
-                    policy,
-                    service_key,
+                    parameters,
+                    self._snapshot_service_key(identity),
                 ),
-                # Prefer snapshots only as freshness becomes at risk, leaving
-                # one heartbeat for publication before the three-interval
-                # stale diagnostic without consuming early startup grants.
-                deadline=attempt_started + 2 * heartbeat_interval_seconds,
+                deadline=deadline,
             )
         return completions
 
     def machine_snapshot_health_view(self, *, limit: int = SNAPSHOT_HEALTH_ITEM_LIMIT) -> dict[str, object]:
         """Return a detached worst-first view of current snapshot publication progress."""
-        return self._snapshot_health.view(limit=limit)
+        return self._snapshots.health.view(limit=limit)
 
     def machine_snapshot_latest_success(
         self, *, runtime_id: str, agent_instance_id: str, project_id: str, registration_generation: str
     ) -> tuple[int, str] | None:
         """Read accepted snapshot publication evidence outside the status sample."""
-        return self._snapshot_health.latest_success(
+        return self._snapshots.health.latest_success(
             runtime_id=runtime_id,
             agent_instance_id=agent_instance_id,
             project_id=project_id,
@@ -4446,88 +4072,24 @@ class ProjectIOController:
 
     def prune_machine_snapshot_observations(self, registered: Sequence[ProjectBinding]) -> None:
         """Retain publication evidence while an exact registration remains in the registry."""
-        self._snapshot_health.prune_observations(
-            (binding.runtime_instance_id, binding.project_id, binding.registration_generation)
-            for binding in registered
-            if binding.runtime_instance_id is not None and binding.registration_generation is not None
-        )
+        self._snapshots.prune_machine_snapshot_observations(registered)
 
     def record_scheduler_coverage(self, checkpoint: ProducerCoverageCheckpoint, *, instance_id: str) -> None:
         """Persist a bounded, rotating slice of covered Project snapshot receipts."""
-        bindings = sorted(checkpoint.observed_at_by_binding)
-        if not bindings:
-            return
-        cursor = self._snapshot_coverage_cursor
-        start = bisect_right(bindings, cursor) if cursor is not None else 0
-        window = (bindings[start:] + bindings[:start])[:16]
-        self._snapshot_coverage_cursor = window[-1]
-        runtime_id = self.runtime.observe_instance_id()
-        for project_id, generation in window:
-            evidence = self._snapshot_health.snapshot_evidence(
-                project_id=project_id,
-                registration_generation=generation,
-                runtime_id=runtime_id,
-                agent_instance_id=instance_id,
-            )
-            if evidence is None:
-                continue
-            snapshot_at, accepted_at = evidence
-            observed_at = checkpoint.observed_at_by_binding[project_id, generation]
-            try:
-                if datetime.fromisoformat(observed_at) <= datetime.fromisoformat(accepted_at):
-                    continue
-                atomic_replace(
-                    self.runtime.project_paths(project_id)["root"] / SNAPSHOT_COVERAGE_FILENAME,
-                    {
-                        "snapshot_coverage": {
-                            "runtime_id": runtime_id,
-                            "agent_instance_id": instance_id,
-                            "registration_generation": generation,
-                            "snapshot_at": snapshot_at,
-                            "accepted_at": accepted_at,
-                            "observed_at": observed_at,
-                        }
-                    },
-                )
-                self.runtime.complete_recovery_snapshot(project_id, generation, snapshot_at)
-            except (OSError, ValueError):
-                continue
-
-    def _record_snapshot_observation(
-        self, identity: _ValidationIdentity, instance_id: str, snapshot_at: str, heartbeat_interval: float
-    ) -> None:
-        accepted_at = datetime.now(timezone.utc).isoformat()
-        try:
-            committed = atomic_replace(
-                self.runtime.project_paths(identity.project_id)["root"] / "snapshot-observation.json",
-                {
-                    "snapshot_observation": {
-                        "runtime_id": identity.runtime_id,
-                        "agent_instance_id": instance_id,
-                        "registration_generation": identity.registration_generation,
-                        "snapshot_at": snapshot_at,
-                        "accepted_at": accepted_at,
-                        "heartbeat_interval_seconds": heartbeat_interval,
-                    }
-                },
-            )
-        except (OSError, ValueError):
-            return
-        if committed is not None:
-            self._snapshot_health.record_snapshot_evidence(identity, snapshot_at, accepted_at)
+        self._snapshots.record_scheduler_coverage(checkpoint, instance_id=instance_id)
 
     def _snapshot_record_failure(
         self,
-        identity: _ValidationIdentity,
+        identity: ValidationIdentity,
         instance_id: str,
         heartbeat_interval_seconds: int | float,
         *,
         reason: object,
         request_id: str | None = None,
-        service_key: tuple[_ValidationIdentity, str, str, str],
+        service_key: tuple[ValidationIdentity, str, str, str],
     ) -> None:
         failure = self._service_backoff.get(service_key)
-        self._snapshot_health.report_failure(
+        self._snapshots.health.report_failure(
             identity,
             instance_id,
             heartbeat_interval_seconds,
@@ -4540,20 +4102,15 @@ class ProjectIOController:
         self,
         binding: ProjectBinding,
         registry_revision: int,
-        instance_id: str,
-        pid: int | None,
-        visible_gpu_ids: list[int],
-        reserved_gpu_ids: list[int],
-        reservation_summaries: list[dict[str, Any]],
-        heartbeat_interval_seconds: int | float,
-        started_at: str,
-        gpu_policy: dict[str, Any],
-        service_key: tuple[_ValidationIdentity, str, str, str],
+        parameters: Mapping[str, Any],
+        service_key: tuple[ValidationIdentity, str, str, str],
     ) -> None:
+        instance_id = parameters["instance_id"]
+        heartbeat_interval_seconds = parameters["heartbeat_interval_seconds"]
         # A recurring heartbeat must not keep an on-demand agent alive after
         # this binding has completed every service lane. Shutdown publishes
         # the authoritative stop snapshot after the executor is fenced.
-        from .config import load_agent_config
+        from ..config import load_agent_config
 
         try:
             is_on_demand = load_agent_config(self.runtime).exit_when_idle
@@ -4562,20 +4119,13 @@ class ProjectIOController:
         if is_on_demand and binding not in self.runtime.working_set.resident_bindings():
             identity = self._binding_identity(binding, registry_revision, self._observed_executor_epoch)
             if identity is not None:
-                self._snapshot_health.discard_progress(identity, instance_id)
+                self._snapshots.health.discard_progress(identity, instance_id)
             return
         try:
             request = self.executor.prepare_machine_snapshot_publish(
                 binding,
                 registry_revision,
-                instance_id=instance_id,
-                pid=pid,
-                visible_gpu_ids=visible_gpu_ids,
-                reserved_gpu_ids=reserved_gpu_ids,
-                reservation_summaries=reservation_summaries,
-                heartbeat_interval_seconds=heartbeat_interval_seconds,
-                started_at=started_at,
-                gpu_policy=gpu_policy,
+                **parameters,
             )
         except (OSError, RuntimeError, ValueError):
             self._record_service_failure(service_key)
@@ -4591,7 +4141,7 @@ class ProjectIOController:
             return
         identity = self._binding_identity(binding, registry_revision, request.executor_epoch)
         if identity is not None:
-            self._snapshot_health.report_request(
+            self._snapshots.health.report_request(
                 identity,
                 instance_id,
                 heartbeat_interval_seconds,
@@ -4670,17 +4220,16 @@ class ProjectIOController:
                 if identity.executor_epoch != executor_epoch or identity.registry_revision != registry_revision:
                     retained.pop(identity, None)
 
-        current: dict[_ValidationIdentity, ProjectBinding] = {}
+        current: dict[ValidationIdentity, ProjectBinding] = {}
         for binding in bindings:
             identity = self._binding_identity(binding, registry_revision, executor_epoch)
             if identity is not None and binding.enabled is True and identity not in current:
                 current[identity] = binding
 
-        unresolved_by_id = {request.request_id: request for request in unresolved}
         unresolved_owners = {
             (request.runtime_id, request.project_id, request.registration_generation) for request in unresolved
         }
-        self._started_requests.intersection_update(unresolved_by_id)
+        self._started_requests.intersection_update(request.request_id for request in unresolved)
         completions: dict[str, Mapping[str, Any]] = {}
         processed_projects: set[str] = set()
 
@@ -4695,7 +4244,6 @@ class ProjectIOController:
                 except (OSError, RuntimeError, ValueError):
                     resolved = False
                 if resolved:
-                    unresolved_by_id.pop(request.request_id, None)
                     unresolved_owners.discard(identity.request_owner)
                     self._started_requests.discard(request.request_id)
                 continue
@@ -4746,7 +4294,6 @@ class ProjectIOController:
             consumed = self.executor.consume(request.request_id, request)
             if consumed is None:
                 continue
-            unresolved_by_id.pop(request.request_id, None)
             unresolved_owners.discard(identity.request_owner)
             self._started_requests.discard(request.request_id)
             if consumed.status == "completed":
@@ -4828,7 +4375,7 @@ class ProjectIOController:
         binding: ProjectBinding,
         registry_revision: int,
         renewal_horizon_seconds: int | float,
-        service_key: tuple[_ValidationIdentity, str, str, str],
+        service_key: tuple[ValidationIdentity, str, str, str],
         *,
         immediate_completions: dict[str, Mapping[str, Any]] | None,
     ) -> None:
@@ -4852,7 +4399,7 @@ class ProjectIOController:
 
     def _record_registration_renewal_failure(
         self,
-        service_key: tuple[_ValidationIdentity, str, str, str],
+        service_key: tuple[ValidationIdentity, str, str, str],
         *,
         blocking_reason: str,
         outcome: str | None = None,
@@ -5050,7 +4597,7 @@ class ProjectIOController:
                 "attempt_number": evidence.get("attempt_number"),
                 "fencing_token": evidence.get("fencing_token"),
                 "reservation_id": evidence.get("reservation_id"),
-                "process_identity": _json_copy(evidence.get("process_identity")),
+                "process_identity": copy_json_data(evidence.get("process_identity")),
                 "source_revisions": dict(revisions),
             }
         return self._advance_activation_io(
@@ -5451,8 +4998,8 @@ class ProjectIOController:
             return {}
         self._observed_executor_epoch = executor_epoch
 
-        current: dict[_ValidationIdentity, ProjectBinding] = {}
-        parameters_for_identity: dict[_ValidationIdentity, dict[str, Any]] = {}
+        current: dict[ValidationIdentity, ProjectBinding] = {}
+        parameters_for_identity: dict[ValidationIdentity, dict[str, Any]] = {}
         allows_disabled_binding = operation_kind in _AUTHORITY_OPERATION_KINDS or operation_kind in {
             "activation_consumer_retire",
             "progress_projection",
@@ -5479,16 +5026,12 @@ class ProjectIOController:
                 **(dict(raw_parameters) if raw_parameters is not None else {}),
             }
 
-        unresolved_by_id = {request.request_id: request for request in unresolved}
         maintenance_descriptor_unresolved = {
             self._request_identity(request)
             for request in unresolved
             if request.operation_kind == "maintenance_descriptor_advance"
         }
-        unresolved_owners = {
-            (request.runtime_id, request.project_id, request.registration_generation) for request in unresolved
-        }
-        self._started_requests.intersection_update(unresolved_by_id)
+        self._started_requests.intersection_update(request.request_id for request in unresolved)
         completions: dict[str, Mapping[str, Any]] = {}
         processed_projects: set[str] = set()
 
@@ -5500,10 +5043,10 @@ class ProjectIOController:
             expected_parameters = parameters_for_identity.get(identity)
             request_matches = dict(request.parameters) == expected_parameters
             if operation_kind in {"progress_projection", "legacy_capture_scan"}:
-                request_matches = _json_copy(request.parameters) == expected_parameters
+                request_matches = copy_json_data(request.parameters) == expected_parameters
             if operation_kind in _AUTHORITY_MUTATION_OPERATION_KINDS and expected_parameters is not None:
                 observed_parameters = (
-                    _json_copy(request.parameters)
+                    copy_json_data(request.parameters)
                     if operation_kind == "authority_termination_commit"
                     else dict(request.parameters)
                 )
@@ -5573,8 +5116,6 @@ class ProjectIOController:
                 except (OSError, RuntimeError, ValueError):
                     resolved = False
                 if resolved:
-                    unresolved_by_id.pop(request.request_id, None)
-                    unresolved_owners.discard(identity.request_owner)
                     self._started_requests.discard(request.request_id)
                     self._service_backoff.pop(stale_service_key, None)
                 elif (
@@ -5602,7 +5143,7 @@ class ProjectIOController:
             result = self.executor.load_result(request.request_id)
             if result is None:
                 if self._service_retry_is_due(service_key):
-                    self._start_activation_request(request, service_key)
+                    self._start_current_epoch_request(request, service_key)
                 continue
             if result.request != request:
                 raise ProjectIOProtocolError("activation I/O result changed request identity.")
@@ -5703,8 +5244,6 @@ class ProjectIOController:
             consumed = self.executor.consume(request.request_id, request)
             if consumed is None:
                 continue
-            unresolved_by_id.pop(request.request_id, None)
-            unresolved_owners.discard(identity.request_owner)
             self._started_requests.discard(request.request_id)
             if consumed.status == "completed":
                 evidence = dict(consumed.evidence)
@@ -5715,7 +5254,7 @@ class ProjectIOController:
                     "recovery_source_hold",
                     "authority_termination_commit",
                 }:
-                    evidence = _json_copy(consumed.evidence)
+                    evidence = copy_json_data(consumed.evidence)
                 completions[binding.project_id] = evidence
                 if operation_kind == "activation_observe":
                     replay = evidence.get("replay")
@@ -5804,11 +5343,11 @@ class ProjectIOController:
     def _prepare_activation_io_request(
         self,
         operation_kind: str,
-        identity: _ValidationIdentity,
+        identity: ValidationIdentity,
         binding: ProjectBinding,
         registry_revision: int,
         parameters: Mapping[str, Any],
-        service_key: tuple[_ValidationIdentity, str, str, str],
+        service_key: tuple[ValidationIdentity, str, str, str],
     ) -> None:
         if operation_kind == "activation_observe" and not self.runtime.working_set.is_activation_observation_due(
             binding,
@@ -5987,151 +5526,40 @@ class ProjectIOController:
         except (OSError, RuntimeError, ValueError):
             self._record_service_failure(service_key)
             return
-        self._start_activation_request(request, service_key)
+        self._start_current_epoch_request(request, service_key)
 
     @staticmethod
-    def _snapshot_gpu_ids(value: Sequence[int], label: str) -> list[int]:
-        if (
-            not isinstance(value, Sequence)
-            or isinstance(value, str | bytes)
-            or len(value) > 4096
-            or any(type(gpu_id) is not int or gpu_id < 0 for gpu_id in value)
-            or len(set(value)) != len(value)
-        ):
-            raise ValueError(f"{label} must be a bounded sequence of unique nonnegative integers.")
-        return sorted(value)
-
-    @staticmethod
-    def _snapshot_reservations(reservations: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
-        if not isinstance(reservations, Sequence) or isinstance(reservations, str | bytes) or len(reservations) > 4096:
-            raise ValueError("reservations must be a bounded sequence.")
-        normalized: list[dict[str, Any]] = []
-        seen_ids: set[str] = set()
-        for item in reservations:
-            if not isinstance(item, Mapping):
-                raise ValueError("reservations must contain reservation objects.")
-            reservation_id = item.get("reservation_id")
-            try:
-                validate_identifier(reservation_id, "reservation_id")
-            except ValueError as exc:
-                raise ValueError("reservation identity is invalid.") from exc
-            if reservation_id in seen_ids:
-                raise ValueError("reservations must have unique reservation IDs.")
-            seen_ids.add(reservation_id)
-            project_id = item.get("project_id")
-            if project_id is not None:
-                try:
-                    validate_identifier(project_id, "project_id")
-                except ValueError as exc:
-                    raise ValueError("reservation project identity is invalid.") from exc
-            state = item.get("state")
-            if state not in ("active", "provisional"):
-                raise ValueError("reservation state is invalid.")
-            gpu_ids_value = item.get("gpu_ids", [])
-            if (
-                not isinstance(gpu_ids_value, Sequence)
-                or isinstance(gpu_ids_value, str | bytes)
-                or len(gpu_ids_value) > 4096
-                or any(type(gpu_id) is not int or gpu_id < 0 for gpu_id in gpu_ids_value)
-                or len(set(gpu_ids_value)) != len(gpu_ids_value)
-            ):
-                raise ValueError("reservation GPU identity is invalid.")
-            summary: dict[str, Any] = {
-                "reservation_id": reservation_id,
-                "project_id": project_id,
-                "gpu_ids": list(gpu_ids_value),
-                "state": state,
-            }
-            for field in ("group_name", "machine_name", "task_id", "attempt_id"):
-                value = item.get(field)
-                if value is not None:
-                    try:
-                        validate_identifier(value, field)
-                    except ValueError as exc:
-                        raise ValueError(f"reservation {field} is invalid.") from exc
-                summary[field] = value
-            admission = item.get("admission")
-            if admission is not None and not isinstance(admission, Mapping):
-                raise ValueError("reservation admission must be an object or null.")
-            summary["admission"] = _json_copy(admission) if admission is not None else None
-            normalized.append(summary)
-        return normalized
-
-    @staticmethod
-    def _snapshot_service_key(identity: _ValidationIdentity) -> tuple[_ValidationIdentity, str, str, str]:
+    def _snapshot_service_key(identity: ValidationIdentity) -> tuple[ValidationIdentity, str, str, str]:
         return (identity, "machine_snapshot_publish", "snapshot", "machine")
 
     @staticmethod
-    def _registration_renew_service_key(identity: _ValidationIdentity) -> tuple[_ValidationIdentity, str, str, str]:
+    def _registration_renew_service_key(identity: ValidationIdentity) -> tuple[ValidationIdentity, str, str, str]:
         return (identity, "registration_renew", "renewal", "registration")
 
     @staticmethod
     def _maintenance_descriptor_service_key(
-        identity: _ValidationIdentity,
-    ) -> tuple[_ValidationIdentity, str, str, str]:
+        identity: ValidationIdentity,
+    ) -> tuple[ValidationIdentity, str, str, str]:
         return (identity, "maintenance_descriptor_advance", "descriptor", "advance")
 
     @staticmethod
     def _activation_service_key(
-        identity: _ValidationIdentity,
+        identity: ValidationIdentity,
         operation_kind: str,
-    ) -> tuple[_ValidationIdentity, str, str, str]:
+    ) -> tuple[ValidationIdentity, str, str, str]:
         return (identity, operation_kind, "activation", "consumer")
 
     @staticmethod
     def _authority_service_key(
-        identity: _ValidationIdentity,
+        identity: ValidationIdentity,
         operation_kind: str = "authority_service",
-    ) -> tuple[_ValidationIdentity, str, str, str]:
+    ) -> tuple[ValidationIdentity, str, str, str]:
         return (identity, operation_kind, "authority", "attempt")
-
-    def _start_activation_request(
-        self,
-        request: ProjectIORequest,
-        service_key: tuple[_ValidationIdentity, str, str, str],
-    ) -> None:
-        if request.executor_epoch != self._observed_executor_epoch:
-            self._record_service_failure(service_key)
-            return
-        try:
-            process = self.executor.start(request.request_id)
-        except (OSError, RuntimeError, ValueError):
-            self._record_service_failure(service_key)
-            return
-        if process is None:
-            self._record_service_failure(service_key)
-            return
-        self._started_requests.add(request.request_id)
-        self._service_backoff.pop(service_key, None)
-
-    @staticmethod
-    def _machine_snapshot_signature(parameters: Mapping[str, Any]) -> str:
-        names = (
-            "instance_id",
-            "pid",
-            "visible_gpu_ids",
-            "reserved_gpu_ids",
-            "reservation_summaries",
-            "heartbeat_interval_seconds",
-            "started_at",
-            "gpu_policy",
-        )
-        try:
-            encoded = json.dumps(
-                {name: _json_copy(parameters[name]) for name in names},
-                sort_keys=True,
-                separators=(",", ":"),
-                ensure_ascii=False,
-                allow_nan=False,
-            ).encode("utf-8")
-        except (KeyError, TypeError, ValueError) as exc:
-            raise ValueError("machine snapshot input is not bounded JSON data.") from exc
-        return hashlib.sha256(encoded).hexdigest()
 
     def _start_machine_snapshot_request(
         self,
         request: ProjectIORequest,
-        service_key: tuple[_ValidationIdentity, str, str, str],
+        service_key: tuple[ValidationIdentity, str, str, str],
     ) -> None:
         identity = self._request_identity(request)
         instance_id = request.parameters.get("instance_id")
@@ -6140,17 +5568,7 @@ class ProjectIOController:
         try:
             process = self.executor.start(request.request_id)
         except (OSError, RuntimeError, ValueError):
-            self._record_service_failure(service_key)
-            if has_progress_identity:
-                self._snapshot_record_failure(
-                    identity,
-                    instance_id,
-                    heartbeat_interval,
-                    reason="worker_start_failed",
-                    request_id=request.request_id,
-                    service_key=service_key,
-                )
-            return
+            process = None
         if process is None:
             self._record_service_failure(service_key)
             if has_progress_identity:
@@ -6166,7 +5584,7 @@ class ProjectIOController:
         self._started_requests.add(request.request_id)
         self._service_backoff.pop(service_key, None)
         if has_progress_identity:
-            self._snapshot_health.report_request(
+            self._snapshots.health.report_request(
                 identity,
                 instance_id,
                 heartbeat_interval,
@@ -6177,7 +5595,7 @@ class ProjectIOController:
     def _start_registration_renew_request(
         self,
         request: ProjectIORequest,
-        service_key: tuple[_ValidationIdentity, str, str, str],
+        service_key: tuple[ValidationIdentity, str, str, str],
     ) -> None:
         if request.executor_epoch != self._observed_executor_epoch:
             self._record_registration_renewal_failure(service_key, blocking_reason="request_epoch_changed")
@@ -6270,7 +5688,7 @@ class ProjectIOController:
     def _start_maintenance_event_request(
         self,
         request: ProjectIORequest,
-        key: tuple[_ValidationIdentity, str, str, str],
+        key: tuple[ValidationIdentity, str, str, str],
     ) -> None:
         try:
             process = self.executor.start(request.request_id)
@@ -6303,9 +5721,9 @@ class ProjectIOController:
 
     @staticmethod
     def _reservation_reconcile_service_key(
-        identity: _ValidationIdentity,
+        identity: ValidationIdentity,
         reservation_id: str,
-    ) -> tuple[_ValidationIdentity, str, str, str]:
+    ) -> tuple[ValidationIdentity, str, str, str]:
         return (identity, "scheduler_reservation_reconcile", "reservation", reservation_id)
 
     def _prepare_scheduler_reservation_reconcile_request(
@@ -6313,7 +5731,7 @@ class ProjectIOController:
         binding: ProjectBinding,
         registry_revision: int,
         reservation: ReservationIdentity,
-        service_key: tuple[_ValidationIdentity, str, str, str],
+        service_key: tuple[ValidationIdentity, str, str, str],
     ) -> None:
         self._reservation_reconcile_cursors[(binding.project_id, binding.registration_generation)] = (
             reservation.reservation_id
@@ -6339,7 +5757,7 @@ class ProjectIOController:
     def _start_reservation_reconcile_request(
         self,
         request: ProjectIORequest,
-        service_key: tuple[_ValidationIdentity, str, str, str],
+        service_key: tuple[ValidationIdentity, str, str, str],
     ) -> None:
         if request.executor_epoch != self._observed_executor_epoch:
             self._record_reservation_reconcile_failure(service_key)
@@ -6358,7 +5776,7 @@ class ProjectIOController:
     @staticmethod
     def _claim_identity_for_reservation(
         reservation: ReservationIdentity,
-        identity: _ValidationIdentity,
+        identity: ValidationIdentity,
     ) -> dict[str, Any] | None:
         prefix = f"{reservation.task_id}-attempt-"
         attempt_id = reservation.attempt_id
@@ -6414,27 +5832,8 @@ class ProjectIOController:
         )
 
     @staticmethod
-    def _launch_service_key(identity: _ValidationIdentity) -> tuple[_ValidationIdentity, str, str, str]:
+    def _launch_service_key(identity: ValidationIdentity) -> tuple[ValidationIdentity, str, str, str]:
         return (identity, "scheduler_launch_authorize", "launch", "active")
-
-    def _start_launch_request(
-        self,
-        request: ProjectIORequest,
-        service_key: tuple[_ValidationIdentity, str, str, str],
-    ) -> None:
-        if request.executor_epoch != self._observed_executor_epoch:
-            self._record_service_failure(service_key)
-            return
-        try:
-            process = self.executor.start(request.request_id)
-        except (OSError, RuntimeError, ValueError):
-            self._record_service_failure(service_key)
-            return
-        if process is None:
-            self._record_service_failure(service_key)
-            return
-        self._started_requests.add(request.request_id)
-        self._service_backoff.pop(service_key, None)
 
     def validated_config(self, binding: ProjectBinding, registry_revision: int) -> RootConfig | None:
         """Return a locally built config only for an exact cached validation identity."""
@@ -6446,7 +5845,7 @@ class ProjectIOController:
         identity = self._binding_identity(binding, registry_revision, self._observed_executor_epoch)
         return identity is not None and self._binding_identity_is_validated(identity)
 
-    def _binding_identity_is_validated(self, identity: _ValidationIdentity) -> bool:
+    def _binding_identity_is_validated(self, identity: ValidationIdentity) -> bool:
         return identity in self._validated
 
     def _binding_identity(
@@ -6454,12 +5853,12 @@ class ProjectIOController:
         binding: ProjectBinding,
         registry_revision: int,
         executor_epoch: str | None,
-    ) -> _ValidationIdentity | None:
+    ) -> ValidationIdentity | None:
         if not binding.registration_generation or not executor_epoch:
             return None
         if binding.runtime_instance_id != self.executor.runtime_id or binding.runtime_root != str(self.runtime.root):
             return None
-        return _ValidationIdentity(
+        return ValidationIdentity(
             self.executor.runtime_id,
             executor_epoch,
             binding.project_id,
@@ -6470,14 +5869,14 @@ class ProjectIOController:
             registry_revision,
         )
 
-    def _request_identity(self, request: ProjectIORequest) -> _ValidationIdentity:
+    def _request_identity(self, request: ProjectIORequest) -> ValidationIdentity:
         if request.operation_kind == "idle_decision_guard":
             machine_name = request.project_id
         elif request.operation_kind == "takeover_registration":
             machine_name = request.parameters["transition"]["target"]["machine_name"]
         else:
             machine_name = request.parameters["machine_name"]
-        return _ValidationIdentity(
+        return ValidationIdentity(
             request.runtime_id,
             request.executor_epoch,
             request.project_id,
@@ -6488,13 +5887,13 @@ class ProjectIOController:
             request.registry_revision,
         )
 
-    def _start_retry_is_due(self, identity: _ValidationIdentity, request_id: str) -> bool:
+    def _start_retry_is_due(self, identity: ValidationIdentity, request_id: str) -> bool:
         if request_id in self._started_requests:
             return False
         failure = self._backoff.get(identity)
         return failure is None or failure.retry_at <= self._monotonic()
 
-    def _start_existing(self, request: ProjectIORequest, identity: _ValidationIdentity) -> None:
+    def _start_existing(self, request: ProjectIORequest, identity: ValidationIdentity) -> None:
         try:
             process = self.executor.start(request.request_id)
         except (OSError, RuntimeError, ValueError):
@@ -6506,7 +5905,7 @@ class ProjectIOController:
         self._started_requests.add(request.request_id)
         self._backoff.pop(identity, None)
 
-    def _record_failure(self, identity: _ValidationIdentity) -> None:
+    def _record_failure(self, identity: ValidationIdentity) -> None:
         previous = self._backoff.get(identity)
         failures = previous.consecutive_failures + 1 if previous is not None else 1
         exponent = min(failures - 1, 6)
@@ -6515,17 +5914,17 @@ class ProjectIOController:
 
     @staticmethod
     def _observation_service_key(
-        identity: _ValidationIdentity,
+        identity: ValidationIdentity,
         lane: str,
         admission_role: str,
-    ) -> tuple[_ValidationIdentity, str, str, str]:
+    ) -> tuple[ValidationIdentity, str, str, str]:
         return (identity, "scheduler_observe", lane, admission_role)
 
-    def _service_retry_is_due(self, key: tuple[_ValidationIdentity, str, str, str]) -> bool:
+    def _service_retry_is_due(self, key: tuple[ValidationIdentity, str, str, str]) -> bool:
         failure = self._service_backoff.get(key)
         return failure is None or failure.retry_at <= self._monotonic()
 
-    def _record_service_failure(self, key: tuple[_ValidationIdentity, str, str, str]) -> None:
+    def _record_service_failure(self, key: tuple[ValidationIdentity, str, str, str]) -> None:
         previous = self._service_backoff.get(key)
         failures = previous.consecutive_failures + 1 if previous is not None else 1
         exponent = min(failures - 1, 6)
@@ -6534,14 +5933,14 @@ class ProjectIOController:
 
     def _reservation_reconcile_retry_is_due(
         self,
-        key: tuple[_ValidationIdentity, str, str, str],
+        key: tuple[ValidationIdentity, str, str, str],
     ) -> bool:
         failure = self._reservation_reconcile_backoff.get(key)
         return failure is None or failure.retry_at <= self._monotonic()
 
     def _record_reservation_reconcile_failure(
         self,
-        key: tuple[_ValidationIdentity, str, str, str],
+        key: tuple[ValidationIdentity, str, str, str],
     ) -> None:
         previous = self._reservation_reconcile_backoff.get(key)
         failures = previous.consecutive_failures + 1 if previous is not None else 1
@@ -6565,10 +5964,10 @@ class ProjectIOController:
 
     @staticmethod
     def _cursor_commit_service_key(
-        identity: _ValidationIdentity,
+        identity: ValidationIdentity,
         lane: str,
         admission_role: str,
-    ) -> tuple[_ValidationIdentity, str, str, str]:
+    ) -> tuple[ValidationIdentity, str, str, str]:
         return (identity, "scheduler_cursor_commit", lane, admission_role)
 
     @staticmethod
@@ -6644,29 +6043,10 @@ class ProjectIOController:
         if any(routes[scope] not in {"committed", "already_applied", "stale"} for scope in ("home", "shared")):
             raise ProjectIOProtocolError("cursor commit result route outcome is invalid.")
 
-    def _start_cursor_commit_request(
-        self,
-        request: ProjectIORequest,
-        service_key: tuple[_ValidationIdentity, str, str, str],
-    ) -> None:
-        if request.executor_epoch != self._observed_executor_epoch:
-            self._record_service_failure(service_key)
-            return
-        try:
-            process = self.executor.start(request.request_id)
-        except (OSError, RuntimeError, ValueError):
-            self._record_service_failure(service_key)
-            return
-        if process is None:
-            self._record_service_failure(service_key)
-            return
-        self._started_requests.add(request.request_id)
-        self._service_backoff.pop(service_key, None)
-
     def _start_observation_request(
         self,
         request: ProjectIORequest,
-        service_key: tuple[_ValidationIdentity, str, str, str],
+        service_key: tuple[ValidationIdentity, str, str, str],
     ) -> None:
         try:
             process = self.executor.start(request.request_id)

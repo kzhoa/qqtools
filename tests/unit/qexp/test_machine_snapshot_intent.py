@@ -454,7 +454,7 @@ def test_renewal_prepare_backoff_retires_each_batch_until_deadline(tmp_path, mon
 
     from qqtools.plugins.qexp.agent.control_plane import _MachineControlPlane
     from qqtools.plugins.qexp.agent.control_plane_health import read_control_plane_health
-    from qqtools.plugins.qexp.agent.project_io_controller import ProjectIOController
+    from qqtools.plugins.qexp.agent.project_io.controller import ProjectIOController
 
     runtime = MachineRuntime(tmp_path / "machine")
     bindings = tuple(

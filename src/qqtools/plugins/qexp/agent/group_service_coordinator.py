@@ -10,11 +10,11 @@ from ..runtime.group_discovery.probe import initial_group_service_probe_state
 from .bindings import ProjectBinding
 from .group_service_transport import (
     GroupServiceRequestSpec,
-    group_service_advance_request,
-    group_service_probe_request,
+    build_group_service_advance_request,
+    build_group_service_probe_request,
     initial_group_service_continuation,
 )
-from .project_io_protocol import ProjectIORequest
+from .project_io.protocol import ProjectIORequest
 from .working_set import BindingTurn
 
 
@@ -268,7 +268,7 @@ class GroupServiceCoordinator:
         if round_state is not offer._expected_round:
             return None
         if round_state is not None and round_state.candidate is not None:
-            request_spec = group_service_advance_request(
+            request_spec = build_group_service_advance_request(
                 binding.machine_name,
                 round_state.candidate,
                 round_state.continuation,
@@ -276,7 +276,7 @@ class GroupServiceCoordinator:
             )
         else:
             state = initial_group_service_probe_state() if round_state is None else round_state.probe_state
-            request_spec = group_service_probe_request(binding.machine_name, state)
+            request_spec = build_group_service_probe_request(binding.machine_name, state)
         request = preparer.prepare_closed_request(
             binding,
             registry_revision,

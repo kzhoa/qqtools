@@ -5,7 +5,7 @@ from dataclasses import FrozenInstanceError
 
 import pytest
 
-from qqtools.plugins.qexp.agent.project_io_arbiter import ProjectIOArbiter, ServiceIntent
+from qqtools.plugins.qexp.agent.project_io.arbiter import ProjectIOArbiter, ServiceIntent
 
 
 def _owner(project: str, generation: str = "generation-1") -> tuple[str, str, str]:

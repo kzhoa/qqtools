@@ -7,12 +7,13 @@ from pathlib import Path
 import pytest
 
 from qqtools.plugins.qexp import init_shared_root, submit
-from qqtools.plugins.qexp.agent import project_io_supervision
 from qqtools.plugins.qexp.agent.context import MachineRuntime
 from qqtools.plugins.qexp.agent.dispatch_loop import dispatch_machine_cycle_locked
-from qqtools.plugins.qexp.agent.project_io_controller import ProjectIOController
-from qqtools.plugins.qexp.agent.project_io_executor import ProjectIOExecutor
-from qqtools.plugins.qexp.agent.project_io_supervision import AttemptSupervisionCoordinator
+from qqtools.plugins.qexp.agent.project_io.controller import ProjectIOController
+from qqtools.plugins.qexp.agent.project_io.executor import ProjectIOExecutor
+from qqtools.plugins.qexp.agent.project_io.supervision import coordinator as project_io_supervision
+from qqtools.plugins.qexp.agent.project_io.supervision import evidence
+from qqtools.plugins.qexp.agent.project_io.supervision.coordinator import AttemptSupervisionCoordinator
 from qqtools.plugins.qexp.agent.setup import initialize_machine
 from qqtools.plugins.qexp.commands.group import create_group
 from qqtools.plugins.qexp.infrastructure.process import process_start_time_ticks
@@ -613,11 +614,10 @@ def test_termination_registration_accepts_explicit_unassigned_reservation(tmp_pa
         registration_path = paths["registrations"] / f"{process_envelope['process']['attempt_id']}.json"
         atomic_replace(registration_path, {"process_registration": process_envelope["process"]})
 
-        registration = project_io_supervision._read_running_publication_source(
+        registration = evidence.read_registration(
             registration_path,
             runtime.project_paths(binding.project_id)["root"],
             binding,
-            "process_registration",
             allow_unassigned_reservation=True,
         )
 
@@ -684,9 +684,7 @@ def test_converged_historical_termination_does_not_repeat_shared_work_or_block_s
                 reconciler.close()
             assert not reservation_snapshot(runtime.root).active
             assert load_task(cfg, task.task_id).state["projection"] == "running"
-        process = project_io_supervision._read_terminal_process_record(
-            manifest, runtime.project_paths(binding.project_id)["root"], binding
-        )
+        process = evidence.read_process_record(manifest, runtime.project_paths(binding.project_id)["root"], binding)
         assert process is not None
         candidate = coordinator._new_termination_candidate(
             binding, coordinator._initial_reconciliation_signature(binding, revision), manifest, process

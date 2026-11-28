@@ -7,9 +7,9 @@ import pytest
 
 from qqtools.plugins.qexp import init_shared_root, submit
 from qqtools.plugins.qexp.agent.context import MachineRuntime
-from qqtools.plugins.qexp.agent.project_io_controller import ProjectIOController
-from qqtools.plugins.qexp.agent.project_io_executor import ProjectIOExecutor
-from qqtools.plugins.qexp.agent.project_io_supervision import AttemptSupervisionCoordinator
+from qqtools.plugins.qexp.agent.project_io.controller import ProjectIOController
+from qqtools.plugins.qexp.agent.project_io.executor import ProjectIOExecutor
+from qqtools.plugins.qexp.agent.project_io.supervision.coordinator import AttemptSupervisionCoordinator
 from qqtools.plugins.qexp.agent.setup import initialize_machine
 from qqtools.plugins.qexp.runtime.paths import attempt_path, local_paths
 from qqtools.plugins.qexp.runtime.process_evidence import ProcessEvidence
@@ -101,7 +101,7 @@ def test_running_coordinator_releases_local_guards_before_typed_publication(
 
         monkeypatch.setattr(controller, "advance_authority_running_publications", checked_publication)
         result = _until(
-            lambda: coordinator.advance_running_publications([binding], revision),
+            lambda: coordinator.running_publications.advance([binding], revision),
             lambda value: binding.project_id in value,
         )[binding.project_id]
 
@@ -155,16 +155,16 @@ def test_running_publication_remains_eligible_across_missed_service_grants(tmp_p
         _until(lambda: controller.advance_binding_validation([binding], revision), bool)
         monkeypatch.setattr(controller, "advance_authority_running_publications", decline)
         for _ in range(6):
-            assert coordinator.advance_running_publications([binding], revision) == {}
+            assert coordinator.running_publications.advance([binding], revision) == {}
         assert len(offers) == 6, "a consumed directory page must not erase unselected work"
         assert all(value["attempt_id"] == attempt.attempt_id for value in offers)
         assert AttemptRecord.from_dict(read_json(attempt_path(cfg.shared_root, task.task_id, 1))).phase == "starting"
         monkeypatch.setattr(controller, "advance_authority_running_publications", original)
         _until(
-            lambda: coordinator.advance_running_publications([binding], revision),
+            lambda: coordinator.running_publications.advance([binding], revision),
             lambda value: value.get(binding.project_id, {}).get("outcome") == "processed",
         )
-        assert not coordinator._running_publication_intents
+        assert not coordinator.running_publications._intents
         assert AttemptRecord.from_dict(read_json(attempt_path(cfg.shared_root, task.task_id, 1))).phase == "running"
     finally:
         coordinator.close()
@@ -186,7 +186,7 @@ def test_running_coordinator_retains_replay_after_controller_failure(tmp_path: P
 
         monkeypatch.setattr(controller, "advance_authority_running_publications", unavailable)
         with pytest.raises(OSError, match="typed publication unavailable"):
-            coordinator.advance_running_publications([binding], revision)
+            coordinator.running_publications.advance([binding], revision)
         manifest = paths["processes"] / f"{attempt.attempt_id}.json"
         manifest_before = manifest.read_bytes()
         registration_path = paths["registrations"] / manifest.name
@@ -195,7 +195,7 @@ def test_running_coordinator_retains_replay_after_controller_failure(tmp_path: P
 
         monkeypatch.setattr(controller, "advance_authority_running_publications", original)
         result = _until(
-            lambda: coordinator.advance_running_publications([binding], revision),
+            lambda: coordinator.running_publications.advance([binding], revision),
             lambda value: binding.project_id in value,
         )[binding.project_id]
         assert result["outcome"] == "processed"
@@ -219,14 +219,14 @@ def test_running_coordinator_pending_control_defers_without_local_or_shared_effe
         _until(lambda: controller.advance_binding_validation([binding], revision), bool)
         for _ in range(4):
             assert (
-                coordinator.advance_running_publications([binding], revision, pending_attempt_ids={attempt.attempt_id})
+                coordinator.running_publications.advance([binding], revision, pending_attempt_ids={attempt.attempt_id})
                 == {}
             )
         assert not (paths["processes"] / f"{attempt.attempt_id}.json").exists()
         assert AttemptRecord.from_dict(read_json(attempt_path(cfg.shared_root, task.task_id, 1))).phase == "starting"
 
         result = _until(
-            lambda: coordinator.advance_running_publications([binding], revision),
+            lambda: coordinator.running_publications.advance([binding], revision),
             lambda value: binding.project_id in value,
         )
         assert result[binding.project_id]["outcome"] == "processed"
@@ -390,7 +390,7 @@ def test_exited_attempt_does_not_retire_another_attempts_running_request(tmp_pat
         )
 
         for _ in range(4):
-            assert coordinator.advance_running_publications([binding], revision) == {}
+            assert coordinator.running_publications.advance([binding], revision) == {}
 
         assert current in executor.unresolved_requests()
     finally:
@@ -443,7 +443,7 @@ def test_running_coordinator_does_not_republish_exited_launch_intent(
     monkeypatch.setattr(controller, "advance_authority_running_publications", reject_running_publication)
     try:
         for _ in range(4):
-            assert coordinator.advance_running_publications([binding], revision) == {}
+            assert coordinator.running_publications.advance([binding], revision) == {}
         assert not executor.has_unfinished_work()
     finally:
         coordinator.close()
@@ -477,11 +477,11 @@ def test_running_coordinator_joins_real_launch_intent_to_later_registration(tmp_
     try:
         _until(lambda: controller.advance_binding_validation([binding], revision), bool)
         assert (
-            coordinator.advance_running_publications([binding], revision, pending_attempt_ids={attempt.attempt_id})
+            coordinator.running_publications.advance([binding], revision, pending_attempt_ids={attempt.attempt_id})
             == {}
         )
         result = _until(
-            lambda: coordinator.advance_running_publications([binding], revision),
+            lambda: coordinator.running_publications.advance([binding], revision),
             lambda value: binding.project_id in value,
         )
         assert result[binding.project_id]["outcome"] == "processed"
@@ -529,13 +529,13 @@ def test_running_coordinator_materializes_unverifiable_intent_without_shared_pub
         raise AssertionError("unverifiable local launch attempted shared publication")
 
     monkeypatch.setattr(
-        "qqtools.plugins.qexp.agent.project_io_supervision.inspect_wrapper_identity",
+        "qqtools.plugins.qexp.agent.project_io.supervision.running_publication.inspect_wrapper_identity",
         unknown_wrapper,
     )
     monkeypatch.setattr(controller, "advance_authority_running_publications", reject_publication)
     try:
         for _ in range(4):
-            coordinator.advance_running_publications([binding], revision)
+            coordinator.running_publications.advance([binding], revision)
             manifest = paths["processes"] / f"{attempt.attempt_id}.json"
             if manifest.exists():
                 break
@@ -588,7 +588,7 @@ def test_running_coordinator_rejects_malformed_registration_before_local_write(
     monkeypatch.setattr(controller, "advance_authority_running_publications", reject_publication)
     try:
         for _ in range(4):
-            assert coordinator.advance_running_publications([binding], revision) == {}
+            assert coordinator.running_publications.advance([binding], revision) == {}
         assert not (paths["processes"] / f"{attempt.attempt_id}.json").exists()
         assert registration_path.exists()
     finally:

@@ -97,8 +97,8 @@ def test_source_locator_read_rejects_nonregular_evidence_without_opening_it(tmp_
 def test_actual_source_worker_reads_without_machine_guards_or_target_writes(tmp_path, monkeypatch, change):
     from qqtools.plugins.qexp import init_shared_root
     from qqtools.plugins.qexp.agent.context import MachineRuntime
-    from qqtools.plugins.qexp.agent.project_io_controller import ProjectIOController
-    from qqtools.plugins.qexp.agent.project_io_executor import ProjectIOExecutor
+    from qqtools.plugins.qexp.agent.project_io.controller import ProjectIOController
+    from qqtools.plugins.qexp.agent.project_io.executor import ProjectIOExecutor
     from qqtools.plugins.qexp.agent.recovery_capture import recovery_owner
     from qqtools.plugins.qexp.agent.setup import initialize_machine
     from qqtools.plugins.qexp.runtime.responsibility_capture import (
@@ -177,7 +177,7 @@ def test_actual_source_worker_reads_without_machine_guards_or_target_writes(tmp_
         }
         if change == "common_admission":
             from qqtools.plugins.qexp import layout
-            from qqtools.plugins.qexp.agent import project_io_worker as worker
+            from qqtools.plugins.qexp.agent.project_io import worker
 
             def forbidden(*_args, **_kwargs):
                 pytest.fail("local coordinator performed shared/source work inline")

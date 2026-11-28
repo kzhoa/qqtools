@@ -66,6 +66,7 @@ def _global_sort_v2(sample_costs: np.ndarray, seed: int) -> np.ndarray:
     for chunk in bins:
         if len(chunk) > 1:
             rng.shuffle(chunk)
+            chunk.reverse()  # Consume the shuffled order from the end in O(1).
 
     lows = bins[: num_bins // 2]
     highs = bins[num_bins // 2 :]
@@ -93,7 +94,7 @@ def _global_sort_v2(sample_costs: np.ndarray, seed: int) -> np.ndarray:
             should_take_low = not should_take_low
             continue
 
-        order.append(current.pop(0))
+        order.append(current.pop())
         ptr += 1
         if should_take_low:
             low_ptr = ptr

@@ -1834,7 +1834,9 @@ request and active epoch to assess the existing 10-second overdue threshold.
 A missing diagnostic sample grants no additional time and has no effect on
 the live decision.
 
-Each request runs in a new subprocess started through a fresh interpreter. The agent never forks
+Each request runs in a fresh interpreter via `python -m qqtools.plugins.qexp.agent.project_io_worker`.
+This module name is stable across package upgrades so the outgoing agent can publish its final
+Project snapshots using the newly installed worker. The agent never forks
 its multithreaded controller and does not use a thread pool for this boundary. The controller:
 
 1. captures the exact binding and source identities and, when required, persists one provisional

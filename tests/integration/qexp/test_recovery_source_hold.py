@@ -6,11 +6,11 @@ import time
 import pytest
 
 from qqtools.plugins.qexp import init_shared_root
-from qqtools.plugins.qexp.agent import project_io_worker as worker
 from qqtools.plugins.qexp.agent.context import MachineRuntime
-from qqtools.plugins.qexp.agent.project_io_controller import ProjectIOController
-from qqtools.plugins.qexp.agent.project_io_executor import ProjectIOExecutor
-from qqtools.plugins.qexp.agent.project_io_protocol import ProjectIOProcess
+from qqtools.plugins.qexp.agent.project_io import worker
+from qqtools.plugins.qexp.agent.project_io.controller import ProjectIOController
+from qqtools.plugins.qexp.agent.project_io.executor import ProjectIOExecutor
+from qqtools.plugins.qexp.agent.project_io.protocol import ProjectIOProcess
 from qqtools.plugins.qexp.agent.recovery_transport import decode_source_hold
 from qqtools.plugins.qexp.agent.setup import initialize_machine
 from qqtools.plugins.qexp.runtime import responsibility_capture as capture
@@ -188,7 +188,7 @@ def test_stale_capture_does_not_establish_source_hold(case, change):
 
 
 def test_lost_source_hold_result_requires_positive_exit_then_exact_replay(case, monkeypatch):
-    from qqtools.plugins.qexp.agent import project_io_executor as executor_module
+    from qqtools.plugins.qexp.agent.project_io import executor as executor_module
 
     runtime, binding, source, checkpoint, state, executor = case
     revision, _ = runtime.load_registry_snapshot()

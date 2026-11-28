@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- Renamed `qqtools.plugins.qexp.tail_log` to `write_log_to_stream`. Use
+  `from qqtools.plugins.qexp import write_log_to_stream` for full or tail output.
+- Removed the four CUDA search aliases with `_warp` or `_triton` suffixes.
+  Import `neighbor_list_obc` or `neighbor_list_pbc` from
+  `qqtools.plugins.qneighbor.cuda.warp` or `qqtools.plugins.qneighbor.cuda.triton`.
+- Breaking change in qneighbor: removed the `build_neighbor_list_batch` and
+  `build_neighbor_list_batch_full_pbc` entry points, including their Warp variants.
+  Use `neighbor_list_pbc(positions, cutoff, batch, max_neighbors, cell=cell, pbc=pbc)`.
+  Omit `pbc` for full periodicity. To select Warp explicitly, import the function
+  from `qqtools.plugins.qneighbor.cuda.warp`.
+
 ## v1.3.32
 
 - feat: add CPU, Warp and Triton neighbor searches for open and periodic

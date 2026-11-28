@@ -9,7 +9,8 @@ import os
 import stat
 import sys
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, BinaryIO, TextIO
@@ -23,6 +24,7 @@ from ..runtime.store import iter_json, read_json
 from ..runtime.tasks import load_task
 
 _FOLLOW_OBSERVATION_RETRIES = 3
+_LOG_CHUNK_SIZE = 64 * 1024
 
 
 def _latest_attempt_for_logs(cfg: RootConfig, task: TaskRecord) -> AttemptRecord:
@@ -51,8 +53,8 @@ def _validate_read_tail(tail_lines: int | None) -> None:
         raise ValueError("tail_lines must be a non-negative integer or None.")
 
 
-def read_log_bytes(cfg: RootConfig, task_id: str, *, tail_lines: int | None = None) -> bytes:
-    """Read the selected finite log without decoding application bytes."""
+def _finite_log_chunks(cfg: RootConfig, task_id: str, tail_lines: int | None) -> Iterator[bytes]:
+    """Read up to the selected file size observed when it was opened."""
     _validate_read_tail(tail_lines)
     path = get_log_path(cfg, task_id)
     if not path.exists():
@@ -62,16 +64,26 @@ def read_log_bytes(cfg: RootConfig, task_id: str, *, tail_lines: int | None = No
             f"log for Task {task_id!r} Attempt {attempt.attempt_id!r} on machine "
             f"{attempt.machine_name!r} was not found at {path}"
         )
-    if tail_lines is None:
-        return path.read_bytes()
     if tail_lines == 0:
-        return b""
+        return
+    _ensure_regular(path, path.stat().st_mode)
     with path.open("rb") as handle:
         file_stat = os.fstat(handle.fileno())
         _ensure_regular(path, file_stat.st_mode)
-        offset = _tail_offset(handle, file_stat.st_size, tail_lines, 64 * 1024)
-        handle.seek(offset)
-        return handle.read()
+        size = file_stat.st_size
+        offset = 0 if tail_lines is None else _tail_offset(handle, size, tail_lines, _LOG_CHUNK_SIZE)
+        remaining = size - offset
+        while remaining > 0:
+            chunk = handle.read(min(_LOG_CHUNK_SIZE, remaining))
+            if not chunk:
+                break
+            remaining -= len(chunk)
+            yield chunk
+
+
+def read_log_bytes(cfg: RootConfig, task_id: str, *, tail_lines: int | None = None) -> bytes:
+    """Read the selected finite log without decoding application bytes."""
+    return b"".join(_finite_log_chunks(cfg, task_id, tail_lines))
 
 
 def read_logs(cfg: RootConfig, task_id: str, *, tail_lines: int | None = None) -> str:
@@ -88,30 +100,40 @@ def _is_binary_stream(stream: TextIO | BinaryIO) -> bool:
     return isinstance(stream, (io.BufferedIOBase, io.RawIOBase, io.BytesIO))
 
 
-def _write_bytes(stream: TextIO | BinaryIO, data: bytes) -> None:
-    if not data:
-        return
-    if _is_binary_stream(stream):
-        stream.write(data)  # type: ignore[arg-type]
-    else:
-        stream.write(data.decode("utf-8", errors="replace"))  # type: ignore[arg-type]
-    stream.flush()
-
-
-def write_logs(
+def write_log_to_stream(
     cfg: RootConfig,
     task_id: str,
     *,
     tail_lines: int | None = None,
     stdout: TextIO | BinaryIO | None = None,
 ) -> None:
-    """Write finite application bytes to stdout, retaining text-stream compatibility in tests."""
-    stream = _binary_stream(sys.stdout) if stdout is None else stdout
-    _write_bytes(stream, read_log_bytes(cfg, task_id, tail_lines=tail_lines))
+    """Copy the selected log, or its last lines, up to the size observed at open.
 
-
-def tail_log(cfg: RootConfig, task_id: str) -> None:
-    write_logs(cfg, task_id)
+    Binary output preserves the application bytes. Text output decodes UTF-8
+    and replaces invalid sequences.
+    """
+    stream = _binary_stream(sys.stdout) if stdout is None or stdout is sys.stdout else stdout
+    with closing(_finite_log_chunks(cfg, task_id, tail_lines)) as chunks:
+        if isinstance(stream, io.TextIOBase) or getattr(stream, "encoding", None):
+            text_output = True
+        elif _is_binary_stream(stream):
+            text_output = False
+        else:
+            # Binary wrappers need not inherit from the standard I/O base classes.
+            try:
+                stream.write(b"")
+            except TypeError:
+                text_output = True
+            else:
+                text_output = False
+        output = codecs.iterdecode(chunks, "utf-8", errors="replace") if text_output else chunks
+        for chunk in output:
+            while chunk:
+                written = stream.write(chunk)
+                if written is None or written <= 0:
+                    raise OSError("Log output stream made no write progress.")
+                chunk = chunk[written:]
+        stream.flush()
 
 
 class _SelectionChanged(RuntimeError):

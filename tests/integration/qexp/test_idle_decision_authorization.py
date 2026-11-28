@@ -12,8 +12,8 @@ from qqtools.plugins.qexp.agent import idle_job_integration
 from qqtools.plugins.qexp.agent.context import MachineRuntime
 from qqtools.plugins.qexp.agent.idle_job import IdleJobSupervisor
 from qqtools.plugins.qexp.agent.idle_job_config import set_idle_job_config
-from qqtools.plugins.qexp.agent.project_io_controller import ProjectIOController
-from qqtools.plugins.qexp.agent.project_io_executor import ProjectIOExecutor
+from qqtools.plugins.qexp.agent.project_io.controller import ProjectIOController
+from qqtools.plugins.qexp.agent.project_io.executor import ProjectIOExecutor
 from qqtools.plugins.qexp.agent.setup import initialize_machine
 from qqtools.plugins.qexp.gpu_policy import GpuDiscovery, GpuReservationPolicy
 
@@ -1060,7 +1060,7 @@ def test_training_arrival_stops_locally_without_a_project_slot(decision, tmp_pat
     from qqtools.plugins.qexp import submit
     from qqtools.plugins.qexp.agent.dispatch_loop import dispatch_machine_cycle_locked
     from qqtools.plugins.qexp.agent.idle_job import idle_job_status
-    from qqtools.plugins.qexp.agent.project_io_protocol import PROJECT_IO_OVERDUE_SECONDS
+    from qqtools.plugins.qexp.agent.project_io.protocol import PROJECT_IO_OVERDUE_SECONDS
     from qqtools.plugins.qexp.runtime.resources.idle_job import read_idle_job_ownership
     from qqtools.plugins.qexp.runtime.resources.reservations import reserve
 

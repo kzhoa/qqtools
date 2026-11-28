@@ -2,7 +2,7 @@ from dataclasses import replace
 
 import pytest
 
-from qqtools.plugins.qexp.agent.project_io_protocol import ProjectIORequest, ProjectIOResult
+from qqtools.plugins.qexp.agent.project_io.protocol import ProjectIORequest, ProjectIOResult
 
 
 def _context(version):

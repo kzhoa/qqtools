@@ -14,14 +14,14 @@ from pathlib import Path
 import pytest
 
 from qqtools.plugins.qexp import init_shared_root, submit
-from qqtools.plugins.qexp.agent import project_io_executor as project_io_executor_module
-from qqtools.plugins.qexp.agent import project_io_worker as project_io_worker_module
 from qqtools.plugins.qexp.agent.context import MachineRuntime
 from qqtools.plugins.qexp.agent.dispatch_probe import PrimaryProbeSession
 from qqtools.plugins.qexp.agent.lifecycle import get_machine_agent_status
 from qqtools.plugins.qexp.agent.primary_probe_transport import encode_probe_session
-from qqtools.plugins.qexp.agent.project_io_executor import ProjectIOExecutor, ProjectIOProtocolError
-from qqtools.plugins.qexp.agent.project_io_protocol import (
+from qqtools.plugins.qexp.agent.project_io import executor as project_io_executor_module
+from qqtools.plugins.qexp.agent.project_io import worker as project_io_worker_module
+from qqtools.plugins.qexp.agent.project_io.executor import ProjectIOExecutor, ProjectIOProtocolError
+from qqtools.plugins.qexp.agent.project_io.protocol import (
     PROJECT_IO_MAX_RECORD_BYTES,
     PROJECT_IO_MAX_RESOLVED_BYTES,
     PROJECT_IO_MAX_RESOLVED_RECORDS,
@@ -29,6 +29,7 @@ from qqtools.plugins.qexp.agent.project_io_protocol import (
     ProjectIOProcess,
     ProjectIOResult,
 )
+from qqtools.plugins.qexp.agent.project_io.scheduling import execution as scheduler_execution
 from qqtools.plugins.qexp.agent.setup import initialize_machine
 from qqtools.plugins.qexp.cli.output import CliOutput, OutputKind, render
 from qqtools.plugins.qexp.runtime import project_activation as project_activation_module
@@ -54,7 +55,7 @@ from qqtools.plugins.qexp.runtime.store import atomic_replace, read_json
 
 
 def test_fresh_worker_import_does_not_load_executor() -> None:
-    source_root = Path(project_io_worker_module.__file__).parents[4]
+    source_root = Path(project_io_worker_module.__file__).parents[5]
     script = f"""
 import importlib.abc
 import sys
@@ -63,13 +64,13 @@ sys.path.insert(0, {str(source_root)!r})
 
 class RejectExecutor(importlib.abc.MetaPathFinder):
     def find_spec(self, fullname, path=None, target=None):
-        if fullname == "qqtools.plugins.qexp.agent.project_io_executor":
+        if fullname == "qqtools.plugins.qexp.agent.project_io.executor":
             raise RuntimeError("worker imported executor orchestration")
         return None
 
 sys.meta_path.insert(0, RejectExecutor())
-import qqtools.plugins.qexp.agent.project_io_worker
-assert "qqtools.plugins.qexp.agent.project_io_executor" not in sys.modules
+import qqtools.plugins.qexp.agent.project_io.worker
+assert "qqtools.plugins.qexp.agent.project_io.executor" not in sys.modules
 """
 
     result = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, timeout=10, check=False)
@@ -142,10 +143,23 @@ def _project_snapshot(root: Path) -> dict[str, tuple[int, int]]:
     }
 
 
+def test_group_worker_handler_has_no_worker_entrypoint_dependency():
+    subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import sys; from qqtools.plugins.qexp.agent import group_service_worker; "
+            "assert 'qqtools.plugins.qexp.agent.project_io.worker' not in sys.modules",
+        ],
+        check=True,
+        timeout=10,
+    )
+
+
 def test_group_service_probe_and_advance_run_in_fresh_workers(tmp_path: Path, monkeypatch) -> None:
     from qqtools.plugins.qexp.agent.group_service_transport import (
-        group_service_advance_request,
-        group_service_probe_request,
+        build_group_service_advance_request,
+        build_group_service_probe_request,
         initial_group_service_continuation,
     )
     from qqtools.plugins.qexp.runtime.group_discovery.coverage import GroupCoverage
@@ -165,7 +179,7 @@ def test_group_service_probe_and_advance_run_in_fresh_workers(tmp_path: Path, mo
         probe = executor.prepare_closed_request(
             binding,
             revision,
-            group_service_probe_request(binding.machine_name, initial_group_service_probe_state()),
+            build_group_service_probe_request(binding.machine_name, initial_group_service_probe_state()),
         )
         executor.start(probe.request_id)
         observed = _wait_for_consumed(executor, probe)
@@ -180,7 +194,7 @@ def test_group_service_probe_and_advance_run_in_fresh_workers(tmp_path: Path, mo
         interrupted = executor.prepare_closed_request(
             binding,
             revision,
-            group_service_advance_request(
+            build_group_service_advance_request(
                 binding.machine_name,
                 candidate,
                 continuation,
@@ -221,7 +235,7 @@ def test_group_service_probe_and_advance_run_in_fresh_workers(tmp_path: Path, mo
             request = executor.prepare_closed_request(
                 binding,
                 revision,
-                group_service_advance_request(
+                build_group_service_advance_request(
                     binding.machine_name,
                     candidate,
                     continuation,
@@ -672,17 +686,60 @@ def test_upgrade_worker_absence_preserves_ambiguous_journal_recovery(tmp_path: P
         executor.shutdown()
 
 
-@pytest.mark.parametrize(
-    ("prepare_name", "reset_name"),
-    [
-        ("prepare_scheduler_due_offer", "reset_ambiguous_scheduler_due_offer_for_retry"),
-        ("prepare_scheduler_ready_index_build", "reset_ambiguous_scheduler_ready_index_build_for_retry"),
-    ],
-)
+@pytest.mark.parametrize("prepare_name", ["prepare_scheduler_due_offer", "prepare_scheduler_ready_index_build"])
+@pytest.mark.parametrize("cross_write_boundary", [False, True])
+@pytest.mark.parametrize("late_epoch_fence", [False, True])
+def test_scheduler_worker_error_preserves_write_boundary(
+    tmp_path, monkeypatch, prepare_name, cross_write_boundary, late_epoch_fence
+):
+    runtime = MachineRuntime(tmp_path / "machine")
+    initialize_machine(runtime, "gpu-1")
+    _cfg, binding, revision = _registered(tmp_path, "project-a", runtime)
+    executor = ProjectIOExecutor(runtime)
+    executor.begin_epoch()
+    request = getattr(executor, prepare_name)(binding, revision)
+    pid = os.getpid()
+    ticks = project_io_worker_module._process_start_time_ticks(pid)
+    assert ticks is not None
+    process = ProjectIOProcess(request, pid, ticks, request.prepared_at, "running")
+    atomic_replace(executor.paths["project_io_processes"] / f"{request.request_id}.json", process.to_dict())
+
+    def fail_slice(kind, cfg, before_shared_mutation):
+        if cross_write_boundary:
+            before_shared_mutation()
+        if late_epoch_fence:
+            executor.fence_epoch()
+            if kind == "scheduler_due_offer":
+                return {"outcome": "noop", "reason": "no_due_deadline", "task_id": None}
+            return {"state": "active", "revision": 1, "phase": None, "build_id": None}
+        raise OSError("injected scheduler I/O failure")
+
+    monkeypatch.setattr(scheduler_execution, "run", fail_slice)
+    assert project_io_worker_module._run(runtime.root, request.request_id) == 0
+    result = executor.load_result(request.request_id)
+    assert result is not None and result.request == request
+    if cross_write_boundary:
+        assert (result.status, result.reason_code, result.evidence) == (
+            "outcome_unknown",
+            "project_io_outcome_unknown",
+            {},
+        )
+    elif late_epoch_fence:
+        assert (result.status, result.reason_code, result.evidence) == (
+            "fenced",
+            "project_io_executor_epoch_fenced",
+            {},
+        )
+    else:
+        assert result.status == "retryable_error"
+        assert result.reason_code == f"project_io_{request.operation_kind}_failed"
+        assert result.evidence == {"exception_type": "OSError"}
+
+
+@pytest.mark.parametrize("prepare_name", ["prepare_scheduler_due_offer", "prepare_scheduler_ready_index_build"])
 def test_scheduler_mutation_worker_absence_replays_exact_request(
     tmp_path: Path,
     prepare_name: str,
-    reset_name: str,
 ) -> None:
     runtime = MachineRuntime(tmp_path / "machine")
     initialize_machine(runtime, "gpu-1")
@@ -699,7 +756,7 @@ def test_scheduler_mutation_worker_absence_replays_exact_request(
         result = executor.load_result(request.request_id)
         assert result is not None and result.status == "outcome_unknown"
         assert not (executor.paths["project_io_processes"] / f"{request.request_id}.json").exists()
-        assert getattr(executor, reset_name)(request.request_id, request)
+        assert executor.reset_ambiguous_scheduler_work(request)
         assert executor.start(request.request_id) is not None
         assert _wait_for_consumed(executor, request).status == "completed"
     finally:

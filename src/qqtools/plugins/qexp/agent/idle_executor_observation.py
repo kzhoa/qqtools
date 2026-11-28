@@ -10,8 +10,8 @@ from pathlib import Path
 from threading import Condition, Event, Thread
 
 from ..runtime.locks import exclusive
-from .project_io_executor import ProjectIOExecutor
-from .project_io_protocol import ProjectIORequest
+from .project_io.executor import ProjectIOExecutor
+from .project_io.protocol import ProjectIORequest
 
 _CONTENTION_RETRY_SECONDS = 0.002
 

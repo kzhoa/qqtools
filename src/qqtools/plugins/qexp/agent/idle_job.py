@@ -20,7 +20,6 @@ import uuid
 from collections.abc import Callable, Mapping
 from contextlib import AbstractContextManager, ExitStack, nullcontext
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from pathlib import Path
 from socket import socket
 from subprocess import Popen
@@ -43,7 +42,8 @@ from ..runtime.resources.idle_job import (
 )
 from ..runtime.resources.reservations import reservation_snapshot
 from ..runtime.responsibility_store import DurableIO
-from ..runtime.store import atomic_replace, json_encoded_size, read_json, read_json_limited
+from ..runtime.store import atomic_replace, json_encoded_size, read_json_limited
+from . import idle_job_status as idle_status
 from .bindings import ProjectBinding
 from .config import load_agent_config
 from .idle_guard_digest import IDLE_DECISION_SECONDS
@@ -61,8 +61,6 @@ from .idle_job_diagnostics import (
     build_demand_observation,
     demand_check,
     observe_demand_detail,
-    validate_demand_detail,
-    validate_interval_detail,
 )
 from .idle_job_interval_history import IdleJobIntervalHistory
 from .idle_job_process import (
@@ -73,14 +71,13 @@ from .idle_job_process import (
     request_idle_job_stop,
     spawn_idle_job,
 )
+from .idle_job_status import IDLE_JOB_STATUS_VERSION, idle_job_status
 from .idle_launch_permit import create_idle_launch_permit, poll_idle_launch_ready, send_idle_launch_permit
 from .idle_local_reader import IdleLocalReader
 from .launch_handoff_state import LaunchHandoffState
 
 _T = TypeVar("_T")
 
-IDLE_JOB_STATUS_VERSION = 1
-IDLE_JOB_STATE_VERSION = 1
 MAX_IDLE_JOB_FAILURE_BACKOFF_SECONDS = 60.0
 NORMAL_EXIT_RETRY_SECONDS = 1.0
 MAX_RETAINED_IDLE_JOB_INSTANCES = 5
@@ -89,8 +86,6 @@ SUPERVISOR_POLL_SECONDS = 0.05
 PREPARATION_TIMEOUT_SECONDS = 30.0
 
 _INSTANCE_ID_PATTERN = re.compile(r"[0-9a-f]{32}\Z")
-_ACTIVE_STATES = frozenset({"launching", "prepared", "running", "stopping"})
-_STATUS_STATES = frozenset({"disabled", "waiting", "running", "stopping", "backoff", "blocked"})
 _STOP_REASONS = frozenset(
     {
         "busy",
@@ -107,36 +102,6 @@ _STOP_REASONS = frozenset(
     }
 )
 
-_STATUS_FIELDS = frozenset(
-    {
-        "version",
-        "state",
-        "reason",
-        "configured_gpu_ids",
-        "resolved_gpu_ids",
-        "process",
-        "started_at",
-        "last_exit_reason",
-        "next_retry_at",
-        "log_path",
-        "config_revision",
-        "supervision_active",
-        "runtime_id",
-        "failure_count",
-    }
-)
-_STATE_FIELDS = frozenset(
-    {
-        "version",
-        "observation_key",
-        "idle_since",
-        "retry_at",
-        "failure_count",
-        "last_exit",
-        "started_at",
-        "log_path",
-    }
-)
 _EXIT_FIELDS = frozenset({"version", "runtime_id", "instance_id", "boot_id", "returncode", "reason", "exited_at"})
 
 
@@ -229,57 +194,13 @@ def _same_owner(left: dict[str, Any] | None, right: object) -> bool:
     return {**left, "phase": right["phase"]} == right
 
 
-def _root(value: Any) -> Path:
-    if isinstance(value, (str, Path)):
-        return Path(value).expanduser().resolve()
-    candidate = getattr(value, "root", None)
-    if candidate is None:
-        raise TypeError("runtime must provide a root path")
-    return Path(candidate).expanduser().resolve()
-
-
-def _runtime_id_without_initializing(value: Any, root: Path) -> str:
-    candidate = getattr(value, "instance_id", None)
-    if isinstance(candidate, str) and candidate:
-        return candidate
-    try:
-        raw = read_json(root / "identity.json")
-        machine_runtime = raw.get("machine_runtime")
-        if isinstance(machine_runtime, dict):
-            effective = machine_runtime.get("runtime_id")
-            seed = machine_runtime.get("instance_id")
-            if isinstance(effective, str) and effective:
-                return effective
-            if isinstance(seed, str) and seed:
-                return seed
-    except (FileNotFoundError, OSError, TypeError, ValueError, KeyError):
-        pass
-    return "machine-runtime"
-
-
 def _safe_instance_id(value: object) -> bool:
     return isinstance(value, str) and _INSTANCE_ID_PATTERN.fullmatch(value) is not None
-
-
-def _finite_number(value: object) -> bool:
-    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(float(value))
 
 
 def _copy_json(value: Any) -> Any:
     """Copy JSON-shaped state without importing a second persistence model."""
     return json.loads(json.dumps(value, ensure_ascii=False))
-
-
-def _utc_epoch(value: object) -> float | None:
-    if not isinstance(value, str):
-        return None
-    try:
-        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError:
-        return None
-    if parsed.tzinfo is None or parsed.utcoffset() != timezone.utc.utcoffset(parsed):
-        return None
-    return parsed.timestamp()
 
 
 def _instance_directory_is_safe(path: Path) -> bool:
@@ -324,7 +245,7 @@ def _read_exit_record(path: Path) -> dict[str, Any] | None:
         raise ValueError("Idle Job exit returncode is invalid")
     if not isinstance(raw["reason"], str) or not raw["reason"]:
         raise ValueError("Idle Job exit reason is invalid")
-    if _utc_epoch(raw["exited_at"]) is None:
+    if idle_status.utc_epoch(raw["exited_at"]) is None:
         raise ValueError("Idle Job exit exited_at is invalid")
     return dict(raw)
 
@@ -338,243 +259,6 @@ def _read_stop_reason(path: Path) -> str | None:
         return "invalid_stop_request"
     reason = value.get("reason")
     return reason if isinstance(reason, str) and reason else "invalid_stop_request"
-
-
-def _canonical_status(value: object) -> dict[str, Any]:
-    if not isinstance(value, dict) or set(value) != _STATUS_FIELDS:
-        raise ValueError("Idle Job status envelope is malformed")
-    if type(value["version"]) is not int or value["version"] != IDLE_JOB_STATUS_VERSION:
-        raise ValueError("Idle Job status version is invalid")
-    if value["state"] not in _STATUS_STATES:
-        raise ValueError("Idle Job status state is invalid")
-    if not isinstance(value["reason"], str) or not value["reason"]:
-        raise ValueError("Idle Job status reason is invalid")
-    for field in ("configured_gpu_ids", "resolved_gpu_ids"):
-        ids = value[field]
-        if ids is not None and (
-            not isinstance(ids, list)
-            or any(type(gpu_id) is not int or gpu_id < (-1 if field == "configured_gpu_ids" else 0) for gpu_id in ids)
-            or (field == "resolved_gpu_ids" and len(set(ids)) != len(ids))
-        ):
-            raise ValueError(f"Idle Job status {field} is invalid")
-    if value["process"] is not None and not isinstance(value["process"], dict):
-        raise ValueError("Idle Job status process is invalid")
-    if value["last_exit_reason"] is not None and (
-        not isinstance(value["last_exit_reason"], str) or not value["last_exit_reason"]
-    ):
-        raise ValueError("Idle Job status last_exit_reason is invalid")
-    if value["started_at"] is not None and _utc_epoch(value["started_at"]) is None:
-        raise ValueError("Idle Job status started_at is invalid")
-    if value["next_retry_at"] is not None and not _finite_number(value["next_retry_at"]):
-        raise ValueError("Idle Job status next_retry_at is invalid")
-    if value["log_path"] is not None and (not isinstance(value["log_path"], str) or not value["log_path"]):
-        raise ValueError("Idle Job status log_path is invalid")
-    revision = value["config_revision"]
-    if revision is not None and (type(revision) is not int or revision < 0):
-        raise ValueError("Idle Job status config_revision is invalid")
-    if type(value["supervision_active"]) is not bool:
-        raise ValueError("Idle Job status supervision_active is invalid")
-    if value["runtime_id"] is not None and (not isinstance(value["runtime_id"], str) or not value["runtime_id"]):
-        raise ValueError("Idle Job status runtime_id is invalid")
-    if type(value["failure_count"]) is not int or value["failure_count"] < 0:
-        raise ValueError("Idle Job status failure_count is invalid")
-    return dict(value)
-
-
-def _canonical_state(value: object) -> dict[str, Any]:
-    if not isinstance(value, dict) or set(value) != {"idle_job_state"}:
-        raise ValueError("Idle Job state envelope is malformed")
-    raw = value["idle_job_state"]
-    if not isinstance(raw, dict) or set(raw) != _STATE_FIELDS:
-        raise ValueError("Idle Job state fields are malformed")
-    if type(raw["version"]) is not int or raw["version"] != IDLE_JOB_STATE_VERSION:
-        raise ValueError("Idle Job state version is invalid")
-    key = raw["observation_key"]
-    if key is not None and (not isinstance(key, str) or len(key) > 4096):
-        raise ValueError("Idle Job observation key is invalid")
-    for field in ("idle_since", "retry_at"):
-        if raw[field] is not None and not _finite_number(raw[field]):
-            raise ValueError(f"Idle Job state {field} is invalid")
-    if type(raw["failure_count"]) is not int or raw["failure_count"] < 0:
-        raise ValueError("Idle Job state failure_count is invalid")
-    if raw["last_exit"] is not None and not isinstance(raw["last_exit"], dict):
-        raise ValueError("Idle Job state last_exit is invalid")
-    if raw["started_at"] is not None and _utc_epoch(raw["started_at"]) is None:
-        raise ValueError("Idle Job state started_at is invalid")
-    if raw["log_path"] is not None and (not isinstance(raw["log_path"], str) or not raw["log_path"]):
-        raise ValueError("Idle Job state log_path is invalid")
-    return dict(raw)
-
-
-def _status_path(root: Path) -> Path:
-    return root / "idle-job" / "status.json"
-
-
-def _state_path(root: Path) -> Path:
-    return root / "idle-job" / "state.json"
-
-
-def _read_status_payload(root: Path, *, include_diagnostics: bool = False) -> dict[str, Any]:
-    path = _status_path(root)
-    metadata = path.lstat()
-    if not stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
-        raise ValueError("Idle Job status must be a regular file")
-    envelope = read_json_limited(path, max_bytes=MAX_STATUS_BYTES, record_type="idle_job_status")
-    payload = _canonical_status(envelope.get("idle_job_status"))
-    if include_diagnostics:
-        payload["demand_detail"] = validate_demand_detail(envelope.get(DEMAND_DETAIL_MEMBER))
-        payload["interval_detail"] = validate_interval_detail(envelope.get(INTERVAL_DETAIL_MEMBER))
-    return payload
-
-
-def _reports_unknown_demand(payload: Mapping[str, Any]) -> bool:
-    return payload["reason"] == "unknown_demand" and payload["state"] in {"waiting", "stopping"}
-
-
-def _ownership_file_exists(root: Path) -> bool:
-    try:
-        root.joinpath("idle-job", "ownership.json").lstat()
-    except FileNotFoundError:
-        return False
-    except OSError:
-        return True
-    return True
-
-
-def _default_status(runtime_id: str | None, *, state: str, reason: str) -> dict[str, Any]:
-    return {
-        "version": IDLE_JOB_STATUS_VERSION,
-        "state": state,
-        "reason": reason,
-        "configured_gpu_ids": None,
-        "resolved_gpu_ids": None,
-        "process": None,
-        "started_at": None,
-        "last_exit_reason": None,
-        "next_retry_at": None,
-        "log_path": None,
-        "config_revision": None,
-        "supervision_active": state in _ACTIVE_STATES,
-        "runtime_id": runtime_id,
-        "failure_count": 0,
-    }
-
-
-def _owner_preparing(owner: Mapping[str, Any]) -> bool:
-    return owner["version"] == 2 and owner["phase"] in {"prepared", "launching"}
-
-
-def _idle_job_status(runtime: Any, *, runtime_id: str | None = None) -> dict[str, Any]:
-    """Read the independent machine-local Idle Job status projection.
-
-    A malformed status or ownership record is reported as ``blocked``.  The
-    function never infers ``disabled`` while an ownership file is present.
-    """
-    root = _root(runtime)
-    runtime_id = runtime_id or _runtime_id_without_initializing(runtime, root)
-    ownership_exists = _ownership_file_exists(root)
-    try:
-        ownership = read_idle_job_ownership(root)
-    except (OSError, RuntimeError, TypeError, ValueError, KeyError):
-        ownership = None
-        ownership_malformed = ownership_exists
-    else:
-        ownership_malformed = False
-
-    try:
-        payload = _read_status_payload(root, include_diagnostics=True)
-    except FileNotFoundError:
-        if ownership is not None and _owner_preparing(ownership):
-            payload = _default_status(runtime_id, state="waiting", reason="preparing")
-        else:
-            payload = _default_status(
-                runtime_id,
-                state="blocked" if ownership_exists else "disabled",
-                reason="malformed_status" if ownership_exists else "disabled",
-            )
-    except (OSError, TypeError, ValueError, KeyError):
-        payload = _default_status(runtime_id, state="blocked", reason="malformed_status")
-    if payload.get("runtime_id") is None:
-        payload["runtime_id"] = runtime_id
-
-    if ownership_malformed:
-        payload["state"] = "blocked"
-        payload["reason"] = "malformed_ownership"
-        payload["supervision_active"] = True
-        return payload
-    if ownership is None:
-        if ownership_exists:
-            payload["state"] = "blocked"
-            payload["reason"] = "malformed_ownership"
-            payload["supervision_active"] = True
-        else:
-            try:
-                config = load_idle_job_config(runtime)
-                payload["configured_gpu_ids"] = list(config.gpu_ids)
-                if not config.enabled:
-                    payload.update(state="disabled", reason="disabled", process=None, started_at=None)
-                elif payload["state"] in {"running", "stopping", "disabled"} or payload["reason"] in {
-                    "launching",
-                    "preparing",
-                }:
-                    state = _canonical_state(
-                        read_json_limited(_state_path(root), max_bytes=65_536, record_type="idle_job_state")
-                    )
-                    retry_at = state["retry_at"]
-                    payload.update(
-                        state="backoff" if retry_at is not None and retry_at > time.time() else "waiting",
-                        reason="ownership_released",
-                        process=None,
-                        started_at=None,
-                        next_retry_at=retry_at,
-                        failure_count=state["failure_count"],
-                        last_exit_reason=(state["last_exit"] or {}).get("reason"),
-                    )
-            except FileNotFoundError:
-                payload.update(state="waiting", reason="awaiting_supervision", process=None, started_at=None)
-            except (OSError, RuntimeError, TypeError, ValueError, KeyError):
-                payload.update(state="blocked", reason="config_or_state_unavailable", process=None, started_at=None)
-        return payload
-
-    if ownership["runtime_id"] != runtime_id:
-        payload["state"] = "blocked"
-        payload["reason"] = "foreign_ownership"
-        payload["supervision_active"] = True
-        return payload
-    try:
-        boot_id = current_boot_id()
-    except (OSError, RuntimeError, TypeError, ValueError):
-        boot_id = None
-    if boot_id is None or ownership["boot_id"] != boot_id:
-        payload["state"] = "blocked"
-        payload["reason"] = "foreign_boot"
-        payload["supervision_active"] = True
-        return payload
-    expected_state = ownership["phase"]
-    preparing = _owner_preparing(ownership)
-    if preparing:
-        payload.update(process=None, started_at=None)
-        if payload["state"] != "blocked":
-            payload.update(state="waiting", reason="preparing")
-    elif payload.get("state") == "disabled" or payload.get("state") not in {"waiting", "running", "stopping"}:
-        visible_state = "waiting" if expected_state == "launching" else expected_state
-        payload["state"] = visible_state
-    payload["supervision_active"] = True
-    payload["runtime_id"] = ownership["runtime_id"]
-    payload["config_revision"] = ownership["config_revision"]
-    payload["resolved_gpu_ids"] = list(ownership["gpu_ids"])
-    payload["log_path"] = str(idle_job_instance_path(root, ownership["instance_id"]) / "command.log")
-    if not preparing and (ownership["version"] == 1 or expected_state == "running"):
-        payload["started_at"] = payload.get("started_at") or ownership["created_at"]
-    return payload
-
-
-def idle_job_status(runtime: Any, *, runtime_id: str | None = None) -> dict[str, Any]:
-    """Read Idle Job status and its last observed interval without refreshing evidence."""
-    payload = _idle_job_status(runtime, runtime_id=runtime_id)
-    payload["demand_detail"] = payload.get("demand_detail") if _reports_unknown_demand(payload) else None
-    payload.setdefault("interval_detail", None)
-    return payload
 
 
 class IdleJobSupervisor:
@@ -592,8 +276,8 @@ class IdleJobSupervisor:
         sleep: Callable[[float], None] | None = None,
     ) -> None:
         self.runtime = runtime
-        self.root = _root(runtime)
-        self.runtime_id = runtime_id or _runtime_id_without_initializing(runtime, self.root)
+        self.root = idle_status.runtime_root(runtime)
+        self.runtime_id = runtime_id or idle_status.runtime_id_without_initializing(runtime, self.root)
         if not isinstance(self.runtime_id, str) or not self.runtime_id or len(self.runtime_id) > 128:
             raise ValueError("runtime_id must be a bounded non-empty string")
         if clock is not None and monotonic is not None:
@@ -646,14 +330,14 @@ class IdleJobSupervisor:
 
     def _load_state(self) -> None:
         try:
-            value = read_json_limited(_state_path(self.root), max_bytes=65_536, record_type="idle_job_state")
+            value = read_json_limited(idle_status.state_path(self.root), max_bytes=65_536, record_type="idle_job_state")
         except FileNotFoundError:
             return
         except (OSError, TypeError, ValueError, KeyError):
             self._state_corrupt = True
             return
         try:
-            state = _canonical_state(value)
+            state = idle_status.validate_state(value)
         except (TypeError, ValueError, KeyError):
             self._state_corrupt = True
             return
@@ -666,7 +350,7 @@ class IdleJobSupervisor:
 
     def _persist_state(self) -> None:
         state = {
-            "version": IDLE_JOB_STATE_VERSION,
+            "version": idle_status.IDLE_JOB_STATE_VERSION,
             "observation_key": self._observation_key,
             "idle_since": self._idle_since,
             "retry_at": self._retry_at,
@@ -675,7 +359,7 @@ class IdleJobSupervisor:
             "started_at": self._started_at,
             "log_path": self._log_path,
         }
-        atomic_replace(_state_path(self.root), {"idle_job_state": state})
+        atomic_replace(idle_status.state_path(self.root), {"idle_job_state": state})
         self._state_corrupt = False
 
     def _payload(self, *, state: str | None = None, reason: str | None = None) -> dict[str, Any]:
@@ -698,7 +382,7 @@ class IdleJobSupervisor:
             "runtime_id": self.runtime_id,
             "failure_count": self._failure_count,
         }
-        return _canonical_status(payload)
+        return idle_status.validate_status(payload)
 
     def _publish(self, *, state: str, reason: str) -> dict[str, Any]:
         self._status_state = "waiting" if state == "launching" else state
@@ -709,7 +393,7 @@ class IdleJobSupervisor:
         self._pending_demand_check = None
         self._pending_agent_instance_id = None
         self._last_demand_detail = None
-        if not _reports_unknown_demand(payload):
+        if not idle_status.reports_unknown_demand(payload):
             detail = None
         try:
             interval = self._interval_history.at_publication(self._idle_since)
@@ -725,7 +409,7 @@ class IdleJobSupervisor:
                     enriched = candidate
             except Exception:
                 pass
-        path = _status_path(self.root)
+        path = idle_status.status_path(self.root)
         if enriched is not base:
             try:
                 atomic_replace(path, enriched)
@@ -1296,7 +980,7 @@ class IdleJobSupervisor:
             or exit_record.get("boot_id") != intent.get("boot_id")
         ):
             return None
-        exited_at = _utc_epoch(exit_record.get("exited_at"))
+        exited_at = idle_status.utc_epoch(exit_record.get("exited_at"))
         if exited_at is None:
             return None
         if not idle_job_processes_exited(path):
@@ -1503,7 +1187,7 @@ class IdleJobSupervisor:
             self._resolved_gpu_ids = list(resolved)
             return self._publish(state="waiting", reason=reason)
         if owner is not None:
-            if _owner_preparing(owner):
+            if idle_status.owner_is_preparing(owner):
                 return self._publish(state="waiting", reason="preparing")
             return self._publish(state=owner["phase"], reason=owner["phase"])
         if not launch_allowed:

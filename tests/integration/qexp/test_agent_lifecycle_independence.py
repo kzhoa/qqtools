@@ -21,7 +21,7 @@ from qqtools.plugins.qexp.agent.lifecycle import (
     start_machine_agent,
     stop_machine_agent,
 )
-from qqtools.plugins.qexp.agent.project_io_executor import ProjectIOExecutor
+from qqtools.plugins.qexp.agent.project_io.executor import ProjectIOExecutor
 from qqtools.plugins.qexp.agent.setup import initialize_machine, register_projects
 from qqtools.plugins.qexp.commands.group import change_worker, create_group
 from qqtools.plugins.qexp.config_types import RootConfig
@@ -290,8 +290,8 @@ def test_real_agent_two_hung_worker_primary_and_renewal_qualification(tmp_path: 
 import json, subprocess, sys, time
 from pathlib import Path
 from qqtools.plugins.qexp.agent.lifecycle import run_machine_agent_loop
-from qqtools.plugins.qexp.agent.project_io_admission import ProjectIOAdmission
-from qqtools.plugins.qexp.agent import project_io_executor
+from qqtools.plugins.qexp.agent.project_io.admission import ProjectIOAdmission
+from qqtools.plugins.qexp.agent.project_io import executor as project_io_executor
 from qqtools.plugins.qexp.runtime.paths import shared_paths
 
 root, healthy, foreground_hold, background_arm, background_started, measurement_gate, trace = sys.argv[1:]
@@ -325,7 +325,7 @@ try:
             if time.monotonic() >= deadline:
                 raise SystemExit(98)
             time.sleep(0.005)
-    from qqtools.plugins.qexp.agent.project_io_worker import main
+    from qqtools.plugins.qexp.agent.project_io.worker import main
     code = main(args)
 finally:
     with Path(trace).open("a", encoding="utf-8") as stream:
@@ -350,7 +350,7 @@ schema, *args = sys.argv[1:]
 # Every selected blocked-binding invocation crosses the injected I/O boundary,
 # even when its particular operation would otherwise use cached schema state.
 Path(schema).read_bytes()
-from qqtools.plugins.qexp.agent.project_io_worker import main
+from qqtools.plugins.qexp.agent.project_io.worker import main
 raise SystemExit(main(args))
 """
 real_popen = project_io_executor.subprocess.Popen
@@ -628,7 +628,8 @@ def test_real_agent_healthy_binding_scale_preserves_incumbent_progress(
         # across the same bounded-window boundary without 130 training launches.
         agent_script = """
 import sys
-from qqtools.plugins.qexp.agent import project_io_admission, project_io_controller
+from qqtools.plugins.qexp.agent.project_io import admission as project_io_admission
+from qqtools.plugins.qexp.agent.project_io import controller as project_io_controller
 from qqtools.plugins.qexp.agent.lifecycle import run_machine_agent_loop
 project_io_admission._MAX_PENDING_INTENTS = int(sys.argv[2])
 project_io_controller._MAX_RETAINED_SCHEDULER_INTENTS = int(sys.argv[2])
@@ -1256,7 +1257,7 @@ def test_li05_launch_boundary_has_no_duplicate_authorized_process(tmp_path: Path
 import os, sys
 from pathlib import Path
 from qqtools.plugins.qexp.agent.lifecycle import run_machine_agent_loop
-from qqtools.plugins.qexp.agent.project_io_executor import ProjectIOExecutor
+from qqtools.plugins.qexp.agent.project_io.executor import ProjectIOExecutor
 boundary, root, reached = sys.argv[1:]
 original_start = ProjectIOExecutor.start
 original_consume = ProjectIOExecutor.consume
@@ -1417,7 +1418,7 @@ def test_li06_terminal_publication_is_idempotent(tmp_path: Path, boundary: str, 
 import os, sys
 from pathlib import Path
 from qqtools.plugins.qexp import lifecycle
-from qqtools.plugins.qexp.agent import project_io_worker
+from qqtools.plugins.qexp.agent.project_io import worker as project_io_worker
 boundary, reached = sys.argv[1:3]
 def crash():
     Path(reached).write_text(boundary)
@@ -1441,7 +1442,8 @@ raise SystemExit(project_io_worker.main(sys.argv[3:]))
         script = """
 import os, sys
 from pathlib import Path
-from qqtools.plugins.qexp.agent import project_io_executor, project_io_supervision
+from qqtools.plugins.qexp.agent.project_io import executor as project_io_executor
+from qqtools.plugins.qexp.agent.project_io.supervision import coordinator as project_io_supervision
 from qqtools.plugins.qexp.agent.lifecycle import run_machine_agent_loop
 boundary, root, reached, worker_script = sys.argv[1:]
 def crash():
@@ -1816,13 +1818,13 @@ from tests.helpers.qexp.worker_diagnostics import trace_project_io_requests
 def reject_direct_stop_publication(*args, **kwargs):
     raise AssertionError("agent cleanup performed direct shared stop publication")
 lifecycle.publish_machine_stop_snapshot = reject_direct_stop_publication
-real_confirm_idle_shutdown = lifecycle._confirm_idle_shutdown
+real_confirm_idle_shutdown = lifecycle.idle_exit.confirm_idle_shutdown
 def confirm_idle_shutdown(runtime, *args, **kwargs):
     guard = real_confirm_idle_shutdown(runtime, *args, **kwargs)
     if guard is not None:
         (Path(runtime.root) / "idle-confirmed").touch()
     return guard
-lifecycle._confirm_idle_shutdown = confirm_idle_shutdown
+lifecycle.idle_exit.confirm_idle_shutdown = confirm_idle_shutdown
 trace_project_io_requests()
 runpy.run_module("qqtools.plugins.qexp.agent.process", run_name="__main__")
 """
@@ -1894,8 +1896,8 @@ def test_finished_process_releases_capacity_while_publication_is_unavailable(
 import sys
 from pathlib import Path
 from qqtools.plugins.qexp.agent.lifecycle import run_machine_agent_loop
-from qqtools.plugins.qexp.agent.project_io_controller import ProjectIOController
-from qqtools.plugins.qexp.agent.project_io_executor import ProjectIOExecutor
+from qqtools.plugins.qexp.agent.project_io.controller import ProjectIOController
+from qqtools.plugins.qexp.agent.project_io.executor import ProjectIOExecutor
 def unavailable(self, *args, **kwargs):
     Path(sys.argv[2]).touch()
     raise OSError("injected shared terminal publication outage")
@@ -1945,7 +1947,7 @@ import sys
 from pathlib import Path
 from qqtools.plugins.qexp.agent import dispatch_loop as machine_agent
 from qqtools.plugins.qexp.agent import lifecycle
-from qqtools.plugins.qexp.agent.project_io_controller import ProjectIOController
+from qqtools.plugins.qexp.agent.project_io.controller import ProjectIOController
 original = ProjectIOController.advance_scheduler_observations
 original_quiescence = ProjectIOController.advance_scheduler_quiescence
 def probe(self, *args, **kwargs):
@@ -1979,19 +1981,19 @@ lifecycle.run_machine_agent_loop(sys.argv[1], loop_interval=0.1, available_gpus=
 
 @pytest.mark.parametrize("kind", ["availability", "group_control", "cleanup"])
 def test_pending_repair_prevents_idle_exit(tmp_path: Path, kind: str) -> None:
-    from qqtools.plugins.qexp.agent.lifecycle import _machine_is_true_idle
+    from qqtools.plugins.qexp.agent.idle_exit import can_exit_when_idle
     from qqtools.plugins.qexp.runtime.operation_store import active_operation_path
 
     runtime = _initialized_runtime(tmp_path / "machine")
     cfg = init_shared_root(tmp_path / "project" / ".qexp", "gpu-1", runtime_root=tmp_path / "legacy")
     _register_project(runtime, cfg)
     runtime.last_cycle_had_demand = False
-    assert _machine_is_true_idle(runtime, has_consumed_binding=True)
+    assert can_exit_when_idle(runtime, has_consumed_binding=True)
     path = active_operation_path(cfg, kind, "pending")
     atomic_replace(path, {"operation": {"state": "pending"}})
-    assert not _machine_is_true_idle(runtime, has_consumed_binding=True)
+    assert not can_exit_when_idle(runtime, has_consumed_binding=True)
     path.unlink()
-    assert _machine_is_true_idle(runtime, has_consumed_binding=True)
+    assert can_exit_when_idle(runtime, has_consumed_binding=True)
 
 
 def test_failed_binding_is_not_consumed_for_idle_exit(tmp_path: Path) -> None:
@@ -2003,7 +2005,7 @@ def test_failed_binding_is_not_consumed_for_idle_exit(tmp_path: Path) -> None:
 import sys
 from pathlib import Path
 from qqtools.plugins.qexp.agent import lifecycle
-from qqtools.plugins.qexp.agent.project_io_controller import ProjectIOController
+from qqtools.plugins.qexp.agent.project_io.controller import ProjectIOController
 original = ProjectIOController.advance_binding_validation
 def validate(self, bindings, registry_revision):
     if not Path(sys.argv[3]).exists():

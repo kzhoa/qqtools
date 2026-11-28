@@ -3,7 +3,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from qqtools.plugins.qexp.agent import project_io_worker as worker
+from qqtools.plugins.qexp.agent.project_io import worker
 from qqtools.plugins.qexp.runtime.upgrade import framework
 
 

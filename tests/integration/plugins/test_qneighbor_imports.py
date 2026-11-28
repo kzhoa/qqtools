@@ -138,9 +138,14 @@ assert cuda._selected is None
 cuda._ensure_backend = saved
 search = qneighbor.neighbor_list
 backend = cuda._selected
-assert backend.name == sys.argv[1]
+assert backend is explicit
+# Importing the public CUDA API must work with just the selected backend installed.
+from qqtools.plugins.qneighbor.cuda import *
+assert neighbor_list is search is explicit.neighbor_list
+assert neighbor_list_obc is explicit.neighbor_list_obc
+assert neighbor_list_pbc is explicit.neighbor_list_pbc
+assert radius_graph is explicit.radius_graph
 assert cuda.radius_graph is backend.radius_graph
-assert qneighbor.build_neighbor_list_batch is backend.build_neighbor_list_batch
 assert qneighbor.radius_graph is backend.radius_graph
 assert qneighbor.neighbor_list_obc is qneighbor.radius_graph
 assert qneighbor.neighbor_list_pbc is backend.neighbor_list_pbc
@@ -163,9 +168,9 @@ for _ in range(2):
     assert generic.tolist() == edges.tolist() and not bool(generic_shift.any())
     public_edges, public_shift = qneighbor.neighbor_list_pbc(pos,1.,cell=cell)
     assert public_edges.tolist() == edges.tolist() and not bool(public_shift.any())
-    edges,shift = qneighbor.build_neighbor_list_batch(pos,cell,True,ids,1.,32)
+    edges,shift = qneighbor.neighbor_list_pbc(pos,1.,ids,32,cell=cell,pbc=True)
     assert edges.tolist() == [[1,0],[0,1]] and not bool(shift.any())
-    edges,shift = backend.build_neighbor_list_batch_full_pbc(pos,cell,ids,1.,32)
+    edges,shift = explicit.neighbor_list_pbc(pos,1.,ids,32,cell=cell)
     assert edges.tolist() == [[1,0],[0,1]] and not bool(shift.any())
 assert not any(name.split('.')[0] == blocked for name in sys.modules)
 """
@@ -184,8 +189,7 @@ class BlockWarp:
 sys.meta_path.insert(0, BlockWarp())
 import qqtools
 from qqtools.plugins import qneighbor
-from qqtools.plugins.qneighbor.cuda.warp.obc import open_radius_graph
-from qqtools.plugins.qneighbor.cuda.warp.pbc import build_neighbor_list_batch_warp
+from qqtools.plugins.qneighbor.cuda.warp import neighbor_list_pbc
 import torch
 
 assert "warp" not in sys.modules
@@ -193,14 +197,11 @@ assert qqtools.qDict({"answer": 1}).answer == 1
 pos = torch.zeros((1, 3))
 batch = torch.zeros(1, dtype=torch.long)
 pbc = torch.zeros(3, dtype=torch.bool)
-for search, args in (
-    (build_neighbor_list_batch_warp, (pos, None, pbc, batch, 1.0, 1)),
-):
-    try:
-        search(*args)
-    except ImportError as exc:
-        assert "qqtools[qneighbor]" in str(exc)
-    else:
-        raise AssertionError("Missing Warp dependency was accepted")
+try:
+    neighbor_list_pbc(pos,1.,batch,1,pbc=pbc)
+except ImportError as exc:
+    assert "qqtools[qneighbor]" in str(exc)
+else:
+    raise AssertionError("Missing Warp dependency was accepted")
 """
     subprocess.run([sys.executable, "-c", script], check=True, timeout=30)

@@ -27,11 +27,10 @@ def extract_int(text) -> List[int]:
     return matches
 
 
-def extract_float(text) -> List[float]:
-    """return [] if not matched"""
-    matches = re.findall(r"[-+]?\d*\.\d+|[-+]?\d+", text)
-    matches = [float(v) for v in matches]
-    return matches
+def extract_float(text: str) -> List[float]:
+    """Extract signed numbers, including scientific and Fortran D exponents."""
+    matches = re.findall(r"[-+]?(?:\d+\.?\d*|\.\d+)(?:[EeDd][-+]?\d+)?", text)
+    return [float(value.replace("D", "E").replace("d", "e")) for value in matches]
 
 
 def is_open_file_handler(var):
@@ -56,7 +55,7 @@ class ReadRule(object):
             pattern (str): pattern string.
             nlines (int or str): read nlines when meet pattern string. If str given, use eval().
             skip_when_meet (int): Defaults to 0.
-            callback (optional): callback(read_lines)->parsedValue. Defaults to None.
+            callback (optional): Transform matched lines. By default, store the lines under the rule name.
             end_pattern (optional): Defaults to None. The endline will be included.
         """
         self.pattern = pattern
@@ -87,7 +86,8 @@ class ReadRule(object):
 
     def evoke_callback(self, lines: List[str], results: dict):
         if self.callback is None:
-            return lines
+            results[self.name] = lines
+            return results
         sig = inspect.signature(self.callback)
         num_params = len(sig.parameters)
         if num_params == 1:
@@ -138,7 +138,7 @@ def _build_jump_table(rules: List[ReadRule]) -> List[List[int]]:
     for i in range(n):
         j = i
         candidates = [j]
-        while not rules[j].required:
+        while j + 1 < n and not rules[j].required:
             j = j + 1
             candidates.append(j)
         table.append(candidates)

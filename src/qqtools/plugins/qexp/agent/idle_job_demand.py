@@ -12,8 +12,8 @@ from typing import Any, Protocol
 from .bindings import ProjectBinding
 from .dispatch_probe import PrimaryProbeSession
 from .primary_probe_transport import encode_probe_session
-from .project_io_protocol import PROJECT_IO_CAPACITY, ProjectIORequest
-from .project_io_transport_support import ProjectIOProtocolError
+from .project_io.protocol import PROJECT_IO_CAPACITY, ProjectIORequest
+from .project_io.transport import ProjectIOProtocolError
 from .working_set import BindingTurn
 
 _MAX_CAPACITY = 4096

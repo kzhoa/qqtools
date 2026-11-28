@@ -60,6 +60,15 @@ def test_open_and_unified_agree(cap):
     assert not shifts.any()
 
 
+def test_single_graph_uses_its_batch_id_for_periodic_metadata():
+    pos = torch.tensor([[0.1, 0, 0], [0.9, 0, 0]])
+    cells = torch.stack((torch.zeros(3, 3), torch.eye(3)))
+    flags = torch.tensor([[False, False, False], [True, False, False]])
+    edge, shifts = neighbor_list_pbc(pos, 0.3, torch.tensor([1, 1]), cell=cells, pbc=flags)
+    torch.testing.assert_close(edge, torch.tensor([[1, 0], [0, 1]]))
+    torch.testing.assert_close(shifts, torch.tensor([[1, 0, 0], [-1, 0, 0]]))
+
+
 def test_empty_singleton_and_periodic_self_images():
     for pos in (torch.empty((0, 3)), torch.zeros((1, 3))):
         assert neighbor_list_obc(pos, 1).shape == (2, 0)

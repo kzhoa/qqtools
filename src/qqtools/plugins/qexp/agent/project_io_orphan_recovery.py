@@ -25,7 +25,7 @@ from .project_io_process import (
 from .project_io_terminal_proof import has_exact_terminal_revisions
 
 if TYPE_CHECKING:
-    from .project_io_controller import ProjectIOController
+    from .project_io.controller import ProjectIOController
 
 _MAX_BINDINGS_PER_TURN = 64
 _MAX_SCANS = 256

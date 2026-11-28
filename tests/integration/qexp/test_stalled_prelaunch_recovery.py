@@ -604,7 +604,7 @@ def test_public_recovery_allows_exactly_one_replacement_through_machine_dispatch
         import sys
         from pathlib import Path
         from qqtools.plugins.qexp.agent.lifecycle import run_machine_agent_loop
-        from qqtools.plugins.qexp.agent.project_io_controller import ProjectIOController
+        from qqtools.plugins.qexp.agent.project_io.controller import ProjectIOController
         original = ProjectIOController.advance_scheduler_reservation_reconciliations
         def paused(self, bindings, registry_revision, *, reservations):
             candidates = [r for r in reservations if r.reservation_id != sys.argv[2]]
@@ -628,7 +628,7 @@ def test_public_recovery_allows_exactly_one_replacement_through_machine_dispatch
         details = cli(capsys, [*prefix, "task", "show", task.task_id, "--details"])
         assert details["prelaunch"][0]["attempt_phase"] == "claimed"
         assert details["prelaunch"][0]["gpu_ids"] == [1]
-        from qqtools.plugins.qexp.agent.project_io_controller import _PRELAUNCH_RESERVATION_RECHECK_SECONDS
+        from qqtools.plugins.qexp.agent.project_io.controller import _PRELAUNCH_RESERVATION_RECHECK_SECONDS
 
         time.sleep(_PRELAUNCH_RESERVATION_RECHECK_SECONDS)
         command = []

@@ -33,6 +33,12 @@ def test_global_even_sort_strategy_characterization(strategy, expected):
     assert order.tolist() == expected
 
 
+def test_v2_keeps_seeded_order_when_revisiting_a_bin():
+    # With 65 samples, only the first of the 64 bins has a second item.
+    order = compute_global_even_sort_order(np.arange(65), seed=3, strategy="v2")
+    assert order[[0, -1]].tolist() == [1, 0]
+
+
 @pytest.mark.parametrize("strategy", ["v1", "v2", "v3"])
 def test_global_even_sort_supports_empty_input(strategy):
     order = compute_global_even_sort_order([], strategy=strategy)

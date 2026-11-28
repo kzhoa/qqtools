@@ -128,7 +128,7 @@ def _canonical_specs(specs: list[Mapping[str, Any]]) -> tuple[Mapping[str, Any],
 
 
 @dataclass(frozen=True, slots=True)
-class SubmissionRequest:
+class SubmissionPlanInput:
     """Frozen caller request used to derive a submission plan."""
 
     specs: tuple[Mapping[str, Any], ...]
@@ -186,7 +186,7 @@ class SubmissionRequest:
 
 def normalize_submission_request(
     specs: list[dict[str, Any]], *, group_name: str | None, kind: str, worker_set: list[str] | Mapping[str, Any] | None
-) -> SubmissionRequest:
+) -> SubmissionPlanInput:
     """Validate and freeze raw submission semantics without reading runtime state."""
     if not specs:
         raise ValueError("submission must contain at least one task.")
@@ -195,7 +195,7 @@ def normalize_submission_request(
     if not isinstance(kind, str) or not kind:
         raise ValueError("submission kind must be a non-empty string.")
     additions = _worker_additions(worker_set)
-    return SubmissionRequest(
+    return SubmissionPlanInput(
         specs=_canonical_specs(specs),
         group_name=group_name,
         kind=kind,
@@ -204,7 +204,7 @@ def normalize_submission_request(
     )
 
 
-def legacy_submission_request_digest(request: SubmissionRequest) -> str:
+def legacy_submission_request_digest(request: SubmissionPlanInput) -> str:
     """Return the pre-tmux-policy digest for historical operation replay."""
     raw_request = request.raw_request
     for task in raw_request["tasks"]:
@@ -504,7 +504,7 @@ def _resolved_context(plan: SubmissionPlan) -> dict[str, Any]:
 
 def _resolve_submission_plan(
     cfg: Any,
-    request: SubmissionRequest,
+    request: SubmissionPlanInput,
     *,
     idempotency_key: str,
     operation_id: str,
@@ -514,8 +514,8 @@ def _resolve_submission_plan(
     policy_snapshot: Mapping[str, Any] | None = None,
 ) -> SubmissionPlan:
     """Resolve a plan using only caller-selected read/write side effects."""
-    if not isinstance(request, SubmissionRequest):
-        raise TypeError("request must be a SubmissionRequest.")
+    if not isinstance(request, SubmissionPlanInput):
+        raise TypeError("request must be a SubmissionPlanInput.")
     if not isinstance(idempotency_key, str) or not idempotency_key:
         raise ValueError("idempotency_key must be a non-empty string.")
     submitting_machine = cfg.machine_name
@@ -712,7 +712,7 @@ def _resolve_submission_plan(
 
 def prepare_submission_plan(
     cfg: Any,
-    request: SubmissionRequest,
+    request: SubmissionPlanInput,
     *,
     idempotency_key: str,
     policy_snapshot: Mapping[str, Any] | None = None,

@@ -4,8 +4,8 @@ from itertools import product
 import pytest
 import torch
 
+from qqtools.plugins.qneighbor.cuda.warp import neighbor_list_pbc
 from qqtools.plugins.qneighbor.cuda.warp.obc import open_radius_graph
-from qqtools.plugins.qneighbor.cuda.warp.pbc import build_neighbor_list_batch_warp
 
 requires_warp = pytest.mark.skipif(importlib.util.find_spec("warp") is None, reason="qneighbor extra required")
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -48,8 +48,13 @@ def test_open_neighbors_match_pairwise_search(device, dtype, cap):
 @pytest.mark.gpu
 def test_all_open_periodic_entry_point_returns_zero_offsets():
     positions = torch.tensor([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]], device="cuda")
-    edges, offsets = build_neighbor_list_batch_warp(
-        positions, None, torch.zeros(3, dtype=torch.bool), torch.zeros(2, dtype=torch.long, device="cuda"), 2.0, 1
+    edges, offsets = neighbor_list_pbc(
+        positions,
+        2.0,
+        torch.zeros(2, dtype=torch.long, device="cuda"),
+        1,
+        cell=None,
+        pbc=torch.zeros(3, dtype=torch.bool),
     )
     torch.testing.assert_close(edges.cpu(), torch.tensor([[1, 0], [0, 1]]))
     torch.testing.assert_close(offsets.cpu(), torch.zeros((2, 3), dtype=torch.long))
@@ -87,8 +92,8 @@ def test_periodic_neighbors_match_image_enumeration(dtype):
     positions = torch.tensor([[10, 0, 0], [0, 0, 0], [0, 0, 0], [3.5, 1, 0], [0, 1, 0], [0, 4, 0]], dtype=dtype)
     cutoff, cap = 4.25, 5
     expected = _periodic_reference(positions, cell, periodic, batch, cutoff, cap)
-    edges, offsets = build_neighbor_list_batch_warp(
-        positions.cuda(), cell.cuda(), periodic.cuda(), batch.cuda(), cutoff, cap
+    edges, offsets = neighbor_list_pbc(
+        positions.cuda(), cutoff, batch.cuda(), cap, cell=cell.cuda(), pbc=periodic.cuda()
     )
     actual = list(map(tuple, torch.cat((edges.T, offsets), dim=1).cpu().tolist()))
     assert set(actual) == expected
@@ -100,17 +105,15 @@ def test_periodic_neighbors_match_image_enumeration(dtype):
 @pytest.mark.gpu
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
 def test_full_pbc_entry_points_match_periodic_images(dtype):
-    from qqtools.plugins.qneighbor import build_neighbor_list_batch_full_pbc_warp
-
     cell = torch.tensor([[4, 1, 0], [0, 4, 0], [0, 0, 4]], dtype=dtype)
     pos = torch.tensor([[10, 0, 0], [0, 0, 0], [0, 1, 0], [1, 0, 0]], dtype=dtype)
     batch = torch.tensor([1, 0, 1, 0])
     mask = torch.ones(2, 3, dtype=torch.bool)
     expected = _periodic_reference(pos, cell.expand(2, -1, -1), mask, batch, 4.25, 7)
     pos, cell, batch = pos.cuda(), cell.cuda(), batch.cuda()
-    direct = build_neighbor_list_batch_full_pbc_warp(pos, cell, batch, 4.25, 7)
+    direct = neighbor_list_pbc(pos, 4.25, batch, 7, cell=cell)
     for pbc in (True, mask.cuda()):
-        result = build_neighbor_list_batch_warp(pos, cell, pbc, batch, 4.25, 7)
+        result = neighbor_list_pbc(pos, 4.25, batch, 7, cell=cell, pbc=pbc)
         torch.testing.assert_close(result, direct)
     edges, shifts = direct
     keys = list(map(tuple, torch.cat((edges.T, shifts), dim=1).cpu().tolist()))
@@ -131,7 +134,7 @@ def test_periodic_grid_compacts_empty_rows_on_current_stream():
         )
         batch = torch.zeros(6, device="cuda", dtype=torch.long)[::2]
         for cutoff, expected in [(0.5, [[], []]), (1.0, [[1, 0], [0, 1]])]:
-            edges, shifts = build_neighbor_list_batch_warp(positions, None, False, batch, cutoff, 5, bin_width=0.25)
+            edges, shifts = neighbor_list_pbc(positions, cutoff, batch, 5, cell=None, pbc=False, bin_width=0.25)
             torch.testing.assert_close(edges.cpu(), torch.tensor(expected, dtype=torch.long))
             torch.testing.assert_close(shifts.cpu(), torch.zeros((edges.shape[1], 3), dtype=torch.long))
         assert positions.grad is None
@@ -147,9 +150,9 @@ def test_periodic_geometry_checks_positions_and_unoccupied_cells():
     cells = torch.eye(3, device="cuda").repeat(3, 1, 1)
     cells[1].zero_()
     with pytest.raises(ValueError, match="finite periodic cells"):
-        build_neighbor_list_batch_warp(positions, cells, True, batch, 1.0, 3)
+        neighbor_list_pbc(positions, 1.0, batch, 3, cell=cells, pbc=True)
     with pytest.raises(ValueError, match="finite positions"):
-        build_neighbor_list_batch_warp(positions.fill_(float("nan")), cells[0], True, batch, 1.0, 3)
+        neighbor_list_pbc(positions.fill_(float("nan")), 1.0, batch, 3, cell=cells[0], pbc=True)
 
 
 @requires_warp
@@ -167,8 +170,8 @@ def test_periodic_pruning_keeps_images_across_bin_faces_and_corners(dtype, cap):
     cutoff = 6.25
     expected = _periodic_reference(positions, cell, periodic, batch, cutoff, cap)
     for width in (0.5, 2.0):
-        edges, offsets = build_neighbor_list_batch_warp(
-            positions.cuda(), cell.cuda(), True, batch.cuda(), cutoff, cap, bin_width=width
+        edges, offsets = neighbor_list_pbc(
+            positions.cuda(), cutoff, batch.cuda(), cap, cell=cell.cuda(), pbc=True, bin_width=width
         )
         actual = list(map(tuple, torch.cat((edges.T, offsets), dim=1).cpu().tolist()))
         assert len(actual) == len(expected)
@@ -183,7 +186,9 @@ def test_public_scalar_validation_even_for_empty_inputs(kwargs):
     args = dict(cutoff=1.0, max_neighbors=32)
     args.update(kwargs)
     with pytest.raises(ValueError):
-        build_neighbor_list_batch_warp(torch.empty(0, 3), torch.eye(3), True, torch.empty(0, dtype=torch.long), **args)
+        neighbor_list_pbc(
+            torch.empty(0, 3), batch=torch.empty(0, dtype=torch.long), cell=torch.eye(3), pbc=True, **args
+        )
 
 
 @pytest.mark.skipif(
@@ -203,7 +208,7 @@ def test_public_shapes_and_metadata_rejected_before_kernel():
         (pos, cell, torch.ones(2, 3), ids + 2),
     ):
         with pytest.raises(ValueError):
-            build_neighbor_list_batch_warp(p, c, mask, b, 1.0, 32)
+            neighbor_list_pbc(p, 1.0, b, 32, cell=c, pbc=mask)
 
 
 @pytest.mark.skipif(
@@ -224,7 +229,7 @@ def test_periodic_current_stream_and_sparse_ids_match_images(cap, mode):
         mask = True if mode == "full" else torch.tensor([mode == "mixed", False, False], device="cuda")
         masks = torch.ones((3, 3), dtype=torch.bool) if mode == "full" else mask.cpu().expand(3, -1)
         expected = _periodic_reference(pos.cpu(), cell.cpu().expand(3, -1, -1), masks, ids.cpu(), 3.0, cap)
-        edges, shifts = build_neighbor_list_batch_warp(pos, cell, mask, ids, 3.0, cap)
+        edges, shifts = neighbor_list_pbc(pos, 3.0, ids, cap, cell=cell, pbc=mask)
         actual = list(map(tuple, torch.cat((edges.T, shifts), dim=1).cpu().tolist()))
         assert len(actual) == len(expected)
         assert set(actual) == expected
@@ -238,7 +243,7 @@ def test_empty_public_graph_has_typed_empty_outputs():
     pos = torch.empty((0, 3), device="cuda")
     ids = torch.empty(0, device="cuda", dtype=torch.long)
     for mask, cell in ((True, torch.eye(3, device="cuda")), (False, None)):
-        edges, shifts = build_neighbor_list_batch_warp(pos, cell, mask, ids, 1.0, 32)
+        edges, shifts = neighbor_list_pbc(pos, 1.0, ids, 32, cell=cell, pbc=mask)
         assert edges.shape == (2, 0) and shifts.shape == (0, 3)
         assert edges.dtype == shifts.dtype == torch.long
         assert edges.device == shifts.device == pos.device
@@ -264,8 +269,8 @@ def test_periodic_geometry_near_wrap_and_grid_boundaries(dtype, is_partial):
             cell[1, 0] = skew
             positions = fractions @ cell
             expected = _periodic_reference(positions, cell[None], periodic, batch, 5.37, 64)
-            edges, offsets = build_neighbor_list_batch_warp(
-                positions.cuda(), cell.cuda(), periodic.cuda(), batch.cuda(), 5.37, 64
+            edges, offsets = neighbor_list_pbc(
+                positions.cuda(), 5.37, batch.cuda(), 64, cell=cell.cuda(), pbc=periodic.cuda()
             )
             actual = list(map(tuple, torch.cat((edges.T, offsets), dim=1).cpu().tolist()))
             assert len(actual) == len(expected)

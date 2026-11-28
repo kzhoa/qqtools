@@ -22,7 +22,7 @@ def canonical(pair):
 @pytest.mark.parametrize("cap", [1, 32, 128, 257])
 @pytest.mark.parametrize("axes", [(True, True, True), (True, False, True)])
 def test_periodic_matches_independent_images(dtype, cap, axes):
-    from qqtools.plugins.qneighbor.cuda.triton.pbc import build_neighbor_list_batch
+    from qqtools.plugins.qneighbor.cuda.triton import neighbor_list_pbc
 
     pos = torch.tensor([[8.0, 0, 0], [0.5, 0, 0], [0, 1.0, 0]], dtype=dtype)
     cell = torch.tensor([[4.0, 1, 0], [0, 4, 0], [0, 0, 4]], dtype=dtype)
@@ -40,13 +40,13 @@ def test_periodic_matches_independent_images(dtype, cap, axes):
             )
         expected.extend((source, target, *shift) for _, source, shift in sorted(candidates)[:cap])
     with torch.cuda.stream(torch.cuda.Stream()):
-        actual = build_neighbor_list_batch(
+        actual = neighbor_list_pbc(
             pos.cuda(),
-            cell.cuda(),
-            torch.tensor(axes, device="cuda"),
-            torch.zeros(len(pos), device="cuda", dtype=torch.long),
             5.0,
+            torch.zeros(len(pos), device="cuda", dtype=torch.long),
             cap,
+            cell=cell.cuda(),
+            pbc=torch.tensor(axes, device="cuda"),
         )
         assert canonical(actual) == sorted(expected)
 
@@ -70,22 +70,22 @@ def test_obc_ties_and_interleaved_batches(dtype):
 
 
 def test_empty_and_invalid_geometry():
-    from qqtools.plugins.qneighbor.cuda.triton.pbc import build_neighbor_list_batch
+    from qqtools.plugins.qneighbor.cuda.triton import neighbor_list_pbc
 
     ids = torch.empty(0, dtype=torch.long, device="cuda")
-    result = build_neighbor_list_batch(
-        torch.empty((0, 3), device="cuda"), torch.eye(3, device="cuda"), True, ids, 1.0, 32
+    result = neighbor_list_pbc(
+        torch.empty((0, 3), device="cuda"), 1.0, ids, 32, cell=torch.eye(3, device="cuda"), pbc=True
     )
     assert result[0].shape == (2, 0) and result[1].shape == (0, 3)
     with pytest.raises(ValueError, match="cell metadata"):
-        build_neighbor_list_batch(torch.empty((0, 3), device="cuda"), None, True, ids, 1.0, 32)
+        neighbor_list_pbc(torch.empty((0, 3), device="cuda"), 1.0, ids, 32, cell=None, pbc=True)
     with pytest.raises(ValueError, match="cell metadata"):
-        build_neighbor_list_batch(
-            torch.empty((0, 3), device="cuda"), torch.empty((2, 3), device="cuda"), True, ids, 1.0, 32
+        neighbor_list_pbc(
+            torch.empty((0, 3), device="cuda"), 1.0, ids, 32, cell=torch.empty((2, 3), device="cuda"), pbc=True
         )
     pos = torch.zeros((1, 3), device="cuda")
     ids = torch.zeros(1, dtype=torch.long, device="cuda")
     with pytest.raises(ValueError, match="geometry"):
-        build_neighbor_list_batch(pos, torch.zeros((3, 3), device="cuda"), True, ids, 1.0, 32)
+        neighbor_list_pbc(pos, 1.0, ids, 32, cell=torch.zeros((3, 3), device="cuda"), pbc=True)
     with pytest.raises(ValueError, match="Negative"):
-        build_neighbor_list_batch(pos, torch.eye(3, device="cuda"), True, ids - 1, 1.0, 32)
+        neighbor_list_pbc(pos, 1.0, ids - 1, 32, cell=torch.eye(3, device="cuda"), pbc=True)

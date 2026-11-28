@@ -13,8 +13,8 @@ from qqtools.plugins.qexp.agent import dispatch_loop as machine_agent
 from qqtools.plugins.qexp.agent import primary_demand
 from qqtools.plugins.qexp.agent.context import MachineRuntime
 from qqtools.plugins.qexp.agent.lifecycle import dispatch_machine_cycle_locked
-from qqtools.plugins.qexp.agent.project_io_controller import ProjectIOController
-from qqtools.plugins.qexp.agent.project_io_executor import ProjectIOExecutor
+from qqtools.plugins.qexp.agent.project_io.controller import ProjectIOController
+from qqtools.plugins.qexp.agent.project_io.executor import ProjectIOExecutor
 from qqtools.plugins.qexp.agent.working_set import SERVICE_LANES
 from qqtools.plugins.qexp.commands import group as group_commands
 from qqtools.plugins.qexp.commands.group import change_worker, create_group

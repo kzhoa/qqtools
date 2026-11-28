@@ -11,8 +11,8 @@ import pytest
 from qqtools.plugins.qexp import init_shared_root
 from qqtools.plugins.qexp.activation import ensure_managed_project_agent_active
 from qqtools.plugins.qexp.agent.context import MachineRuntime
-from qqtools.plugins.qexp.agent.helpers import _machine_is_true_idle
-from qqtools.plugins.qexp.agent.lifecycle import _confirm_idle_shutdown, ensure_machine_agent_started
+from qqtools.plugins.qexp.agent.idle_exit import can_exit_when_idle, confirm_idle_shutdown
+from qqtools.plugins.qexp.agent.lifecycle import ensure_machine_agent_started
 from qqtools.plugins.qexp.agent.setup import initialize_machine
 from qqtools.plugins.qexp.runtime.store import atomic_replace, read_json
 
@@ -29,7 +29,7 @@ def _runtime(tmp_path: Path) -> MachineRuntime:
 
 
 def _confirm(runtime: MachineRuntime):
-    return _confirm_idle_shutdown(
+    return confirm_idle_shutdown(
         runtime,
         has_consumed_binding=True,
         available_gpus=[],
@@ -93,9 +93,9 @@ def test_local_idle_fence_rejects_changed_or_unreadable_capture(tmp_path, monkey
     def forbidden(*_args, **_kwargs):
         raise AssertionError("isolated final idle check attempted synchronous shared I/O")
 
-    monkeypatch.setattr("qqtools.plugins.qexp.agent.lifecycle._dispatch.dispatch_machine_cycle_locked", forbidden)
+    monkeypatch.setattr("qqtools.plugins.qexp.agent.dispatch_loop.dispatch_machine_cycle_locked", forbidden)
     monkeypatch.setattr(runtime, "iter_recovery_blockers", forbidden)
-    assert _machine_is_true_idle(runtime, has_consumed_binding=True)
+    assert can_exit_when_idle(runtime, has_consumed_binding=True)
     if change == "wake":
         with runtime.agent_lifecycle_guard():
             runtime.activation_wake.publish_locked()
@@ -112,7 +112,7 @@ def test_local_idle_fence_rejects_changed_or_unreadable_capture(tmp_path, monkey
             record["generation"] = "a" * 1024
         atomic_replace(runtime.paths["agent"] / "activation-wake.json", {"machine_activation_wake": record})
     assert not runtime.activation_wake.is_current()
-    assert not _machine_is_true_idle(runtime, has_consumed_binding=True)
+    assert not can_exit_when_idle(runtime, has_consumed_binding=True)
     assert _confirm(runtime) is None
     with runtime.agent_lifecycle_guard(blocking=False) as acquired:
         assert acquired
@@ -126,7 +126,7 @@ def test_isolated_final_idle_holds_guard_without_dispatch_or_shared_reads(tmp_pa
     def forbidden(*_args, **_kwargs):
         raise AssertionError("isolated final idle check performed shared work")
 
-    monkeypatch.setattr("qqtools.plugins.qexp.agent.lifecycle._dispatch.dispatch_machine_cycle_locked", forbidden)
+    monkeypatch.setattr("qqtools.plugins.qexp.agent.dispatch_loop.dispatch_machine_cycle_locked", forbidden)
     monkeypatch.setattr(runtime, "iter_recovery_blockers", forbidden)
     guard = _confirm(runtime)
     assert guard is not None
@@ -215,7 +215,7 @@ def test_isolated_idle_requires_all_service_lanes_to_settle(tmp_path, monkeypatc
         raise AssertionError("missing asynchronous idle proof was replaced by shared I/O")
 
     monkeypatch.setattr(runtime, "iter_recovery_blockers", forbidden)
-    assert not _machine_is_true_idle(runtime, has_consumed_binding=True)
+    assert not can_exit_when_idle(runtime, has_consumed_binding=True)
 
 
 def test_wake_does_not_recreate_a_partly_archived_project_partition(tmp_path):

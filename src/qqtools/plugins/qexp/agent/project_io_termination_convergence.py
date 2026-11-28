@@ -44,7 +44,9 @@ _RESERVATION_STATES = frozenset({"unassigned", "released", "active", "provisiona
 def _invalid(
     reason: str, *, manifest_exit_code: int | None = None, process_absent: bool = False
 ) -> TerminationConvergence:
-    return TerminationConvergence("invalid", reason, manifest_exit_code, process_absent, False)
+    return TerminationConvergence(
+        "invalid", reason, manifest_exit_code, process_absent=process_absent, reservation_settled=False
+    )
 
 
 def _valid_exit_code(value: object) -> tuple[bool, int | None]:
@@ -68,8 +70,8 @@ def classify_termination_convergence(evidence: TerminationConvergenceEvidence) -
             "repairable",
             "termination_decision_progress_pending",
             None,
-            bool(evidence.process_absent) if type(evidence.process_absent) is bool else False,
-            False,
+            process_absent=bool(evidence.process_absent) if type(evidence.process_absent) is bool else False,
+            reservation_settled=False,
         )
     if decision_state != "confirmed":
         return _invalid("termination_decision_invalid")
@@ -113,8 +115,8 @@ def classify_termination_convergence(evidence: TerminationConvergenceEvidence) -
             "repairable",
             "termination_manifest_completion_pending",
             exit_code,
-            True,
-            False,
+            process_absent=True,
+            reservation_settled=False,
         )
 
     if reservation_state in {"active", "provisional", "release_pair"}:
@@ -122,7 +124,9 @@ def classify_termination_convergence(evidence: TerminationConvergenceEvidence) -
             "repairable",
             "termination_reservation_release_pending",
             exit_code,
-            True,
-            False,
+            process_absent=True,
+            reservation_settled=False,
         )
-    return TerminationConvergence("converged", "termination_converged", exit_code, True, True)
+    return TerminationConvergence(
+        "converged", "termination_converged", exit_code, process_absent=True, reservation_settled=True
+    )

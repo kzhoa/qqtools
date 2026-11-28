@@ -40,16 +40,20 @@ def _inputs(positions: Tensor, batch: Tensor | None, cutoff: float, cap: int) ->
     return points, batch_ids, cap
 
 
+def _cap_incoming(target, order, cap):
+    if not len(order):
+        return order
+    sorted_targets = target[order]
+    ranks = np.arange(len(order))
+    starts = np.maximum.accumulate(np.where(np.r_[True, sorted_targets[1:] != sorted_targets[:-1]], ranks, 0))
+    return order[ranks - starts < cap]
+
+
 def _select(source, target, shifts, squared, cutoff, cap):
     valid = (squared < cutoff * cutoff) & ((source != target) | np.any(shifts != 0, axis=1))
     source, target, shifts, squared = source[valid], target[valid], shifts[valid], squared[valid]
     order = np.lexsort((shifts[:, 2], shifts[:, 1], shifts[:, 0], source, squared, target))
-    sorted_targets = target[order]
-    if not len(order):
-        return np.empty((2, 0), dtype=np.int64), np.empty((0, 3), dtype=np.int64)
-    ranks = np.arange(len(order))
-    starts = np.maximum.accumulate(np.where(np.r_[True, sorted_targets[1:] != sorted_targets[:-1]], ranks, 0))
-    keep = order[ranks - starts < cap]
+    keep = _cap_incoming(target, order, cap)
     return np.stack((source[keep], target[keep])), shifts[keep]
 
 
@@ -61,8 +65,7 @@ def _open(points, cutoff, cap):
         # Original source order plus stable sorting resolves equal distances.
         nearest = np.argsort(squared, axis=1, kind="stable")[:, : min(cap, len(points))]
         target, rank = np.nonzero(np.take_along_axis(squared, nearest, axis=1) < cutoff * cutoff)
-        edge = np.stack((nearest[target, rank], target))
-        return edge, np.zeros((len(target), 3), dtype=np.int64)
+        return np.stack((nearest[target, rank], target))
     # Each unordered pair is discovered once; both incoming directions share
     # its distance. Unlike periodic search this needs only one tree.
     pairs = cKDTree(points).query_pairs(cutoff, output_type="ndarray")
@@ -70,8 +73,11 @@ def _open(points, cutoff, cap):
     source = np.concatenate((pairs[:, 1], pairs[:, 0]))
     delta = points[target] - points[source]
     squared = np.einsum("ij,ij->i", delta, delta)
-    shifts = np.zeros((len(source), 3), dtype=np.int64)
-    return _select(source, target, shifts, squared, cutoff, cap)
+    valid = squared < cutoff * cutoff
+    source, target, squared = source[valid], target[valid], squared[valid]
+    order = np.lexsort((source, squared, target))
+    keep = _cap_incoming(target, order, cap)
+    return np.stack((source[keep], target[keep]))
 
 
 def _periodic_pairs(
@@ -123,7 +129,8 @@ def _nearest_pairs(tree: cKDTree, points: np.ndarray, cutoff: float, cap: int) -
 
 def _periodic(points, cell, flags, cutoff, cap):
     if not np.any(flags):
-        return _open(points, cutoff, cap)
+        edge = _open(points, cutoff, cap)
+        return edge, np.zeros((edge.shape[1], 3), dtype=np.int64)
     inverse = np.linalg.inv(cell)
     winding_float = np.where(flags, np.floor(points @ inverse), 0)
     if np.any(np.abs(winding_float) >= 2**62):
@@ -163,20 +170,35 @@ def _periodic(points, cell, flags, cutoff, cap):
     return _select(source, target, shifts, np.einsum("ij,ij->i", delta, delta), cutoff, cap)
 
 
-def _assemble(points, batch_ids, cutoff, cap, cells=None, masks=None) -> tuple[Tensor, Tensor]:
+def _graph_neighbors(points, graph, cutoff, cap, cells, masks):
+    if masks is None:
+        return _open(points, cutoff, cap), None
+    flags = masks[0 if len(masks) == 1 else graph]
+    cell = cells[0 if len(cells) == 1 else graph] if cells is not None else None
+    return _periodic(points, cell, flags, cutoff, cap)
+
+
+def _assemble(points, batch_ids, cutoff, cap, cells=None, masks=None) -> tuple[Tensor, Tensor | None]:
+    if not len(batch_ids):
+        edge = torch.empty((2, 0), dtype=torch.long)
+        return edge, edge.new_empty((0, 3)) if masks is not None else None
+
+    if np.all(batch_ids == batch_ids[0]):
+        edge, shift = _graph_neighbors(points, batch_ids[0], cutoff, cap, cells, masks)
+        return torch.from_numpy(edge), torch.from_numpy(shift) if shift is not None else None
+
+    # Stable grouping preserves original source order for equal-distance neighbors.
+    indices = np.argsort(batch_ids, kind="stable")
+    sorted_ids = batch_ids[indices]
+    boundaries = np.flatnonzero(sorted_ids[1:] != sorted_ids[:-1]) + 1
     edges, shifts = [], []
-    for graph in np.unique(batch_ids):
-        index = np.flatnonzero(batch_ids == graph)
-        if masks is None:
-            edge, shift = _open(points[index], cutoff, cap)
-        else:
-            flags = masks[0 if len(masks) == 1 else graph]
-            cell = cells[0 if len(cells) == 1 else graph] if cells is not None else None
-            edge, shift = _periodic(points[index], cell, flags, cutoff, cap)
+    for index in np.split(indices, boundaries):
+        edge, shift = _graph_neighbors(points[index], batch_ids[index[0]], cutoff, cap, cells, masks)
         edges.append(index[edge])
-        shifts.append(shift)
-    if not edges:
-        return torch.empty((2, 0), dtype=torch.long), torch.empty((0, 3), dtype=torch.long)
-    edge, shift = np.concatenate(edges, axis=1), np.concatenate(shifts)
+        if shift is not None:
+            shifts.append(shift)
+    edge = np.concatenate(edges, axis=1)
     order = np.argsort(edge[1], kind="stable")
-    return torch.from_numpy(edge[:, order].copy()), torch.from_numpy(shift[order].copy())
+    sorted_edges = torch.from_numpy(edge[:, order].copy())
+    sorted_shifts = torch.from_numpy(np.concatenate(shifts)[order]) if shifts else None
+    return sorted_edges, sorted_shifts

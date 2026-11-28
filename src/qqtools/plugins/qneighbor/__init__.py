@@ -4,16 +4,10 @@ __all__ = ["neighbor_list", "neighbor_list_obc", "neighbor_list_pbc", "radius_gr
 
 
 def __getattr__(name: str):
-    if name in __all__ or name in ("build_neighbor_list_batch", "build_neighbor_list_batch_full_pbc"):
-        from . import cuda
-
-        value = getattr(cuda, name)
-    elif name in ("build_neighbor_list_batch_warp", "build_neighbor_list_batch_full_pbc_warp"):
-        # Permanent explicit-Warp entry points, independent of the neutral backend.
-        from .cuda.warp import pbc
-
-        value = getattr(pbc, name)
-    else:
+    if name not in __all__:
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    from . import cuda
+
+    value = getattr(cuda, name)
     globals()[name] = value
     return value

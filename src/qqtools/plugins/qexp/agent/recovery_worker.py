@@ -13,7 +13,7 @@ from ..layout import load_machine_record, load_root_config
 from ..runtime.paths import machine_project_paths, machine_runtime_paths
 from ..runtime.registration_authority import RegistrationIdentity
 from ..runtime.store import fenced_mutations, read_json_limited
-from .project_io_protocol import PROJECT_IO_MAX_RECORD_BYTES, ProjectIORequest
+from .project_io.protocol import PROJECT_IO_MAX_RECORD_BYTES, ProjectIORequest
 
 
 class RecoveryExecutorEpochFenced(RuntimeError):

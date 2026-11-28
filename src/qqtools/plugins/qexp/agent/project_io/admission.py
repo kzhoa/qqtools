@@ -7,8 +7,8 @@ from collections import OrderedDict
 from collections.abc import Callable, Collection, Sequence
 from dataclasses import dataclass
 
-from .project_io_arbiter import WORK_FAMILIES, BindingOwner, ProjectIOArbiter, ServiceClass, ServiceIntent
-from .project_io_protocol import PROJECT_IO_CAPACITY, PROJECT_IO_OPERATIONS
+from .arbiter import WORK_FAMILIES, BindingOwner, ProjectIOArbiter, ServiceClass, ServiceIntent
+from .protocol import PROJECT_IO_CAPACITY, PROJECT_IO_OPERATIONS
 
 _SERVICE_CLASSES: tuple[ServiceClass, ...] = ("authority", "primary", "background")
 _MAX_PENDING_INTENTS = 64

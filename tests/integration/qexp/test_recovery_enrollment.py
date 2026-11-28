@@ -11,9 +11,9 @@ import pytest
 
 from qqtools.plugins.qexp import init_shared_root
 from qqtools.plugins.qexp.agent.context import MachineRuntime
-from qqtools.plugins.qexp.agent.helpers import _machine_is_true_idle
-from qqtools.plugins.qexp.agent.project_io_controller import ProjectIOController
-from qqtools.plugins.qexp.agent.project_io_executor import ProjectIOExecutor
+from qqtools.plugins.qexp.agent.idle_exit import can_exit_when_idle
+from qqtools.plugins.qexp.agent.project_io.controller import ProjectIOController
+from qqtools.plugins.qexp.agent.project_io.executor import ProjectIOExecutor
 from qqtools.plugins.qexp.agent.recovery_enrollment import RecoveryEnrollment
 from qqtools.plugins.qexp.agent.setup import initialize_machine
 from qqtools.plugins.qexp.layout import LOCAL_RECOVERY_CAPABILITY
@@ -100,7 +100,7 @@ def test_all_registered_projects_are_prepared_in_fair_bounded_passes(tmp_path, m
             advance_coordinated(enrollment, controller)
             assert len(calls) <= 4
             if runtime.recovery_enrollment_pending_projects:
-                assert not _machine_is_true_idle(runtime, has_consumed_binding=True)
+                assert not can_exit_when_idle(runtime, has_consumed_binding=True)
             return not runtime.recovery_enrollment_pending_projects
 
         wait_until("nine-projects-settled", completed, stage="recovery-enrollment:fair-passes", timeout=30)

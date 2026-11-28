@@ -7,8 +7,8 @@ import re
 import sys
 from pathlib import Path
 
-from ..infrastructure.host import host_instance_id
-from ..runtime.store import read_json_limited
+from ...infrastructure.host import host_instance_id
+from ...runtime.store import read_json_limited
 
 _PROCESS_LIVE = "same_live_process"
 _PROCESS_ABSENT = "positively_absent_or_reused"

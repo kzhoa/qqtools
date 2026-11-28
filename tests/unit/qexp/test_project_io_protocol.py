@@ -8,7 +8,7 @@ import pytest
 
 from qqtools.plugins.qexp.agent.dispatch_probe import PrimaryProbeSession
 from qqtools.plugins.qexp.agent.primary_probe_transport import encode_probe_session
-from qqtools.plugins.qexp.agent.project_io_protocol import (
+from qqtools.plugins.qexp.agent.project_io.protocol import (
     PROJECT_IO_MAX_RECORD_BYTES,
     PROJECT_IO_PROTOCOL_VERSION,
     ProjectIORequest,

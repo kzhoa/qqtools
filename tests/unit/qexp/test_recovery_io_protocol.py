@@ -3,7 +3,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from qqtools.plugins.qexp.agent.project_io_protocol import ProjectIORequest, ProjectIOResult
+from qqtools.plugins.qexp.agent.project_io.protocol import ProjectIORequest, ProjectIOResult
 from qqtools.plugins.qexp.runtime.responsibility_source_scan import initial_source_scan_cursor
 
 
@@ -331,7 +331,7 @@ def test_stale_source_read_cannot_return_identity(tmp_path):
 
 @pytest.mark.parametrize("transition", ["unchanged", "batch_changed", "completed", "epoch_fenced", "source_missing"])
 def test_source_worker_rechecks_capture_and_epoch_after_read(tmp_path, monkeypatch, transition):
-    from qqtools.plugins.qexp.agent import project_io_worker as worker
+    from qqtools.plugins.qexp.agent.project_io import worker
     from qqtools.plugins.qexp.agent.recovery_transport import decode_capture_locator
     from qqtools.plugins.qexp.runtime import responsibility_source_read as source_read
 

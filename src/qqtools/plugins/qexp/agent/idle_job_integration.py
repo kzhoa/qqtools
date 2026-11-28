@@ -19,8 +19,8 @@ from .idle_job_config import load_idle_job_config
 from .idle_job_demand import idle_job_capacity_key
 from .idle_job_diagnostics import build_demand_observation
 from .launch_handoff_state import LaunchHandoffState
-from .project_io_controller import ProjectIOController
-from .project_io_executor import ProjectIOExecutor
+from .project_io.controller import ProjectIOController
+from .project_io.executor import ProjectIOExecutor
 
 _ORDINARY_ERRORS = (AttributeError, OSError, RuntimeError, TypeError, ValueError, KeyError)
 _DEMANDS = frozenset({"idle", "busy", "unknown"})
@@ -81,7 +81,7 @@ def _safe_tick(
         return {}
 
 
-def _unknown(
+def _tick_with_unknown_demand(
     supervisor: IdleJobSupervisor,
     code: str | None = None,
     *,
@@ -238,10 +238,10 @@ def advance_machine_idle_job(
     executor = getattr(runtime, "project_io_executor", None)
     has_guard = isinstance(controller, ProjectIOController) and isinstance(executor, ProjectIOExecutor)
 
-    def unknown(code: str | None = None, **detail: Any) -> dict[str, Any]:
+    def tick_with_unknown_demand(code: str | None = None, **detail: Any) -> dict[str, Any]:
         if has_guard:
             controller.disarm_idle_job_guard()
-        return _unknown(
+        return _tick_with_unknown_demand(
             supervisor,
             code,
             agent_instance_id=instance_id,
@@ -253,7 +253,7 @@ def advance_machine_idle_job(
     try:
         config = load_idle_job_config(runtime)
         if not config.enabled:
-            return unknown()
+            return tick_with_unknown_demand()
 
         # Hardware discovery is deliberately outside the reservation lock. A
         # reservation already held by training is busy evidence for both
@@ -280,46 +280,48 @@ def advance_machine_idle_job(
             return _safe_tick(supervisor, "busy", gpu_policy=reservation_policy, agent_instance_id=instance_id)
 
         if not cycle_completed:
-            return unknown("dispatch_cycle_incomplete")
+            return tick_with_unknown_demand("dispatch_cycle_incomplete")
         if not enablement_converged:
-            return unknown("enablement_unready")
+            return tick_with_unknown_demand("enablement_unready")
         if not isinstance(bindings, Sequence) or isinstance(bindings, (str, bytes, bytearray)):
-            return unknown("bindings_unknown")
+            return tick_with_unknown_demand("bindings_unknown")
         observed_bindings = tuple(bindings)
         if any(not isinstance(binding, ProjectBinding) for binding in observed_bindings):
-            return unknown("bindings_unknown")
+            return tick_with_unknown_demand("bindings_unknown")
 
         handoffs = getattr(runtime, "pending_launch_handoffs", {})
         handoff_revision, has_pending_handoffs = (
             handoffs.snapshot() if isinstance(handoffs, LaunchHandoffState) else (None, bool(handoffs))
         )
         if has_pending_handoffs:
-            return unknown("launch_handoff_pending")
+            return tick_with_unknown_demand("launch_handoff_pending")
         if getattr(runtime, "upgrade_discovery_unknown", False):
-            return unknown("upgrade_evidence_unknown")
+            return tick_with_unknown_demand("upgrade_evidence_unknown")
         if upgrade_blockers := getattr(runtime, "upgrade_idle_blocked_projects", set()):
-            return unknown("upgrade_blocks_idle", project_ids=upgrade_blockers, bindings=observed_bindings)
+            return tick_with_unknown_demand(
+                "upgrade_blocks_idle", project_ids=upgrade_blockers, bindings=observed_bindings
+            )
         if enrollment_blockers := getattr(runtime, "recovery_enrollment_pending_projects", set()):
-            return unknown("recovery_enrollment_pending", project_ids=enrollment_blockers)
+            return tick_with_unknown_demand("recovery_enrollment_pending", project_ids=enrollment_blockers)
         if retry_blockers := getattr(runtime, "maintenance_retry_idle_blocked_projects", set()):
-            return unknown("maintenance_retry_pending", project_ids=retry_blockers)
+            return tick_with_unknown_demand("maintenance_retry_pending", project_ids=retry_blockers)
         if partition_observation is None:
             partition_observation = _observe_unregistered_partitions(runtime, observed_bindings)
         if partition_observation not in {"clear", "pending"}:
-            return unknown("partition_unknown")
+            return tick_with_unknown_demand("partition_unknown")
         if not _binding_recovery_is_clear(runtime, observed_bindings):
-            return unknown("recovery_unknown")
+            return tick_with_unknown_demand("recovery_unknown")
         unready = _first_unready_authority(runtime, observed_bindings)
         if unready is not None:
-            return unknown("authority_unready", project_ids=(unready.project_id,))
+            return tick_with_unknown_demand("authority_unready", project_ids=(unready.project_id,))
 
         if not isinstance(controller, ProjectIOController):
-            return unknown("demand_census_unknown")
+            return tick_with_unknown_demand("demand_census_unknown")
         if executor is None or controller.executor is not executor:
-            return unknown("executor_unready")
+            return tick_with_unknown_demand("executor_unready")
 
         if policy_observation is None:
-            return unknown("gpu_policy_unknown")
+            return tick_with_unknown_demand("gpu_policy_unknown")
         reservation_policy, policy_view, allowed_gpu_ids = policy_observation
 
         cpu_policy, _cpu_reservations = (
@@ -328,9 +330,9 @@ def advance_machine_idle_job(
             else cpu_reservation_snapshot(runtime.root)
         )
         if type(cpu_policy.revision) is not int or cpu_policy.revision < 0:
-            return unknown("cpu_policy_unknown")
+            return tick_with_unknown_demand("cpu_policy_unknown")
         if type(cpu_policy.capacity) is not int or cpu_policy.capacity < 0:
-            return unknown("cpu_policy_unknown")
+            return tick_with_unknown_demand("cpu_policy_unknown")
 
         enabled_bindings = tuple(binding for binding in observed_bindings if binding.enabled)
         if has_guard:
@@ -388,7 +390,7 @@ def advance_machine_idle_job(
             decision_deadline=decision_deadline,
         )
     except _ORDINARY_ERRORS:
-        return unknown("observation_failed")
+        return tick_with_unknown_demand("observation_failed")
 
 
 __all__ = ["advance_machine_idle_job"]

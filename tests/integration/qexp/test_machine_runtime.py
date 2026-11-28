@@ -19,8 +19,8 @@ from qqtools.plugins.qexp.agent.context import (
     ProjectBinding,
     resolve_machine_runtime_root,
 )
+from qqtools.plugins.qexp.agent.idle_exit import confirm_idle_shutdown
 from qqtools.plugins.qexp.agent.lifecycle import (
-    _confirm_idle_shutdown,
     _MachineControlPlane,
     _pid_start_time_ticks,
     _publish_project_snapshots,
@@ -34,7 +34,7 @@ from qqtools.plugins.qexp.agent.lifecycle import (
     start_machine_agent,
     stop_machine_agent,
 )
-from qqtools.plugins.qexp.agent.project_io_executor import ProjectIOExecutor
+from qqtools.plugins.qexp.agent.project_io.executor import ProjectIOExecutor
 from qqtools.plugins.qexp.agent.setup import initialize_machine
 from qqtools.plugins.qexp.commands.cleanup import clean
 from qqtools.plugins.qexp.commands.group import create_group
@@ -1977,13 +1977,13 @@ def test_idle_shutdown_rechecks_demand_under_activation_lock(
             assert not acquired
         runtime.last_cycle_had_demand = demand_arrives
 
-    monkeypatch.setattr("qqtools.plugins.qexp.agent.lifecycle._dispatch.dispatch_machine_cycle_locked", dispatch)
+    monkeypatch.setattr("qqtools.plugins.qexp.agent.dispatch_loop.dispatch_machine_cycle_locked", dispatch)
     monkeypatch.setattr(
-        "qqtools.plugins.qexp.agent.lifecycle._machine_is_true_idle",
+        "qqtools.plugins.qexp.agent.idle_exit.can_exit_when_idle",
         lambda _runtime, *, has_consumed_binding: has_consumed_binding and not runtime.last_cycle_had_demand,
     )
 
-    guard = _confirm_idle_shutdown(
+    guard = confirm_idle_shutdown(
         runtime,
         has_consumed_binding=True,
         available_gpus=[0],
@@ -2014,12 +2014,12 @@ def test_idle_shutdown_defers_when_lifecycle_operation_owns_lock(
     runtime = MachineRuntime(tmp_path / "machine-runtime")
     initialize_machine(runtime, "gpu-1")
     monkeypatch.setattr(
-        "qqtools.plugins.qexp.agent.lifecycle._dispatch.dispatch_machine_cycle_locked",
+        "qqtools.plugins.qexp.agent.dispatch_loop.dispatch_machine_cycle_locked",
         lambda *_args, **_kwargs: pytest.fail("idle confirmation dispatched without the lifecycle lock"),
     )
 
     with runtime.agent_lifecycle_guard():
-        guard = _confirm_idle_shutdown(
+        guard = confirm_idle_shutdown(
             runtime,
             has_consumed_binding=True,
             available_gpus=[0],

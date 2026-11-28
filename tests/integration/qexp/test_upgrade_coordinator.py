@@ -8,7 +8,7 @@ import pytest
 
 from qqtools.plugins.qexp import init_shared_root
 from qqtools.plugins.qexp.agent.context import MachineRuntime
-from qqtools.plugins.qexp.agent.helpers import _machine_is_true_idle
+from qqtools.plugins.qexp.agent.idle_exit import can_exit_when_idle
 from qqtools.plugins.qexp.agent.setup import initialize_machine
 from qqtools.plugins.qexp.commands.task import submit as submit_task
 from qqtools.plugins.qexp.layout import read_schema_version
@@ -222,7 +222,7 @@ def test_busy_upgrade_discovery_fails_closed_during_cache_publication(tmp_path: 
     runtime.add_binding(cfg.shared_root, cfg.machine_name)
     discover_registered_upgrades(runtime)
     runtime.last_cycle_had_demand = False
-    assert _machine_is_true_idle(runtime, has_consumed_binding=True)
+    assert can_exit_when_idle(runtime, has_consumed_binding=True)
     entered = Event()
     release = Event()
     original_setattr = MachineRuntime.__setattr__
@@ -245,7 +245,7 @@ def test_busy_upgrade_discovery_fails_closed_during_cache_publication(tmp_path: 
     assert stale["discovery_stale"] is True
     assert stale["aggregate_state"] == "unknown"
     assert runtime.upgrade_discovery_unknown is True
-    assert not _machine_is_true_idle(runtime, has_consumed_binding=True)
+    assert not can_exit_when_idle(runtime, has_consumed_binding=True)
     pause_publication = False
     release.set()
     worker.join(5)

@@ -12,11 +12,9 @@ avoid the outer boundary dispatch. All three entries share
 keyword-only. Omitting `batch` selects one structure. The unified entry defaults
 to `pbc=False`, and the explicit PBC entry defaults to `pbc=True`.
 The same four names in `qqtools.plugins.qneighbor.cuda` share the top-level
-function objects and one-time backend selection. The CUDA namespace also exposes
-`neighbor_list_obc_warp`, `neighbor_list_pbc_warp`, `neighbor_list_obc_triton`, and
-`neighbor_list_pbc_triton`. These are lazily bound direct aliases of the existing
-backend functions, with no call wrapper, fallback, or default-backend selection.
-A failed resolution is not cached; its error propagates to the caller.
+function objects and one-time backend selection. Import the same names from
+`qqtools.plugins.qneighbor.cuda.warp` or `qqtools.plugins.qneighbor.cuda.triton`
+to select a specific implementation independently of the default binding.
 The top-level namespace remains CUDA-only. CPU functions are available separately
 from `qqtools.plugins.qneighbor.cpu`; see [CPU validation](qneighbor-cpu-validation.md).
 
@@ -30,9 +28,7 @@ independently of the full extra. Backend selection does not gate on a Warp
 version number. Use a wheel compatible with the host driver.
 
 Warp PBC uses the grid/heap implementation. The Warp `neighbor_list_pbc` also
-accepts the backend-specific keyword `bin_width`. The lower-level
-`build_neighbor_list_batch_warp` and `build_neighbor_list_batch_full_pbc_warp`
-entry points accept an optional `bin_width`, defaulting to a target width of 2 Å.
+accepts the backend-specific keyword `bin_width`. The default target bin width is 2 Å.
 There is no public algorithm selector. The pre-release auto selector and scan
 implementation were withdrawn after performance validation; they are not part
 of the installed package. OBC and Triton implementations are unchanged.
@@ -62,8 +58,9 @@ No backend promises universal performance superiority.
 ## Production layout
 
 Top-level `__init__.py` lazily re-exports the default CUDA functions.
-`cuda/__init__.py` owns the sole backend selection state and explicit aliases.
-`_dispatch.py` contains shared OBC/PBC dispatch for CPU and CUDA. CPU imports do
+`cuda/__init__.py` owns the default backend selection state.
+Each backend constructs its own `neighbor_list` using the shared OBC/PBC logic in
+`_boundary.py`. The default CUDA namespace reuses the selected function object. CPU imports do
 not load the CUDA namespace. The former `api.py` was removed; users import
 functions from `qneighbor`, `qneighbor.cuda`, or the explicit backend namespaces.
 
@@ -171,12 +168,9 @@ Exploration stopped after this limited comparison.
 
 ## CUDA namespace exports
 
-The CUDA namespace adds the four shared default names and four explicit
-backend-suffixed aliases described above. Regression coverage checks import with
-both optional backends blocked, concurrent access through both default
-namespaces, direct alias identity, absence of repeated resolution, explicit
-backend isolation, and retry after an import error. Real CUDA contract tests
-also verify the suffixed aliases are the existing Warp/Triton function objects.
+In v1.3.32, the CUDA namespace offered shared default names and backend-suffixed
+aliases. That release tested alias identity, import isolation and retry after an
+import error. The current explicit interface uses backend module paths.
 
 Validation on 2026-11-28: the managed export/binding selection passed **17 tests**;
 the complete qneighbor suite with CUDA and Warp 1.19 passed **159 tests**
@@ -185,16 +179,13 @@ requirements changed, so performance benchmarks were not repeated.
 
 ## API module consolidation
 
-The former `api.py` responsibilities now live in `cuda/__init__.py` (backend
-selection and binding) and `_dispatch.py` (shared boundary dispatch). Top-level
-exports resolve directly from CUDA. Existing top-level, CPU and explicit CUDA
-function imports retain their signatures and identities; the removed pre-release
-`qneighbor.api` import path has no compatibility shim.
+When `api.py` was removed, backend selection moved to `cuda/__init__.py` and
+shared boundary dispatch moved to `_dispatch.py` (now `_boundary.py`). The
+pre-release `qneighbor.api` import path was retired at that time.
 
-The CPU subprocess regression additionally confirms that importing and calling
-CPU builders does not load `qqtools.plugins.qneighbor.cuda`. Concurrent default
-binding, precise missing-dependency fallback, explicit aliases and repeated-call
-behavior remain covered after retargeting tests to the CUDA state owner.
+The CPU subprocess regression confirmed that importing and calling CPU builders
+did not load `qqtools.plugins.qneighbor.cuda`. The consolidation also tested
+concurrent default binding, missing-dependency fallback and repeated calls.
 The managed binding/export/CPU selection passed **78 tests**; the complete CUDA
 qneighbor suite passed **159 tests** (26.27 s). Full-repository Ruff and diff
 checks passed. No search kernels changed.

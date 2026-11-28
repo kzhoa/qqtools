@@ -77,9 +77,9 @@ from .inventory import InventoryReconciliation, exact_binding_for_entry
 from .launch_handoff import _LaunchHandoffBatch
 from .launch_handoff import _PendingLaunchHandoff as _PendingLaunchHandoff
 from .primary_demand import PrimaryDemandProbe, probe_primary_demand
-from .project_io_controller import ProjectIOController
-from .project_io_executor import ProjectIOExecutor
-from .project_io_supervision import AttemptSupervisionCoordinator
+from .project_io.controller import ProjectIOController
+from .project_io.executor import ProjectIOExecutor
+from .project_io.supervision.coordinator import AttemptSupervisionCoordinator
 from .scheduler_diagnostics import SchedulerDiagnosticStore
 
 _SCHEDULER_DIAGNOSTIC_PUBLISH_INTERVAL_NS = 5_000_000_000

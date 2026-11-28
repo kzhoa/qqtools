@@ -12,7 +12,7 @@ from qqtools.plugins.qexp.agent.group_service_coordinator import (
     GroupServiceTransition,
 )
 from qqtools.plugins.qexp.agent.group_service_transport import initial_group_service_continuation
-from qqtools.plugins.qexp.agent.project_io_controller import ProjectIOController
+from qqtools.plugins.qexp.agent.project_io.controller import ProjectIOController
 from qqtools.plugins.qexp.agent.working_set import BindingTurn
 from qqtools.plugins.qexp.runtime.group_discovery.advance import (
     initial_control_continuation,

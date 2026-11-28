@@ -6,9 +6,9 @@ from dataclasses import replace
 import pytest
 
 from qqtools.plugins.qexp.agent.context import MachineRuntime
-from qqtools.plugins.qexp.agent.project_io_controller import ProjectIOController
-from qqtools.plugins.qexp.agent.project_io_executor import ProjectIOExecutor
-from qqtools.plugins.qexp.agent.project_io_protocol import ProjectIORequest
+from qqtools.plugins.qexp.agent.project_io.controller import ProjectIOController
+from qqtools.plugins.qexp.agent.project_io.executor import ProjectIOExecutor
+from qqtools.plugins.qexp.agent.project_io.protocol import ProjectIORequest
 from qqtools.plugins.qexp.agent.setup import initialize_machine, initialize_project, register_projects
 from qqtools.plugins.qexp.agent.takeover_intent import TakeoverIntent, save_takeover_intent
 from qqtools.plugins.qexp.agent.takeover_transport import run_takeover_step

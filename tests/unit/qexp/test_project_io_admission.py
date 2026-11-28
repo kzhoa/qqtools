@@ -4,8 +4,8 @@ from functools import partial
 
 import pytest
 
-from qqtools.plugins.qexp.agent.project_io_admission import ProjectIOAdmission
-from qqtools.plugins.qexp.agent.project_io_arbiter import ServiceIntent
+from qqtools.plugins.qexp.agent.project_io.admission import ProjectIOAdmission
+from qqtools.plugins.qexp.agent.project_io.arbiter import ServiceIntent
 
 
 def _intent(project: str, service: str = "primary", *, epoch: str = "epoch-1") -> ServiceIntent:

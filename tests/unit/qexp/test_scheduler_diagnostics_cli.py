@@ -4,6 +4,7 @@ import json
 import shlex
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from time import monotonic
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -13,8 +14,8 @@ from qqtools.plugins.qexp import init_shared_root
 from qqtools.plugins.qexp.agent import scheduler_diagnostics
 from qqtools.plugins.qexp.agent.context import MachineRuntime
 from qqtools.plugins.qexp.agent.lifecycle import get_machine_agent_status
+from qqtools.plugins.qexp.agent.machine_snapshot_publication import MachineSnapshotPublication
 from qqtools.plugins.qexp.agent.project_admin import register_project
-from qqtools.plugins.qexp.agent.project_io_controller import ProjectIOController
 from qqtools.plugins.qexp.agent.scheduler_diagnostics import ProducerCoverageCheckpoint, SchedulerDiagnosticStore
 from qqtools.plugins.qexp.agent.setup import initialize_machine
 from qqtools.plugins.qexp.agent.snapshot_publication_health import SNAPSHOT_COVERAGE_FILENAME
@@ -271,10 +272,9 @@ def test_project_status_distinguishes_heartbeat_snapshot_and_post_repair_verific
     assert status()["diagnostic_recovery"]["state"] == "awaiting_observation"
     store = SchedulerDiagnosticStore(runtime)
 
-    controller = object.__new__(ProjectIOController)
-    controller.runtime = runtime
-    controller._snapshot_coverage_cursor = None
-    controller._snapshot_health = SimpleNamespace(snapshot_evidence=lambda **_identity: (heartbeat_at, heartbeat_at))
+    publication = MachineSnapshotPublication(
+        runtime, SimpleNamespace(snapshot_evidence=lambda **_identity: (heartbeat_at, heartbeat_at)), monotonic
+    )
 
     def publish(project, observed_at, *, cached=()):
         checkpoint = store.publish_cycle(
@@ -293,7 +293,7 @@ def test_project_status_distinguishes_heartbeat_snapshot_and_post_repair_verific
             observed_at=observed_at,
         )
         assert checkpoint is not None
-        controller.record_scheduler_coverage(checkpoint, instance_id="current-agent")
+        publication.record_scheduler_coverage(checkpoint, instance_id="current-agent")
 
     cached = {
         "coverage": "complete",
@@ -349,11 +349,10 @@ def test_project_status_distinguishes_heartbeat_snapshot_and_post_repair_verific
 def test_complete_coverage_services_all_bindings_through_a_bounded_rotating_window(tmp_path):
     runtime = MachineRuntime(tmp_path / "machine")
     initialize_machine(runtime, "gpu-1")
-    controller = object.__new__(ProjectIOController)
-    controller.runtime = runtime
-    controller._snapshot_coverage_cursor = None
     timestamp = datetime.now(timezone.utc).isoformat()
-    controller._snapshot_health = SimpleNamespace(snapshot_evidence=lambda **_identity: (timestamp, timestamp))
+    publication = MachineSnapshotPublication(
+        runtime, SimpleNamespace(snapshot_evidence=lambda **_identity: (timestamp, timestamp)), monotonic
+    )
     covered = tuple((f"project-{index:02d}", "generation") for index in range(65))
 
     def count():
@@ -363,8 +362,8 @@ def test_complete_coverage_services_all_bindings_through_a_bounded_rotating_wind
         )
 
     checkpoint = ProducerCoverageCheckpoint(dict.fromkeys(covered, datetime.now(timezone.utc).isoformat()))
-    controller.record_scheduler_coverage(checkpoint, instance_id="current")
+    publication.record_scheduler_coverage(checkpoint, instance_id="current")
     assert count() == 16
     for _turn in range(4):
-        controller.record_scheduler_coverage(checkpoint, instance_id="current")
+        publication.record_scheduler_coverage(checkpoint, instance_id="current")
     assert count() == len(covered)

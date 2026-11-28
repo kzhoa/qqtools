@@ -13,7 +13,7 @@ from ..runtime.group_discovery.advance import advance_group_service
 from ..runtime.group_discovery.probe import probe_group_service
 from ..runtime.paths import machine_project_paths
 from ..runtime.store import fenced_mutations
-from .project_io_protocol import ProjectIORequest
+from .project_io.protocol import ProjectIORequest
 
 _GROUP_SERVICE_OPERATION_KINDS = frozenset({"group_service_probe", "group_service_advance"})
 

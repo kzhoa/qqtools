@@ -81,6 +81,7 @@ from ..scheduler import (
 )
 from . import dispatch_loop as _dispatch
 from . import helpers as _helpers
+from . import idle_exit
 from .config import load_agent_config
 from .context import MachineRuntime, ProjectBinding, default_machine_runtime_root
 from .control_plane import _MachineControlPlane
@@ -101,7 +102,6 @@ from .dispatch_loop import dispatch_machine_cycle
 from .helpers import (
     _active_machine_identity,
     _consume_first_registered_binding,
-    _machine_is_true_idle,
     _machine_only_recovery_complete,
     _observe_unregistered_partitions,
     _pid_start_time_ticks,
@@ -109,13 +109,14 @@ from .helpers import (
     _publish_project_snapshots,
     _read_pid,
 )
-from .idle_job import IdleJobSupervisor, idle_job_status
+from .idle_job import IdleJobSupervisor
 from .idle_job_diagnostics import display_demand_detail
 from .idle_job_integration import advance_machine_idle_job
+from .idle_job_status import idle_job_status
 from .inventory import exact_binding_for_entry, load_inventory, observe_live_bindings, reconcile_live_bindings_locked
 from .project_admin import _stop_verified_legacy_agent, migrate_project
-from .project_io_controller import ProjectIOController
-from .project_io_executor import ProjectIOExecutor
+from .project_io.controller import ProjectIOController
+from .project_io.executor import ProjectIOExecutor
 from .project_io_stop import publish_project_stop_snapshots
 from .readiness import machine_project_readiness
 from .recovery_capture import inspect_recovery_capture
@@ -953,14 +954,14 @@ def run_machine_agent_loop(
                     # Dispatch can take a full multi-project cycle. Consume the
                     # service's latest completion before deciding to stay alive.
                     recovery_enrollment.poll()
-                    is_idle = _machine_is_true_idle(machine_runtime, has_consumed_binding=has_consumed_binding)
+                    is_idle = idle_exit.can_exit_when_idle(machine_runtime, has_consumed_binding=has_consumed_binding)
                 except (OSError, RuntimeError, ValueError, KeyError, TypeError):
                     is_idle = False
                 if is_idle:
                     if idle_since is None:
                         idle_since = time.monotonic()
                     elif time.monotonic() - idle_since >= loop_interval:
-                        idle_shutdown_guard = _confirm_idle_shutdown(
+                        idle_shutdown_guard = idle_exit.confirm_idle_shutdown(
                             machine_runtime,
                             has_consumed_binding=has_consumed_binding,
                             available_gpus=available_gpus,
@@ -1244,62 +1245,6 @@ def run_machine_agent_loop(
             raise primary_exception.with_traceback(primary_traceback)
         if cleanup_failures:
             raise MachineAgentStopError("machine agent cleanup failed in step(s): " + ", ".join(cleanup_failures))
-
-
-def _confirm_idle_shutdown(
-    runtime: MachineRuntime,
-    *,
-    has_consumed_binding: bool,
-    available_gpus: list[int] | None,
-    executor: Executor | None,
-    instance_id: str,
-    loop_interval: float,
-    started_at: str,
-) -> ContextManager[bool] | None:
-    """Recheck demand while excluding a concurrent activation decision.
-
-    Submission publishes its durable ready work before entering the same
-    lifecycle guard in ``ensure_machine_agent_started``. Isolated callers check
-    captured local wake and registry identities instead of dispatching shared
-    work under that guard. Hold it through stopped-status publication so a
-    concurrent activation cannot accept an agent already committed to exit.
-    """
-
-    # The process already owns scheduler authority. Lifecycle operations take
-    # this lock before waiting for that process, so an idle check must never
-    # wait here and invert the lifecycle/scheduler lock order.
-    guard = runtime.agent_lifecycle_guard(blocking=False)
-    acquired = guard.__enter__()
-    if not acquired:
-        guard.__exit__(None, None, None)
-        return None
-    try:
-        with runtime.migration_read_guard() as is_migration_clear:
-            if not is_migration_clear:
-                guard.__exit__(None, None, None)
-                return None
-            if getattr(runtime, "project_io_executor", None) is not None:
-                if not runtime.activation_wake.is_current():
-                    guard.__exit__(None, None, None)
-                    return None
-            else:
-                _dispatch.dispatch_machine_cycle_locked(
-                    runtime,
-                    available_gpus=available_gpus,
-                    executor=executor,
-                    instance_id=instance_id,
-                    heartbeat_interval_seconds=loop_interval,
-                    started_at=started_at,
-                    supervise=False,
-                    publish_snapshots=False,
-                )
-        if not _machine_is_true_idle(runtime, has_consumed_binding=has_consumed_binding):
-            guard.__exit__(None, None, None)
-            return None
-        return guard
-    except BaseException:
-        guard.__exit__(*sys.exc_info())
-        raise
 
 
 def _start_machine_agent_locked(

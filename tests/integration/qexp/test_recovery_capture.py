@@ -10,7 +10,7 @@ import pytest
 
 from qqtools.plugins.qexp import init_shared_root
 from qqtools.plugins.qexp.agent.context import MachineRuntime
-from qqtools.plugins.qexp.agent.helpers import _machine_is_true_idle
+from qqtools.plugins.qexp.agent.idle_exit import can_exit_when_idle
 from qqtools.plugins.qexp.agent.recovery_capture import RecoveryCapture
 from qqtools.plugins.qexp.agent.setup import initialize_machine
 from qqtools.plugins.qexp.runtime import responsibility_completion as completion
@@ -859,7 +859,7 @@ def test_qualified_idle_and_inbox_do_not_scan_attempt_history_or_sync(project, m
         patch.setattr(context, "iter_evidence_files", guarded)
         patch.setattr(DurableIO, "sync_directory", no_sync)
         for _ in range(3):
-            assert _machine_is_true_idle(runtime, has_consumed_binding=True)
+            assert can_exit_when_idle(runtime, has_consumed_binding=True)
             runtime.drain_legacy_runner_evidence(binding)
 
 
@@ -872,7 +872,7 @@ def test_qualified_idle_retains_each_membership_stage(project, stage):
     generation = ledger.publish("task-attempt-1", {"task_id": "task", "attempt_number": 1})
     if stage == "maintenance":
         ledger.handoff("task-attempt-1", generation)
-    assert not _machine_is_true_idle(runtime, has_consumed_binding=True)
+    assert not can_exit_when_idle(runtime, has_consumed_binding=True)
     assert "recovery_responsibilities" in runtime.iter_recovery_blockers(binding, should_use_capture=True)
 
 
@@ -883,7 +883,7 @@ def test_qualified_idle_preserves_legacy_reservation_blockers(project, lane):
     assert finish(RecoveryCapture(runtime, binding))
     runtime.last_cycle_had_demand = False
     atomic_replace(local_paths(cfg.runtime_root)[lane] / "reservation.json", {"reservation": {}})
-    assert not _machine_is_true_idle(runtime, has_consumed_binding=True)
+    assert not can_exit_when_idle(runtime, has_consumed_binding=True)
     assert f"legacy:{lane}:reservation" in runtime.iter_recovery_blockers(binding, should_use_capture=True)
 
 
@@ -926,7 +926,7 @@ def test_qualified_inbox_preserves_late_event_transport_and_barrier_retry(projec
     target = local_paths(root)["events"] / "machine/late.json"
     event = {"event_id": "late", "event_type": "diagnostic"}
     atomic_replace(source, event)
-    assert not _machine_is_true_idle(runtime, has_consumed_binding=True)
+    assert not can_exit_when_idle(runtime, has_consumed_binding=True)
     original = DurableIO.sync_directory
 
     def fail_destination(io, directory, label):
@@ -941,7 +941,7 @@ def test_qualified_inbox_preserves_late_event_transport_and_barrier_retry(projec
     assert read_json(source) == read_json(target) == event
     runtime.drain_legacy_runner_evidence(binding)
     assert not source.exists() and read_json(target) == event
-    assert not _machine_is_true_idle(runtime, has_consumed_binding=True)
+    assert not can_exit_when_idle(runtime, has_consumed_binding=True)
 
 
 def test_qualified_inbox_uses_direct_capture_membership_for_late_runner_exit(project, monkeypatch):
@@ -1001,13 +1001,13 @@ def test_qualified_idle_requires_matching_release_receipt_after_source_hold_remo
         value = read_json(receipt)
         value["completion_digest"] = "different"
         atomic_replace(receipt, value)
-    assert not _machine_is_true_idle(runtime, has_consumed_binding=True)
+    assert not can_exit_when_idle(runtime, has_consumed_binding=True)
     assert "legacy:writer_capture_unavailable" in runtime.iter_recovery_blockers(binding, should_use_capture=True)
 
 
 def test_group_isolation_activates_while_captured_source_remains_owned(project):
-    from qqtools.plugins.qexp.agent.project_io_controller import ProjectIOController
-    from qqtools.plugins.qexp.agent.project_io_executor import ProjectIOExecutor
+    from qqtools.plugins.qexp.agent.project_io.controller import ProjectIOController
+    from qqtools.plugins.qexp.agent.project_io.executor import ProjectIOExecutor
     from qqtools.plugins.qexp.agent.recovery_enrollment import RecoveryEnrollment
     from qqtools.plugins.qexp.runtime.group_namespace import is_group_authority_isolated
 

@@ -1,4 +1,4 @@
-"""Shared boundary dispatch for CPU and explicit or selected CUDA backends."""
+"""Open and periodic boundary selection shared by the neighbor backends."""
 
 from typing import Callable
 
@@ -6,7 +6,7 @@ import torch
 from torch import Tensor
 
 
-def _dispatcher(obc: Callable, periodic: Callable) -> Callable:
+def make_neighbor_list(obc: Callable, periodic: Callable) -> Callable:
     def neighbor_list(
         positions: Tensor,
         cutoff: float,
@@ -31,7 +31,11 @@ def _dispatcher(obc: Callable, periodic: Callable) -> Callable:
         Args:
             positions: Cartesian positions (N, 3) on the selected backend device.
             cutoff: Strict distance cutoff.
-            batch: Optional int64 graph IDs; defaults to a single graph.
+            batch: Optional int64 graph IDs; defaults to a single graph. For periodic
+                CUDA searches, number the graphs in each batch from 0 to B-1, where B
+                is the number of graphs. Nodes may be interleaved. Use these IDs to
+                index per-graph cell and pbc rows. GPU workspaces scale with
+                max(batch) + 1, so gaps can increase memory use and runtime.
             max_neighbors: Incoming nearest-neighbor cap.
             cell: Row-vector lattice required for periodic axes.
             pbc: False for OBC, True for full PBC, or axis flags (3,)/(B,3).

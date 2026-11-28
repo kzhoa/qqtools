@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import base64
 import json
-from io import BytesIO
+from io import BytesIO, StringIO
 from pathlib import Path
+from tempfile import NamedTemporaryFile
 
 import pytest
 
+from qqtools.plugins.qexp import write_log_to_stream
 from qqtools.plugins.qexp.commands import logs
 from qqtools.plugins.qexp.commands import wait as wait_commands
 from qqtools.plugins.qexp.config_types import RootConfig
@@ -218,9 +220,73 @@ def test_finite_log_writer_preserves_invalid_utf8_for_binary_stdout(monkeypatch,
     monkeypatch.setattr(logs, "get_log_path", lambda _cfg, _task_id: path)
     stdout = BytesIO()
 
-    logs.write_logs(cfg, "task-1", stdout=stdout)
+    write_log_to_stream(cfg, "task-1", stdout=stdout)
 
     assert stdout.getvalue() == payload
+
+
+def test_public_log_writer_outputs_the_selected_log_to_stdout(monkeypatch, tmp_path: Path, capsysbinary) -> None:
+    path = tmp_path / "attempt.log"
+    payload = b"first line\n" * 20 + b"last line\xff"
+    path.write_bytes(payload)
+    monkeypatch.setattr(logs, "get_log_path", lambda _cfg, _task_id: path)
+
+    cfg = _cfg(tmp_path)
+    write_log_to_stream(cfg, "task-1")
+
+    assert capsysbinary.readouterr().out == payload
+
+    write_log_to_stream(cfg, "task-1", tail_lines=1)
+    assert capsysbinary.readouterr().out == b"last line\xff"
+
+
+def test_log_writer_preserves_bytes_in_a_wrapped_binary_file(monkeypatch, tmp_path: Path) -> None:
+    path = tmp_path / "attempt.log"
+    payload = b"first line\nlast line\xff"
+    path.write_bytes(payload)
+    monkeypatch.setattr(logs, "get_log_path", lambda *_: path)
+
+    with NamedTemporaryFile("w+b", dir=tmp_path) as output:
+        write_log_to_stream(_cfg(tmp_path), "task-1", stdout=output)
+        output.seek(0)
+        assert output.read() == payload
+
+
+@pytest.mark.parametrize("tail_lines", [None, 1])
+def test_log_writer_reads_bounded_chunks_and_decodes_split_utf8(monkeypatch, tmp_path: Path, tail_lines) -> None:
+    path = tmp_path / "attempt.log"
+    payload = b"abc" + "雪".encode() + b"def\xe2"
+    path.write_bytes(payload)
+    monkeypatch.setattr(logs, "get_log_path", lambda *_: path)
+    monkeypatch.setattr(logs, "_LOG_CHUNK_SIZE", 4)
+    original_open = Path.open
+
+    class BoundedReader:
+        def __enter__(self):
+            self.file = original_open(path, "rb")
+            return self
+
+        def __exit__(self, *_):
+            self.file.close()
+
+        def __getattr__(self, name):
+            return getattr(self.file, name)
+
+        def read(self, size=-1):
+            assert 0 < size <= 4
+            return self.file.read(size)
+
+    class GrowingLogOutput(StringIO):
+        def write(self, text):
+            if self.tell() == 0:
+                with original_open(path, "ab") as log:
+                    log.write(b"more")
+            return super().write(text)
+
+    monkeypatch.setattr(Path, "open", lambda *_args, **_kwargs: BoundedReader())
+    output = GrowingLogOutput()
+    write_log_to_stream(_cfg(tmp_path), "task-1", tail_lines=tail_lines, stdout=output)
+    assert output.getvalue() == payload.decode("utf-8", errors="replace")
 
 
 def test_name_cursor_v2_binds_exact_filter_and_v1_stays_unchanged() -> None:

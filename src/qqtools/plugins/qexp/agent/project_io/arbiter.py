@@ -8,7 +8,7 @@ from collections.abc import Collection, Sequence
 from dataclasses import dataclass
 from typing import Literal
 
-from .project_io_protocol import PROJECT_IO_CAPACITY, PROJECT_IO_OPERATIONS
+from .protocol import PROJECT_IO_CAPACITY, PROJECT_IO_OPERATIONS
 
 BindingOwner = tuple[str, str, str]
 ServiceClass = Literal["authority", "primary", "background"]

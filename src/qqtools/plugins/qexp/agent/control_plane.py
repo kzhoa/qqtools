@@ -37,7 +37,7 @@ from .context import MachineRuntime, ProjectBinding
 from .control_plane_health import ControlPlaneHealth
 from .deadlines import advance_deadline
 from .helpers import _read_pid
-from .project_io_controller import ProjectIOController
+from .project_io.controller import ProjectIOController
 from .recovery_capture import recovery_owner
 from .scheduler_diagnostics import MAX_AUTOMATIC_RETIREMENTS, SchedulerDiagnosticStore
 

@@ -23,7 +23,7 @@ from .takeover_intent import (
 
 if TYPE_CHECKING:
     from .context import MachineRuntime
-    from .project_io_controller import ProjectIOController
+    from .project_io.controller import ProjectIOController
 
 _FROZEN_PHASES = {"verifying_drain", "committing", "shared_committed", "publishing_binding"}
 _DRAIN_RETRY_SECONDS = 1.0

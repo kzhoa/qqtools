@@ -5,9 +5,9 @@ from types import SimpleNamespace
 import pytest
 
 from qqtools.plugins.qexp import init_shared_root, submit
-from qqtools.plugins.qexp.agent import project_io_worker as worker
 from qqtools.plugins.qexp.agent.context import MachineRuntime
-from qqtools.plugins.qexp.agent.project_io_executor import ProjectIOExecutor
+from qqtools.plugins.qexp.agent.project_io import worker
+from qqtools.plugins.qexp.agent.project_io.executor import ProjectIOExecutor
 from qqtools.plugins.qexp.agent.setup import initialize_machine
 from qqtools.plugins.qexp.runtime.dependency_projection import (
     mark_degraded,
@@ -190,11 +190,11 @@ def _wait(executor, request, *, consume=False):
 def _instrument_children(monkeypatch, tmp_path, body):
     import subprocess
 
-    from qqtools.plugins.qexp.agent import project_io_executor as executor_module
+    from qqtools.plugins.qexp.agent.project_io import executor as executor_module
 
     script = tmp_path / "instrument_worker.py"
     script.write_text(
-        "from qqtools.plugins.qexp.agent import project_io_worker as worker\n"
+        "from qqtools.plugins.qexp.agent.project_io import worker\n"
         "from qqtools.plugins.qexp.runtime.upgrade import UpgradeCoordinator\n"
         + body
         + "\nraise SystemExit(worker.main())\n"
@@ -246,7 +246,7 @@ UpgradeCoordinator.advance = advance""",
 def test_controller_rotates_backlogged_projects_with_one_slot(tmp_path, monkeypatch):
     import time
 
-    from qqtools.plugins.qexp.agent.project_io_controller import ProjectIOController
+    from qqtools.plugins.qexp.agent.project_io.controller import ProjectIOController
 
     runtime = MachineRuntime(tmp_path / "machine")
     initialize_machine(runtime, "gpu-1")
@@ -302,7 +302,7 @@ def test_daemon_window_throughput_from_identical_checkpoint(legacy, monkeypatch,
     import shutil
     import time
 
-    from qqtools.plugins.qexp.agent.project_io_controller import ProjectIOController
+    from qqtools.plugins.qexp.agent.project_io.controller import ProjectIOController
 
     cfg, runtime, executor, _request = legacy
     revision, bindings = runtime.load_registry()
