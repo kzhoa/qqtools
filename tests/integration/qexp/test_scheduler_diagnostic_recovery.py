@@ -104,14 +104,22 @@ def test_restart_from_project_recovers_full_store_without_foreground_repair(proj
     history = first_project_history(store, binding.project_id)
     assert history["disposition"] == "superseded"
 
-    def verified_status():
-        result = _cli_json(capsys, "status")
-        if result["scheduling_readiness"]["state"] == "observed":
-            return result
-        return None
+    status = {}
 
-    wait_until("selected binding verified", verified_status, timeout=35, stage="diagnostic recovery")
-    status = verified_status()
+    def verified_status():
+        nonlocal status
+        status = _cli_json(capsys, "status")
+        return status["scheduling_readiness"]["state"] == "observed"
+
+    wait_until(
+        "selected binding verified",
+        verified_status,
+        timeout=35,
+        stage="diagnostic recovery",
+        on_timeout=lambda: {
+            key: status.get(key) for key in ("scheduling_readiness", "diagnostic_recovery", "project_snapshot")
+        },
+    )
     assert status["scheduler_diagnostics"]["coverage"] == "complete"
     assert status["scheduler_diagnostics"]["machine_coverage"] == "incomplete"
     assert status["project_snapshot"]["freshness"] == "fresh"

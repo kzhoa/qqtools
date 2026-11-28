@@ -40,6 +40,8 @@ from .recovery_transport import (
 )
 from .takeover_transport import takeover_registration_evidence, takeover_registration_parameters
 
+RESERVATION_RECONCILE_RELEASE_REASONS = frozenset({"task_missing", "claim_missing", "lease_expired_before_launch"})
+
 PROJECT_IO_PROTOCOL_VERSION = 1
 PROJECT_IO_CAPACITY = 4
 PROJECT_IO_SUPPORTED_HANG_LIMIT = 2
@@ -2279,7 +2281,7 @@ def _validate_evidence(request: ProjectIORequest, status: str, value: Mapping[st
                     raise ValueError("reservation reconciliation outcome contains invalid authority.")
             elif outcome == "release":
                 if (
-                    reason not in {"task_missing", "claim_missing", "lease_expired_before_launch"}
+                    reason not in RESERVATION_RECONCILE_RELEASE_REASONS
                     or target_attempt_id is not None
                     or target_fencing_token is not None
                 ):

@@ -411,7 +411,10 @@ def maintain_scheduler_diagnostics(
                     if _write_report(runtime, report, stop_event=stop_event):
                         unpublished_progress_at = None
                         unpublished_retired = 0
-                        if report["state"] in {"idle", "awaiting_observation"}:
+                        if report["state"] == "awaiting_observation":
+                            runtime.request_recovery_snapshots(report["last_progress_at"])
+                            return
+                        if report["state"] == "idle":
                             return
                     else:
                         unpublished_retired += result["retired"]

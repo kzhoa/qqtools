@@ -15,6 +15,7 @@ from contextlib import closing, contextmanager
 from contextvars import ContextVar
 from copy import deepcopy
 from dataclasses import dataclass, replace
+from datetime import datetime, timezone
 from hashlib import sha256
 from pathlib import Path
 from threading import Lock, RLock
@@ -157,6 +158,7 @@ class MachineRuntime:
     def __init__(self, root: str | Path | None = None) -> None:
         self.root = resolve_machine_runtime_root(root)
         self._machine_snapshot_intent_lock = Lock()
+        self._recovery_snapshots: dict[tuple[str, str], datetime] = {}
         self._pending_machine_snapshot_intent: MachineSnapshotIntent | None = None
         self._registration_renewal_intent_lock = Lock()
         self._pending_registration_renewal_intent: RegistrationRenewalIntent | None = None
@@ -225,6 +227,28 @@ class MachineRuntime:
         self.working_set = BindingWorkingSet(self)
         self.activation_wake = ActivationWakeFence(self)
 
+    def request_recovery_snapshots(self, progress_at: str) -> None:
+        """Request one post-retirement coverage receipt per current enabled generation."""
+        after = datetime.fromisoformat(progress_at)
+        _, registered = self.registration.load_registry_snapshot()
+        with self._machine_snapshot_intent_lock:
+            self._recovery_snapshots = {
+                (binding.project_id, binding.registration_generation): after
+                for binding in registered
+                if binding.enabled and binding.registration_generation
+            }
+
+    def complete_recovery_snapshot(self, project_id: str, generation: str, snapshot_at: str) -> None:
+        with self._machine_snapshot_intent_lock:
+            key = (project_id, generation)
+            after = self._recovery_snapshots.get(key)
+            intent = self._pending_machine_snapshot_intent
+            if after is not None and intent is not None:
+                snapshot = datetime.fromisoformat(snapshot_at)
+                age = (datetime.now(timezone.utc) - snapshot).total_seconds()
+                if snapshot > after and 0 <= age <= 3 * intent.heartbeat_interval_seconds:
+                    del self._recovery_snapshots[key]
+
     def publish_machine_snapshot_intent(
         self,
         *,
@@ -251,6 +275,15 @@ class MachineRuntime:
             gpu_policy=deepcopy(dict(gpu_policy)),
         )
         with self._machine_snapshot_intent_lock:
+            if self._recovery_snapshots:
+                renewal = self.registration_renewal_intent()
+                if renewal is not None and renewal.registry_revision == registry_revision:
+                    pending = (
+                        binding
+                        for binding in renewal.bindings
+                        if (binding.project_id, binding.registration_generation) in self._recovery_snapshots
+                    )
+                    intent = replace(intent, bindings=tuple(dict.fromkeys((*intent.bindings, *pending))))
             self._pending_machine_snapshot_intent = intent
 
     def machine_snapshot_intent(

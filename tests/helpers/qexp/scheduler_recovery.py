@@ -1,5 +1,6 @@
 """Fixtures for the version-1 scheduler diagnostic publication limit."""
 
+import time
 from pathlib import Path
 
 from qqtools.plugins.qexp.agent.context import MachineRuntime
@@ -90,8 +91,12 @@ def diagnostic_tree(root: Path) -> dict[Path, bytes]:
 
 def first_project_history(store: SchedulerDiagnosticStore, project_id: str) -> dict:
     cursor = None
+    deadline = time.monotonic() + 5
     for _page in range(512):
         result = store.history_view(project_id=project_id, limit=1, cursor=cursor)
+        while result["reason"] == "store_unavailable" and time.monotonic() < deadline:
+            time.sleep(0.02)
+            result = store.history_view(project_id=project_id, limit=1, cursor=cursor)
         if result["items"]:
             return result["items"][0]
         assert not result["end_of_capture"], result

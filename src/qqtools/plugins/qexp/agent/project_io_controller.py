@@ -56,6 +56,7 @@ from .project_io_protocol import (
     IDLE_DECISION_GUARD_PROJECT_ID,
     PROJECT_IO_OPERATIONS,
     PROJECT_IO_OVERDUE_SECONDS,
+    RESERVATION_RECONCILE_RELEASE_REASONS,
     ProjectIORequest,
 )
 from .ready_cursor_validation import validate_ready_cursor_transition
@@ -1048,8 +1049,22 @@ class ProjectIOController:
             if operation_kind not in _PREVALIDATION_RECONCILIATION_OPERATION_KINDS:
                 continue
             identity = self._request_identity(request)
-            if identity in current_binding_identities and identity in self._validated:
-                continue
+            if identity in self._validated:
+                if identity in current_binding_identities:
+                    continue
+                if operation_kind == "machine_snapshot_publish":
+                    intent = self.runtime.machine_snapshot_intent()
+                    if (
+                        intent is not None
+                        and intent.registry_revision == request.registry_revision
+                        and any(
+                            self._binding_identity(binding, intent.registry_revision, executor_epoch) == identity
+                            for binding in intent.bindings
+                        )
+                    ):
+                        # A post-recovery snapshot may still own a dormant
+                        # binding's request. Let its publisher accept the result.
+                        continue
             if operation_kind == "authority_running_publish" and request.executor_epoch != executor_epoch:
                 continue
             try:
@@ -3087,7 +3102,12 @@ class ProjectIOController:
             if result.status == "completed" and binding is not None:
                 outcome = result.evidence.get("outcome")
                 try:
-                    local_state = classify_exact_reservation(self.runtime.root, requested)
+                    reason = result.evidence.get("reason") if outcome == "release" else None
+                    local_state = classify_exact_reservation(
+                        self.runtime.root,
+                        requested,
+                        release_pair_reasons=frozenset({reason}) if isinstance(reason, str) else None,
+                    )
                     if outcome in {"retained", "prelaunch_retained"}:
                         if local_state == "matching_active" and current == requested:
                             trusted = requested
@@ -3111,12 +3131,9 @@ class ProjectIOController:
                             if target_state == "matching_active":
                                 trusted = target
                     elif outcome == "release":
-                        reason = result.evidence.get("reason")
                         if not isinstance(reason, str):
                             applied = False
-                        elif local_state == "matching_active" or (
-                            local_state == "matching_release_pair" and reason == "lease_expired_before_launch"
-                        ):
+                        elif local_state in {"matching_active", "matching_release_pair"}:
                             released = release_if_matches(self.runtime.root, requested, reason)
                             if not released and classify_exact_reservation(self.runtime.root, requested) not in {
                                 "matching_released",
@@ -4472,6 +4489,7 @@ class ProjectIOController:
                         }
                     },
                 )
+                self.runtime.complete_recovery_snapshot(project_id, generation, snapshot_at)
             except (OSError, ValueError):
                 continue
 
@@ -6302,7 +6320,7 @@ class ProjectIOController:
         )
         try:
             if classify_exact_reservation(
-                self.runtime.root, reservation, release_pair_reason="lease_expired_before_launch"
+                self.runtime.root, reservation, release_pair_reasons=RESERVATION_RECONCILE_RELEASE_REASONS
             ) not in {
                 "matching_active",
                 "matching_release_pair",
@@ -6420,12 +6438,13 @@ class ProjectIOController:
 
     def validated_config(self, binding: ProjectBinding, registry_revision: int) -> RootConfig | None:
         """Return a locally built config only for an exact cached validation identity."""
+        return self._root_config(binding) if self.is_binding_validated(binding, registry_revision) else None
+
+    def is_binding_validated(self, binding: ProjectBinding, registry_revision: int) -> bool:
         if type(registry_revision) is not int or registry_revision < 0:
-            return None
+            return False
         identity = self._binding_identity(binding, registry_revision, self._observed_executor_epoch)
-        if identity is None or not self._binding_identity_is_validated(identity):
-            return None
-        return self._root_config(binding)
+        return identity is not None and self._binding_identity_is_validated(identity)
 
     def _binding_identity_is_validated(self, identity: _ValidationIdentity) -> bool:
         return identity in self._validated

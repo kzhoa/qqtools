@@ -2580,6 +2580,8 @@ class AttemptSupervisionCoordinator:
         self,
         bindings: Sequence[ProjectBinding],
         registry_revision: int,
+        *,
+        validated_registry: Sequence[ProjectBinding] | None = None,
     ) -> None:
         """Advance startup readiness and fresh activation-bound authority censuses."""
         eligible = list(bindings)
@@ -2591,9 +2593,15 @@ class AttemptSupervisionCoordinator:
                 self._discard_initial_scan(signature)
                 self._discard_authority_census(signature)
                 self._initial_observed.discard(signature)
-                self._initial_reconciled.discard(signature)
         self._initial_observed.intersection_update(signatures)
-        self._initial_reconciled.intersection_update(signatures)
+        # A resident rotation may temporarily omit an already recovered binding.
+        # Preserve only its completed startup proof for the exact validated registry.
+        retained = (
+            signatures
+            if validated_registry is None
+            else {self._initial_reconciliation_signature(binding, registry_revision) for binding in validated_registry}
+        )
+        self._initial_reconciled.intersection_update(retained)
         try:
             executor_epoch = self.controller.executor.status_view().get("executor_epoch")
         except _SUPERVISION_LANE_ERRORS:
@@ -2802,6 +2810,8 @@ class AttemptSupervisionCoordinator:
         self,
         bindings: Sequence[ProjectBinding],
         registry_revision: int,
+        *,
+        validated_registry: Sequence[ProjectBinding] | None = None,
     ) -> dict[str, Mapping[str, Any]]:
         """Advance every attempt-supervision lane in one admission turn.
 
@@ -2841,7 +2851,7 @@ class AttemptSupervisionCoordinator:
                 continue
             if isinstance(value, Mapping):
                 results[name] = value
-        self._advance_initial_reconciliation(bindings, registry_revision)
+        self._advance_initial_reconciliation(bindings, registry_revision, validated_registry=validated_registry)
         return results
 
     def advance_running_publications(

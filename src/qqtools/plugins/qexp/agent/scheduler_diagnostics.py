@@ -2058,16 +2058,21 @@ def _tree_bytes(root: Path) -> int:
         return 0
     total = 0
     entries = 0
-    for path in root.rglob("*"):
-        entries += 1
-        if entries > MAX_ACTIVE_RECORDS + MAX_DECISIONS + MAX_HISTORY_ENTRIES + 32:
-            raise _StoreReadError("store_oversized")
-        if path.is_symlink():
-            raise _StoreReadError("store_corrupt")
-        if path.is_file():
-            total += path.stat().st_size
-            if total > MAX_PHYSICAL_PEAK_BYTES:
-                raise _StoreReadError("store_oversized")
+    directories = [os.fspath(root)]
+    while directories:
+        with os.scandir(directories.pop()) as children:
+            for child in children:
+                entries += 1
+                if entries > MAX_ACTIVE_RECORDS + MAX_DECISIONS + MAX_HISTORY_ENTRIES + 32:
+                    raise _StoreReadError("store_oversized")
+                if child.is_symlink():
+                    raise _StoreReadError("store_corrupt")
+                if child.is_dir(follow_symlinks=False):
+                    directories.append(child.path)
+                elif child.is_file(follow_symlinks=False):
+                    total += child.stat(follow_symlinks=False).st_size
+                    if total > MAX_PHYSICAL_PEAK_BYTES:
+                        raise _StoreReadError("store_oversized")
     return total
 
 

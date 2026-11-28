@@ -762,7 +762,15 @@ def _advance_machine_snapshot_publications(
             revision, registered = registry_snapshot
             controller.prune_machine_snapshot_observations(registered)
             parameters["observed_registry_revision"] = revision
-        intent = runtime.machine_snapshot_intent(validated_project_ids=tuple(validated_project_ids))
+            # Heartbeat intents also cover validated dormant bindings. The
+            # resident scheduler window may contain none of their Project IDs.
+            intent = runtime.machine_snapshot_intent()
+            if intent is not None and not any(
+                controller.is_binding_validated(binding, revision) for binding in intent.bindings
+            ):
+                return
+        else:
+            intent = runtime.machine_snapshot_intent(validated_project_ids=tuple(validated_project_ids))
         if intent is not None:
             controller.advance_machine_snapshot_publications(
                 intent.bindings,
@@ -1163,7 +1171,13 @@ def _dispatch_isolated_machine_cycle(
     coordinator = getattr(runtime, "attempt_supervision_coordinator", None)
     if not isinstance(coordinator, AttemptSupervisionCoordinator):
         raise RuntimeError("isolated dispatch requires the runtime-owned attempt supervision coordinator.")
-    coordinator.advance_all(supervision_bindings, registry_revision)
+    coordinator.advance_all(
+        supervision_bindings,
+        registry_revision,
+        validated_registry=[
+            binding for binding in registered_bindings if controller.is_binding_validated(binding, registry_revision)
+        ],
+    )
     ready_generations = getattr(runtime, "authority_ready_generations", None)
     if not isinstance(ready_generations, dict):
         ready_generations = {}

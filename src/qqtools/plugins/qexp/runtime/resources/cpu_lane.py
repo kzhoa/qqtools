@@ -483,7 +483,7 @@ def classify_exact_reservation(
     runtime_root: Path,
     identity: ReservationIdentity,
     *,
-    release_pair_reason: str | None = None,
+    release_pair_reasons: frozenset[str] | None = None,
 ) -> Literal["absent", "matching_active", "matching_released", "matching_release_pair", "conflict"]:
     """Read one active/released CPU reservation using its complete identity."""
     paths = local_paths(runtime_root)
@@ -503,8 +503,11 @@ def classify_exact_reservation(
                 and identity.exactly_matches(reservation)
                 and (
                     state != "released"
-                    or release_pair_reason is None
-                    or reservation.get("release_reason") == release_pair_reason
+                    or release_pair_reasons is None
+                    or (
+                        isinstance(reservation.get("release_reason"), str)
+                        and reservation["release_reason"] in release_pair_reasons
+                    )
                 )
                 for state, path in found
                 for reservation in (read_json(path).get("reservation", {}),)

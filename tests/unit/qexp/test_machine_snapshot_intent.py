@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -101,6 +102,48 @@ def test_dispatch_snapshot_handoff_forwards_exact_intent_and_consumes_failures(t
         "gpu_policy": {"mode": "auto"},
     }
     assert runtime.machine_snapshot_intent() is not None
+
+    controller.prune_machine_snapshot_observations = lambda bindings: None
+    controller.is_binding_validated = lambda candidate, revision: candidate == binding and revision == 7
+    for revision in (8, 7):
+        dispatch_loop._advance_machine_snapshot_publications(
+            runtime, controller, (), registry_snapshot=(revision, [binding])
+        )
+    assert len(calls) == 2
+    assert calls[1] == ((binding,), 7, {**parameters, "observed_registry_revision": 7})
+
+
+def test_recovery_keeps_dormant_snapshot_due_until_fresh_coverage(tmp_path, monkeypatch):
+    runtime = MachineRuntime(tmp_path / "machine")
+    binding = ProjectBinding("project-a", tmp_path / "project" / ".qexp", "gpu-1", registration_generation="gen")
+    monkeypatch.setattr(runtime.registration, "load_registry_snapshot", lambda: (7, (binding,)))
+    runtime.publish_registration_renewal_intent(
+        bindings=(binding,), registry_revision=7, renewal_horizon_seconds=10, heartbeat_interval_seconds=5
+    )
+
+    def heartbeat():
+        runtime.publish_machine_snapshot_intent(
+            bindings=(),
+            registry_revision=7,
+            instance_id="agent",
+            pid=1,
+            visible_gpu_ids=[],
+            reservations=[],
+            heartbeat_interval_seconds=5,
+            started_at="2026-09-28T00:00:00Z",
+            gpu_policy={},
+        )
+        return runtime.machine_snapshot_intent().bindings
+
+    now = datetime.now(timezone.utc)
+    runtime.request_recovery_snapshots((now - timedelta(minutes=1)).isoformat())
+    assert heartbeat() == (binding,)
+    runtime.complete_recovery_snapshot(binding.project_id, "gen", (now - timedelta(seconds=30)).isoformat())
+    assert heartbeat() == (binding,)
+    runtime.complete_recovery_snapshot(binding.project_id, "old", now.isoformat())
+    assert heartbeat() == (binding,)
+    runtime.complete_recovery_snapshot(binding.project_id, "gen", now.isoformat())
+    assert heartbeat() == ()
 
 
 def test_registration_renewal_intent_is_latest_state_and_dispatch_forwards_it(tmp_path: Path) -> None:

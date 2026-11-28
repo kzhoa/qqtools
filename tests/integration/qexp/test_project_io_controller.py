@@ -553,6 +553,8 @@ def test_initial_reconciliation_is_fenced_by_registry_revision(tmp_path: Path) -
         coordinator._advance_initial_reconciliation([binding], revision)
         coordinator._advance_initial_reconciliation([binding], revision)
         assert coordinator.initially_reconciled(binding, revision)
+        coordinator._advance_initial_reconciliation([], revision, validated_registry=[binding])
+        assert coordinator.initially_reconciled(binding, revision)
         runtime.authority_ready_generations = {
             binding.project_id: binding.registration_generation,
         }
