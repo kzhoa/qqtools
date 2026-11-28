@@ -15,7 +15,12 @@
 - fix: recover stalled pre-launch claims and scheduler diagnostics after agent
   turnover. Verify current binding and agent evidence during recovery and
   isolate registration renewal preparation failures.
-- fix: bound Idle Job observations and preserve admission for training work.
+- fix: refresh dormant Project activation observations when the Idle Job guard
+  detects a changed checkpoint, so queued CPU and GPU training can preempt the
+  Idle Job. Keep observations bounded and preserve training admission checks.
+- fix: let termination recovery finish interrupted reservation releases while
+  retaining replay support for expired pre-launch claims. Show active Project
+  I/O separately from blocking conditions in human-readable agent status.
 - breaking: rename the balanced sampler and batch grouping strategy
   `lpt-medium` to `lpt_medium`. The existing short alias `lpt` still selects
   the medium tier.
