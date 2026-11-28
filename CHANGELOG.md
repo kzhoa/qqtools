@@ -24,6 +24,8 @@
 - fix: preserve startup recovery evidence across scheduler rotations, complete
   interrupted releases for missing Tasks and claims, and refresh dormant
   Project snapshots until post-recovery coverage is verified.
+- fix: finish local cleanup for confirmed historical terminations. Preserve
+  Group cancellation backoff while membership coverage is unchanged.
 - breaking: rename the balanced sampler and batch grouping strategy
   `lpt-medium` to `lpt_medium`. The existing short alias `lpt` still selects
   the medium tier.
