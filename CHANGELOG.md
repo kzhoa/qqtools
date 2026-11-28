@@ -26,6 +26,8 @@
   Project snapshots until post-recovery coverage is verified.
 - fix: finish local cleanup for confirmed historical terminations. Preserve
   Group cancellation backoff while membership coverage is unchanged.
+- fix: preserve subsecond heartbeat evidence for pre-launch recovery and
+  pace repeated checks of confirmed signal exits so shared offers can proceed.
 - breaking: rename the balanced sampler and batch grouping strategy
   `lpt-medium` to `lpt_medium`. The existing short alias `lpt` still selects
   the medium tier.
