@@ -21,6 +21,9 @@
 - fix: let termination recovery finish interrupted reservation releases while
   retaining replay support for expired pre-launch claims. Show active Project
   I/O separately from blocking conditions in human-readable agent status.
+- fix: preserve startup recovery evidence across scheduler rotations, complete
+  interrupted releases for missing Tasks and claims, and refresh dormant
+  Project snapshots until post-recovery coverage is verified.
 - breaking: rename the balanced sampler and batch grouping strategy
   `lpt-medium` to `lpt_medium`. The existing short alias `lpt` still selects
   the medium tier.
